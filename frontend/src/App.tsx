@@ -1,0 +1,829 @@
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import type { AppState, ModalState, Page, ToastData, MediaFile, SearchResult } from './lib/types';
+import { api } from './lib/api';
+import { apiToMediaFile } from './lib/adapters';
+import { cacheGet, cacheSet } from './lib/cache';
+import { IcSpin } from './lib/icons';
+import { Sidebar, Topbar, Toast } from './components/ui';
+import { ManualSearchModal, RenamePreviewModal, KeyboardShortcutsModal, FileDetailsModal } from './components/modals';
+import { Onboarding, isOnboarded } from './components/Onboarding';
+import { DashboardPage } from './pages/DashboardPage';
+import { ReviewPage } from './pages/ReviewPage';
+import { HistoryPage } from './pages/HistoryPage';
+import { SettingsPage } from './pages/SettingsPage';
+
+// Read the page name out of the URL hash on first render. Falls back to
+// review (the main work surface) if the hash is missing or unknown.
+function pageFromHash(): Page {
+  const h = window.location.hash.replace(/^#\/?/, '').trim().toLowerCase();
+  if (h === 'dashboard' || h === 'review' || h === 'history' || h === 'settings') return h;
+  return 'review';
+}
+
+export default function App() {
+  const [active, setActiveState] = useState<Page>(() => pageFromHash());
+  const [onboarded, setOnboardedState] = useState<boolean>(() => isOnboarded());
+  const [searchQuery, setSearchQuery] = useState('');
+
+  // Keep the hash in sync with the active page so refresh + back/forward work.
+  const setActive = useCallback((p: Page) => {
+    setActiveState(p);
+    if (window.location.hash !== `#/${p}`) window.location.hash = `#/${p}`;
+  }, []);
+
+  useEffect(() => {
+    const onHashChange = () => setActiveState(pageFromHash());
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
+  // Stale-while-revalidate: hydrate from localStorage cache synchronously
+  // so on second+ refresh the user sees the previous library INSTANTLY,
+  // then the background fetch updates it silently. First-ever load (no
+  // cache) starts empty + hydrated=false, so pages show skeletons.
+  const cachedFiles = cacheGet<MediaFile[]>('files');
+  const [state, setState] = useState<AppState>({
+    files: cachedFiles ?? [],
+    scanRunning: false,
+    scanProgress: 0,
+    scanFound: 0,
+    scanMessage: 'Walking directory tree...',
+    // If we restored from cache, treat the page as hydrated for layout
+    // purposes — the previous data is good enough to render. The
+    // background fetch below will replace it with fresher data when it
+    // lands.
+    hydrated: cachedFiles !== null,
+  });
+  // Track backend connectivity explicitly so the UI can show "Disconnected"
+  // instead of pretending an empty library is real.
+  const [backendOk, setBackendOk] = useState<boolean | null>(null);
+
+  // Pull real files from the backend on mount. Empty list is empty — never
+  // fall back to mock data, since that confuses users about what's real.
+  // `hydrated` flips in `.finally()` so success AND failure both unlock the
+  // empty-state UIs (a failed backend hits backendOk=false rendering, not
+  // the "Library is empty" hero — but either way the loading window is over).
+  //
+  // Cache write: every successful response gets persisted so the next
+  // refresh can hydrate the previous data instantly (stale-while-revalidate).
+  useEffect(() => {
+    api.listFiles({ limit: 500 })
+      .then(rows => {
+        setBackendOk(true);
+        const mapped = rows.map(apiToMediaFile);
+        setState(s => ({ ...s, files: mapped }));
+        cacheSet('files', mapped);
+      })
+      .catch(err => {
+        setBackendOk(false);
+        console.warn('Kira API unreachable:', err);
+      })
+      .finally(() => {
+        setState(s => ({ ...s, hydrated: true }));
+      });
+  }, []);
+
+  const pendingCount = useMemo(() =>
+    state.files.filter(f => f.status === 'pending').length,
+  [state.files]);
+
+  const [modal, setModal] = useState<ModalState>(null);
+  const openModal = (kind: string, payload?: unknown) => setModal({ kind, payload } as ModalState);
+  const closeModal = () => setModal(null);
+
+  const [toasts, setToasts] = useState<ToastData[]>([]);
+  const pushToast = useCallback((t: Omit<ToastData, 'id'>) => {
+    const id = Math.random().toString(36).slice(2);
+    setToasts(xs => [...xs, { id, ...t }]);
+    // Duration scales with content length: short success toasts vanish
+    // quickly; long error messages (e.g. file paths or stack traces)
+    // stick around long enough to actually read. Errors get a 50% bonus.
+    const contentLen = (t.title?.length ?? 0) + (t.sub?.length ?? 0);
+    const baseMs = Math.max(4000, Math.min(15000, contentLen * 60));
+    const ms = t.kind === 'error' ? Math.round(baseMs * 1.5) : baseMs;
+    setTimeout(() => setToasts(xs => xs.filter(x => x.id !== id)), ms);
+  }, []);
+  // Manual dismiss — passed to Toast components so users can clear long
+  // error messages without waiting.
+  const dismissToast = useCallback((id: string) => {
+    setToasts(xs => xs.filter(x => x.id !== id));
+  }, []);
+
+  const [focusedId, setFocusedId] = useState(state.files[0]?.id ?? '');
+
+  // Rename defaults + library root pulled from settings so the rest of
+  // the app stays consistent with what the user configured. Hardcoded
+  // 'Z:\\media' was Windows-/this-user-specific and broke for anyone else.
+  const [savedOp, setSavedOp] = useState<string>('move');
+  const [savedProfile, setSavedProfile] = useState<string>('Plex');
+  const [scanRoot, setScanRoot] = useState<string>('/media');
+  useEffect(() => {
+    const loadDefaults = async () => {
+      try {
+        const s = await api.getSettings();
+        if (typeof s['rename.default_op'] === 'string') setSavedOp(s['rename.default_op'] as string);
+        if (typeof s['naming.profile'] === 'string') setSavedProfile(s['naming.profile'] as string);
+        // library_root may be saved as a bare string OR as {value: "..."}
+        // depending on which write path produced it. Handle both shapes.
+        const lr = s['paths.library_root'];
+        if (typeof lr === 'string' && lr) setScanRoot(lr);
+        else if (lr && typeof lr === 'object' && 'value' in lr && typeof (lr as { value?: unknown }).value === 'string') {
+          setScanRoot((lr as { value: string }).value);
+        }
+      } catch { /* defaults stay */ }
+    };
+    void loadDefaults();
+    // Reload when Settings page saves
+    const onChange = () => { void loadDefaults(); };
+    window.addEventListener('kira:settings-saved', onChange);
+    return () => window.removeEventListener('kira:settings-saved', onChange);
+  }, []);
+
+  // The path Kira will scan. Pulled from settings (`paths.library_root`)
+  // with a sensible fallback. Falls through to '/media' if no setting is
+  // saved — that's the canonical Docker mount point.
+  const SCAN_ROOT = scanRoot;
+
+  const refreshFiles = useCallback(async () => {
+    try {
+      const rows = await api.listFiles({ limit: 500 });
+      setBackendOk(true);
+      const mapped = rows.map(apiToMediaFile);
+      setState(s => ({ ...s, files: mapped }));
+      cacheSet('files', mapped);
+    } catch (err) {
+      setBackendOk(false);
+      console.warn('Failed to refresh files:', err);
+    }
+  }, []);
+
+  const runScan = useCallback(async () => {
+    if (state.scanRunning) {
+      // User-reported bug: Dashboard "Scan now" button silently doing
+      // nothing. Likely cause: a previous scan crashed and left
+      // scanRunning=true (the finally clears it normally, but if the
+      // browser navigated away mid-scan or React unmounted during the
+      // long-running poll, the setState never ran). The button is then
+      // disabled visually, looking "broken".
+      //
+      // Watchdog escape hatch: if scanRunning is true but we haven't
+      // seen a progress update in 90 seconds, the polling loop is dead
+      // (the browser tab was backgrounded long enough for setTimeout
+      // throttling to kill it, the websocket died, etc.). Just clear
+      // the flag and let this click start a new scan — there's no
+      // actual in-flight loop to collide with.
+      const stale = Date.now() - lastProgressAtRef.current > 90_000;
+      if (stale) {
+        // eslint-disable-next-line no-console
+        console.warn('[Kira] scanRunning stuck true with no progress in >90s — force-clearing and proceeding.');
+        setState(s => ({ ...s, scanRunning: false, scanProgress: 0 }));
+        // Fall through to start a new scan below. We don't `return` so
+        // the same click that triggered the watchdog reset also kicks
+        // off the scan it was trying to start — feels responsive.
+      } else {
+        pushToast({
+          title: 'Scan already in progress',
+          sub: 'Wait for the current scan to finish — or reload the page if it appears stuck.',
+          kind: 'error',
+        });
+        return;
+      }
+    }
+    setState(s => ({
+      ...s,
+      scanRunning: true, scanProgress: 0, scanFound: 0,
+      scanMessage: `Walking ${SCAN_ROOT}...`,
+    }));
+
+    try {
+      // PB-4: mark the start so ETA math has a baseline. We use wall-clock
+      // monotonic-enough (Date.now) because the scan runs on the order
+      // of minutes; sub-second drift doesn't matter.
+      scanStartedAtRef.current = Date.now();
+      // Watchdog baseline — bumped every poll cycle below so a stuck
+      // scanRunning state can be detected on the NEXT click via the
+      // runScan early-return staleness check (see above).
+      lastProgressAtRef.current = Date.now();
+      // Backend kicks off the work as a background task and returns the scan id.
+      const scan = await api.createScan(SCAN_ROOT);
+
+      // Poll scan progress AND refresh the file list every second so rows
+      // animate into the Review queue as they're discovered + matched.
+      // Match phase gets the 50–95% range; scan phase 0–50%.
+      let done = false;
+      while (!done) {
+        await new Promise(r => setTimeout(r, 800));
+        let s: typeof scan;
+        try {
+          s = await api.getScan(scan.id);
+        } catch {
+          continue; // transient — keep polling
+        }
+        // Always refresh the file list so the user sees rows appear live.
+        try {
+          const rows = await api.listFiles({ limit: 500 });
+          setState(st => ({ ...st, files: rows.map(apiToMediaFile) }));
+        } catch { /* swallow */ }
+
+        if (s.status.startsWith('failed')) {
+          throw new Error(s.status);
+        }
+
+        // Compute a real progress percentage from the backend counts.
+        // PB-4: when `estimated_total` is present (set after Phase 1),
+        // use it for an honest percent. Add an ETA based on the matched-
+        // per-second rate so the user can plan around it ("~2 min left"
+        // is a totally different commitment than "watch the count climb
+        // and hope it stops eventually").
+        let pct = 0;
+        let msg = 'Walking directory tree...';
+        const total = s.estimated_total;
+        if (s.status === 'scanning') {
+          // No total yet — show file count climbing, cap visually at 50%.
+          pct = Math.min(50, Math.round(s.file_count * 0.25));
+          msg = s.current_path
+            ? `Scanning… ${s.file_count} files found`
+            : `Scanning ${SCAN_ROOT}...`;
+        } else if (s.status === 'matching') {
+          const denom = total ?? s.file_count;
+          const matchPct = denom > 0 ? (s.matched_count / denom) : 0;
+          pct = 50 + Math.round(matchPct * 45);
+          // ETA — only meaningful if we have a denominator + non-zero progress.
+          let etaSuffix = '';
+          if (total && s.matched_count > 0 && scanStartedAtRef.current) {
+            const elapsedMs = Date.now() - scanStartedAtRef.current;
+            const ratePerMs = s.matched_count / Math.max(1, elapsedMs);
+            const remaining = Math.max(0, total - s.matched_count);
+            const etaMs = remaining / Math.max(0.001, ratePerMs);
+            const etaMin = Math.round(etaMs / 60000);
+            if (etaMin >= 1) etaSuffix = ` · ~${etaMin} min left`;
+            else if (etaMs > 5000) etaSuffix = ` · <1 min left`;
+          }
+          msg = `Matching ${s.matched_count} / ${denom}${etaSuffix}`;
+        } else if (s.status === 'completed' || s.status === 'completed_partial') {
+          pct = 100;
+          const partial = s.status === 'completed_partial' ? ' (partial — see notifications)' : '';
+          msg = `Done · ${s.file_count} files, ${s.matched_count} matched${partial}`;
+          done = true;
+        }
+        setState(st => ({ ...st, scanProgress: pct, scanFound: s.file_count, scanMessage: msg }));
+        // Watchdog heartbeat — refreshed on every successful poll cycle.
+        // If the loop dies (browser throttle, network error storm),
+        // this ref goes stale and the next Scan click can detect it.
+        lastProgressAtRef.current = Date.now();
+      }
+
+      // Final refresh after completion.
+      await refreshFiles();
+      const final = await api.getScan(scan.id);
+      pushToast({
+        title: 'Scan complete',
+        sub: `${final.file_count} files · ${final.matched_count} matched`,
+        kind: 'success',
+      });
+    } catch (err) {
+      setBackendOk(false);
+      pushToast({
+        title: 'Scan failed',
+        sub: (err as Error).message.includes('Failed to fetch')
+          ? 'Backend not reachable — is uvicorn running on :8000?'
+          : (err as Error).message,
+        kind: 'error',
+      });
+    } finally {
+      // Brief delay so the user sees the 100% before the banner disappears.
+      setTimeout(() => setState(s => ({ ...s, scanRunning: false })), 600);
+    }
+  }, [state.scanRunning, pushToast, refreshFiles]);
+
+  // ── Action handlers (backed by the API; local state mirrors the response) ──
+  // Defined here, BEFORE the keyboard useEffect, so the effect's dependency
+  // array can reference them without hitting a TDZ error at render time.
+  const setFileStatus = useCallback(async (id: string, status: 'approved' | 'rejected' | 'pending') => {
+    const backendId = Number(id);
+    if (!Number.isFinite(backendId)) {
+      setState(s => ({ ...s, files: s.files.map(f => f.id === id ? { ...f, status } : f) }));
+      return;
+    }
+    try {
+      const updated = await api.updateFileStatus(backendId, status);
+      setState(s => ({ ...s, files: s.files.map(f => f.id === id ? apiToMediaFile(updated) : f) }));
+    } catch (e) {
+      pushToast({ title: 'Failed to update', sub: (e as Error).message, kind: 'error' });
+    }
+  }, [pushToast]);
+
+  const setFileStatusBulk = useCallback(async (ids: string[], status: 'approved' | 'rejected' | 'pending') => {
+    const backendIds = ids.map(Number).filter(Number.isFinite);
+    if (backendIds.length === 0) {
+      setState(s => ({ ...s, files: s.files.map(f => ids.includes(f.id) ? { ...f, status } : f) }));
+      return;
+    }
+    // Snapshot previous statuses so we can revert on backend failure.
+    // Previously this fired optimistically without a rollback path —
+    // when the call failed, the toast said "Failed to update" but the
+    // UI kept the wrong status until next refresh, gaslighting the user.
+    let prevByid = new Map<string, string>();
+    setState(s => {
+      prevByid = new Map(s.files.filter(f => ids.includes(f.id)).map(f => [f.id, f.status]));
+      return { ...s, files: s.files.map(f => ids.includes(f.id) ? { ...f, status } : f) };
+    });
+    try {
+      await api.bulkStatus(backendIds, status);
+    } catch (e) {
+      // Revert local state — the backend rejected, so the UI must too.
+      setState(s => ({
+        ...s,
+        files: s.files.map(f =>
+          prevByid.has(f.id)
+            ? { ...f, status: prevByid.get(f.id) as typeof f.status }
+            : f
+        ),
+      }));
+      pushToast({ title: 'Failed to update', sub: (e as Error).message, kind: 'error' });
+    }
+  }, [pushToast]);
+
+  /** Direct rename for a list of file IDs — no modal, uses the saved
+   *  default profile + op. Approve and rename should be one click for
+   *  90% of cases; the modal is reserved for "I want to preview / pick
+   *  non-default settings".
+   *
+   *  Declared here (BEFORE the keyboard useEffect) so the `a` key
+   *  handler can reference it without hitting a temporal dead zone.
+   *  The previous placement (after pickCandidate, ~line 480) broke the
+   *  whole app — useEffect deps array evaluated `renameFilesDirectly`
+   *  before it was initialized, blanking the page.
+   *
+   *  ── Serialization (H1) ───────────────────────────────────────────
+   *  Multiple concurrent rename calls (rapid keyboard `a`, "Approve &
+   *  rename" bulk-bar smashed twice, popup approve cascading through 8
+   *  episodes) used to race each other AND race their own preceding
+   *  setFileStatusBulk. Backend would see one rename targeting matches
+   *  whose `is_selected` flag was still mid-commit from a sibling
+   *  request — silent wrong-target renames.
+   *
+   *  We now serialize ALL rename calls behind a Promise chain held in
+   *  `renameChainRef`. Each new call appends; the next one only runs
+   *  after the previous resolves. The chain never blocks the UI thread
+   *  — it just enforces "rename N completes before rename N+1 starts".
+   *  Cost: a perceived <100ms queue for users mashing the button. */
+  const renameChainRef = useRef<Promise<void>>(Promise.resolve());
+  // PB-4: timestamp captured when a scan starts polling. Used to derive
+  // an ETA in the scan banner — `(elapsed_ms / matched_count)` gives a
+  // matched-per-ms rate that extrapolates over (estimated_total - matched).
+  const scanStartedAtRef = useRef<number | null>(null);
+  // Watchdog: bumped to `Date.now()` on every progress tick inside the
+  // scan polling loop. The runScan early-return path checks this — if
+  // scanRunning is true but the ref hasn't been touched in >90s, the
+  // loop is dead (browser tab throttling, hot-reload, etc.) and the
+  // next click force-clears scanRunning instead of silently no-op'ing.
+  // Initialized to 0 so the very first click ALWAYS passes the staleness
+  // check (no in-flight scan to defer to). On subsequent runs, scan
+  // starts by bumping it to Date.now() so the watchdog has a baseline.
+  const lastProgressAtRef = useRef<number>(0);
+  const renameFilesDirectly = useCallback(async (fileIds: string[]): Promise<void> => {
+    const backendIds = fileIds.map(Number).filter(Number.isFinite);
+    if (backendIds.length === 0) return;
+    // Chain onto whatever's already in-flight. We capture the previous
+    // chain BEFORE assigning the new one so concurrent callers all see
+    // distinct predecessors and run strictly serially.
+    const prev = renameChainRef.current;
+    const run = (async () => {
+      // R2-M4: await the previous chain so this one starts after it
+      // settles, but DON'T let its failure block our turn — independent
+      // rename batches must not cascade-fail each other.
+      try {
+        await prev;
+      } catch {
+        // Previous batch threw; toast was already shown by that batch.
+        // Continue with our work.
+      }
+      // R2-M4: re-throw on failure so subsequent callers see this chain
+      // as rejected, not silently resolved. The old `.catch(() => undefined)`
+      // converted rejected → resolved which meant the NEXT renameFilesDirectly
+      // call had no idea the previous one failed — and on a partial-disk
+      // failure (source moved, dest missing), the next call would phantom-
+      // rename and silently double-record.
+      try {
+        const res = await api.rename({ file_ids: backendIds, profile: savedProfile, op: savedOp });
+        const rows = await api.listFiles({ limit: 500 });
+        setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
+        if (res.failed === 0) {
+          pushToast({
+            title: `${res.succeeded} file${res.succeeded === 1 ? '' : 's'} renamed`,
+            sub: `${savedOp} · ${savedProfile} — see Renamed filter or History.`,
+            kind: 'success',
+          });
+          window.dispatchEvent(new CustomEvent('kira:rename-success'));
+          return;
+        }
+        if (res.succeeded > 0) {
+          pushToast({
+            title: `${res.succeeded} renamed, ${res.failed} failed`,
+            sub: res.items.find(i => !i.ok)?.error ?? 'See History page for details.',
+            kind: 'error',
+          });
+          // Partial failure — still throw so chain knows something was wrong
+          throw new Error(`${res.failed} of ${res.succeeded + res.failed} files failed to rename`);
+        }
+        pushToast({
+          title: `Rename failed`,
+          sub: res.items.find(i => !i.ok)?.error ?? 'See History page for details.',
+          kind: 'error',
+        });
+        throw new Error(res.items.find(i => !i.ok)?.error ?? 'All files failed to rename');
+      } catch (e) {
+        // Toast is already shown above for known failure shapes; for
+        // surprise errors (network drop, JSON parse) toast here.
+        if (!(e instanceof Error) || !e.message.includes('files failed to rename')) {
+          pushToast({ title: 'Rename failed', sub: (e as Error).message, kind: 'error' });
+        }
+        throw e;
+      }
+    })();
+    renameChainRef.current = run;
+    return run;
+  }, [savedOp, savedProfile, pushToast]);
+
+  const pickCandidate = useCallback(async (fileId: string, candidate: { matchId?: number; title?: string; year?: number | null }) => {
+    const backendFileId = Number(fileId);
+    if (!candidate.matchId || !Number.isFinite(backendFileId)) {
+      pushToast({ title: 'Cannot select', sub: 'This candidate has no backend record yet.', kind: 'error' });
+      return;
+    }
+    try {
+      const updated = await api.selectMatch(backendFileId, candidate.matchId);
+      setState(s => ({ ...s, files: s.files.map(f => f.id === fileId ? apiToMediaFile(updated) : f) }));
+      pushToast({ title: 'Match changed', sub: `${candidate.title}${candidate.year ? ' (' + candidate.year + ')' : ''}`, kind: 'success' });
+    } catch (e) {
+      pushToast({ title: 'Failed to select match', sub: (e as Error).message, kind: 'error' });
+    }
+  }, [pushToast]);
+
+  useEffect(() => {
+    const isFormField = (el: Element | null) =>
+      el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || (el as HTMLElement).isContentEditable);
+
+    let gMode = false;
+    let gModeTimer: ReturnType<typeof setTimeout>;
+
+    const handler = (e: KeyboardEvent) => {
+      if (isFormField(e.target as Element) && e.key !== 'Escape') return;
+
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'a') {
+        e.preventDefault();
+        const ids = state.files.filter(f => f.confidence >= 85 && f.status === 'pending').map(f => f.id);
+        void setFileStatusBulk(ids, 'approved');
+        pushToast({ title: `${ids.length} high-confidence matches approved`, kind: 'success' });
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        openModal('renamePreview', state.files.filter(f => f.status === 'approved' || f.confidence >= 85));
+        return;
+      }
+
+      if (gMode) {
+        clearTimeout(gModeTimer);
+        gMode = false;
+        if (e.key === 'd') { setActive('dashboard'); e.preventDefault(); return; }
+        if (e.key === 'r') { setActive('review'); e.preventDefault(); return; }
+        if (e.key === 'h') { setActive('history'); e.preventDefault(); return; }
+        if (e.key === 's') { setActive('settings'); e.preventDefault(); return; }
+      }
+
+      if (e.key === '?' || (e.shiftKey && e.key === '/')) {
+        e.preventDefault();
+        openModal('shortcuts');
+        return;
+      }
+      if (e.key === '/') {
+        e.preventDefault();
+        (document.querySelector('.topbar .search input') as HTMLInputElement)?.focus();
+        return;
+      }
+      if (e.key === 'g') {
+        gMode = true;
+        gModeTimer = setTimeout(() => { gMode = false; }, 700);
+        return;
+      }
+      if (e.key === 'Escape') {
+        if (modal) { closeModal(); return; }
+      }
+
+      if (active !== 'review') return;
+      const list = state.files.filter(f => f.status === 'pending');
+      const idx = list.findIndex(f => f.id === focusedId);
+
+      if (e.key === 'j') {
+        e.preventDefault();
+        const n = list[Math.min(list.length - 1, idx + 1)] || list[0];
+        if (n) setFocusedId(n.id);
+      } else if (e.key === 'k') {
+        e.preventDefault();
+        const n = list[Math.max(0, idx - 1)] || list[0];
+        if (n) setFocusedId(n.id);
+      } else if (e.key === 'a' && !e.metaKey && !e.ctrlKey) {
+        const f = state.files.find(x => x.id === focusedId);
+        if (f && f.match?.provider && f.match?.providerId
+            && (f.status === 'pending' || f.status === 'matched' || f.status === 'matching')) {
+          // Approve + rename in one shot — same contract as the card
+          // green check + bulk-bar button. Without the rename call the
+          // keyboard shortcut would only flip status, stranding the file
+          // in 'approved' limbo (this was a real bug — caught by the
+          // pipeline trace audit). setFileStatus first so the local
+          // state reflects the approval; rename fires immediately after
+          // (backend rename endpoint doesn't actually require approval).
+          void (async () => {
+            await setFileStatus(focusedId, 'approved');
+            await renameFilesDirectly([focusedId]);
+          })();
+        }
+      } else if (e.key === 'r' && !e.metaKey && !e.ctrlKey) {
+        const f = state.files.find(x => x.id === focusedId);
+        if (f && f.status === 'pending') {
+          void setFileStatus(focusedId, 'rejected');
+          pushToast({ title: 'Rejected', sub: f.filename, kind: 'error' });
+        }
+      } else if (e.key === 'm') {
+        const f = state.files.find(x => x.id === focusedId);
+        if (f) openModal('manualSearch', f);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        const f = state.files.find(x => x.id === focusedId);
+        if (f) openModal('fileDetails', f);
+      }
+    };
+
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [active, focusedId, state.files, modal, pushToast, setFileStatus, setFileStatusBulk, renameFilesDirectly]);
+
+  const handleApply = useCallback(async (opts: { profile: string; op: string }) => {
+    const target = (modal?.kind === 'renamePreview' ? modal.payload : []) as MediaFile[];
+    // Only ship files with a REAL provider+providerId — synthesised
+    // matches (built from parsed data for no_match cards) would otherwise
+    // get sent and the backend would reject each one individually.
+    const backendIds = target
+      .filter(f => f.match?.provider && f.match?.providerId)
+      .map(f => Number(f.id))
+      .filter(Number.isFinite);
+    if (backendIds.length === 0) {
+      pushToast({ title: 'Nothing to rename', sub: 'No files with matches selected.', kind: 'error' });
+      closeModal();
+      return;
+    }
+    try {
+      const res = await api.rename({ file_ids: backendIds, profile: opts.profile, op: opts.op });
+      // Refresh from backend — files that moved have new paths + 'renamed' status.
+      const rows = await api.listFiles({ limit: 500 });
+      setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
+      if (res.failed === 0) {
+        pushToast({
+          title: `${res.succeeded} file${res.succeeded === 1 ? '' : 's'} renamed`,
+          sub: `Switched to "Renamed" view — also visible on the History page.`,
+          kind: 'success',
+        });
+        // Auto-switch the Review filter so the user immediately SEES the
+        // result instead of staring at the Pending view that just lost
+        // these files. Without this, every successful rename feels like
+        // a no-op — files vanish from the current view with no breadcrumb.
+        window.dispatchEvent(new CustomEvent('kira:rename-success'));
+      } else if (res.succeeded > 0) {
+        pushToast({
+          title: `${res.succeeded} renamed, ${res.failed} failed`,
+          sub: res.items.find(i => !i.ok)?.error ?? 'See History page for details.',
+          kind: 'error',
+        });
+      } else {
+        // 0 succeeded — show the FIRST error so the user knows what to fix
+        // (e.g. "No match to rename to — match the file first.").
+        pushToast({
+          title: `Rename failed`,
+          sub: res.items.find(i => !i.ok)?.error ?? 'See History page for details.',
+          kind: 'error',
+        });
+      }
+    } catch (e) {
+      pushToast({ title: 'Apply failed', sub: (e as Error).message, kind: 'error' });
+    }
+    closeModal();
+  }, [modal, pushToast]);
+
+  const handleManualSelect = useCallback(async (selection: SearchResult & { _provider?: string; _providerId?: string; _posterUrl?: string | null }) => {
+    if (modal?.kind !== 'manualSearch') return;
+    const file = modal.payload;
+    const backendId = Number(file.id);
+    // Find ALL files in the same cluster — siblings sharing the user's
+    // file's series_key. Previously this only applied the pick to the
+    // single file the user opened Manual Search from, so a cluster of 8
+    // wrongly-matched files saw 1 fix + 7 still-wrong. From the user's
+    // perspective Manual Search "did nothing" because the cover card
+    // still showed the bad match (driven by the highest-confidence file
+    // in the cluster, which was usually one of the 7 untouched ones).
+    //
+    // Now: when the selected file has a series_key AND siblings, apply
+    // the manual pick to ALL of them in one bulk call. Movies (and any
+    // file with no series_key) fall through to the single-file path
+    // since there's no cluster to bulk-apply to.
+    const seriesKey = (file as { seriesKey?: string | null }).seriesKey ?? null;
+    const cluster = seriesKey
+      ? state.files.filter(f => (f as { seriesKey?: string | null }).seriesKey === seriesKey)
+      : [file];
+    const clusterIds = cluster
+      .map(f => Number(f.id))
+      .filter(Number.isFinite);
+    try {
+      if (clusterIds.length > 1) {
+        // Bulk path — covers the cluster-of-files case (e.g. a TV/anime
+        // series with N episode files all wrongly matched to the same
+        // bad show; pinning the right show fixes everyone at once).
+        const res = await api.bulkSelectManualMatch({
+          file_ids: clusterIds,
+          provider: (selection._provider ?? 'tvdb').toLowerCase(),
+          provider_id: selection._providerId ?? '',
+          title: selection.title ?? null,
+          year: selection.year ?? null,
+          // Forward the provider's poster_url from the search result.
+          // Without this, the backend's poster_url guard kept the old
+          // (wrong-match) poster, so the cover never visibly updated.
+          poster_url: selection._posterUrl ?? null,
+          overview: selection.overview ?? null,
+          media_type: selection.mediaType ?? file.mediaType,
+        });
+        const rows = await api.listFiles({ limit: 1000 });
+        setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
+        pushToast({
+          title: `Pinned ${res.updated} file${res.updated === 1 ? '' : 's'} to ${selection.title}`,
+          sub: 'Future rescans will leave these alone.',
+          kind: 'success',
+        });
+      } else {
+        // Single-file path — movies, orphans, files without a cluster.
+        const updated = await api.selectManualMatch(backendId, {
+          provider: (selection._provider ?? 'tvdb').toLowerCase(),
+          provider_id: selection._providerId ?? '',
+          title: selection.title ?? null,
+          year: selection.year ?? null,
+          // Forward the provider's poster_url so the backend writes it
+          // onto the (possibly-commandeered) Match row — otherwise the
+          // cover stays on whatever the prior auto-match's poster was
+          // (the "Match updated" toast appears but nothing visibly
+          // changes on screen because the row's poster_url is unchanged).
+          poster_url: selection._posterUrl ?? null,
+          overview: selection.overview ?? null,
+          media_type: selection.mediaType ?? file.mediaType,
+        });
+        setState(s => ({ ...s, files: s.files.map(f => f.id === file.id ? apiToMediaFile(updated) : f) }));
+        pushToast({ title: 'Match updated', sub: `${selection.title}${selection.year ? ' (' + selection.year + ')' : ''}`, kind: 'success' });
+      }
+    } catch (e) {
+      pushToast({ title: 'Failed to apply match', sub: (e as Error).message, kind: 'error' });
+    }
+  }, [modal, pushToast, state.files]);
+
+  // `rematchCluster` was removed when the popup's "Re-match" button
+  // was replaced by "Re-identify" (manual search → bulk-select-manual
+  // with per-file cour routing). `api.rematchFile` still exists for
+  // auto-heal + bulk-rematch-all on the backend; nothing in the frontend
+  // calls it directly anymore.
+
+  /** Bulk-pin one show across N files. Backend writes is_manual=true so
+   *  the user's pick survives every subsequent heal/rematch. Used by the
+   *  "Match all to..." flow in the Needs matching section. */
+  const handleBulkManualMatch = useCallback(async (
+    fileIds: string[],
+    selection: SearchResult & { _provider?: string; _providerId?: string },
+    contextMediaType?: string,
+  ) => {
+    const backendIds = fileIds.map(id => Number(id)).filter(Number.isFinite);
+    if (backendIds.length === 0) return;
+    try {
+      const res = await api.bulkSelectManualMatch({
+        file_ids: backendIds,
+        provider: (selection._provider ?? 'tvdb').toLowerCase(),
+        provider_id: selection._providerId ?? '',
+        title: selection.title ?? null,
+        year: selection.year ?? null,
+        overview: selection.overview ?? null,
+        media_type: selection.mediaType ?? contextMediaType,
+      });
+      // Refetch all files so the new matches propagate everywhere
+      // (Needs matching section recomputes, cards re-render with the
+      // matched cover, the no_match counts drop).
+      const rows = await api.listFiles({ limit: 1000 });
+      setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
+      pushToast({
+        title: `Pinned ${res.updated} file${res.updated === 1 ? '' : 's'} to ${selection.title}`,
+        sub: 'Future rescans will leave these alone.',
+        kind: 'success',
+      });
+    } catch (e) {
+      pushToast({ title: 'Bulk match failed', sub: (e as Error).message, kind: 'error' });
+    }
+  }, [pushToast]);
+
+  return (
+    <>
+      <div className="backdrop" />
+      {!onboarded && (
+        <Onboarding onComplete={() => {
+          setOnboardedState(true);
+          pushToast({ title: "You're all set", sub: 'Running your first scan now…', kind: 'success' });
+          setTimeout(() => runScan(), 350);
+        }} />
+      )}
+      <div className="app">
+        <Sidebar active={active} setActive={setActive} pendingCount={pendingCount} scanRunning={state.scanRunning} backendOk={backendOk} />
+        <main className="main">
+          <Topbar
+            active={active}
+            onScan={runScan}
+            scanRunning={state.scanRunning}
+            onShortcuts={() => openModal('shortcuts')}
+            searchQuery={searchQuery}
+            onSearchChange={setSearchQuery}
+          />
+
+          {/* Global scan-progress strip — visible on every page while a scan
+              runs so the user is never "out of touch" with what's happening. */}
+          {state.scanRunning ? (
+            <div className="global-scan-bar">
+              <div className="global-scan-bar-fill" style={{ width: `${state.scanProgress}%` }} />
+              <div className="global-scan-bar-content">
+                <div className="global-scan-spinner"><IcSpin /></div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="font-semibold text-sm" style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+                    <span>Scanning library</span>
+                    <span className="text-xs text-muted">· {state.scanMessage}</span>
+                  </div>
+                </div>
+                <div className="text-sm font-semibold text-mono" style={{ color: 'var(--accent)' }}>
+                  {state.scanProgress}%
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {active === 'dashboard' && (
+            <DashboardPage state={state} openModal={openModal} runScan={runScan} setActive={setActive} scanRoot={SCAN_ROOT} />
+          )}
+          {active === 'review' && (
+            <ReviewPage
+              state={state} openModal={openModal}
+              focusedId={focusedId} setFocusedId={setFocusedId}
+              setFileStatus={setFileStatus}
+              setFileStatusBulk={setFileStatusBulk}
+              searchQuery={searchQuery}
+              onBulkManualMatch={handleBulkManualMatch}
+              renameFilesDirectly={renameFilesDirectly}
+            />
+          )}
+          {active === 'history' && (
+            <HistoryPage pushToast={pushToast} />
+          )}
+          {active === 'settings' && (
+            <SettingsPage state={state} pushToast={pushToast} />
+          )}
+        </main>
+      </div>
+
+      {modal?.kind === 'manualSearch' && (
+        <ManualSearchModal file={modal.payload} onClose={closeModal} onSelect={handleManualSelect} />
+      )}
+      {modal?.kind === 'renamePreview' && (
+        <RenamePreviewModal
+          files={modal.payload}
+          onClose={closeModal}
+          onApply={handleApply}
+          defaultOp={savedOp}
+          defaultProfile={savedProfile}
+        />
+      )}
+      {modal?.kind === 'shortcuts' && (
+        <KeyboardShortcutsModal onClose={closeModal} />
+      )}
+      {modal?.kind === 'fileDetails' && (
+        <FileDetailsModal
+          file={state.files.find(f => f.id === modal.payload.id) || modal.payload}
+          onClose={closeModal}
+          onApprove={(id, st = 'approved') => {
+            void setFileStatus(id, st as 'approved' | 'pending');
+            const f = state.files.find(x => x.id === id);
+            if (st === 'approved') pushToast({ title: 'Approved', sub: f?.match?.title || f?.filename, kind: 'success' });
+          }}
+          onReject={(id) => {
+            void setFileStatus(id, 'rejected');
+            const f = state.files.find(x => x.id === id);
+            pushToast({ title: 'Rejected', sub: f?.filename, kind: 'error' });
+          }}
+          onManualSearch={(file) => openModal('manualSearch', file)}
+          onPickCandidate={(id, candidate) => { void pickCandidate(id, candidate); }}
+        />
+      )}
+
+      <Toast toasts={toasts} onDismiss={dismissToast} />
+    </>
+  );
+}

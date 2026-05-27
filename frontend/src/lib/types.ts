@@ -1,0 +1,309 @@
+export type MediaType = 'movie' | 'tv' | 'anime' | 'music';
+
+export interface PosterData {
+  init: string;
+  tint: [string, string];
+  year: number | null;
+}
+
+export interface MatchData {
+  // Movie / TV / Anime common
+  title?: string;
+  year?: number | null;
+  /** Provider that produced this match ('tmdb' | 'tvdb' | 'anidb' | 'musicbrainz').
+   *  Combined with `providerId`, this is the ground-truth identity used for
+   *  series-card clustering — beats parser heuristics. */
+  provider?: string;
+  providerId?: string;
+  /** Franchise identity for visual grouping on the Review page.
+   *  Cards sharing this value sit together under a sub-heading. */
+  seriesGroupId?: string;
+  tmdbId?: number | null;
+  runtime?: number;
+  poster?: PosterData;
+  posterUrl?: string | null;   // real cover from TMDB/TVDB; falls back to `poster` gradient
+  overview?: string;
+  season?: number;
+  episode?: number;
+  episodeTitle?: string;
+
+  // Anime
+  titleRomaji?: string;
+  titleNative?: string;
+  altTitles?: string[];
+  anidbId?: number;
+  absoluteEpisode?: number;
+
+  // Rich popup metadata — hydrated from Match.metadata_blob by the
+  // adapter. Every field optional; UI renders only what's present.
+  genres?: string[];
+  cast?: string[];
+  director?: string;
+  network?: string;
+  studio?: string;
+  label?: string;
+  language?: string;
+  country?: string;
+  /** Pre-formatted "2022 – 2024" or "2022 –" — set on series only. */
+  yearRange?: string;
+
+  // Music
+  artist?: string;
+  album?: string;
+  albumYear?: number;
+  track?: number;
+  trackTitle?: string;
+  totalTracks?: number;
+  duration?: string;
+  mbid?: string;
+  acoustidMatch?: boolean;
+  acoustidConfidence?: number;
+  art?: PosterData;
+  genre?: string;
+}
+
+export interface CandidateData {
+  // Movie / TV / Anime
+  matchId?: number;            // backend Match row id — used by POST /files/{id}/select/{matchId}
+  title?: string;
+  year?: number | null;
+  confidence: number;
+  poster?: PosterData;
+  posterUrl?: string | null;
+  season?: number;
+  episode?: number;
+  absoluteEpisode?: number;
+
+  // Music
+  artist?: string;
+  album?: string;
+  track?: number;
+  trackTitle?: string;
+  art?: PosterData;
+}
+
+export interface MediaFile {
+  id: string;
+  filename: string;
+  folder: string;
+  mediaType: MediaType;
+  // 'matching' = backend is currently fetching candidates for this file.
+  // Drives the per-row shimmer; reverts to 'pending' once a Match row exists
+  // (or to 'no_match' if matching returned nothing).
+  // 'renamed' = file was successfully moved/hardlinked to the library
+  // root. Without this state in the union, the adapter's status-mapping
+  // fell through to 'pending' and the file kept appearing in the
+  // pending queue forever — even after a successful rename.
+  status: 'pending' | 'matching' | 'approved' | 'rejected' | 'no_match' | 'renamed';
+  confidence: number;
+  match: MatchData | null;
+  candidates: CandidateData[];
+  releaseGroup?: string;
+  /** Format-strip findings — surfaced so the FileRow can show "1080p" /
+   *  "WEB-DL" / "x265" tags. Critical when two release groups of the
+   *  same episode end up on the same row pair and the user needs to
+   *  tell them apart at a glance. */
+  quality?: string;
+  source?: string;
+  codec?: string;
+  /** Pre-formatted size string ("3.4 GB"). Backend stores raw bytes;
+   *  adapter formats via humanSize() before reaching the UI. */
+  size?: string;
+  /** Raw size in bytes — needed by the dedupe ranker as a tie-breaker. */
+  sizeBytes?: number;
+  /** Normalized "10bit" / "8bit" from the format-stripper. */
+  bitDepth?: string;
+  /** The clean title the parser extracted from the filename — e.g.
+   *  "Kanojo, Okarishimasu" from "[Moozzi2] Kanojo, Okarishimasu-01.mkv".
+   *  Used as the Manual Search seed because the *current* match.title is
+   *  what the user is trying to replace. */
+  parsedTitle?: string;
+  /** Clustering key from the backend. Files sharing this become one SeriesCard.
+   *  Null for movies and any file we couldn't cluster (e.g. parser missed the title). */
+  seriesKey?: string | null;
+}
+
+export interface HistoryEntry {
+  id: string;
+  when: string;
+  mediaType: MediaType;
+  poster: PosterData;
+  title: string;
+  op: string;
+  from: string;
+  to: string;
+}
+
+export interface SearchResult {
+  title?: string;
+  titleRomaji?: string;
+  year?: number | null;
+  mediaType?: MediaType;
+  poster?: PosterData;
+  art?: PosterData;
+  overview?: string;
+  votes?: number;
+  /** Alternate titles for disambiguation in Manual Search (anime romaji,
+   *  TVDB language variants, TMDB original_name when distinct). */
+  aliases?: string[] | null;
+
+  // Provider-specific extras
+  tmdbId?: number;
+  tvdbId?: number;
+  anidbId?: number;
+  mbid?: string;
+  eps?: number;
+  studio?: string;
+  artist?: string;
+  album?: string;
+  tracks?: number;
+}
+
+export type ProviderKey = 'TMDB' | 'TVDB' | 'AniDB' | 'MusicBrainz' | 'AcoustID';
+
+export interface ProviderMeta {
+  name: string;
+  for: MediaType[];
+  color: string;
+  icon: 'film' | 'tv' | 'anime' | 'disc' | 'waveform';
+  desc: string;
+}
+
+export interface NamingProfile {
+  movie: string;
+  tv: string;
+  anime: string;
+  music: string;
+}
+
+export interface NamingToken { k: string; d: string; }
+
+export interface ContentTypes {
+  movies: boolean;
+  tv: boolean;
+  anime: boolean;
+  music: boolean;
+}
+
+export interface ToastData {
+  id: string;
+  title: string;
+  sub?: string;
+  kind?: 'success' | 'error';
+}
+
+export interface AppState {
+  files: MediaFile[];
+  scanRunning: boolean;
+  scanProgress: number;
+  scanFound: number;
+  scanMessage: string;
+  /** False until the first /files fetch resolves (success OR failure).
+   *  Pages use this to suppress empty-state UIs during the initial load
+   *  window — without it, the user sees "No library scanned yet" / "Library
+   *  is empty" hero for ~200-500ms on every refresh before the real file
+   *  list lands, which reads as a glitch. */
+  hydrated: boolean;
+}
+
+export type ModalState =
+  | { kind: 'manualSearch'; payload: MediaFile }
+  | { kind: 'renamePreview'; payload: MediaFile[] }
+  | { kind: 'shortcuts'; payload?: undefined }
+  | { kind: 'fileDetails'; payload: MediaFile }
+  | null;
+
+export type Page = 'dashboard' | 'review' | 'history' | 'settings';
+
+// ─────────────────────────────────────────────────────────────────────
+// Library grid model — derived shape consumed by CoverCard / CoverPopup.
+// Built in adapters.ts by grouping flat MediaFile[] under series_key.
+// ─────────────────────────────────────────────────────────────────────
+
+/** A single file as it appears inside a LibraryItem's `files` array. */
+export interface LibFile {
+  id: string;
+  filename: string;
+  folder: string;
+  /** Pre-formatted size for display ("3.4 GB"). */
+  size?: string;
+  /** Raw size in bytes — used by the dedupe ranker as the ultimate
+   *  tie-breaker (larger usually = higher bitrate = better quality). */
+  sizeBytes?: number;
+  quality?: string;
+  source?: string;
+  codec?: string;
+  /** Normalized "10bit" | "8bit" — drives the bit-depth step of the
+   *  dedupe ranker. 10-bit is the anime gold standard for killing
+   *  color banding in gradients. */
+  bitDepth?: string;
+  releaseGroup?: string | null;
+  /** Index into the parent item's `episodes` array; null when unmatched. */
+  matchedToEpisode: number | null;
+  /** True when matched to an episode but the filename suggests a different one. */
+  matchedWrong: boolean;
+  // See MediaFile.status above — 'renamed' is a real state the backend
+  // emits and the UI must carry forward, else renamed files appear
+  // back in the pending queue.
+  status: 'pending' | 'matching' | 'approved' | 'rejected' | 'no_match' | 'renamed';
+  confidence: number;
+}
+
+/** One episode/track entry on a series or album item. */
+export interface LibEpisode {
+  season: number;
+  episode: number;
+  absolute?: number | null;
+  title?: string;
+  airDate?: string;
+  runtime?: number;
+  overview?: string;
+  duration?: string; // music tracks
+  /** Track number for albums (same data as `episode` but named per convention). */
+  track?: number;
+}
+
+/** The atomic unit on the Review page — series, movie, or album. */
+export interface LibraryItem {
+  id: string;
+  kind: 'series' | 'movie' | 'album';
+  mediaType: MediaType;
+  title: string;
+  year?: number | null;
+  yearRange?: string;
+  overview?: string;
+  studio?: string;
+  network?: string;
+  label?: string;          // music label
+  director?: string;       // movies
+  language?: string;
+  country?: string;
+  genres?: string[];
+  cast?: string[];         // movies
+  altTitles?: string[];
+  titleRomaji?: string;
+  titleNative?: string;
+  artist?: string;         // music
+  runtime?: number;        // movies
+  providers?: { tmdb?: number | string; tvdb?: number | string; anidb?: number | string; musicbrainz?: string };
+  poster: PosterData;
+  /** Real cover art from the matched provider (TMDB, TVDB, AniDB CDN).
+   *  When null/missing, the CoverCard falls back to the gradient + initials. */
+  posterUrl?: string | null;
+  /** Franchise identity — cards sharing this value cluster under one
+   *  sub-heading inside their media-type section on the Review page. */
+  seriesGroupId?: string | null;
+  /** Canonical season number from the matched provider (AniDB Fribb
+   *  cross-ref or TMDB/TVDB season layout). Displayed as "Season N" on
+   *  the card meta row when ≥ 1. Authoritative — replaces the old
+   *  year-sort heuristic that picked Season 1/2/3 by index. */
+  season?: number | null;
+  episodes: LibEpisode[];
+  files: LibFile[];
+  /** True when the item couldn't be matched to any provider at all. */
+  noMatch?: boolean;
+  /** True while backend is actively matching this item's files. */
+  matchingState?: boolean;
+  /** Override aggregate state ('rejected' if user explicitly killed the whole item). */
+  overallStatus?: 'approved' | 'rejected';
+}

@@ -1,0 +1,66 @@
+# ── Secrets — NEVER commit ────────────────────────────────────────────
+.env
+.env.*
+*.env
+!.env.example
+backend/.env
+backend/.env.*
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg
+
+# ── Node / Vite frontend ──────────────────────────────────────────────
+node_modules/
+dist/
+dist-ssr/
+*.local
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── SQLite DB + WAL files (user data; regenerable via re-scan) ───────
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+kira.db
+backend/kira.db
+
+# ── Provider caches (regenerable; large; AniDB title dump is ~20MB) ──
+backend/.cache/
+.cache/
+
+# ── Editor / IDE / OS ─────────────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# ── Claude / agent state (per-machine; not for the public repo) ──────
+.claude/
+*.bak
+
+# ── User-local test fixtures the project doesn't ship ────────────────
+# (test-media/ has empty placeholder files for parser fixtures —
+#  keep them; they're tiny and useful for `pytest`. If you ever add
+#  REAL media files there, uncomment the next line.)
+# test-media/

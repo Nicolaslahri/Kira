@@ -1,0 +1,55 @@
+[project]
+name = "kira"
+version = "0.1.0"
+description = "Self-hosted, Docker-native media metadata fixer"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "aiosqlite>=0.20",
+    "alembic>=1.14",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "httpx>=0.28",
+    "python-multipart>=0.0.20",
+    # PB-1: drop-in stdlib XML API hardened against XXE / billion-laughs /
+    # external-entity attacks. Required because we parse XML fetched from
+    # AniDB's CDN — a MITM or compromised cache could inject malicious
+    # entities to exfiltrate local files or DoS the parser. Same API as
+    # xml.etree.ElementTree.
+    "defusedxml>=0.7.1",
+    # Autopsy 5: bounded LRU + TTL cache for the series-episodes endpoint.
+    # The previous handwritten timestamp dict was unbounded — a long-lived
+    # server browsing 500+ shows over hours accumulated dozens of MBs of
+    # episode lists in process memory until OOM-killed. cachetools.TTLCache
+    # enforces both a max entry count AND a per-entry TTL, with proper
+    # async-safe access via an asyncio.Lock at the call site.
+    "cachetools>=5.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["kira*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
