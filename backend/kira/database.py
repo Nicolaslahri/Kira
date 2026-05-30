@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -16,6 +17,21 @@ class Base(DeclarativeBase):
 
 engine = create_async_engine(settings.database_url, echo=False, future=True)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+# v0.4→v0.5 naming-engine migration. The renamer switched from a
+# `str.replace("{token}", …)` loop to a Jinja2 SandboxedEnvironment (see
+# renamer/templates.py). Built-in profiles were rewritten to `{{token}}` in
+# code, but user-saved custom profiles live in the DB (`naming.custom.*`
+# settings rows) and still hold single-brace `{token}` strings that Jinja
+# renders literally. `_migrate_legacy_naming_templates` uses this regex to
+# rewrite a bare `{token}` → `{{token}}` while leaving already-migrated
+# `{{ … }}` (and any Jinja with spaces/filters) untouched, so the migration
+# is idempotent and safe to run on every boot.
+#   (?<!\{)   — the `{` isn't already part of an opening `{{`
+#   \{(\w+)\} — a single brace wrapping a bare identifier (n, y, s2, e2, …)
+#   (?!\})    — the `}` isn't already part of a closing `}}`
+_LEGACY_TOKEN_RE = re.compile(r"(?<!\{)\{(\w+)\}(?!\})")
 
 
 # H9: SQLite ships with foreign-key enforcement OFF by default — including
@@ -112,6 +128,10 @@ async def init_db() -> None:
         await _backfill_series_keys(conn)
         await _backfill_variant_keys(conn)
         await _backfill_series_group_ids(conn)
+        # v0.4→v0.5: rewrite custom naming profiles from `{token}` to Jinja
+        # `{{token}}`. Idempotent — a no-op once every stored profile is
+        # already double-brace, so it's cheap to run on every boot.
+        await _migrate_legacy_naming_templates(conn)
         # Autopsy 6: ensure the multi-worker scan lock row exists. Value
         # is an integer Unix-timestamp; 0 = idle, nonzero = scan started
         # at that timestamp. INSERT OR IGNORE — first writer wins, never
@@ -181,6 +201,48 @@ async def _ensure_column(conn, table: str, column: str, ddl_type: str) -> bool:
         await conn.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_{column} ON {table}({column})"))
         return True
     return False
+
+
+async def _migrate_legacy_naming_templates(conn) -> None:
+    """Rewrite user-saved custom naming profiles from the old single-brace
+    `{token}` syntax to Jinja2 `{{token}}` (v0.4→v0.5 engine switch).
+
+    Built-in profiles (`DEFAULT_PROFILES`) were updated in code; only the
+    custom profiles the user saved through Settings → Naming live in the DB,
+    under `naming.custom.<name>` settings rows whose JSON value is a
+    `{movie, tv, anime, music}` dict of template strings. Under the old
+    `str.replace` engine those were `{token}`; Jinja renders them literally,
+    so a profile like `{n} - S{s2}E{e2}` would produce the path
+    `{n} - S{s2}E{e2}` verbatim. Rewrite each field in place.
+
+    Idempotent: `_LEGACY_TOKEN_RE` skips already-`{{…}}` tokens, so a row
+    that's already been migrated produces no change and no write.
+    """
+    from sqlalchemy import text
+
+    rows = list(await conn.execute(
+        text("SELECT key, value FROM settings WHERE key LIKE 'naming.custom.%'")
+    ))
+    for key, raw in rows:
+        try:
+            profile = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            continue
+        if not isinstance(profile, dict):
+            continue
+        changed = False
+        for field in ("movie", "tv", "anime", "music"):
+            tmpl = profile.get(field)
+            if isinstance(tmpl, str):
+                migrated = _LEGACY_TOKEN_RE.sub(r"{{\1}}", tmpl)
+                if migrated != tmpl:
+                    profile[field] = migrated
+                    changed = True
+        if changed:
+            await conn.execute(
+                text("UPDATE settings SET value = :v WHERE key = :k"),
+                {"v": json.dumps(profile), "k": key},
+            )
 
 
 async def _backfill_series_group_ids(conn) -> None:
