@@ -67,6 +67,18 @@ async def put_settings(
         from kira.providers.anidb import AniDBProvider
         AniDBProvider.reset_rejection()
 
+    # Watched-folders: if the watch config or the scanned paths changed,
+    # re-arm the daemon so the new settings take effect without a restart.
+    watch_touched = any(k in payload.values for k in (
+        "watch.config", "paths.library_root", "paths.watch_folders",
+    ))
+    if watch_touched:
+        try:
+            from kira.watcher import watcher
+            await watcher.reconfigure()
+        except Exception as e:
+            print(f"settings: watcher reconfigure failed: {e!r}")
+
     return {"updated": n}
 
 

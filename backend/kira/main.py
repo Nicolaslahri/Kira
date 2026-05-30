@@ -59,11 +59,26 @@ async def lifespan(app: FastAPI):
     # so without this binding the GC can collect the warmup mid-fetch and
     # leave the cross-reference table un-refreshed without any error log.
     warmup_task = asyncio.create_task(_warmup())
+
+    # Watched-folders daemon: arm the auto-scan watcher from settings. It's
+    # opt-in (does nothing unless watch.config.auto_scan is true) and never
+    # raises out of start(), so a watcher problem can't block boot.
+    try:
+        from kira.watcher import watcher
+        await watcher.start()
+    except Exception as e:
+        print(f"startup: watcher start failed: {e!r}")
+
     try:
         yield
     finally:
         if not warmup_task.done():
             warmup_task.cancel()
+        try:
+            from kira.watcher import watcher
+            await watcher.stop()
+        except Exception as e:
+            print(f"shutdown: watcher stop failed: {e!r}")
 
 
 app = FastAPI(

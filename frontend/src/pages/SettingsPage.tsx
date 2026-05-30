@@ -744,6 +744,41 @@ function PathsSection({
     }
   };
 
+  // ── Watched-folders auto-scan config (single JSON blob under watch.config).
+  // Backend re-arms the daemon on save (settings PUT → watcher.reconfigure()).
+  type FolderCfg = { mode: 'scan' | 'auto_rename'; threshold: number };
+  type WatchCfg = {
+    auto_scan: boolean;
+    debounce_seconds: number;
+    poll_interval_seconds: number;
+    folders: Record<string, FolderCfg>;
+  };
+  const watchCfg: WatchCfg = (() => {
+    const raw = rawSettings['watch.config'];
+    const base: WatchCfg = { auto_scan: false, debounce_seconds: 30, poll_interval_seconds: 900, folders: {} };
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      const r = raw as Record<string, unknown>;
+      if (typeof r.auto_scan === 'boolean') base.auto_scan = r.auto_scan;
+      if (typeof r.debounce_seconds === 'number') base.debounce_seconds = r.debounce_seconds;
+      if (typeof r.poll_interval_seconds === 'number') base.poll_interval_seconds = r.poll_interval_seconds;
+      if (r.folders && typeof r.folders === 'object') base.folders = r.folders as Record<string, FolderCfg>;
+    }
+    return base;
+  })();
+
+  const saveWatchCfg = async (next: WatchCfg) => {
+    setRawSettings(s => ({ ...s, 'watch.config': next as unknown as Record<string, unknown>[string] }));
+    try {
+      await api.putSettings({ 'watch.config': next });
+      pushToast({ title: 'Auto-scan settings saved', kind: 'success' });
+    } catch (e) {
+      pushToast({ title: 'Save failed', sub: (e as Error).message, kind: 'error' });
+    }
+  };
+
+  const folderModeFor = (path: string): FolderCfg =>
+    watchCfg.folders[path] ?? { mode: 'scan', threshold: 0.9 };
+
   const typeRows = [
     { label: 'Movies', sub: 'Movies', value: targetMovie, key: 'paths.targets.movie' as const, pickerFor: 'target-movie' as const, icon: <IcFilm />, color: '#bdc1d0' },
     { label: 'TV',     sub: 'TV',     value: targetTv,    key: 'paths.targets.tv'    as const, pickerFor: 'target-tv'    as const, icon: <IcTv />,   color: '#49b8fe' },
@@ -811,6 +846,102 @@ function PathsSection({
             Add watch folder
           </Button>
         </div>
+      </div>
+
+      {/* Auto-scan (watched folders) */}
+      <div className={`p-4 ${SETTINGS_CARD}`}>
+        <div className={`flex items-start gap-3 border-b pb-3.5 ${SETTINGS_DIVIDER}`}>
+          <FeaturedIcon size="md" color="gray" icon={<IcScan />} />
+          <div className="min-w-0 flex-1">
+            <div className="text-[15px] font-semibold text-ink">Auto-scan</div>
+            <div className="mt-1 text-[12.5px] leading-relaxed text-ink-muted">
+              Watch your folders and scan automatically when new files appear — no need to click “Scan now”.
+              Detected via filesystem events with a periodic poll fallback for network drives.
+            </div>
+          </div>
+          <label className="flex shrink-0 cursor-pointer items-center gap-2 pt-0.5">
+            <input
+              type="checkbox"
+              checked={watchCfg.auto_scan}
+              onChange={e => void saveWatchCfg({ ...watchCfg, auto_scan: e.target.checked })}
+              className="size-4 accent-[var(--brand-solid,#7c5cff)]"
+            />
+            <span className="text-[13px] font-medium text-ink-muted">{watchCfg.auto_scan ? 'On' : 'Off'}</span>
+          </label>
+        </div>
+
+        {watchCfg.auto_scan ? (
+          <div className="mt-4 flex flex-col gap-4">
+            {/* timing */}
+            <div className="flex flex-wrap gap-4">
+              <label className="flex flex-col gap-1">
+                <span className="text-[12px] font-medium text-ink-muted">Settle delay (seconds)</span>
+                <input
+                  type="number" min={5}
+                  value={watchCfg.debounce_seconds}
+                  onChange={e => void saveWatchCfg({ ...watchCfg, debounce_seconds: Math.max(5, Number(e.target.value) || 5) })}
+                  className={`w-32 px-2.5 py-1.5 font-mono text-[13px] ${SETTINGS_NESTED}`}
+                />
+                <span className="text-[11px] text-ink-soft">Wait this long after the last change before scanning.</span>
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-[12px] font-medium text-ink-muted">Poll interval (seconds)</span>
+                <input
+                  type="number" min={60}
+                  value={watchCfg.poll_interval_seconds}
+                  onChange={e => void saveWatchCfg({ ...watchCfg, poll_interval_seconds: Math.max(60, Number(e.target.value) || 60) })}
+                  className={`w-32 px-2.5 py-1.5 font-mono text-[13px] ${SETTINGS_NESTED}`}
+                />
+                <span className="text-[11px] text-ink-soft">Fallback re-check for network drives.</span>
+              </label>
+            </div>
+
+            {/* per-folder mode */}
+            <div className="flex flex-col gap-2">
+              <div className="text-[12px] font-medium text-ink-muted">Per-folder behaviour</div>
+              {Array.from(new Set([libraryRoot, ...watchFolders])).filter(Boolean).map(path => {
+                const fc = folderModeFor(path);
+                return (
+                  <div key={path} className={`flex flex-wrap items-center gap-2.5 px-3 py-2.5 ${SETTINGS_NESTED}`}>
+                    <IcFolder style={{ width: 14, height: 14 }} className="shrink-0 text-ink-soft" />
+                    <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink-muted">{path}</span>
+                    <select
+                      value={fc.mode}
+                      onChange={e => {
+                        const mode = e.target.value as FolderCfg['mode'];
+                        void saveWatchCfg({ ...watchCfg, folders: { ...watchCfg.folders, [path]: { ...fc, mode } } });
+                      }}
+                      className={`px-2 py-1 text-[12.5px] ${SETTINGS_NESTED}`}
+                    >
+                      <option value="scan">Scan + match only</option>
+                      <option value="auto_rename">Auto-rename high-confidence</option>
+                    </select>
+                    {fc.mode === 'auto_rename' ? (
+                      <label className="flex items-center gap-1.5 text-[12px] text-ink-soft">
+                        ≥
+                        <input
+                          type="number" min={0} max={100} step={1}
+                          value={Math.round(fc.threshold * 100)}
+                          onChange={e => {
+                            const threshold = Math.min(1, Math.max(0, (Number(e.target.value) || 0) / 100));
+                            void saveWatchCfg({ ...watchCfg, folders: { ...watchCfg.folders, [path]: { ...fc, threshold } } });
+                          }}
+                          className={`w-16 px-2 py-1 font-mono text-[12.5px] ${SETTINGS_NESTED}`}
+                        />
+                        % conf
+                      </label>
+                    ) : null}
+                  </div>
+                );
+              })}
+              <p className="text-[11px] leading-relaxed text-ink-soft">
+                <span className="font-medium text-ink-muted">Scan + match only</span> surfaces new files in Review for you to approve.{' '}
+                <span className="font-medium text-ink-muted">Auto-rename</span> additionally organizes matches above the confidence
+                threshold automatically (coming soon — currently behaves as scan-only).
+              </p>
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {/* Per-type destinations */}

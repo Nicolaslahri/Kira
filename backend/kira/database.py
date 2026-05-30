@@ -123,6 +123,9 @@ async def init_db() -> None:
         # rows stay NULL (interpreted as "standalone"), perfectly
         # backward-compatible.
         await _ensure_column(conn, "rename_history", "parent_id", "INTEGER")
+        # Watched-folders: who triggered a scan — "manual" (user clicked Scan)
+        # or "auto" (the watch daemon). Default keeps pre-column rows as manual.
+        await _ensure_column(conn, "scans", "source", "VARCHAR DEFAULT 'manual'")
         # Idempotent backfills: cheap when there's nothing to fix, so we run
         # them every boot rather than gating on "just-added the column".
         await _backfill_series_keys(conn)

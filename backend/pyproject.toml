@@ -37,6 +37,10 @@ dependencies = [
     # bundle the native libmediainfo; the code degrades to filename-only when
     # the lib can't load, so this stays optional-at-runtime.
     "pymediainfo>=6.1",
+    # Watched-folders auto-scan daemon. Rust-backed filesystem-event watcher
+    # (awatch) with a poll fallback for NAS/SMB mounts. Drives the opt-in
+    # auto-scan in kira/watcher.py.
+    "watchfiles>=0.21",
 ]
 
 [project.optional-dependencies]

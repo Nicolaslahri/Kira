@@ -1296,7 +1296,33 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> None:
                         + "\n".join(shown) + more
                     )[:1000],
                 ))
+            # Watched-folders: a daemon-triggered scan that actually found new
+            # files gets a persistent notification, so the user knows files
+            # appeared and were matched without them clicking anything. Manual
+            # scans stay quiet (the user is already watching the UI). Zero-new
+            # auto-scans (the common debounce/poll case) stay quiet too.
+            if scan and getattr(scan, "source", "manual") == "auto" and count > 0:
+                from kira.models import Notification as _Notif
+                plural = "s" if count != 1 else ""
+                session.add(_Notif(
+                    kind="info",
+                    title=f"Auto-scan: {count} new file{plural} found",
+                    body=(
+                        "New media appeared in a watched folder and was matched. "
+                        "Open Review to approve the renames."
+                    ),
+                ))
             await session.commit()
+
+            # Watched-folders: per-folder auto_rename hook. Currently log-only
+            # (no files are moved); the real rename execution is a planned
+            # follow-up. Runs only for auto-source scans that found new files.
+            if scan and getattr(scan, "source", "manual") == "auto" and all_new:
+                try:
+                    from kira.watcher import maybe_auto_rename
+                    await maybe_auto_rename(scan_id, all_new)
+                except Exception as e:
+                    print(f"_scan_worker: auto_rename hook failed (non-fatal): {e!r}")
         except Exception as e:
             scan = await session.get(Scan, scan_id)
             if scan:
@@ -1596,7 +1622,10 @@ async def _start_scan(paths: list[str], source: str = "manual") -> int | None:
     # Launch outside the session context. asyncio.create_task keeps the worker
     # alive for the lifetime of the event loop (same as the BackgroundTasks
     # path), and the worker's finally block releases both locks.
-    asyncio.create_task(_scan_worker_locked(scan_id, effective_roots, source))
+    # NB: source is persisted on the Scan row (above); the worker reads it
+    # back from the DB at completion to decide whether to fire the auto-scan
+    # notification. _scan_worker_locked therefore takes only (id, roots).
+    asyncio.create_task(_scan_worker_locked(scan_id, effective_roots))
     return scan_id
 
 
@@ -1674,6 +1703,13 @@ async def create_scan(
 async def list_scans(session: AsyncSession = Depends(get_session)) -> list[Scan]:
     result = await session.scalars(select(Scan).order_by(Scan.created_at.desc()))
     return list(result)
+
+
+@router.get("/watch/status")
+async def watch_status() -> dict:
+    """Current state of the watched-folders auto-scan daemon."""
+    from kira.watcher import watcher  # lazy: avoid import cycle
+    return watcher.status()
 
 
 @router.get("/{scan_id}", response_model=ScanOut)
