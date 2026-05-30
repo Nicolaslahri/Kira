@@ -60,6 +60,9 @@ Thumbs.db
 .kira-cleanup-backup-*/
 *.bak
 
+# ── Recovered planning journal (local working notes; not for the repo) ──
+PLAN.md
+
 # ── User-local test fixtures the project doesn't ship ────────────────
 # (test-media/ has empty placeholder files for parser fixtures —
 #  keep them; they're tiny and useful for `pytest`. If you ever add
