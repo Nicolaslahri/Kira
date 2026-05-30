@@ -1,7 +1,8 @@
 import { useState, useMemo, useEffect } from 'react';
 import type { AppState, MediaFile, ModalState, LibraryItem } from '../lib/types';
 import { IcCheck, IcX, IcSparkles, IcPlay, IcFilm, IcTv, IcAnime, IcMusic, IcSearch } from '../lib/icons';
-import { FilterPill } from '../components/ui';
+import { FilterPill, FilterGroup } from '../components/ui';
+import { Button } from '../components/base/buttons/button';
 import { LibraryGrid } from '../components/LibraryGrid';
 import { CoverPopup } from '../components/CoverPopup';
 import { ManualSearchModal } from '../components/modals';
@@ -108,11 +109,34 @@ export function ReviewPage({
   // Use the UNFILTERED `allItemsById` so the popup keeps showing
   // approved/renamed files — they're still part of the cluster, just
   // hidden from the grid view.
+  //
+  // Falls back to a seriesKey + file-overlap match when the id
+  // misses. This happens after a Sonarr Force Import: a previously-
+  // unmatched cluster gains its first matched file, the LibraryItem
+  // id flips from `lib_<seriesKey>` → `lib_<seriesKey>_<provider>_<id>`,
+  // and the popup's stored id no longer points anywhere. Without the
+  // fallback, the popup stays frozen showing "Just imported" forever
+  // even though the real file row is sitting in the new cluster.
   useEffect(() => {
     if (!popup) return;
-    const fresh = allItemsById.get(popup.item.id);
+    let fresh = allItemsById.get(popup.item.id);
+    if (!fresh) {
+      // Look for any item whose seriesKey matches AND has at least
+      // one file in common with the popup's current item. The file-
+      // overlap check guards against false positives in case multiple
+      // clusters happen to share a seriesKey (rare but possible).
+      const oldFileIds = new Set(popup.item.files.map(f => f.id));
+      for (const it of allItemsById.values()) {
+        if (popup.item.seriesKey
+            && it.seriesKey === popup.item.seriesKey
+            && it.files.some(f => oldFileIds.has(f.id))) {
+          fresh = it;
+          break;
+        }
+      }
+    }
     if (fresh && fresh !== popup.item) {
-      setPopup(p => p ? { ...p, item: fresh } : p);
+      setPopup(p => p ? { ...p, item: fresh as LibraryItem } : p);
     }
   }, [allItemsById, popup]);
 
@@ -266,169 +290,129 @@ export function ReviewPage({
   return (
     <div className="page">
       {(isLoading || isLibraryEmpty) ? null : (
-      <div className="lib-header">
-        <div className="lib-header-top">
+      <div className="mb-5">
+        <div className="mb-4 flex flex-wrap items-end justify-between gap-4">
           <div>
             <h1 className="page-title">Library</h1>
-            <p className="page-sub">
-              <span className="sub-strong">{statusCounts.pending}</span> pending
-              {statusCounts.noMatch > 0 ? (
-                <> (<span className="sub-strong" style={{ color: 'var(--conf-low)' }}>{statusCounts.noMatch}</span> no match)</>
-              ) : null}
-              {' · '}
-              <span className="sub-strong">{statusCounts.approved}</span> approved ·{' '}
-              <span className="sub-strong" style={{ color: 'var(--conf-high)' }}>{statusCounts.renamed}</span> renamed ·{' '}
-              <span className="sub-strong">{statusCounts.rejected}</span> rejected
+            <p className="mt-1 text-[13px] text-ink-muted">
+              <b className="font-semibold text-ink">{statusCounts.pending}</b> pending
+              {statusCounts.noMatch > 0 ? <> · <b className="font-semibold text-conf-low">{statusCounts.noMatch}</b> no match</> : null}
+              {' · '}<b className="font-semibold text-ink">{statusCounts.approved}</b> approved
+              {' · '}<b className="font-semibold text-conf-high">{statusCounts.renamed}</b> renamed
+              {' · '}<b className="font-semibold text-ink">{statusCounts.rejected}</b> rejected
             </p>
           </div>
-          <div className="lib-header-actions">
-            {statusF === 'approved' && statusCounts.approved > 0 ? (
-              // Stuck-approved sweep: when looking at the Approved view,
-              // a single button to push every approved file through rename.
-              // Saves the user from having to select-all + click again.
-              <button
-                className="btn btn-primary"
-                onClick={async () => {
-                  const ids = state.files
-                    .filter(f => f.status === 'approved')
-                    .map(f => f.id);
-                  if (ids.length && renameFilesDirectly) await renameFilesDirectly(ids);
-                }}
-              >
-                <IcPlay /> Rename {statusCounts.approved} approved
-              </button>
-            ) : (
-              // Just the selector — the redundant "Preview rename (0)"
-              // button used to sit here, but it was disabled until the
-              // user clicked Select high-confidence, AND the action bar
-              // that appears post-selection already has its own Preview
-              // button. Two preview buttons in the same flow was UI
-              // noise. The action bar is the single source of truth for
-              // any selection-based action (preview, approve, reject,
-              // manual search) once anything is selected.
-              <button className="btn btn-primary" onClick={selectHighConf}>
-                <IcSparkles /> Select high-confidence
-              </button>
-            )}
-          </div>
+          {statusF === 'approved' && statusCounts.approved > 0 ? (
+            <Button
+              color="primary"
+              size="md"
+              iconLeading={IcPlay}
+              onClick={async () => {
+                const ids = state.files.filter(f => f.status === 'approved').map(f => f.id);
+                if (ids.length && renameFilesDirectly) await renameFilesDirectly(ids);
+              }}
+            >
+              Rename {statusCounts.approved} approved
+            </Button>
+          ) : (
+            <Button color="secondary" size="md" iconLeading={IcSparkles} onClick={selectHighConf}>
+              Select high-confidence
+            </Button>
+          )}
         </div>
 
-        <div className="lib-header-filters">
-          <div className="filter-group">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2.5">
+          <FilterGroup>
             <FilterPill on={statusF === 'pending'}  onClick={() => setStatusF('pending')}  label="Pending"  num={statusCounts.pending} />
             <FilterPill
               on={statusF === 'no_match'}
               onClick={() => setStatusF('no_match')}
-              label={<span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><span className="dot" style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: 'var(--conf-low)' }} />No match</span>}
+              label={<span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full" style={{ background: 'var(--conf-low)' }} />No match</span>}
               num={statusCounts.noMatch}
             />
             <FilterPill on={statusF === 'approved'} onClick={() => setStatusF('approved')} label="Approved" num={statusCounts.approved} />
             <FilterPill
               on={statusF === 'renamed'}
               onClick={() => setStatusF('renamed')}
-              label={<span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><IcCheck style={{ width: 11, height: 11, color: 'var(--conf-high)' }} />Renamed</span>}
+              label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3 [&_svg]:text-conf-high"><IcCheck />Renamed</span>}
               num={statusCounts.renamed}
             />
             <FilterPill on={statusF === 'rejected'} onClick={() => setStatusF('rejected')} label="Rejected" num={statusCounts.rejected} />
             <FilterPill on={statusF === 'all'}      onClick={() => setStatusF('all')}      label="All"      num={statusCounts.all} />
-          </div>
+          </FilterGroup>
 
-          <div className="filter-group">
+          <FilterGroup>
             <FilterPill on={conf === 'all'}  onClick={() => setConf('all')}  label="Any" num={counts.all} />
-            <FilterPill on={conf === 'high'} onClick={() => setConf('high')} label={<span><span className="dot" style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: 'var(--conf-high)', marginRight: 6 }} />Strong</span>} num={counts.high} />
-            {/* F-04: pill labeled "Needs review" — the prior "Review"
-                label collided with the sidebar nav item AND the
-                "Review queue" breadcrumb in the same viewport, forcing
-                the user to context-switch each time the word appeared. */}
-            <FilterPill on={conf === 'mid'}  onClick={() => setConf('mid')}  label={<span><span className="dot" style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: 'var(--conf-mid)', marginRight: 6 }} />Needs review</span>} num={counts.mid} />
-            <FilterPill on={conf === 'low'}  onClick={() => setConf('low')}  label={<span><span className="dot" style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: 'var(--conf-low)', marginRight: 6 }} />Low</span>}  num={counts.low} />
-          </div>
+            <FilterPill on={conf === 'high'} onClick={() => setConf('high')} label={<span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full" style={{ background: 'var(--conf-high)' }} />Strong</span>} num={counts.high} />
+            <FilterPill on={conf === 'mid'}  onClick={() => setConf('mid')}  label={<span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full" style={{ background: 'var(--conf-mid)' }} />Needs review</span>} num={counts.mid} />
+            <FilterPill on={conf === 'low'}  onClick={() => setConf('low')}  label={<span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full" style={{ background: 'var(--conf-low)' }} />Low</span>}  num={counts.low} />
+          </FilterGroup>
 
-          <div className="filter-group">
+          <FilterGroup>
             <FilterPill on={type === 'all'}   onClick={() => setType('all')}   label="All media" />
-            <FilterPill on={type === 'movie'} onClick={() => setType('movie')} label={<span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><IcFilm style={{ width: 11, height: 11 }} />Movies</span>}  num={counts.movie} />
-            <FilterPill on={type === 'tv'}    onClick={() => setType('tv')}    label={<span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><IcTv style={{ width: 11, height: 11 }} />TV</span>}      num={counts.tv} />
-            <FilterPill on={type === 'anime'} onClick={() => setType('anime')} label={<span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: type === 'anime' ? '#c89bff' : undefined }}><IcAnime style={{ width: 11, height: 11 }} />Anime</span>} num={counts.anime} />
-            <FilterPill on={type === 'music'} onClick={() => setType('music')} label={<span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: type === 'music' ? '#ffb14a' : undefined }}><IcMusic style={{ width: 11, height: 11 }} />Music</span>} num={counts.music} />
-          </div>
+            <FilterPill on={type === 'movie'} onClick={() => setType('movie')} label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3"><IcFilm />Movies</span>}  num={counts.movie} />
+            <FilterPill on={type === 'tv'}    onClick={() => setType('tv')}    label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3"><IcTv />TV</span>}      num={counts.tv} />
+            <FilterPill on={type === 'anime'} onClick={() => setType('anime')} label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3" style={{ color: type === 'anime' ? '#c89bff' : undefined }}><IcAnime />Anime</span>} num={counts.anime} />
+            <FilterPill on={type === 'music'} onClick={() => setType('music')} label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3" style={{ color: type === 'music' ? '#ffb14a' : undefined }}><IcMusic />Music</span>} num={counts.music} />
+          </FilterGroup>
         </div>
       </div>
       )}
 
       {selected.size > 0 ? (
-        <div className="bulkbar" style={{ borderRadius: 12, marginBottom: 12 }}>
-          <div>
-            <b>{selected.size} selected</b>
+        <div className="mb-3 flex flex-wrap items-center gap-3 rounded-xl border border-white/[0.12] bg-white/[0.045] px-4 py-2.5 shadow-[0_1px_3px_rgba(0,0,0,0.35)]">
+          <div className="text-[13px] text-ink">
+            <b className="font-semibold">{selected.size} selected</b>
             {selectedNoMatchInfo.items.length > 0 ? (
-              <span style={{ color: 'var(--ink-3)', marginLeft: 8, fontSize: 12 }}>
+              <span className="ml-2 text-[12px] text-ink-soft">
                 · {selectedNoMatchInfo.items.length} need matching ({selectedNoMatchInfo.fileIds.length} files)
               </span>
             ) : null}
           </div>
-          <div className="ml-auto flex gap-2" style={{ alignItems: 'center' }}>
-            {/* Left → right flow:
-                Clear (escape) → Reject (destructive) → divider →
-                Match N (curative) → Preview (inspect) → Approve (commit).
-                All buttons cluster at the right edge via the parent's
-                ml-auto; the thin divider just gives a visual breath
-                between the dismissive pair and the commit pipeline. */}
-            <button className="btn btn-sm" onClick={() => setSelected(new Set())}>Clear</button>
-            <button
-              className="btn btn-sm btn-danger"
+          {/* Left → right: Clear (escape) → Reject (destructive) → divider →
+              Match N (curative) → Preview (inspect) → Approve (commit). */}
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <Button color="secondary" size="sm" onClick={() => setSelected(new Set())}>Clear</Button>
+            <Button
+              color="secondary-destructive"
+              size="sm"
+              iconLeading={IcX}
               onClick={() => {
                 void setFileStatusBulk(selectedFileIds, 'rejected');
                 setSelected(new Set());
               }}
-            ><IcX /> Reject</button>
+            >Reject</Button>
 
-            {/* Thin vertical divider — separates dismissive from commit
-                without the chasm a flex-grow spacer would create. */}
-            <span
-              aria-hidden="true"
-              style={{
-                width: 1,
-                height: 22,
-                background: 'rgba(255,255,255,0.12)',
-                margin: '0 4px',
-                flex: '0 0 auto',
-              }}
-            />
+            <span aria-hidden="true" className="mx-1 h-5 w-px bg-white/[0.12]" />
 
-            {/* "Match all to..." — visible only when no_match cards are
-                in the selection. Opens Manual Search seeded with the
-                first no_match file; on pick, applies to EVERY file
-                across every selected no_match cluster via the bulk
-                endpoint. Prerequisite for the rest of the pipeline. */}
             {selectedNoMatchInfo.items.length > 0 && selectedNoMatchInfo.seed ? (
-              <button
-                className="btn btn-sm"
-                style={{ borderColor: 'var(--conf-low)', color: 'var(--conf-low)' }}
+              <Button
+                color="secondary"
+                size="sm"
+                iconLeading={IcSearch}
                 onClick={() => setBulkMatchSeed(selectedNoMatchInfo.seed)}
-              ><IcSearch /> Match {selectedNoMatchInfo.fileIds.length} files to…</button>
+              >Match {selectedNoMatchInfo.fileIds.length} files to…</Button>
             ) : null}
-            {/* "Manual search" used to live here. Removed: it only seeded
-                the modal with the FIRST selected item, which (a) silently
-                ignored every other cluster in a multi-cluster selection,
-                and (b) duplicated the cover magnify icon for the
-                single-cluster case. */}
-            <button
-              className="btn btn-sm"
+            <Button
+              color="secondary"
+              size="sm"
+              iconLeading={IcPlay}
               title="Open preview modal to customize op/profile before renaming"
               onClick={() => openModal('renamePreview', state.files.filter(f => selectedFileIds.includes(f.id)))}
-            ><IcPlay /> Preview rename</button>
-            <button
-              className="btn btn-sm btn-primary"
+            >Preview rename</Button>
+            <Button
+              color="primary"
+              size="sm"
+              iconLeading={IcCheck}
               onClick={async () => {
-                // Approve + rename in one shot. Direct rename uses saved
-                // profile + op; no modal, no second click. Files immediately
-                // go through approved → renamed and show up in History.
+                // Approve + rename in one shot using saved profile + op.
                 const ids = selectedFileIds;
                 if (!ids.length) return;
                 await setFileStatusBulk(ids, 'approved');
                 if (renameFilesDirectly) await renameFilesDirectly(ids);
                 setSelected(new Set());
               }}
-            ><IcCheck /> Approve & rename ({selectedFileIds.length})</button>
+            >Approve &amp; rename ({selectedFileIds.length})</Button>
           </div>
         </div>
       ) : null}

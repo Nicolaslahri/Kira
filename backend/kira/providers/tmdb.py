@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+from cachetools import TTLCache
+
 from kira.providers.base import (
     EpisodeResult,
     MetadataProvider,
@@ -13,6 +15,19 @@ from kira.providers.base import (
 
 class TMDBProvider(MetadataProvider):
     key: ClassVar[ProviderKey] = "tmdb"
+
+    # KI-15: in-memory cache for per-season poster URLs. Without this,
+    # every cluster's poster fetch re-hits `/tv/{id}/season/{N}` even
+    # when an earlier cluster in the same scan already resolved it for
+    # the same (series, season). Bounded LRU + 24h TTL gives us a memory
+    # ceiling and "TMDB poster basically never changes" staleness budget.
+    # Class-level (shared across instances) because the factory may
+    # rebuild TMDBProvider per session but the upstream data is static.
+    # Sentinel for "we asked and got nothing" so a real None hit is
+    # distinguishable from a miss — keeps the cache truthful and avoids
+    # repeated fetches for series that legitimately have no poster.
+    _POSTER_CACHE_MISS = object()
+    _season_poster_cache: ClassVar[TTLCache] = TTLCache(maxsize=2048, ttl=24 * 3600)
 
     async def search_movie(self, title: str, year: int | None = None) -> list[MovieResult]:
         params = {"query": title, **self._auth_params()}
@@ -64,7 +79,15 @@ class TMDBProvider(MetadataProvider):
             for d in r.json().get("results", [])
         ]
 
-    async def get_episodes(self, series_id: str, season: int) -> list[EpisodeResult]:
+    async def get_episodes(
+        self, series_id: str, season: int, include_specials: bool = False,
+        order: str = "default",
+    ) -> list[EpisodeResult]:
+        # `include_specials` is a no-op for TMDB: specials live in season 0,
+        # so the caller requests `get_episodes(id, 0)`. `order` is a no-op too
+        # (TMDB has no DVD/absolute ordering API). Both exist to satisfy the
+        # shared provider signature.
+        del include_specials, order
         # `language=en-US` forces English titles + overviews. TMDB's default
         # falls back to the show's master record language for non-localized
         # shows (e.g. anime returns Japanese names). Explicit `language` lets
@@ -112,6 +135,12 @@ class TMDBProvider(MetadataProvider):
         directors = [c.get("name") for c in crew if c.get("job") == "Director" and c.get("name")]
         cast = [c.get("name") for c in (credits.get("cast") or [])[:5] if c.get("name")]
         return {
+            # Phase 14: identity fields so the embedded-ID bypass can build a
+            # ScoredMatch from a get-by-id call (additive — existing
+            # metadata_blob consumers ignore the extra keys).
+            "title": d.get("title") or d.get("original_title"),
+            "year": _year_from(d.get("release_date")),
+            "poster_url": _poster_url(d.get("poster_path")),
             "genres": [g.get("name") for g in (d.get("genres") or []) if g.get("name")],
             "cast": cast,
             "director": directors[0] if directors else None,
@@ -133,7 +162,23 @@ class TMDBProvider(MetadataProvider):
 
         Uses `/tv/{id}/season/{N}` which returns the season's poster_path
         directly. Falls back to the series-level poster if unavailable.
+
+        KI-15: caches successful + "no poster" outcomes in
+        `_season_poster_cache` (bounded TTLCache). Repeated calls within
+        the cache window — common during bulk scan/rematch — skip the
+        HTTP round-trips entirely. Transient errors (exception path)
+        deliberately DO NOT cache so the next call retries; mirrors the
+        AniDB cache discipline.
         """
+        cache_key = (series_id, season_number)
+        cached = self._season_poster_cache.get(cache_key, self._POSTER_CACHE_MISS)
+        if cached is not self._POSTER_CACHE_MISS:
+            return cached  # may be a real URL str OR a cached None ("definitively no poster")
+
+        # Successful 200 — either we got a poster path or the API
+        # confirmed there isn't one for this (series, season).
+        # Transient errors (exception) fall through WITHOUT caching so
+        # the next call retries from scratch.
         try:
             r = await self.client.get(
                 f"{self.base_url}/tv/{series_id}/season/{season_number}",
@@ -144,9 +189,15 @@ class TMDBProvider(MetadataProvider):
             if r.status_code == 200:
                 p = r.json().get("poster_path")
                 if p:
-                    return f"https://image.tmdb.org/t/p/w500{p}"
+                    url = f"https://image.tmdb.org/t/p/w500{p}"
+                    self._season_poster_cache[cache_key] = url
+                    return url
+                # 200 with no poster_path → series has no per-season art.
+                # Fall through to the series-level fallback below; cache
+                # only happens after we've decided final outcome.
         except Exception:
-            pass
+            # Transient — let the caller hit it again. Don't poison cache.
+            return None
         # Fallback: series-level poster
         try:
             r = await self.client.get(
@@ -158,9 +209,16 @@ class TMDBProvider(MetadataProvider):
             if r.status_code == 200:
                 p = r.json().get("poster_path")
                 if p:
-                    return f"https://image.tmdb.org/t/p/w500{p}"
+                    url = f"https://image.tmdb.org/t/p/w500{p}"
+                    self._season_poster_cache[cache_key] = url
+                    return url
+                # 200 with no poster — series legitimately has no art.
+                # Cache the None outcome so subsequent calls don't refetch.
+                self._season_poster_cache[cache_key] = None
+                return None
         except Exception:
-            pass
+            # Transient on fallback — same logic: don't cache, let retry.
+            return None
         return None
 
     async def get_tv_details(self, series_id: str) -> dict[str, Any]:
@@ -181,6 +239,10 @@ class TMDBProvider(MetadataProvider):
         run_times = d.get("episode_run_time") or []
         creators = d.get("created_by") or []
         return {
+            # Phase 14: identity fields for the embedded-ID bypass.
+            "title": d.get("name") or d.get("original_name"),
+            "year": _year_from(d.get("first_air_date")),
+            "poster_url": _poster_url(d.get("poster_path")),
             "genres": [g.get("name") for g in (d.get("genres") or []) if g.get("name")],
             "cast": cast,
             "director": creators[0].get("name") if creators else None,

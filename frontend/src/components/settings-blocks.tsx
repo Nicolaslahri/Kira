@@ -1,7 +1,24 @@
-import { useState, useEffect, type ReactNode } from 'react';
+import { useState, useEffect, useRef, type ReactNode, type FC } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import type { ProviderKey, MediaType } from '../lib/types';
-import { PROVIDERS, NAMING_PROFILES, NAMING_TOKENS, TYPE_COLOR } from '../lib/data';
-import { IcChevDown, IcRefresh, IcAlertTri, IcFilm, IcTv, IcAnime, IcMusic } from '../lib/icons';
+import { PROVIDERS, TYPE_COLOR } from '../lib/data';
+import { api } from '../lib/api';
+import { IcChevDown, IcRefresh, IcAlertTri, IcFilm, IcTv, IcAnime, IcMusic, IcDisc, IcWaveform, IcEye, IcEyeOff } from '../lib/icons';
+import { cn } from '../lib/utils';
+import { Button } from './base/buttons/button';
+import { FeaturedIcon } from './base/featured-icons/featured-icon';
+import { BadgeWithDot, Badge } from './base/badges/badges';
+import { Input } from './base/input/input';
+import { Alert } from './base/alert/alert';
+import { Toggle } from './base/toggle/toggle';
+import { Select } from './ui';
+
+// ── Shared settings surface styles ──────────────────────────────────
+// One source of truth so every Settings section (Connections, Paths,
+// Integrations, …) uses the exact same card + nested-box treatment.
+export const SETTINGS_CARD = 'rounded-2xl border border-white/[0.12] bg-white/[0.045] shadow-[0_1px_3px_rgba(0,0,0,0.35)]';
+export const SETTINGS_NESTED = 'rounded-xl border border-white/[0.1] bg-white/[0.07]';
+export const SETTINGS_DIVIDER = 'border-white/[0.1]';
 
 type FieldKind = 'text' | 'password' | 'select' | 'toggle';
 
@@ -19,82 +36,69 @@ export interface ProviderFieldProps {
 export function ProviderField({ kind = 'text', label, value, placeholder, options, mono, desc, onSave }: ProviderFieldProps) {
   const [text, setText] = useState(value ?? '');
   const [on, setOn] = useState(value !== 'false');
+  const [show, setShow] = useState(false);
 
-  // Sync local `text` state when the upstream `value` prop changes.
-  // Without this, the API key field stays empty after a fresh page
-  // load: the field mounts with rawSettings=[] (the initial empty
-  // state), `text` initializes to '', then rawSettings resolves with
-  // the saved key but `text` never re-syncs because useState's
-  // initializer only fires once. Result: input visually empty while
-  // the backend reports "Connected" because the registry CAN see the
-  // saved key.
-  //
-  // Re-sync on every value change UNLESS the user has typed
-  // something that differs from value (= they're mid-edit, don't
-  // clobber). The "user is editing" heuristic: text !== value AND
-  // text !== '' AND there was a previous non-empty value. This
-  // preserves typing-in-progress while still picking up server
-  // updates.
+  // Re-sync local `text` when the upstream `value` arrives late (the field
+  // mounts before rawSettings hydrates). Only adopt the server value while the
+  // field is empty so we never clobber an in-progress edit.
   useEffect(() => {
-    // Always re-sync if the field is currently empty (mount + value
-    // arriving late case). If text differs from value and user is
-    // actively typing, leave their local state alone.
-    if (text === '' && value) {
-      setText(value);
-    } else if (text === value) {
-      // No-op (already in sync).
-    }
-    // Intentionally ignoring `text` in deps — we only want to react
-    // to upstream value changes, not loop on local edits.
+    if (text === '' && value) setText(value);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
 
+  const labelBlock = (
+    <div>
+      <div className="text-[13px] font-medium text-ink">{label}</div>
+      {desc ? <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-soft">{desc}</div> : null}
+    </div>
+  );
+
   if (kind === 'toggle') {
     return (
-      <div className="provider-field">
-        <div className="provider-field-label">
-          <span>{label}</span>
-          {desc ? <span className="provider-field-desc">{desc}</span> : null}
-        </div>
-        <label className="flex items-center gap-2" style={{ cursor: 'pointer' }}>
-          <input
-            type="checkbox"
-            checked={on}
-            onChange={() => { const next = !on; setOn(next); onSave?.(next); }}
-            style={{ accentColor: 'var(--accent)', width: 16, height: 16 }}
-          />
-          <span className="text-sm">{on ? 'Enabled' : 'Disabled'}</span>
-        </label>
+      <div className="flex items-center justify-between gap-4">
+        {labelBlock}
+        <Toggle isSelected={on} onChange={() => { const next = !on; setOn(next); onSave?.(next); }} aria-label={label} />
       </div>
     );
   }
+
   if (kind === 'select') {
     return (
-      <div className="provider-field">
-        <div className="provider-field-label"><span>{label}</span></div>
-        <select
-          className="input"
-          defaultValue={value}
-          onChange={e => onSave?.(e.target.value)}
-        >
-          {options?.map(o => <option key={o}>{o}</option>)}
-        </select>
+      <div>
+        <div className="mb-1.5">{labelBlock}</div>
+        <Select<string>
+          value={value ?? null}
+          onChange={v => onSave?.(v)}
+          options={(options ?? []).map(o => ({ value: o, label: o }))}
+          placeholder={placeholder}
+        />
       </div>
     );
   }
+
+  const isPassword = kind === 'password';
   return (
-    <div className="provider-field">
-      <div className="provider-field-label">
-        <span>{label}</span>
-        {desc ? <span className="provider-field-desc">{desc}</span> : null}
-      </div>
-      <input
-        className={`input ${mono ? 'mono' : ''}`}
-        type={kind === 'password' ? 'password' : 'text'}
+    <div>
+      <div className="mb-1.5">{labelBlock}</div>
+      <Input
+        mono={mono}
+        type={isPassword && !show ? 'password' : 'text'}
         value={text}
         onChange={e => setText(e.target.value)}
         onBlur={() => { if (text !== value) onSave?.(text); }}
         placeholder={placeholder}
+        autoComplete={isPassword ? 'off' : undefined}
+        trailing={isPassword ? (
+          <button
+            type="button"
+            onClick={() => setShow(s => !s)}
+            title={show ? 'Hide' : 'Show'}
+            aria-label={show ? 'Hide value' : 'Show value'}
+            className="grid size-6 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink [&_svg]:size-[14px]"
+          >
+            {show ? <IcEyeOff /> : <IcEye />}
+          </button>
+        ) : undefined}
       />
     </div>
   );
@@ -107,7 +111,7 @@ interface ProviderBlockProps {
   status?: 'connected' | 'warning' | 'error' | 'disabled' | 'coming-soon' | 'not-configured';
   rateLimit?: string;
   warning?: string;
-  onTest?: () => void;
+  onTest?: () => void | Promise<void>;
   /** Unix timestamp (seconds) when the provider's ban expires. When set
    *  AND > now, the block renders a live countdown banner. AniDB only. */
   bannedUntil?: number | null;
@@ -137,32 +141,13 @@ function BanCountdownBanner({
     ? `Kira is using ${fallbackChain.map(k => k.toUpperCase()).join(' → ')} in the meantime.`
     : 'New matches against this provider will fail until then.';
   return (
-    <div
-      role="status"
-      style={{
-        display: 'flex',
-        alignItems: 'flex-start',
-        gap: 10,
-        padding: '10px 12px',
-        marginBottom: 14,
-        background: 'rgba(255, 201, 74, 0.10)',
-        border: '1px solid rgba(255, 201, 74, 0.32)',
-        borderRadius: 8,
-        color: 'var(--ink-1)',
-        fontSize: 13,
-        lineHeight: 1.45,
-      }}
+    <Alert
+      color="warning"
+      icon={IcAlertTri}
+      title={`Rate-limited — unbans in ${remaining} (at ${atStr})`}
     >
-      <IcAlertTri style={{ width: 16, height: 16, color: 'var(--conf-mid)', flex: '0 0 auto', marginTop: 2 }} />
-      <div style={{ flex: 1 }}>
-        <div style={{ fontWeight: 600, marginBottom: 2 }}>
-          Rate-limited — unbans in {remaining} (at {atStr})
-        </div>
-        <div style={{ color: 'var(--ink-3)', fontSize: 12 }}>
-          {fallback}
-        </div>
-      </div>
-    </div>
+      {fallback}
+    </Alert>
   );
 }
 
@@ -186,10 +171,39 @@ function useCountdown(unixSec: number | null | undefined): string | null {
   return `${m}m`;
 }
 
-export function ProviderBlock({ providerKey, fields = [], defaultOpen = false, status = 'connected', rateLimit, warning, onTest, bannedUntil, fallbackChain }: ProviderBlockProps) {
+// Map a provider's icon slug (from PROVIDERS metadata) to an icon component.
+const PROVIDER_ICON: Record<string, FC<{ className?: string }>> = {
+  film: IcFilm, tv: IcTv, anime: IcAnime, disc: IcDisc, waveform: IcWaveform,
+};
+
+// Provider avatar: tries the official logo at /providers/<slug>.svg and falls
+// back to the tinted media-type icon when that file is missing. Drop brand
+// SVGs into frontend/public/providers/ to light these up.
+function ProviderLogo({ slug, color, icon: Icon }: { slug: string; color: string; icon: FC<{ className?: string }> }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <FeaturedIcon size="md" tint={color} icon={<Icon />} />;
+  return (
+    <span className="size-9 shrink-0 overflow-hidden rounded-lg bg-white/[0.06]">
+      <img
+        src={`/providers/${slug}.svg`}
+        alt=""
+        draggable={false}
+        onError={() => setFailed(true)}
+        className="size-full object-contain"
+      />
+    </span>
+  );
+}
+
+export function ProviderCard({ providerKey, fields = [], defaultOpen = false, status = 'connected', warning, onTest, bannedUntil, fallbackChain }: ProviderBlockProps) {
   const [open, setOpen] = useState(defaultOpen);
+  const [testing, setTesting] = useState(false);
   const p = PROVIDERS[providerKey];
   if (!p) return null;
+
+  const Icon = PROVIDER_ICON[p.icon] ?? IcFilm;
+  const slug = providerKey.toLowerCase();
+
   // F-06: clearer labels for the discovered states. "Coming soon"
   // distinguishes "we haven't built this yet" from "you need a key";
   // "Not configured" is for implemented providers awaiting credentials.
@@ -199,74 +213,174 @@ export function ProviderBlock({ providerKey, fields = [], defaultOpen = false, s
     status === 'error' ? 'Error' :
     status === 'coming-soon' ? 'Coming soon' :
     status === 'not-configured' ? 'Not configured' : 'Disabled';
-  const statusColor =
-    status === 'connected' ? 'var(--conf-high)' :
-    status === 'warning' ? 'var(--conf-mid)' :
-    status === 'error' ? 'var(--conf-low)' :
-    status === 'coming-soon' ? 'var(--ink-3)' :
-    status === 'not-configured' ? 'var(--ink-3)' : 'var(--ink-3)';
+  const statusColor: 'success' | 'warning' | 'error' | 'gray' =
+    status === 'connected' ? 'success' :
+    status === 'warning' ? 'warning' :
+    status === 'error' ? 'error' : 'gray';
+
+  const handleTest = async () => {
+    if (!onTest) return;
+    setTesting(true);
+    try { await onTest(); } finally { setTesting(false); }
+  };
 
   return (
-    <div className={`provider-block ${open ? 'open' : ''}`}>
-      <button className="provider-block-head" onClick={() => setOpen(!open)}>
-        <span className="provider-dot" style={{ background: p.color }} />
-        <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span className="provider-block-name">{p.name}</span>
-            <span className="provider-block-for">for {p.for.join(' · ')}</span>
+    <div className={cn('overflow-hidden transition-colors', SETTINGS_CARD)}>
+      <button className="flex w-full items-center gap-3 px-4 py-3.5 text-left" onClick={() => setOpen(o => !o)}>
+        <ProviderLogo slug={slug} color={p.color} icon={Icon} />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[14px] font-semibold text-ink">{p.name}</span>
+            {p.for.map(t => <Badge key={t}>{t}</Badge>)}
           </div>
-          <div className="provider-block-desc">{p.desc}</div>
+          <div className="mt-0.5 truncate text-[12px] text-ink-muted">{p.desc}</div>
         </div>
-        <span className="status-pill"><span className="swatch" style={{ background: statusColor }} />{statusLabel}</span>
-        <span className={`provider-chev ${open ? 'open' : ''}`}><IcChevDown /></span>
+        <BadgeWithDot color={statusColor}>{statusLabel}</BadgeWithDot>
+        <IcChevDown className={cn('size-4 shrink-0 text-ink-soft transition-transform duration-200', open && 'rotate-180')} />
       </button>
-      {open ? (
-        <div className="provider-block-body">
-          {/* Ban countdown banner — only renders when bannedUntil is
-              set AND in the future. Auto-disappears when the ban
-              expires (countdown component returns null). */}
-          {bannedUntil ? <BanCountdownBanner unixSec={bannedUntil} fallbackChain={fallbackChain} /> : null}
-          {warning ? (
-            <div className="onboarding-state error" style={{ marginBottom: 14, lineHeight: 1.5 }}>
-              <IcAlertTri /><span>{warning}</span>
+
+      <AnimatePresence initial={false}>
+        {open ? (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.22, ease: 'easeOut' }}
+            className="overflow-hidden"
+          >
+            <div className={cn('flex flex-col gap-3.5 border-t px-4 py-4', SETTINGS_DIVIDER)}>
+              {/* Ban countdown — only renders while bannedUntil is set + future. */}
+              {bannedUntil ? <BanCountdownBanner unixSec={bannedUntil} fallbackChain={fallbackChain} /> : null}
+              {warning ? <Alert color="warning" icon={IcAlertTri}>{warning}</Alert> : null}
+              {fallbackChain && fallbackChain.length > 0 ? (
+                <Alert color="info">
+                  <strong className="text-ink-muted">Fallback chain:</strong> if unavailable, Kira tries{' '}
+                  {fallbackChain.map((k, i) => (
+                    <span key={k}>{i > 0 ? ' → ' : ''}<span className="text-ink-muted">{k.toUpperCase()}</span></span>
+                  ))}{' '}in order.
+                </Alert>
+              ) : null}
+
+              {fields.length > 0 ? (
+                <div className="flex flex-col gap-3.5">
+                  {fields.map((f, i) => <ProviderField key={i} {...f} />)}
+                </div>
+              ) : null}
+
+              <div className="flex justify-end">
+                <Button color="secondary" size="sm" iconLeading={IcRefresh} isLoading={testing} showTextWhileLoading onClick={handleTest}>
+                  Test connection
+                </Button>
+              </div>
             </div>
-          ) : null}
-          {/* Fallback chain hint — always shown when defined, even
-              when the provider is up. Lets the user see "if AniDB
-              breaks, we try TVDB then TMDB" without hunting through
-              docs. */}
-          {fallbackChain && fallbackChain.length > 0 ? (
-            <div style={{
-              fontSize: 12, color: 'var(--ink-3)', marginBottom: 14,
-              padding: '8px 10px', background: 'rgba(255,255,255,0.03)',
-              borderRadius: 6, border: '1px solid var(--line)',
-            }}>
-              <strong style={{ color: 'var(--ink-2)' }}>Fallback chain:</strong>{' '}
-              if this provider is unavailable, Kira tries{' '}
-              {fallbackChain.map((k, i) => (
-                <span key={k}>
-                  {i > 0 ? ' → ' : ''}
-                  <span style={{ color: 'var(--ink-2)' }}>{k.toUpperCase()}</span>
-                </span>
-              ))}
-              {' '}in order.
-            </div>
-          ) : null}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-            {fields.map((f, i) => <ProviderField key={i} {...f} />)}
-          </div>
-          <div className="provider-block-foot">
-            {rateLimit ? <span className="text-xs text-muted">{rateLimit}</span> : <span />}
-            <button className="btn btn-sm" onClick={onTest}><IcRefresh /> Test connection</button>
-          </div>
-        </div>
-      ) : null}
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
     </div>
   );
 }
 
-// 4-tab naming template editor (Movie / TV / Anime / Music)
-export function NamingTemplateTabs({ profile }: { profile: string }) {
+// Jinja2 ({{ }}) versions of the built-in profiles — mirror backend
+// DEFAULT_PROFILES. Kept LOCAL (not the shared NAMING_PROFILES, which stays
+// {token} so the rename-modal preview's formatPath keeps working) and used
+// as editor seeds + the input to the real backend live preview.
+const JINJA_PROFILES: Record<string, Record<MediaType, string>> = {
+  Plex: {
+    movie: '{{n}} ({{y}})/{{n}} ({{y}}){{variant}} [{{q}}].{{x}}',
+    tv:    '{{n}} ({{y}})/Season {{s2}}/{{n}} - S{{s2}}E{{e2}}{{variant}} - {{t}} [{{q}}].{{x}}',
+    anime: '{{n}}/Season {{s2}}/{{n}} - S{{s2}}E{{e2}}{{variant}} - {{t}} [{{rg}}].{{x}}',
+    music: '{{artist}}/{{album}} ({{y}})/{{tn}}{{variant}} - {{title}}.{{x}}',
+  },
+  Jellyfin: {
+    movie: '{{n}} ({{y}})/{{n}} ({{y}}){{variant}}.{{x}}',
+    tv:    '{{n}} ({{y}})/Season {{s2}}/{{n}} ({{y}}) - S{{s2}}E{{e2}}{{variant}} - {{t}}.{{x}}',
+    anime: '{{n}} ({{y}})/Season {{s2}}/{{n}} - S{{s2}}E{{e2}}{{variant}} - {{t}}.{{x}}',
+    music: '{{artist}}/{{album}}/{{tn}}{{variant}} {{title}}.{{x}}',
+  },
+  Kodi: {
+    movie: '{{n}} ({{y}})/{{n}} ({{y}}){{variant}} - {{q}}.{{x}}',
+    tv:    '{{n}}/Season {{s2}}/{{n}}.S{{s2}}E{{e2}}{{variant}}.{{t}}.{{x}}',
+    anime: '{{n}}/S{{s2}}/{{n}} - {{abs}}{{variant}} - {{t}}.{{x}}',
+    music: '{{artist}} - {{album}}/{{tn}}{{variant}}. {{title}}.{{x}}',
+  },
+  Custom: {
+    movie: '{{n}} ({{y}})/{{n}} ({{y}}).{{x}}',
+    tv:    '{{n}}/Season {{s2}}/{{n}} - S{{s2}}E{{e2}}.{{x}}',
+    anime: '{{n}}/{{n}} - {{abs}} [{{rg}}].{{x}}',
+    music: '{{artist}} - {{album}}/{{tn}}. {{title}}.{{x}}',
+  },
+};
+
+// Complete token reference per media type ({{ }} syntax). Mirrors every
+// token the backend _build_ctx provides so the palette is a true reference,
+// not a subset. Filters (| pad, | ascii, | roman, | clean, | sortName,
+// | upperInitial, | acronym, plus Jinja's | upper/lower/replace/default)
+// are documented in TOKEN_FILTERS below.
+const TOKEN_CHIPS: Record<MediaType, { k: string; d: string }[]> = {
+  movie: [
+    { k: '{{n}}', d: 'Title' }, { k: '{{y}}', d: 'Year' }, { k: '{{ny}}', d: 'Title (Year)' },
+    { k: '{{decade}}', d: '1990s' }, { k: '{{x}}', d: 'Ext' }, { k: '{{q}}', d: 'Quality' },
+    { k: '{{resolution}}', d: '1080p' }, { k: '{{source}}', d: 'BluRay/WEB' }, { k: '{{vc}}', d: 'Video codec' },
+    { k: '{{ac}}', d: 'Audio codec' }, { k: '{{channels}}', d: 'Audio ch (5.1)' }, { k: '{{hdr}}', d: 'HDR' },
+    { k: '{{bitdepth}}', d: '10bit' }, { k: '{{edition}}', d: 'Edition' }, { k: '{{variant}}', d: 'Variant suffix' },
+    { k: '{{director}}', d: 'Director' }, { k: '{{cast}}', d: 'Cast' }, { k: '{{genres}}', d: 'Genres' },
+    { k: '{{genre}}', d: 'First genre' }, { k: '{{studio}}', d: 'Studio' }, { k: '{{country}}', d: 'Country' },
+    { k: '{{runtime}}', d: 'Minutes' }, { k: '{{gigabytes}}', d: 'Size (GB)' },
+    { k: '{{tmdbid}}', d: 'TMDB id' }, { k: '{{imdbid}}', d: 'IMDb id' }, { k: '{{plex}}', d: 'Full Plex path' },
+  ],
+  tv: [
+    { k: '{{n}}', d: 'Series' }, { k: '{{y}}', d: 'Year' }, { k: '{{s2}}', d: 'Season (00)' },
+    { k: '{{e2}}', d: 'Episode (00)' }, { k: '{{e2end}}', d: 'End ep (ranges)' }, { k: '{{s00e00}}', d: 'S01E05' },
+    { k: '{{sxe}}', d: '1x05' }, { k: '{{t}}', d: 'Ep title' }, { k: '{{airdate}}', d: 'Air date' },
+    { k: '{{q}}', d: 'Quality' }, { k: '{{resolution}}', d: '1080p' }, { k: '{{vc}}', d: 'Video codec' },
+    { k: '{{channels}}', d: 'Audio ch (5.1)' }, { k: '{{hdr}}', d: 'HDR' }, { k: '{{variant}}', d: 'Variant suffix' },
+    { k: '{{network}}', d: 'Network' }, { k: '{{studio}}', d: 'Studio' }, { k: '{{genres}}', d: 'Genres' },
+    { k: '{{yearrange}}', d: '2022 – 2024' }, { k: '{{tvdbid}}', d: 'TVDB id' }, { k: '{{plex}}', d: 'Full Plex path' },
+  ],
+  anime: [
+    { k: '{{n}}', d: 'Series' }, { k: '{{s2}}', d: 'Season' }, { k: '{{e2}}', d: 'Episode' },
+    { k: '{{abs}}', d: 'Absolute (000)' }, { k: '{{s00e00}}', d: 'S01E05' }, { k: '{{t}}', d: 'Ep title' },
+    { k: '{{rg}}', d: 'Group' }, { k: '{{group}}', d: 'Group (blank)' }, { k: '{{cour}}', d: 'Cour #' },
+    { k: '{{vc}}', d: 'Video codec' }, { k: '{{channels}}', d: 'Audio ch (5.1)' }, { k: '{{hdr}}', d: 'HDR' },
+    { k: '{{bitdepth}}', d: '10bit' }, { k: '{{variant}}', d: 'Audio/edition' }, { k: '{{studio}}', d: 'Studio' },
+    { k: '{{genres}}', d: 'Genres' }, { k: '{{anidbid}}', d: 'AniDB id' }, { k: '{{plex}}', d: 'Full Plex path' },
+  ],
+  music: [
+    { k: '{{artist}}', d: 'Artist' }, { k: '{{album}}', d: 'Album' }, { k: '{{y}}', d: 'Year' },
+    { k: '{{decade}}', d: '1990s' }, { k: '{{tn}}', d: 'Track # (02)' }, { k: '{{title}}', d: 'Track title' },
+    { k: '{{label}}', d: 'Label' }, { k: '{{genres}}', d: 'Genres' }, { k: '{{x}}', d: 'Ext' },
+  ],
+};
+
+// Reusable filters (advanced string helpers + Jinja built-ins). Shown as a hint under
+// the token palette so users can discover them. e.g. `{{ n | upper }}`,
+// `{{ episode | pad(3) }}`, `{{ n | acronym }}`.
+const TOKEN_FILTERS = 'pad(n) · ascii · roman · clean · sortName · upperInitial · acronym · upper · lower · replace(a,b) · default(x)';
+
+// Seed the 4-type template set for a profile. For Custom, layer any saved
+// custom templates over the built-in Custom defaults so unset types still
+// render sensibly.
+function seedTemplates(profile: string, savedCustom?: Record<string, string>): Record<MediaType, string> {
+  if (profile === 'Custom') {
+    return { ...JINJA_PROFILES.Custom, ...(savedCustom ?? {}) } as Record<MediaType, string>;
+  }
+  return { ...(JINJA_PROFILES[profile] ?? JINJA_PROFILES.Plex) };
+}
+
+// 4-tab naming template editor with a REAL live preview (rendered by the
+// backend engine against the user's own files — see LiveTemplatePreview).
+// Layout is a 2-pane editor | preview grid so the wide Settings column gets
+// used: the editor (tabs + template + token palette) sits on the left, the
+// live-rendered paths (which are long) get the full right pane.
+//
+// Custom-profile edits persist via onSaveCustom → backend `naming.custom.Custom`
+// (the same JSON dict the rename engine reads at rename time). Built-in
+// profiles are read-only.
+export function NamingTemplateTabs({ profile, savedCustom, onSaveCustom }: {
+  profile: string;
+  savedCustom?: Record<string, string>;
+  onSaveCustom?: (dict: Record<string, string>) => void;
+}) {
   const tabs: { key: MediaType; label: string; icon: ReactNode }[] = [
     { key: 'movie', label: 'Movies', icon: <IcFilm style={{ width: 13, height: 13 }} /> },
     { key: 'tv',    label: 'TV',     icon: <IcTv style={{ width: 13, height: 13 }} /> },
@@ -274,11 +388,63 @@ export function NamingTemplateTabs({ profile }: { profile: string }) {
     { key: 'music', label: 'Music',  icon: <IcMusic style={{ width: 13, height: 13 }} /> },
   ];
   const [tab, setTab] = useState<MediaType>('movie');
-  const tpl = NAMING_PROFILES[profile][tab];
-  const tokens = NAMING_TOKENS[tab] || [];
+  const [templates, setTemplates] = useState<Record<MediaType, string>>(() => seedTemplates(profile, savedCustom));
+
+  // Keep the latest saved-custom values in a ref so a profile switch can
+  // re-seed from them WITHOUT savedCustom being a seed-effect dependency —
+  // otherwise every debounced save (which updates savedCustom) would re-seed
+  // and clobber the user's in-progress edits / jump their caret.
+  const savedCustomRef = useRef(savedCustom);
+  useEffect(() => { savedCustomRef.current = savedCustom; }, [savedCustom]);
+
+  // Re-seed only when the profile changes. Declared AFTER the ref-sync effect
+  // so that when a settings load lands both a new profile AND savedCustom in
+  // the same commit, the ref is already current before this reads it.
+  useEffect(() => {
+    setTemplates(seedTemplates(profile, savedCustomRef.current));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profile]);
+
+  const editable = profile === 'Custom';
+  const tpl = templates[tab];
+  const tokens = TOKEN_CHIPS[tab] || [];
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Apply an edit to the active tab. Updates local state and, for the Custom
+  // profile, persists the whole 4-type dict through onSaveCustom (debounced
+  // upstream).
+  function applyEdit(nextForTab: string) {
+    // Compute the next dict from the current closure value and call both
+    // setters OUTSIDE any updater. (Calling the parent's onSaveCustom from
+    // inside a setTemplates updater triggers React's "setState while
+    // rendering another component" warning.)
+    const next = { ...templates, [tab]: nextForTab };
+    setTemplates(next);
+    if (editable) onSaveCustom?.(next);
+  }
+
+  // Click a token chip → insert it at the caret (Custom profile only).
+  function insertToken(k: string) {
+    if (!editable) return;
+    const el = inputRef.current;
+    const cur = templates[tab] ?? '';
+    if (el && typeof el.selectionStart === 'number') {
+      const a = el.selectionStart, b = el.selectionEnd ?? a;
+      applyEdit(cur.slice(0, a) + k + cur.slice(b));
+      // restore caret just after the inserted token
+      requestAnimationFrame(() => {
+        el.focus();
+        const pos = a + k.length;
+        el.setSelectionRange(pos, pos);
+      });
+    } else {
+      applyEdit(cur + k);
+    }
+  }
+
   return (
     <div>
-      <div className="provider-tabs" style={{ marginBottom: 14 }}>
+      <div className="provider-tabs" style={{ marginBottom: 16 }}>
         {tabs.map(t => (
           <button key={t.key} className={`provider-tab ${tab === t.key ? 'on' : ''}`} onClick={() => setTab(t.key)}>
             <span style={{ display: 'inline-flex', alignItems: 'center', width: 13, height: 13, color: tab === t.key ? TYPE_COLOR[t.key] : 'var(--ink-3)' }}>
@@ -289,54 +455,118 @@ export function NamingTemplateTabs({ profile }: { profile: string }) {
         ))}
       </div>
 
-      <div className="text-xs text-muted font-medium" style={{ textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
-        {tabs.find(t => t.key === tab)!.label} template
-      </div>
-      <input className="input mono" value={tpl} readOnly={profile !== 'Custom'} onChange={() => { /* prototype */ }} />
+      <div className="naming-editor">
+        {/* ── LEFT: template + token palette ───────────────── */}
+        <div className="naming-pane">
+          <div className="naming-pane-head">
+            <span>{tabs.find(t => t.key === tab)!.label} template</span>
+            {!editable
+              ? <span className="naming-lock">{profile} preset · pick Custom to edit</span>
+              : <span className="naming-lock" style={{ color: 'var(--accent)' }}>editable · autosaved</span>}
+          </div>
+          <input
+            ref={inputRef}
+            className="input mono"
+            value={tpl}
+            readOnly={!editable}
+            spellCheck={false}
+            onChange={e => applyEdit(e.target.value)}
+          />
+          <div className="naming-hint">
+            Pipe filters like <code>{'{{ n | upper }}'}</code> and conditionals
+            like <code>{'{% if hdr %}…{% endif %}'}</code> work too.
+          </div>
 
-      <div className="text-xs text-muted" style={{ marginTop: 14, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 600 }}>
-        Tokens available for {tab}
-      </div>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-        {tokens.map(t => (
-          <span key={t.k} className="token-chip">
-            <span className="kbd" style={{ margin: 0 }}>{t.k}</span>
-            <span style={{ color: 'var(--ink-3)', fontSize: 11 }}>{t.d}</span>
-          </span>
-        ))}
-      </div>
-
-      <div style={{ marginTop: 14 }}>
-        <div className="text-xs text-muted font-medium" style={{ textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
-          Preview
+          <div className="naming-pane-head" style={{ marginTop: 18 }}>
+            <span>Tokens for {tab}</span>
+            {editable ? <span className="naming-lock">click to insert</span> : null}
+          </div>
+          <div className="naming-tokens">
+            {tokens.map(t => (
+              <button
+                key={t.k}
+                type="button"
+                className={`token-chip ${editable ? 'clickable' : ''}`}
+                disabled={!editable}
+                onClick={() => insertToken(t.k)}
+                title={editable ? `Insert ${t.k}` : t.d}
+              >
+                <span className="kbd" style={{ margin: 0 }}>{t.k}</span>
+                <span style={{ color: 'var(--ink-3)', fontSize: 11 }}>{t.d}</span>
+              </button>
+            ))}
+          </div>
+          <div style={{ marginTop: 8, fontSize: 11, color: 'var(--ink-3)', lineHeight: 1.5 }}>
+            <span style={{ color: 'var(--ink-4)' }}>Filters (pipe with </span>
+            <code style={{ color: 'var(--ink-2)' }}>|</code>
+            <span style={{ color: 'var(--ink-4)' }}>): </span>
+            {TOKEN_FILTERS}
+          </div>
         </div>
-        <div className="preview-side new" style={{ padding: '10px 12px' }}>
-          <div className="preview-path">{namingPreview(tab, tpl)}</div>
+
+        {/* ── RIGHT: live preview against the real library ─── */}
+        <div className="naming-pane naming-pane-preview">
+          <div className="naming-pane-head">
+            <span>Live preview · your library</span>
+          </div>
+          <LiveTemplatePreview tab={tab} template={tpl} />
         </div>
       </div>
     </div>
   );
 }
 
-function namingPreview(type: MediaType, tpl: string) {
-  const data: Record<MediaType, Record<string, string | number>> = {
-    movie: { n: 'Dune: Part Two', y: 2024, q: '2160p WEB-DL', x: 'mkv' },
-    tv:    { n: 'Severance', y: 2022, s2: '02', e2: '07', t: 'Chikhai Bardo', q: '2160p WEB-DL', x: 'mkv' },
-    anime: { n: "Frieren: Beyond Journey's End", y: 2023, s2: '01', e2: '28', abs: '028', t: 'A Bird Cage of Silver', rg: 'SubsPlease', x: 'mkv' },
-    music: { artist: 'Radiohead', album: 'OK Computer', y: 1997, tn: '03', title: 'Subterranean Homesick Alien', x: 'flac' },
-  };
-  let out = tpl;
-  for (const [k, v] of Object.entries(data[type] || {})) {
-    out = out.replace(new RegExp('\\{' + k + '\\}', 'g'), String(v));
+// Real live preview: debounces edits, calls the backend's /rename/preview-
+// template (the SAME engine a real rename uses) against the user's recent
+// matched files, and shows the actual paths it would produce.
+function LiveTemplatePreview({ tab, template }: { tab: MediaType; template: string }) {
+  const [samples, setSamples] = useState<{ filename: string; rendered: string; error: string | null }[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setErr(null);
+    const handle = window.setTimeout(async () => {
+      try {
+        const body: { movie?: string; tv?: string; anime?: string; music?: string; samples_per_type?: number } = { samples_per_type: 3 };
+        body[tab] = template;
+        const resp = await api.previewTemplate(body);
+        if (cancelled) return;
+        setSamples(resp.samples.filter(s => s.media_type === tab));
+      } catch (e) {
+        if (!cancelled) { setErr((e as Error).message); setSamples(null); }
+      }
+    }, 350);
+    return () => { cancelled = true; window.clearTimeout(handle); };
+  }, [tab, template]);
+
+  if (err) {
+    return <div className="naming-preview-empty" style={{ color: 'var(--conf-low)' }}>Preview unavailable: {err}</div>;
   }
-  const root = '/media/library/' + ({ movie: 'Movies', tv: 'TV', anime: 'Anime', music: 'Music' } as const)[type];
-  const parts = out.split('/');
-  const last = parts.pop();
-  const dir = root + (parts.length ? '/' + parts.join('/') : '');
+  if (samples === null) {
+    return <div className="naming-preview-empty">Rendering…</div>;
+  }
+  if (samples.length === 0) {
+    return (
+      <div className="naming-preview-empty">
+        No matched {tab} files yet — scan &amp; match some to see a live preview.
+      </div>
+    );
+  }
   return (
-    <>
-      <span className="seg-dir">{dir}/</span>
-      <span className="seg-new">{last}</span>
-    </>
+    <div className="naming-preview-list">
+      {samples.map((s, i) => (
+        <div key={i} className="naming-preview-row">
+          {s.error ? (
+            <span style={{ color: 'var(--conf-low)', fontSize: 12 }}>{s.filename}: {s.error}</span>
+          ) : (
+            <>
+              <div className="naming-preview-src">{s.filename}</div>
+              <div className="preview-path"><span className="seg-new">{s.rendered}</span></div>
+            </>
+          )}
+        </div>
+      ))}
+    </div>
   );
 }

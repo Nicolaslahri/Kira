@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -21,6 +22,41 @@ _IGNORED_PREFIXES = (".", "@", "$", "__MACOSX", "#recycle")
 # Exact-match dirs we always skip — common NAS thumbnail/trash folders
 # whose names don't share a single prefix character.
 _IGNORED_NAMES = frozenset({"System Volume Information", "Thumbs.db", "lost+found"})
+
+# Phase 19: sample / extras / trailer exclusion. Scene releases ship a
+# tiny `sample.mkv` (5-50 MB preview), `trailer.mp4`, `proof.mkv`, and
+# Plex/Jellyfin extras folders (Featurettes/, Behind The Scenes/, …). Without
+# excluding them a 30 MB sample gets renamed AS the real episode/movie. We
+# skip them at walk time (the reference renamer's default). NOTE: "Specials" is NOT an
+# extras folder — Phase 2 routes specials to season 0 as real content.
+_EXTRAS_DIRNAMES = frozenset({
+    "extras", "featurettes", "behind the scenes", "deleted scenes", "bloopers",
+    "interviews", "trailers", "trailer", "sample", "samples", "shorts", "other",
+})
+# A `sample` / `trailer` / `proof` token bounded by separators or string ends.
+_SAMPLE_TOKEN_RE = re.compile(r"(?:^|[\s._-])(?:sample|trailer|proof)(?:[\s._-]|$)", re.IGNORECASE)
+# Below this, a `sample`-named video is almost certainly a real sample, not a
+# legit title that happens to contain the word.
+_SAMPLE_MAX_BYTES = 300 * 1024 * 1024
+
+
+def _is_sample_or_extra(p: Path) -> bool:
+    """True when `p` is a scene sample, trailer, proof, or lives in an
+    extras folder — files we must NOT rename as the main media."""
+    if p.parent.name.lower() in _EXTRAS_DIRNAMES:
+        return True
+    stem = p.stem.lower()
+    # Unambiguous junk stems regardless of size.
+    if stem in ("sample", "trailer", "proof") or stem.endswith(("-sample", ".sample", "-trailer")):
+        return True
+    # A `sample`/`trailer`/`proof` token elsewhere in the name → confirm with
+    # size so a legit title ("Free Sample", "Trailer Park Boys") isn't culled.
+    if _SAMPLE_TOKEN_RE.search(stem):
+        try:
+            return p.stat().st_size < _SAMPLE_MAX_BYTES
+        except OSError:
+            return False
+    return False
 
 # Windows file attribute: FILE_ATTRIBUTE_REPARSE_POINT (0x400) marks
 # junctions, symlinks, and mount points. Used by R2-C6 to detect
@@ -206,6 +242,11 @@ def walk(root: str | Path) -> Iterator[Path]:
                 print(f"[SCAN] OSError on {p}: {e!r}")
                 continue
             if p.suffix.lower() in MEDIA_EXTENSIONS:
+                # Phase 19: drop scene samples / trailers / extras so a 30 MB
+                # sample never gets renamed as the real episode/movie.
+                if _is_sample_or_extra(p):
+                    print(f"[SCAN] Skipping sample/extra: {p}")
+                    continue
                 yield p
 
 

@@ -10,6 +10,7 @@ import asyncio
 from typing import Any, ClassVar
 
 import httpx
+from cachetools import TTLCache
 
 from kira.providers.base import (
     EpisodeResult,
@@ -30,10 +31,29 @@ class TVDBProvider(MetadataProvider):
     # processed in parallel scans, that compounds to 25+ concurrent
     # TVDB HTTP calls per second. TVDB has no published rate-limit
     # number but community testing shows 3 concurrent is the safe ceiling
-    # before 429s start cascading. Semaphore is class-level so all
-    # provider instances (constructed per match cluster) share it.
-    _CONCURRENCY: ClassVar[int] = 3
-    _request_sem: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(_CONCURRENCY)
+    # before 429s start cascading.
+    #
+    # KI-4: TWO class-level semaphores — one for direct mode (the strict
+    # 3-slot pool, unchanged) and one for cloud mode (10 slots — the
+    # Kira Cloud proxy aggregates TVDB requests centrally with its own
+    # rate-limit budget, so per-client throttling can be much looser).
+    # `_get` picks the right pool at runtime via `_is_cloud()`.
+    #
+    # Class-level (not instance-level) is intentional: `registry.build()`
+    # creates a fresh TVDBProvider per call site, so an instance-level
+    # semaphore would multiply the effective concurrency by the number
+    # of concurrent build sites. The mode-keyed split lets us tighten
+    # direct-mode while loosening cloud-mode without that risk.
+    _DIRECT_CONCURRENCY: ClassVar[int] = 3
+    _CLOUD_CONCURRENCY: ClassVar[int] = 10
+    # Kept under the original name for back-compat in case any external
+    # code (tests, debug scripts) references the old constant.
+    _CONCURRENCY: ClassVar[int] = _DIRECT_CONCURRENCY
+    _request_sem_direct: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(_DIRECT_CONCURRENCY)
+    _request_sem_cloud: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(_CLOUD_CONCURRENCY)
+    # Alias for back-compat — points at the direct pool (the previous
+    # default behaviour). New code should use the mode-aware accessor.
+    _request_sem: ClassVar[asyncio.Semaphore] = _request_sem_direct
 
     # ── R2-C3 helper: cache get_series_extended results ────────────────
     # The matcher fires get_series_extended for every TVDB candidate
@@ -41,9 +61,27 @@ class TVDBProvider(MetadataProvider):
     # 200-file scan where 50 files match the same TVDB series, we'd
     # otherwise issue 50 extended calls. Keep one cached payload per
     # series_id so subsequent files (and subsequent reranks) reuse it.
-    # Per-process cache; clears on backend restart. Bounded by series
-    # count, not file count, so memory is trivial.
-    _extended_cache: ClassVar[dict[str, dict[str, Any]]] = {}
+    #
+    # KI-10: bounded TTLCache instead of a plain dict. Original assumption
+    # ("bounded by series count, memory trivial") held in practice on
+    # small libraries, but unbounded ClassVar dict on a long-running
+    # backend scanning a 50k-series library accumulated ~250MB of resident
+    # data — fine on a fat host, painful on Raspberry Pi / NAS deployments.
+    # maxsize=2048 covers any realistic single-user library while keeping
+    # the memory ceiling predictable. 24h TTL is a free side-benefit: it
+    # bounds the impact of KI-2 (malformed-response poisoning) by letting
+    # bad cached payloads self-expire instead of living until restart.
+    _extended_cache: ClassVar[TTLCache] = TTLCache(maxsize=2048, ttl=24 * 3600)
+
+    # KI-1 + KI-2: separate cache for the RAW /extended payload, shared
+    # between `get_series_extended` (which transforms into aliases/cast/
+    # network/etc.) and `get_season_poster` (which needs seasons[] +
+    # image[] + image_url[]). Both go through `_get_extended_raw` which
+    # applies envelope validation before caching (Pattern D / KI-2).
+    # Memory ceiling: 2048 entries × ~10-20KB raw payload = ~30MB max,
+    # comparable to the transformed cache; bounded by the same TTL so
+    # bad data self-corrects.
+    _extended_raw_cache: ClassVar[TTLCache] = TTLCache(maxsize=2048, ttl=24 * 3600)
 
     def __init__(self, base_url: str, auth: ProviderAuth, client: httpx.AsyncClient):
         super().__init__(base_url=base_url, auth=auth, client=client)
@@ -89,7 +127,19 @@ class TVDBProvider(MetadataProvider):
         # All HTTP exits this single chokepoint — the concurrency
         # semaphore lives here so it gates every API call regardless of
         # which higher-level method initiated it.
-        async with TVDBProvider._request_sem:
+        #
+        # KI-4: pick the cloud or direct pool BEFORE entering the with
+        # block. Cloud's higher slot count lets paying users scan faster
+        # without bumping direct-mode users into 429-storm territory.
+        # The `_is_cloud()` check reads only `self.auth.*` and
+        # `self.base_url` — both set by the parent constructor — so this
+        # is safe to call at any point after __init__.
+        sem = (
+            TVDBProvider._request_sem_cloud
+            if self._is_cloud()
+            else TVDBProvider._request_sem_direct
+        )
+        async with sem:
             if self._is_cloud():
                 # Cloud proxy: auth preset on `self.auth`; base helper attaches it.
                 headers = self._auth_headers()
@@ -164,6 +214,68 @@ class TVDBProvider(MetadataProvider):
             ))
         return out
 
+    async def _get_extended_raw(self, series_id: str) -> dict[str, Any] | None:
+        """Fetch the RAW /series/{id}/extended payload, with envelope validation.
+
+        Single source of truth for the extended endpoint. Both
+        `get_series_extended` (popup hero / anime re-rank — needs
+        aliases, cast, network) and `get_season_poster` (per-season
+        artwork — needs seasons[], image, image_url) call this. Sharing
+        the upstream fetch means one HTTP call serves both paths AND
+        both paths benefit from the same cache entry.
+
+        ── KI-2: envelope-validation invariant (Pattern D) ──────────
+        A TVDB response with `{"data": null}` is "200 OK but the lookup
+        produced nothing" — semantically a transient failure from our
+        perspective, often caused by a brief upstream glitch or a
+        series being re-indexed. Pre-KI-2 we'd cache the resulting
+        empty result forever and silently degrade every consumer
+        (aliases/originalLanguage/seasons all empty) until backend
+        restart. Now: the envelope check rejects null `data` without
+        writing to the cache, so the next call retries from scratch.
+        KI-10's 24h TTL bounds the worst-case staleness for any other
+        flavour of malformed-but-non-raising response.
+
+        Returns the raw `data` dict on success, or None on transient
+        failure (caller decides fallback behaviour).
+
+        ── KI-1: shared caching for poster path ─────────────────────
+        Pre-KI-1 `get_season_poster` issued its own direct `_get` call
+        for the same endpoint, bypassing the cache entirely. A page
+        showing 50 per-season cards for the same series re-fetched
+        `/extended` 50 times, each serialized through the 3-slot
+        semaphore — ~250s worst case on a network hiccup. Routing
+        through this helper eliminates that.
+        """
+        cached = TVDBProvider._extended_raw_cache.get(series_id)
+        if cached is not None:
+            return cached
+        try:
+            data = await self._get(
+                f"/series/{series_id}/extended",
+                params={"meta": "translations"},
+            )
+        except Exception:
+            # Transient (timeout, 5xx, connection drop). DON'T cache —
+            # the next call retries. This is the most important branch
+            # for KI-2; a misclassified transient that gets cached is
+            # exactly what poisons every downstream consumer.
+            return None
+        # Envelope validation — distinguish "API gave a real response"
+        # from "API said null." Both arrive as a non-raising HTTP 200,
+        # but only the former represents ground truth worth caching.
+        if not isinstance(data, dict) or data.get("data") is None:
+            return None
+        payload = data["data"]
+        if not isinstance(payload, dict):
+            # Defensive: TVDB has historically returned `data` as a list
+            # for some endpoints, but `/series/{id}/extended` should
+            # always be a dict. If the shape ever drifts, treat as
+            # transient rather than caching a structurally-wrong entry.
+            return None
+        TVDBProvider._extended_raw_cache[series_id] = payload
+        return payload
+
     async def get_series_extended(self, series_id: str) -> dict[str, Any]:
         """Fetch extended series metadata for the popup hero + anime re-rank.
 
@@ -181,16 +293,25 @@ class TVDBProvider(MetadataProvider):
         The matcher's Fribb-empty fallback + anime re-rank can both
         request extended for the same series_id during a single scan.
         Cache hit returns instantly without any HTTP call.
+
+        ── KI-1 + KI-2: re-routed through _get_extended_raw ──────────
+        Both the raw fetch + envelope validation now live in the
+        shared helper. This method keeps caching its transformed
+        result separately (the transform is non-trivial — ~50 lines
+        of array walks and conditional extraction — and benefits
+        from the per-call cache lookup as well).
         """
-        # Cache hit: bypass the HTTP fetch + semaphore entirely.
+        # Transformed cache hit: bypass both the helper AND the transform.
         cached = TVDBProvider._extended_cache.get(series_id)
         if cached is not None:
             return cached
-        try:
-            data = await self._get(f"/series/{series_id}/extended", params={"meta": "translations"})
-        except Exception:
+        payload = await self._get_extended_raw(series_id)
+        if payload is None:
+            # Transient failure — DON'T cache the empty result. The
+            # next call retries from scratch. Pre-KI-2 we cached `{}`
+            # here which silently broke aliases/originalLanguage for
+            # the rest of the process lifetime.
             return {}
-        payload = data.get("data", {}) or {}
         # TVDB v4 returns aliases as [{language, name}] — flatten to a list of strings.
         aliases_raw = payload.get("aliases") or []
         aliases: list[str] = []
@@ -261,7 +382,12 @@ class TVDBProvider(MetadataProvider):
         if not overview:
             overview = payload.get("overview")
 
+        # Phase 14: identity fields for the embedded-ID bypass.
+        _fa = (payload.get("firstAired") or "")[:4]
         result: dict[str, Any] = {
+            "title": payload.get("name"),
+            "year": int(_fa) if _fa.isdigit() else None,
+            "poster_url": payload.get("image"),
             "aliases": aliases,
             "original_language": payload.get("originalLanguage"),
             "original_country": payload.get("originalCountry"),
@@ -356,12 +482,23 @@ class TVDBProvider(MetadataProvider):
              to get the highest-resolution poster artwork.
           5. Else, fall back to the series-level poster so the card isn't
              blank.
+
+        ── KI-1: route the /extended fetch through `_get_extended_raw` ─
+        Pre-KI-1 this called `self._get` directly, bypassing the
+        per-series cache that `get_series_extended` populates. A page
+        showing 50 per-season cards for the same series re-fetched the
+        endpoint 50 times, each serialized through the 3-slot
+        semaphore. Now both methods share one cache entry per series.
+        If the helper returns None (transient failure / malformed
+        envelope), we fall back to the series-level poster so the card
+        doesn't go blank — preserves pre-KI-1 behaviour on errors.
         """
-        try:
-            data = await self._get(f"/series/{series_id}/extended")
-        except Exception:
+        payload = await self._get_extended_raw(series_id)
+        if payload is None:
+            # Transient or malformed envelope — fall back to the simpler
+            # series-level fetch (different endpoint, different cache).
+            # Existing behavior pre-KI-1; preserved exactly.
             return await self.get_series_poster(series_id)
-        payload = (data or {}).get("data") or {}
         seasons = payload.get("seasons") or []
 
         # TVDB has multiple "season orders" (Aired, DVD, etc.). Default is
@@ -411,7 +548,24 @@ class TVDBProvider(MetadataProvider):
         # the card isn't blank.
         return payload.get("image") or payload.get("image_url") or await self.get_series_poster(series_id)
 
-    async def get_episodes(self, series_id: str, season: int) -> list[EpisodeResult]:
+    # TVDB episode-ordering schemes. Anime sometimes uses DVD order, which
+    # differs from broadcast (aired) order — the same episodes in a different
+    # sequence. `default` == aired.
+    _VALID_ORDERS = frozenset({"default", "official", "dvd", "absolute", "alternate", "regional"})
+
+    async def get_episodes(
+        self, series_id: str, season: int, include_specials: bool = False,
+        order: str = "default",
+    ) -> list[EpisodeResult]:
+        # `include_specials` is a no-op for TVDB: specials live in season 0,
+        # so the caller simply requests `get_episodes(id, 0)`. The param
+        # exists to satisfy the shared provider signature (AniDB needs it
+        # because it has no season concept).
+        del include_specials
+        # Phase 18: episode ordering scheme. Anime fansubs occasionally follow
+        # DVD order, which the aired-order list pairs wrong. Callers retry with
+        # order="dvd" / "absolute" when aired-order pairing leaves orphans.
+        order = order if order in self._VALID_ORDERS else "default"
         # TVDB paginates at 100 ep/page. Long-running shows (One Piece, Pokémon,
         # Simpsons) lose episodes past page 0 without this walk. We follow the
         # `links.next` token until exhausted, with a hard cap to avoid infinite
@@ -428,7 +582,7 @@ class TVDBProvider(MetadataProvider):
         while page < 50:
             try:
                 data = await self._get(
-                    f"/series/{series_id}/episodes/default/eng",
+                    f"/series/{series_id}/episodes/{order}/eng",
                     params={"page": page},
                 )
             except Exception:
@@ -437,19 +591,31 @@ class TVDBProvider(MetadataProvider):
                 # record (Japanese for most anime) once and accept it —
                 # better than empty episode rows in the popup.
                 data = await self._get(
-                    f"/series/{series_id}/episodes/default",
+                    f"/series/{series_id}/episodes/{order}",
                     params={"page": page},
                 )
             payload = data.get("data", {}) or {}
             episodes = payload.get("episodes", []) or []
             for ep in episodes:
-                if ep.get("seasonNumber") != season:
+                # Phase 18: non-aired orders (dvd/absolute) re-sequence
+                # episodes and may NOT carry the requested seasonNumber the
+                # same way — when a non-default order is requested, keep every
+                # episode (the caller is pairing by number, not season).
+                if order == "default" and ep.get("seasonNumber") != season:
                     continue
+                # Autopsy 17: TVDB exposes `absoluteNumber` on shows that
+                # maintain absolute numbering (One Piece's S23E5 row
+                # carries `absoluteNumber=1158`). Piping it through lets
+                # the bipartite Pass 2 pair `parsed.absolute_episode=1158`
+                # against the right TVDB episode when AniDB is unreachable
+                # — closes the orphan window during an AniDB ban for
+                # long-running absolute-numbered anime.
                 out.append(EpisodeResult(
                     provider="tvdb",
                     series_id=series_id,
                     season=ep.get("seasonNumber"),
                     episode=ep.get("number") or ep.get("episodeNumber"),
+                    absolute_number=ep.get("absoluteNumber"),
                     title=ep.get("name"),
                     air_date=ep.get("aired"),
                     overview=ep.get("overview"),

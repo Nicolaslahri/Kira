@@ -15,12 +15,14 @@
 // matched episode) get appended at the bottom with a blank right side.
 
 import { memo, useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import type { LibraryItem, LibEpisode, LibFile, MediaType } from '../lib/types';
 import {
-  IcCheck, IcX, IcSearch, IcRefresh, IcFolder, IcAlertTri, IcExternal, IcChevDown, IcTrash,
+  IcCheck, IcX, IcSearch, IcRefresh, IcAlertTri, IcExternal, IcChevDown, IcTrash, IcDownload,
 } from '../lib/icons';
 import { api } from '../lib/api';
 import { MediaTypeIcon } from './ui';
+import { Button } from './base/buttons/button';
 import { libraryStats, confTier } from './LibraryGrid';
 import { fetchAnidbPoster, getCachedAnidbPoster } from '../lib/posters';
 import { fetchSeriesEpisodes, getCachedEpisodes, type ProviderEpisode } from '../lib/episodes';
@@ -38,6 +40,196 @@ interface CoverPopupProps {
    *  "Approve & rename" button actually rename instead of just
    *  flipping status (which never moved files OR wrote History). */
   renameFilesDirectly?: (fileIds: string[]) => void | Promise<void>;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// MarqueeText — ping-pong auto-scroll for overflowing text.
+//
+// When the wrapped content is wider than its container (the row's
+// title cell is fixed-width; long release-group filenames overflow),
+// we translate the inner text leftward to reveal the end, pause
+// briefly, then translate back to the start, pause, repeat. The
+// pauses give the eye a moment to read both edges; the slides are
+// fast enough that nothing feels stuck.
+//
+// (Previous v1 was a seamless duplicate-text continuous loop — but
+// the user couldn't tell where the text actually ended; the
+// duplicate looked like the file had another release tagged at
+// the end. Ping-pong has clearer "this is one filename, here are
+// its bookends" semantics.)
+//
+// When content fits, we just render plain text with ellipsis. Detection
+// happens once on mount + on any resize via ResizeObserver.
+//
+// Hover pauses. prefers-reduced-motion disables the animation
+// entirely — users with vestibular sensitivity see plain truncated
+// text + the native `title` tooltip on hover for the full string.
+// ─────────────────────────────────────────────────────────────────────
+
+interface MarqueeTextProps {
+  children: React.ReactNode;
+  className?: string;
+  /** Approx scrolling speed in pixels-per-second. Higher = snappier.
+   *  The math: one ping-pong cycle is two slides of (overflow_amount)
+   *  each, plus two short pauses. At 100 px/s, a 200px overflow
+   *  cycles in about 6s total — readable without being frenetic. */
+  speed?: number;
+}
+
+function MarqueeText({ children, className, speed = 100 }: MarqueeTextProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const innerRef = useRef<HTMLSpanElement>(null);
+  const [overflows, setOverflows] = useState(false);
+  const [durationSec, setDurationSec] = useState(8);
+  const [shiftPx, setShiftPx] = useState(0);
+
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    const inner = innerRef.current;
+    if (!container || !inner) return;
+
+    const check = () => {
+      const naturalWidth = inner.scrollWidth;
+      const visibleWidth = container.clientWidth;
+      const overflowAmount = naturalWidth - visibleWidth;
+      const isOverflow = overflowAmount > 2;
+      setOverflows(isOverflow);
+      if (isOverflow) {
+        // Negative shift: translateX(shiftPx) moves the inner LEFT
+        // by exactly the overflow amount so the END of the text
+        // aligns with the right edge of the container. The small
+        // -4px padding gives a touch of breathing room so the last
+        // character isn't kissing the container border.
+        setShiftPx(-(overflowAmount + 4));
+        // Cycle math: two slides of overflowAmount + 1.4s of pauses.
+        // Slide time = overflowAmount / speed each direction.
+        const slideTimeSec = overflowAmount / speed;
+        const totalCycle = (slideTimeSec * 2) + 1.4;
+        // Floor at 4s so tiny overflows still have a visible pause
+        // rhythm; ceiling at 18s so absurd-length text doesn't
+        // demand the user wait forever for the other end.
+        const d = Math.max(4, Math.min(18, totalCycle));
+        setDurationSec(d);
+      }
+    };
+    check();
+    const ro = new ResizeObserver(check);
+    ro.observe(container);
+    ro.observe(inner);
+    return () => ro.disconnect();
+  }, [children, speed]);
+
+  return (
+    <div ref={containerRef} className={`marquee-outer ${className ?? ''}`}>
+      <span
+        ref={innerRef}
+        className={overflows ? 'marquee-inner scrolling' : 'marquee-inner'}
+        style={overflows ? {
+          ['--marquee-duration' as never]: `${durationSec}s`,
+          ['--marquee-shift' as never]: `${shiftPx}px`,
+        } as React.CSSProperties : undefined}
+      >
+        {children}
+      </span>
+    </div>
+  );
+}
+
+
+// Live Sonarr queue item, as seen by the popup. Mirrors the backend
+// QueueItemOut shape — kept inline (rather than imported from a shared
+// types file) so the rest of the app doesn't take a hard dep on Sonarr
+// types until/unless Phase B's library-grid pill code wants them too.
+export interface SonarrQueueEntry {
+  tvdb_id: number;
+  /** Reverse Fribb cross-ref — populated for anime queue items only. */
+  anidb_aid?: number | null;
+  season: number;
+  episode_number: number;
+  episode_title: string | null;
+  status: string;            // see normalized states in backend
+  progress_pct: number;      // 0..100
+  eta_seconds: number | null;
+  size_bytes: number | null;
+  size_left_bytes: number | null;
+  release_title: string | null;
+  protocol: string | null;
+  error_message: string | null;
+  download_client: string | null;
+  /** Sonarr's queue.id (numeric) and downloadId (string). We pass
+   *  `download_id` back to the retry-import endpoint when the user
+   *  clicks "Force import" on a stuck entry. */
+  queue_id?: number | null;
+  download_id?: string | null;
+  /** True when Sonarr is stuck on "Downloaded - Unable to Import
+   *  Automatically". Renders a distinct "Stuck — manual import
+   *  needed" banner with a one-click fix button in the popup row. */
+  needs_manual_import?: boolean;
+}
+
+// Popup-only hook. Polls /integrations/sonarr/queue?match_id=N every
+// 4 seconds while the popup is mounted with a usable matchId. Stops
+// polling on the first 400 (Sonarr-not-configured) so we don't hammer
+// an endpoint that structurally can't help — the user opens Settings,
+// configures, reopens popup, fresh poll begins.
+//
+// Returns null while we haven't fetched yet OR if Sonarr is
+// unreachable. Returns [] for a configured Sonarr with no active
+// downloads for this series. Both states render the same way in the
+// popup (no progress rows shown), so the caller doesn't need to
+// distinguish — the empty state matches the "no Sonarr" state.
+function useSonarrQueuePopup(matchId: number | null): SonarrQueueEntry[] | null {
+  const [items, setItems] = useState<SonarrQueueEntry[] | null>(null);
+  useEffect(() => {
+    if (matchId == null) {
+      setItems(null);
+      return;
+    }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    // Backoff state — if the endpoint repeatedly errors we slow down
+    // (4s → 12s → 30s → stop) so we don't burn a 4s tick forever on a
+    // configuration that'll never succeed. Reset on first success.
+    let errCount = 0;
+    const tick = async () => {
+      try {
+        const r = await api.sonarrQueue({ match_id: matchId });
+        if (cancelled) return;
+        setItems(r.items);
+        errCount = 0;
+        // 1.5s while popup is open. The rAF extrapolation in
+        // DownloadProgressRow interpolates smoothly between polls
+        // using Sonarr's ETA, so the bar never looks stuck — fast
+        // polling just means the extrapolated prediction gets
+        // re-anchored against ground truth more often, reducing
+        // any visible snap when reality diverges from prediction.
+        timer = setTimeout(tick, 1500);
+      } catch (e) {
+        if (cancelled) return;
+        errCount += 1;
+        // 400 = Sonarr not configured. Don't keep polling forever —
+        // surface the empty state to the caller and stop. The user
+        // will reopen the popup after configuring.
+        const msg = String(e ?? '');
+        if (msg.includes('Sonarr URL') || msg.includes('Sonarr API key') || msg.includes('not configured')) {
+          setItems(null);
+          return; // intentionally NO further scheduling
+        }
+        // Transient (Sonarr down, network blip). Back off but keep
+        // trying — Sonarr coming back online should auto-recover the
+        // live progress without the user needing to reopen the popup.
+        const delay = errCount <= 1 ? 4000 : errCount <= 3 ? 12000 : 30000;
+        if (errCount > 8) return;   // give up entirely after ~6 minutes
+        timer = setTimeout(tick, delay);
+      }
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [matchId]);
+  return items;
 }
 
 export function CoverPopup({
@@ -415,6 +607,266 @@ export function CoverPopup({
     onManualSearch(item, null, null);
   }, [item, onManualSearch]);
 
+  // ── Sonarr: live queue progress ───────────────────────────────────
+  // Poll Sonarr's queue every ~4s while the popup is open. Items are
+  // filtered server-side to this match's TVDB series + season, so the
+  // result is "what's currently downloading for the show I'm looking
+  // at." Used to paint per-row progress bars on the missing-episode
+  // blanks below.
+  //
+  // Failure mode: backend returns 400 when Sonarr isn't configured.
+  // We catch and stop polling — no point hammering an endpoint that
+  // structurally can't help us. (If the user configures Sonarr while
+  // a popup is open, they'll need to close + reopen; cheap and rare.)
+  //
+  // Key + interval lift to a tiny hook so the cover-card pills (Phase
+  // B, separate file) can reuse the same shape without duplicating
+  // the lifecycle.
+  const sonarrMatchId = item.files.find(f => f.matchId != null)?.matchId ?? null;
+  const sonarrEnabled =
+    item.kind === 'series'
+    && (providerKey === 'tvdb' || providerKey === 'anidb')
+    && sonarrMatchId != null;
+  const queueItems = useSonarrQueuePopup(sonarrEnabled ? sonarrMatchId : null);
+
+  // Map keyed by episode number for O(1) lookup when rendering rows.
+  // We dedup by episode number alone (not season+episode tuples) for
+  // the same reason the missing-numbers computation does: AniDB native
+  // vs TVDB cross-ref disagree on the season tag but agree on the
+  // episode number for a given physical episode.
+  const queueByEpisode = useMemo(() => {
+    const m = new Map<number, NonNullable<typeof queueItems>[number]>();
+    for (const q of queueItems ?? []) {
+      if (typeof q.episode_number === 'number') m.set(q.episode_number, q);
+    }
+    return m;
+  }, [queueItems]);
+
+  // ── "Just imported" transitional state ────────────────────────────
+  // When a Sonarr download finishes, the /queue entry vanishes within
+  // ~30s. The file is on disk but Kira's library DB has no record of
+  // it until the next scan. Without intervention the row reverts to
+  // "No file for this episode" — the user sees an empty state right
+  // after watching a 90%-filled green bar.
+  //
+  // Fix: track which episode numbers were "in flight" (downloading /
+  // importing / queued) in the previous poll. When one vanishes from
+  // the current poll, mark it "recentlyImported" with a timestamp.
+  // The blank-row branch in FileRowCell checks this Set and renders
+  // a "Just imported · scanning…" placeholder instead of the empty
+  // state — survives 5 minutes, plenty of time for the auto-scan
+  // (dispatched below) to find the new file.
+  const prevQueueRef = useRef<Map<number, string>>(new Map());
+  const [recentlyImported, setRecentlyImported] = useState<Map<number, number>>(new Map());
+  useEffect(() => {
+    if (queueItems == null) return; // first poll hasn't landed yet
+    const prev = prevQueueRef.current;
+    const cur = new Map<number, string>();
+    queueByEpisode.forEach((q, ep) => cur.set(ep, q.status));
+
+    // Diff: entries that were active in prev but now vanished from
+    // cur → likely imported. Plus entries currently in "completed"
+    // state — Sonarr keeps these briefly before removal; we want to
+    // shift them to the post-import placeholder too, since the
+    // download bar is already at 100% and "completed" → "imported"
+    // is the natural narrative.
+    const activeStatuses = new Set(['downloading', 'importing', 'queued', 'searching', 'completed']);
+    const newlyImported: number[] = [];
+    prev.forEach((prevStatus, epNum) => {
+      if (!activeStatuses.has(prevStatus)) return;
+      const curStatus = cur.get(epNum);
+      if (curStatus == null) {
+        // Vanished entirely — Sonarr finished and cleaned up.
+        newlyImported.push(epNum);
+      }
+    });
+
+    prevQueueRef.current = cur;
+
+    if (newlyImported.length > 0) {
+      const now = Date.now();
+      setRecentlyImported(prev => {
+        const next = new Map(prev);
+        newlyImported.forEach(ep => next.set(ep, now));
+        return next;
+      });
+      // Ask App.tsx to run a debounced rescan so the new files on
+      // disk get indexed and the placeholder transitions into real
+      // file rows. Debouncing lives in App; we just dispatch on
+      // every detected completion and let it coalesce.
+      window.dispatchEvent(new CustomEvent('kira:request-rescan'));
+    }
+  }, [queueItems, queueByEpisode]);
+
+  // Auto-expire entries from recentlyImported after 5 minutes —
+  // plenty for any auto-scan to land. If the file never appears (Sonarr
+  // import failed silently, file landed in a folder Kira doesn't scan,
+  // etc.) the placeholder gracefully reverts to the static "No file"
+  // state rather than staying forever.
+  useEffect(() => {
+    if (recentlyImported.size === 0) return;
+    const interval = setInterval(() => {
+      const now = Date.now();
+      setRecentlyImported(prev => {
+        let changed = false;
+        const next = new Map(prev);
+        next.forEach((seenAt, epNum) => {
+          if (now - seenAt > 5 * 60 * 1000) {
+            next.delete(epNum);
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
+      });
+    }, 30_000);
+    return () => clearInterval(interval);
+  }, [recentlyImported.size]);
+
+  // Also: drop entries from recentlyImported once the corresponding
+  // file actually appears on the library item — at that point the
+  // row is rendering as a real matched file, no placeholder needed,
+  // and the Set should shrink so memory doesn't drift. (`item.files`
+  // changes whenever App.tsx refreshes /files after a scan.)
+  useEffect(() => {
+    if (recentlyImported.size === 0) return;
+    const presentEpisodeNumbers = new Set<number>();
+    for (const f of item.files) {
+      if (typeof f.matchedToEpisode !== 'number') continue;
+      const merged = item.episodes[f.matchedToEpisode];
+      if (merged && typeof merged.episode === 'number') {
+        presentEpisodeNumbers.add(merged.episode);
+      }
+    }
+    setRecentlyImported(prev => {
+      let changed = false;
+      const next = new Map(prev);
+      next.forEach((_, epNum) => {
+        if (presentEpisodeNumbers.has(epNum)) {
+          next.delete(epNum);
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+  }, [item.files, item.episodes, recentlyImported.size]);
+
+  // ── Sonarr: send missing episodes ─────────────────────────────────
+  // One-click handoff for the gaps Kira already knows about. The popup
+  // already renders missing-episode rows in the right column (blank-on-
+  // left, real episode title on right) — this button turns that data
+  // into a Sonarr action without making the user retype anything.
+  //
+  // We don't check Sonarr-is-configured locally; the backend returns
+  // a clear 400 if not, and the toast surfaces the message. That
+  // avoids needing to wire a "Sonarr ready?" probe into every popup
+  // open — most users either have it configured or don't.
+  const [sonarrSending, setSonarrSending] = useState(false);
+  // Sonarr-heal: pulls authoritative metadata from Sonarr for files
+  // Kira couldn't match. Scoped to this cluster's file IDs only —
+  // doesn't touch other low-confidence clusters in the library.
+  const [sonarrHealing, setSonarrHealing] = useState(false);
+  const handleSonarrHeal = useCallback(async () => {
+    if (sonarrHealing) return;
+    const fileIds = item.files
+      .map(f => Number(f.id))
+      .filter(n => Number.isFinite(n));
+    if (fileIds.length === 0) return;
+    setSonarrHealing(true);
+    try {
+      const r = await api.sonarrHealUnmatched({ file_ids: fileIds });
+      if (r.ok && r.healed > 0) {
+        pushToast?.({
+          title: `Pinned ${r.healed} file${r.healed === 1 ? '' : 's'} from Sonarr`,
+          sub: r.series_pinned === 1
+            ? 'Metadata synced. The popup will refresh with the new match.'
+            : `${r.series_pinned} series synced. The popup will refresh.`,
+          kind: 'success',
+        });
+        // Close so the parent's listFiles polling picks up the freshly-
+        // pinned matches — the cluster will re-render with the correct
+        // identity next time the user opens it. (Leaving the popup
+        // open would show stale data until React props refresh.)
+        setTimeout(() => handleClose(), 600);
+      } else {
+        const reason = r.detail
+          ?? (r.no_sonarr_match > 0
+            ? "These files aren't in any of your Sonarr-managed folders."
+            : 'Nothing to heal.');
+        pushToast?.({
+          title: 'Sonarr couldn\'t identify these files',
+          sub: reason,
+          kind: 'error',
+        });
+      }
+    } catch (e) {
+      pushToast?.({ title: 'Sonarr heal failed', sub: (e as Error).message, kind: 'error' });
+    } finally {
+      setSonarrHealing(false);
+    }
+  }, [sonarrHealing, item.files, pushToast, handleClose]);
+  const handleSonarrSendMissing = useCallback(async (
+    matchId: number, season: number, episodeNumbers: number[],
+  ) => {
+    if (sonarrSending) return;
+    setSonarrSending(true);
+    // Helper: feed the toast OR fall back to a native alert when the
+    // popup is mounted somewhere the parent forgot to pass pushToast.
+    // We discovered an earlier silent-fail where the API call fired
+    // successfully but the toast was a no-op — surfacing zero
+    // feedback to the user. window.alert is ugly but guaranteed to
+    // be visible.
+    const notify = (title: string, sub: string, kind: 'success' | 'error') => {
+      if (typeof pushToast === 'function') {
+        pushToast({ title, sub, kind });
+      } else {
+        // eslint-disable-next-line no-alert
+        window.alert(`${title}\n\n${sub}`);
+      }
+    };
+    try {
+      const r = await api.sonarrSendMissing({
+        match_id: matchId,
+        season,
+        episode_numbers: episodeNumbers,
+      });
+      const addedNote = r.series_was_added && r.sonarr_series_title
+        ? ` "${r.sonarr_series_title}" added to Sonarr.`
+        : '';
+      const notInListNote = r.skipped_episodes && r.skipped_episodes.length > 0
+        ? ` ${r.skipped_episodes.length} ep${r.skipped_episodes.length === 1 ? '' : 's'} weren't in Sonarr's episode list — try refreshing the series in Sonarr.`
+        : '';
+      if (r.ok && r.queued > 0) {
+        const detailNote = r.detail ? ` ${r.detail}` : '';
+        notify(
+          `Sent ${r.queued} episode${r.queued === 1 ? '' : 's'} to Sonarr`,
+          `Sonarr will search and import.${addedNote}${notInListNote}${detailNote}`,
+          'success',
+        );
+      } else if (r.ok) {
+        // Search succeeded but nothing was queued — NOT an error. Usually the
+        // episodes are already in Sonarr, or its quality profile won't replace
+        // the existing files. Show it as a neutral outcome, not a red failure.
+        notify(
+          'Nothing to queue',
+          `${r.detail ?? 'All requested episodes are already in Sonarr.'}${notInListNote}`,
+          'success',
+        );
+      } else {
+        notify(
+          'Sonarr couldn\'t queue the search',
+          r.detail ?? 'See Sonarr logs.',
+          'error',
+        );
+      }
+    } catch (e) {
+      // Backend 4xx (e.g. "Sonarr URL isn't configured.") surfaces here
+      // with the specific message — no need to swap toast text by case.
+      notify('Sonarr handoff failed', (e as Error).message, 'error');
+    } finally {
+      setSonarrSending(false);
+    }
+  }, [sonarrSending, pushToast]);
+
   // Delete-confirmation modal state. null = no modal open.
   const [pendingDelete, setPendingDelete] = useState<LibFile | null>(null);
 
@@ -582,6 +1034,66 @@ export function CoverPopup({
       }
     });
 
+    // ── Fallback: TVDB-numbered file → AniDB-relative episode ──
+    // Common pain for anime: file "Attack.On.Titan.S04E17.mkv" matched
+    // to an AniDB AID whose authoritative episode list is E01-E12.
+    // The file's Match row stored episode=17, which doesn't appear
+    // anywhere in 1-12, so the normal pairing leaves it orphaned.
+    //
+    // For each still-unmatched file in an anime cluster, extract the
+    // episode number from its filename, compute offset from the
+    // smallest unmatched episode, and drop the file into the blank
+    // slot at that offset. Offset (rather than index) preserves
+    // alignment when episodes are missing — e.g. user has S04E17
+    // and S04E19 but is missing E18; result: E17→AniDB E01,
+    // E19→AniDB E03 (not E02, which would be the index-based bug).
+    //
+    // Only applies to anime clusters where providerEpisodes is the
+    // authoritative list. TVDB/TMDB clusters use the same episode
+    // numbering on both sides so this fallback would never fire there.
+    if (item.mediaType === 'anime' && providerEpisodes && providerEpisodes.length > 0) {
+      const blankSlots: { outIdx: number; episode: LibEpisode }[] = [];
+      out.forEach((r, outIdx) => {
+        if (r.kind === 'blank' && r.episode) {
+          blankSlots.push({ outIdx, episode: r.episode });
+        }
+      });
+      // Extract season-local episode number from filename. Handles
+      // standard SxxExx form. Anime-absolute forms ("- 17" / "[17]")
+      // skip — those usually match correctly via the normal
+      // abs-{N} path and don't need this fallback.
+      const extractFileEp = (filename: string): number | null => {
+        const m = filename.match(/[Ss]\d{1,2}[Ee](\d{1,3})/);
+        return m ? parseInt(m[1], 10) : null;
+      };
+      const orphansWithEp = item.files
+        .filter(f => !matchedFileIds.has(f.id) && !deletedIds.has(f.id))
+        .map(f => ({ file: f, parsedEp: extractFileEp(f.filename) }))
+        .filter(o => o.parsedEp !== null)
+        .sort((a, b) => a.parsedEp! - b.parsedEp!);
+      if (orphansWithEp.length > 0 && blankSlots.length > 0) {
+        const baseEp = orphansWithEp[0].parsedEp!;
+        for (const { file, parsedEp } of orphansWithEp) {
+          const offset = parsedEp! - baseEp;
+          const slot = blankSlots[offset];
+          if (slot) {
+            // Replace the blank row in-place with a paired row.
+            // matchedWrong stays false — we're inferring this pairing
+            // from filename positions, but the user can still see
+            // exactly what we paired by reading the row.
+            out[slot.outIdx] = {
+              key: out[slot.outIdx].key,
+              kind: 'single',
+              episode: slot.episode,
+              episodeIdx: out[slot.outIdx].episodeIdx,
+              file,
+            };
+            matchedFileIds.add(file.id);
+          }
+        }
+      }
+    }
+
     // Sort orphan files by filename using natural ordering so that
     // S17E5 < S17E10 < S17E14 < S17E39 instead of the original DB-
     // insertion / OS-scan order which interleaves them arbitrarily
@@ -718,6 +1230,13 @@ export function CoverPopup({
         onClick={(e) => e.stopPropagation()}
         style={{ ['--hue-a' as never]: tint[0], ['--hue-b' as never]: tint[1] } as React.CSSProperties}
       >
+        {/* Ambient cover-color bleed — a blurred, enlarged copy of the poster
+            behind the content so the cover's real colors spread across the
+            popup. Falls back to the shell's tint gradient when there's no
+            image (no-match / not yet fetched). */}
+        {effectivePosterUrl && !item.noMatch ? (
+          <div className="cx-bg-bleed" aria-hidden="true" style={{ backgroundImage: `url("${effectivePosterUrl}")` }} />
+        ) : null}
         {/* Re-match + Close moved into the footer (.cx-foot-right) — keeps
             every popup action in one row at the bottom alongside Approve /
             Reject / Resolve duplicates. The old top-right pair was easy to
@@ -758,13 +1277,29 @@ export function CoverPopup({
               <div style={{ fontWeight: 600, marginBottom: 2 }}>
                 Low-confidence match — best guess is {Math.round(clusterMaxConfidence!)}%.
               </div>
-              <div style={{ color: 'var(--ink-3)', fontSize: 12 }}>
+              <div style={{ color: 'var(--ink-2)', fontSize: 12 }}>
                 The matcher couldn't find a confident provider entry for these files.
-                Use <strong>Search for a better match</strong> below to pick the right one
-                manually — renaming with the current data would write generic episode
-                titles to disk.
+                If Sonarr downloaded them, click <strong>Sync from Sonarr</strong> below
+                to pull authoritative metadata — otherwise use{' '}
+                <strong>Search for a better match</strong> to pick the right show
+                manually.
               </div>
             </div>
+            {/* Sync-from-Sonarr fast path. Only render when we have any
+                files to heal (always true inside this banner) — the
+                backend handles the "no Sonarr config" case with a
+                graceful toast. Eye-catching so the user sees it before
+                they reach for the slower manual-search route below. */}
+            <button
+              className="btn btn-primary"
+              onClick={handleSonarrHeal}
+              disabled={sonarrHealing}
+              style={{ flex: '0 0 auto', whiteSpace: 'nowrap' }}
+              title="Pull metadata from Sonarr for these files. Works when Sonarr already imported them — Sonarr knows the correct TVDB/AniDB identity."
+            >
+              <IcDownload />
+              <span>{sonarrHealing ? 'Syncing…' : 'Sync from Sonarr'}</span>
+            </button>
           </div>
         ) : null}
         <div className="cx-main">
@@ -789,11 +1324,15 @@ export function CoverPopup({
                 // get episodes (provider exists, not a movie) and
                 // haven't received them yet.
                 episodesLoading={
-                  item.kind !== 'movie' &&
+                  // (Already inside the non-movie branch — `item.kind` is
+                  // 'series' | 'album' here, so no movie check needed.)
                   !!providerKey && !!providerId &&
                   (providerEpisodes === null || providerEpisodes.length === 0) &&
                   rows.length === 0
                 }
+                queueByEpisode={queueByEpisode}
+                recentlyImported={recentlyImported}
+                pushToast={pushToast}
               />
           }
         </div>
@@ -873,14 +1412,14 @@ export function CoverPopup({
                 action buttons. Close is icon-only via `cx-foot-close`
                 which only zeroes the horizontal padding — vertical
                 padding matches .btn so the height aligns. */}
-            <button
-              className="btn cx-foot-close"
+            <Button
+              color="secondary"
+              size="sm"
+              iconLeading={IcX}
               onClick={handleClose}
               title="Close (Esc)"
               aria-label="Close"
-            >
-              <IcX />
-            </button>
+            />
             {(() => {
               // Re-identify button.
               //
@@ -905,18 +1444,143 @@ export function CoverPopup({
                 ? 'Search for a match'
                 : item.kind === 'movie' ? 'Re-identify movie' : 'Re-identify';
               return (
-                <button
-                  className="btn"
+                <Button
+                  color="secondary"
+                  size="sm"
+                  iconLeading={IcSearch}
                   onClick={handleReidentify}
                   title={!hasAnyMatch
                     ? 'Open manual search and pick the right show for these files.'
                     : 'Open manual search and pick a different show — applies to every file in this cluster.'}
                 >
-                  <IcSearch />
-                  <span>{label}</span>
-                </button>
+                  {label}
+                </Button>
               );
             })()}
+
+            {/* ── Sync from Sonarr (no-match clusters) ────────────────
+                Visible specifically on no-match clusters where the
+                low-confidence banner DOESN'T render (banner only fires
+                when at least one file has a matched-to-episode row at
+                <50% conf). True no-match clusters get this footer
+                button instead so the user always has the fast path.
+                Low-confidence clusters get the SAME action via the
+                button embedded in the banner above — we don't render
+                it here to avoid two identical buttons. */}
+            {!clusterIsDead && item.noMatch ? (
+              <Button
+                color="secondary"
+                size="sm"
+                iconLeading={IcDownload}
+                isLoading={sonarrHealing}
+                showTextWhileLoading
+                onClick={handleSonarrHeal}
+                title="Pull metadata from Sonarr for these files. Works when Sonarr already imported them."
+              >
+                {sonarrHealing ? 'Syncing…' : 'Sync from Sonarr'}
+              </Button>
+            ) : null}
+
+            {/* ── Get missing → Sonarr ────────────────────────────────
+                One-click handoff for missing episodes. Hidden unless:
+                  * Cluster is a TV/anime series (movies + albums skip)
+                  * Provider is TVDB or AniDB (Sonarr is TVDB-centric;
+                    AniDB matches cross-ref to TVDB server-side)
+                  * The cluster has at least one matched file (we need
+                    a Match row id to send) AND at least one missing
+                    episode in the provider's authoritative list
+                The backend handles "Sonarr not configured" via 400 +
+                a clear toast — no need to gate the button on a probe
+                of Settings here. */}
+            {(() => {
+              if (clusterIsDead) return null;
+              if (item.kind !== 'series') return null;
+              // TMDB-only matches can't go to Sonarr (it's TVDB-centric);
+              // backend would reject anyway, but suppress the button to
+              // avoid a button that always toasts an error.
+              if (!(providerKey === 'tvdb' || providerKey === 'anidb')) return null;
+
+              // Find a rep match id from any file in the cluster.
+              // Reads the adapter-surfaced `matchId` (LibFile.matchId)
+              // — the bare integer is enough for cluster-level cross-
+              // system actions without re-fetching the full match.
+              const repWithMatch = item.files.find(f => f.matchId != null);
+              const matchId = repWithMatch?.matchId;
+              if (matchId == null) return null;
+
+              // Missing episodes = episodes in the PROVIDER's full list
+              // that no file in the cluster is matched to.
+              //
+              // We use `providerEpisodes` (the lazy-fetched authoritative
+              // list from `/series/{provider}/{id}/episodes`) — not
+              // `item.episodes`. The adapter populates `item.episodes`
+              // from MATCH ROWS only, which means it only contains
+              // episodes the user has files for. The popup's right
+              // column renders from a DIFFERENT merged list built each
+              // render from `providerEpisodes` (see line ~564). Pre-fix,
+              // we were reading from the matches-only list and finding
+              // "0 missing" even when the popup was visually rendering
+              // 20 blank-on-left missing-episode rows.
+              //
+              // If `providerEpisodes` hasn't loaded yet (initial render,
+              // before the lazy fetch resolves), hide the button — we
+              // can't know what's missing without the full list. The
+              // button will appear once the fetch completes and React
+              // re-renders.
+              if (!providerEpisodes || providerEpisodes.length === 0) return null;
+
+              // Build the set of episode NUMBERS the user has files for.
+              // We dedup by episode number alone (not (season, episode)
+              // tuples) because the popup's `providerEpisodes` and the
+              // matched `item.episodes[idx]` can disagree on the season
+              // tag — AniDB's native episode list reports season=1 for
+              // everything (it has one AID per season), while the file's
+              // match.season_number came from Fribb's TVDB cross-ref
+              // (e.g. season=2 for Frieren S2). Both lists are scoped to
+              // a single season's fetch, so collapsing to "is this
+              // episode number present?" gives the right missing set
+              // regardless of how the two layers disagree on labels.
+              const haveEpisodeNumbers = new Set<number>();
+              for (const f of item.files) {
+                if (typeof f.matchedToEpisode !== 'number') continue;
+                const merged = item.episodes[f.matchedToEpisode];
+                if (merged && typeof merged.episode === 'number') {
+                  haveEpisodeNumbers.add(merged.episode);
+                }
+              }
+              const missingNumbers: number[] = [];
+              for (const pe of providerEpisodes) {
+                if (typeof pe.episode !== 'number') continue;
+                if (haveEpisodeNumbers.has(pe.episode)) continue;
+                missingNumbers.push(pe.episode);
+              }
+              if (missingNumbers.length === 0) return null;
+
+              // Season: the provider list is fetched against ONE season
+              // (via seasonForFetch). For AniDB clusters where the
+              // backend cross-refs to TVDB, providerEpisodes[0].season
+              // is the TVDB-side season number — which is what Sonarr
+              // wants. For TVDB-direct clusters it's the TVDB season
+              // directly. Either way, taking the first provider
+              // episode's season gives us the right value for Sonarr.
+              const seasonNum = providerEpisodes[0]?.season ?? 1;
+
+              const providerLabel = providerKey === 'anidb' ? 'AniDB→TVDB' : 'TVDB';
+              return (
+                <Button
+                  color="secondary"
+                  size="sm"
+                  iconLeading={IcDownload}
+                  isLoading={sonarrSending}
+                  showTextWhileLoading
+                  onClick={() => void handleSonarrSendMissing(matchId, seasonNum, missingNumbers)}
+                  title={`Tell Sonarr to search for the ${missingNumbers.length} missing episode${missingNumbers.length === 1 ? '' : 's'} of this season. (${providerLabel})`}
+                >
+                  {sonarrSending ? 'Sending…' : `Get missing (${missingNumbers.length}) → Sonarr`}
+                </Button>
+              );
+            })()}
+
             {/* Push the action triad (dupes / reject / approve) to the
                 far right so Close + Re-match sit left, destructive +
                 primary stay right — the classic "secondary | primary"
@@ -935,14 +1599,11 @@ export function CoverPopup({
               }
               if (dupes.length === 0) return null;
               return (
-                <button
-                  className="btn"
-                  style={{
-                    background: 'rgba(255,201,74,0.18)',
-                    borderColor: 'rgba(255,201,74,0.5)',
-                    color: 'var(--conf-mid)',
-                    fontWeight: 600,
-                  }}
+                <Button
+                  color="secondary"
+                  size="sm"
+                  className="bg-[rgba(255,201,74,0.14)] text-conf-mid ring-[rgba(255,201,74,0.5)] hover:bg-[rgba(255,201,74,0.22)]"
+                  iconLeading={<IcAlertTri className="size-4 text-conf-mid" />}
                   title="Pick which copy to keep for each duplicate; the rest are deleted from disk."
                   onClick={() => {
                     const [first, ...rest] = dupes;
@@ -951,8 +1612,8 @@ export function CoverPopup({
                     setDupeModal(first);
                   }}
                 >
-                  <IcAlertTri /> Resolve {dupes.length} duplicate{dupes.length === 1 ? '' : 's'}
-                </button>
+                  Resolve {dupes.length} duplicate{dupes.length === 1 ? '' : 's'}
+                </Button>
               );
             })()}
             {(() => {
@@ -1000,8 +1661,10 @@ export function CoverPopup({
                 tooltip = 'Mark these files as rejected — they won\'t be renamed.';
               }
               return (
-                <button
-                  className="btn btn-danger"
+                <Button
+                  color="secondary-destructive"
+                  size="sm"
+                  iconLeading={IcX}
                   onClick={() => {
                     if (item.kind === 'movie') updateFile(0, { status: 'rejected' });
                     else handleRejectAll();
@@ -1019,8 +1682,8 @@ export function CoverPopup({
                   }}
                   title={tooltip}
                 >
-                  <IcX /> {label}
-                </button>
+                  {label}
+                </Button>
               );
             })()}
             {(() => {
@@ -1056,8 +1719,10 @@ export function CoverPopup({
 
               if (eligibleCount === 0 && hasOrphans) {
                 return (
-                  <button
-                    className="btn btn-primary"
+                  <Button
+                    color="primary"
+                    size="sm"
+                    iconLeading={IcSearch}
                     onClick={() => {
                       // Hand control to the Manual Search modal — same
                       // entry point the per-row "Search" link uses.
@@ -1065,8 +1730,8 @@ export function CoverPopup({
                     }}
                     title="Open Manual Search to find a match for this file"
                   >
-                    <IcSearch /> Search manually
-                  </button>
+                    Search manually
+                  </Button>
                 );
               }
 
@@ -1092,8 +1757,10 @@ export function CoverPopup({
                 //     no actions left.
                 if (canRestore) {
                   return (
-                    <button
-                      className="btn btn-primary"
+                    <Button
+                      color="primary"
+                      size="sm"
+                      iconLeading={IcRefresh}
                       onClick={() => {
                         // Flip every rejected file back to pending so
                         // it re-enters the review queue. Sequential
@@ -1109,20 +1776,20 @@ export function CoverPopup({
                       }}
                       title="Move these files back to the review queue so they show up in Pending again."
                     >
-                      <IcRefresh /> Restore {rejectedCount} file{rejectedCount === 1 ? '' : 's'}
-                    </button>
+                      Restore {rejectedCount} file{rejectedCount === 1 ? '' : 's'}
+                    </Button>
                   );
                 }
                 return (
-                  <button
-                    className="btn btn-primary"
-                    aria-disabled="true"
-                    style={{ opacity: 0.4, cursor: 'not-allowed' }}
-                    onClick={(e) => e.preventDefault()}
+                  <Button
+                    color="primary"
+                    size="sm"
+                    iconLeading={IcCheck}
+                    isDisabled
                     title="All files in this cluster are already renamed"
                   >
-                    <IcCheck /> Nothing to rename
-                  </button>
+                    Nothing to rename
+                  </Button>
                 );
               }
 
@@ -1151,8 +1818,10 @@ export function CoverPopup({
 
               if (isLowConfidence) {
                 return (
-                  <button
-                    className="btn btn-primary"
+                  <Button
+                    color="primary"
+                    size="sm"
+                    iconLeading={IcSearch}
                     onClick={() => {
                       // Open Manual Search prefilled for the first
                       // eligible file — the user can search the right
@@ -1162,14 +1831,16 @@ export function CoverPopup({
                     }}
                     title={`Matches are low-confidence (best is ${Math.round(maxConf)}%). Search manually to find the real series.`}
                   >
-                    <IcSearch /> Search for a better match
-                  </button>
+                    Search for a better match
+                  </Button>
                 );
               }
 
               return (
-                <button
-                  className="btn btn-primary"
+                <Button
+                  color="primary"
+                  size="sm"
+                  iconLeading={IcCheck}
                   onClick={async () => {
                     // Cancel any in-flight debounce — the hero button takes
                     // precedence over per-row debounced renames (we're
@@ -1190,16 +1861,8 @@ export function CoverPopup({
                     setTimeout(() => handleClose(), 250);
                   }}
                 >
-                  <IcCheck /> {
-                    item.kind === 'movie'
-                      ? 'Approve & rename'
-                      // Be explicit "files" not bare "(N)" so the user
-                      // knows we're counting files, not episodes. A 10
-                      // for 8 episodes (with dupes) used to read like a
-                      // bug — now it says "Approve & rename 10 files".
-                      : `Approve & rename ${eligibleCount} file${eligibleCount === 1 ? '' : 's'}`
-                  }
-                </button>
+                  Approve all {eligibleCount}
+                </Button>
               );
             })()}
           </div>
@@ -1232,7 +1895,6 @@ interface HeroProps {
 }
 
 function Hero({ item, stats, tint, shape, heroSlotRef, settled, posterUrl }: HeroProps) {
-  const visibleAlts = (item.altTitles || []).filter(t => t !== item.title && t !== item.titleRomaji).slice(0, 3);
   return (
     <div className={`cx-hero variant-side shape-${shape}`}>
       <div
@@ -1302,11 +1964,14 @@ function Hero({ item, stats, tint, shape, heroSlotRef, settled, posterUrl }: Her
             {item.artist ? <span style={{ color: 'var(--ink-2)', fontWeight: 600 }}>{item.artist} — </span> : null}
             {item.title}
           </h2>
-          {(item.titleRomaji || item.titleNative || visibleAlts.length > 0) ? (
+          {/* Romaji + native-script title for anime/foreign series.
+              The user explicitly removed the "a.k.a. <Localized name>"
+              chips (Spanish/Italian/French/etc. translations) — they
+              added noise without value in a single-locale UI. */}
+          {(item.titleRomaji || item.titleNative) ? (
             <div className="cx-hero-alt">
               {item.titleRomaji && item.titleRomaji !== item.title ? <span>{item.titleRomaji}</span> : null}
               {item.titleNative ? <span>{item.titleNative}</span> : null}
-              {visibleAlts.map((t, i) => <span key={i} className="alt-chip">a.k.a. {t}</span>)}
             </div>
           ) : null}
         </div>
@@ -1520,9 +2185,25 @@ interface SeriesBodyProps {
   onOpenDupeModal: (episode: LibEpisode, files: LibFile[]) => void;
   /** PB-2: when true, render skeleton rows instead of blank columns. */
   episodesLoading?: boolean;
+  /** Sonarr's in-flight downloads keyed by episode number. Drives the
+   *  per-row "Downloading" / "Queued" / "Importing" progress UI in
+   *  place of the static "No file for this episode" placeholder. Null
+   *  when Sonarr isn't configured (or hasn't responded yet); the
+   *  blank rows fall back to the regular static placeholder. */
+  queueByEpisode?: Map<number, SonarrQueueEntry>;
+  /** Episode numbers whose Sonarr download has finished and queue
+   *  entry has vanished, but the file hasn't been picked up by a
+   *  Kira scan yet. The blank row renders a "Just imported, scanning
+   *  …" transitional placeholder instead of the static "No file"
+   *  state during this window (~5 min, naturally cleared when the
+   *  file appears or expires). */
+  recentlyImported?: Map<number, number>;
+  /** Toast handler threaded down to DownloadProgressRow so its
+   *  "Force import" button can surface success/failure feedback. */
+  pushToast?: (toast: { title: string; sub?: string; kind?: 'success' | 'error' }) => void;
 }
 
-function SeriesBody({ item, rows, updateFile, onManualSearch, onOpenDupeModal, episodesLoading }: SeriesBodyProps) {
+function SeriesBody({ item, rows, updateFile, onManualSearch, onOpenDupeModal, episodesLoading, queueByEpisode, recentlyImported, pushToast }: SeriesBodyProps) {
   const leftRef = useRef<HTMLDivElement>(null);
   const rightRef = useRef<HTMLDivElement>(null);
   const syncing = useRef(false);
@@ -1532,6 +2213,29 @@ function SeriesBody({ item, rows, updateFile, onManualSearch, onOpenDupeModal, e
   // write per frame cuts paint work to display-refresh rate without
   // changing the visual sync feel.
   const rafIdRef = useRef<number | null>(null);
+
+  // ── Progressive render for huge clusters (One Piece = 1000+ episodes) ──
+  // Rendering the full row list × 2 columns synchronously on open froze the
+  // popup for ~5s. Instead we mount a small initial slice (so the popup opens
+  // instantly) and grow it over subsequent frames until everything is in the
+  // DOM. We never shrink an already-expanded list, so per-row edits (status
+  // toggles, renames) don't cause a flicker — this only engages on first
+  // mount and when the provider's full episode list arrives and balloons
+  // `rows`. Small series (≤ INITIAL) render fully on the first frame, exactly
+  // as before.
+  const INITIAL_ROWS = 60;
+  const ROW_STEP = 120;
+  const [visibleCount, setVisibleCount] = useState(() => Math.min(rows.length, INITIAL_ROWS));
+  useEffect(() => {
+    // Clamp to the new length without collapsing below the initial chunk.
+    setVisibleCount(c => Math.min(Math.max(c, INITIAL_ROWS), rows.length));
+  }, [rows.length]);
+  useEffect(() => {
+    if (visibleCount >= rows.length) return;
+    const id = requestAnimationFrame(() => setVisibleCount(c => Math.min(rows.length, c + ROW_STEP)));
+    return () => cancelAnimationFrame(id);
+  }, [visibleCount, rows.length]);
+  const shownRows = visibleCount >= rows.length ? rows : rows.slice(0, visibleCount);
 
   const onScroll = (e: React.UIEvent<HTMLDivElement>, otherRef: React.RefObject<HTMLDivElement | null>) => {
     if (syncing.current || !otherRef.current) return;
@@ -1574,16 +2278,30 @@ function SeriesBody({ item, rows, updateFile, onManualSearch, onOpenDupeModal, e
         >
           {episodesLoading
             ? Array.from({ length: 8 }).map((_, i) => <SkeletonRow key={`sk-l-${i}`} side="left" />)
-            : rows.map(r => (
-                <FileRowCell
-                  key={r.key}
-                  row={r}
-                  item={item}
-                  updateFile={updateFile}
-                  onManualSearch={onManualSearch}
-                  onOpenDupeModal={onOpenDupeModal}
-                />
-              ))}
+            : shownRows.map(r => {
+                // Look up queue state by the row's episode number so
+                // both columns (file-side blank → progress bar, episode-
+                // side details → "downloading" badge) stay in sync.
+                const qEntry = r.episode && queueByEpisode
+                  ? queueByEpisode.get(r.episode.episode) ?? null
+                  : null;
+                const justImported = r.episode && recentlyImported
+                  ? recentlyImported.has(r.episode.episode)
+                  : false;
+                return (
+                  <FileRowCell
+                    key={r.key}
+                    row={r}
+                    item={item}
+                    updateFile={updateFile}
+                    onManualSearch={onManualSearch}
+                    onOpenDupeModal={onOpenDupeModal}
+                    queueEntry={qEntry}
+                    justImported={justImported}
+                    pushToast={pushToast}
+                  />
+                );
+              })}
         </div>
       </div>
 
@@ -1603,16 +2321,26 @@ function SeriesBody({ item, rows, updateFile, onManualSearch, onOpenDupeModal, e
         >
           {episodesLoading
             ? Array.from({ length: 8 }).map((_, i) => <SkeletonRow key={`sk-r-${i}`} side="right" />)
-            : rows.map(r => (
-                <EpisodeRowCell
-                  key={r.key}
-                  row={r}
-                  item={item}
-                  updateFile={updateFile}
-                  onManualSearch={onManualSearch}
-                  onOpenDupeModal={onOpenDupeModal}
-                />
-              ))}
+            : shownRows.map(r => {
+                const qEntry = r.episode && queueByEpisode
+                  ? queueByEpisode.get(r.episode.episode) ?? null
+                  : null;
+                const justImported = r.episode && recentlyImported
+                  ? recentlyImported.has(r.episode.episode)
+                  : false;
+                return (
+                  <EpisodeRowCell
+                    key={r.key}
+                    row={r}
+                    item={item}
+                    updateFile={updateFile}
+                    onManualSearch={onManualSearch}
+                    onOpenDupeModal={onOpenDupeModal}
+                    queueEntry={qEntry}
+                    justImported={justImported}
+                  />
+                );
+              })}
         </div>
       </div>
     </div>
@@ -1656,6 +2384,22 @@ interface RowCellProps {
   updateFile: (idx: number, patch: Partial<LibFile>) => void;
   onManualSearch: (item: LibraryItem, episodeIdx?: number | null, fileIdx?: number | null) => void;
   onOpenDupeModal: (episode: LibEpisode, files: LibFile[]) => void;
+  /** Sonarr's in-flight progress for this row's episode, when known.
+   *  Used by the FileRowCell blank-state to render a download-progress
+   *  row in place of the static "No file for this episode" placeholder.
+   *  Memo equality (rowsEqualFile) compares the progress/status fields
+   *  so an updated tick re-renders this row but not its neighbors. */
+  queueEntry?: SonarrQueueEntry | null;
+  /** Set by the parent when this episode JUST finished a Sonarr download
+   *  but Kira hasn't yet scanned the new file from disk. Renders a
+   *  "Just imported, scanning…" transitional row instead of the static
+   *  "No file" placeholder, bridging the gap between download-complete
+   *  and file-on-disk-appears-in-Kira. */
+  justImported?: boolean;
+  /** Toast surface for action buttons inside the row (e.g. the
+   *  stuck-import "Force import" retry). Threaded down from CoverPopup
+   *  via SeriesBody. */
+  pushToast?: (toast: { title: string; sub?: string; kind?: 'success' | 'error' }) => void;
 }
 
 // PB-2: row-level memoization. Equality function checks the
@@ -1701,28 +2445,77 @@ const rowsEqualFile = (a: RowCellProps, b: RowCellProps): boolean => {
     if (ea.runtime !== eb.runtime) return false;
     if (ea.overview !== eb.overview) return false;
   }
+  // Sonarr queue progress changes every poll. Compare the fields that
+  // visibly affect the row — adding the queue entry to the memo
+  // without checking these would freeze the progress bar at 0% on the
+  // first render. Equal-by-identity short-circuits when both are null.
+  const qa = a.queueEntry, qb = b.queueEntry;
+  if ((qa == null) !== (qb == null)) return false;
+  if (qa && qb) {
+    if (qa.status !== qb.status) return false;
+    if (qa.progress_pct !== qb.progress_pct) return false;
+    if (qa.eta_seconds !== qb.eta_seconds) return false;
+    if (qa.error_message !== qb.error_message) return false;
+    // release_title can flip mid-download if Sonarr swaps to a better
+    // release; rare but real, so compare for completeness.
+    if (qa.release_title !== qb.release_title) return false;
+  }
+  // "Just imported" transitional flag — flips when a Sonarr completion
+  // is detected, drives the post-import placeholder. Skipping this
+  // would leave the row stuck on either the static "No file" state
+  // (after a download finishes) or the imported placeholder forever
+  // (after the real file appears).
+  if (a.justImported !== b.justImported) return false;
   // Callback identity not checked — they're recreated each render by
   // the parent, and the row already short-circuits via row.key / file /
   // episode content above.
   return true;
 };
 
-function FileRowCellImpl({ row, item, updateFile, onManualSearch, onOpenDupeModal }: RowCellProps) {
+function FileRowCellImpl({ row, item, updateFile, onManualSearch, onOpenDupeModal, queueEntry, justImported, pushToast }: RowCellProps) {
   const file = row.file;
   const fileIdx = file ? item.files.indexOf(file) : -1;
 
   // Blank — episode without a file.
   //
-  // Note on the missing button: this row used to render a "Find a file"
-  // CTA that opened Manual Search. That was misleading — Manual Search
-  // picks a different SHOW/EPISODE metadata match, it has no way to
-  // attach a file from disk. The only honest answer when you don't have
-  // a file is "scan more folders" (top-bar Scan button) or "live with
-  // the gap". So the row now just labels the gap without offering a
-  // dead-end action. `onManualSearch` is still in scope (used by the
-  // file-side row below) but deliberately not wired here.
+  // Three paths:
+  // (1) Sonarr is actively working on it (queueEntry != null) → render
+  //     a download-progress row with a green-fill bar + status label.
+  //     Live progress that updates every 2s while the popup is open.
+  //
+  // (2) Sonarr JUST finished + the file isn't yet scanned in (queueEntry
+  //     gone but justImported=true) → render an "Imported · scanning…"
+  //     transitional row so the user doesn't see an empty placeholder
+  //     during the brief window between Sonarr's import-complete and
+  //     Kira's auto-scan finding the new file on disk. Self-clears
+  //     when the file appears or after 5 minutes.
+  //
+  // (3) No queue entry and not recently imported → keep the original
+  //     static placeholder. Manual Search wouldn't help (it picks
+  //     metadata, not files from disk); the honest answers are "scan
+  //     more folders" or "use Get Missing → Sonarr in the footer".
+  //     No CTA on the row itself — the footer button is the
+  //     discoverable entry point.
   void onManualSearch;
   if (!file) {
+    if (queueEntry) {
+      return <DownloadProgressRow queueEntry={queueEntry} episode={row.episode} pushToast={pushToast} />;
+    }
+    if (justImported) {
+      return <JustImportedRow episode={row.episode} />;
+    }
+    // Has the episode aired yet? If the air date is in the future,
+    // "No file for this episode" is misleading — the file CAN'T exist
+    // yet. Render a friendlier "Upcoming · airs Monday" state so the
+    // user can tell at a glance which gaps are "not yet aired" vs
+    // "aired but I don't have it". Detection is based on the episode's
+    // `airDate` (ISO date string from the provider).
+    const upcomingText = row.episode?.airDate
+      ? formatUpcomingAirDate(row.episode.airDate)
+      : null;
+    if (upcomingText) {
+      return <UpcomingEpisodeRow episode={row.episode!} airDateLabel={upcomingText} />;
+    }
     return (
       <div className="cx-row blank">
         <div className="cx-file-row">
@@ -1791,8 +2584,16 @@ function FileRowCellImpl({ row, item, updateFile, onManualSearch, onOpenDupeModa
           <span className="ep-num">{thumbNum}</span>
         </div>
         <div className="cx-row-content">
-          <div className="cx-row-title mono">{file.filename}</div>
-          <div className="cx-row-sub mono"><span className="seg">{file.folder}</span></div>
+          {/* Marquee both filename and folder so long release-group
+              names and deep paths become readable. Plain truncated
+              text + browser tooltip is the fallback when overflow
+              isn't detected or motion is reduced. */}
+          <MarqueeText className="cx-row-title mono">
+            <span title={file.filename}>{file.filename}</span>
+          </MarqueeText>
+          <MarqueeText className="cx-row-sub mono">
+            <span className="seg" title={file.folder}>{file.folder}</span>
+          </MarqueeText>
           <div className="cx-row-tags">
             {file.size ? <span className="cx-row-tag">{file.size}</span> : null}
             {(() => { const q = inferQuality(file); return q ? <span className="cx-row-tag">{q}</span> : null; })()}
@@ -1849,7 +2650,7 @@ function FileRowCellImpl({ row, item, updateFile, onManualSearch, onOpenDupeModa
             <span
               className="cx-row-conf low"
               title={
-                file.match
+                file.matchId != null
                   ? `Series matched at ${conf}% but no episode in that series matches this file's S/E number. Use Search to fix.`
                   : 'No match at all — use Search manually to find one.'
               }
@@ -1874,7 +2675,835 @@ function FileRowCellImpl({ row, item, updateFile, onManualSearch, onOpenDupeModa
 // PB-2: memo wrapper — see rowsEqualFile comment above.
 const FileRowCell = memo(FileRowCellImpl, rowsEqualFile);
 
-function EpisodeRowCellImpl({ row, item, updateFile, onManualSearch, onOpenDupeModal }: RowCellProps) {
+// ─────────────────────────────────────────────────────────────────────
+// DownloadProgressRow — replaces the "No file for this episode" blank
+// when Sonarr is actively working on the episode. Live updates every
+// 4s via the parent's useSonarrQueuePopup hook.
+//
+// Visual design:
+//   * The whole row is a low-opacity green band (cx-row.downloading)
+//     when status === 'downloading'. The green-fill is rendered as a
+//     ::before pseudo-element with `width: <progress>%` — see
+//     index.css `.cx-row.downloading::before`.
+//   * Status chips (queued / importing / failed / warning) get a
+//     coloured pill on the right side mirroring the existing
+//     status-pill style.
+//   * Release name (Sonarr-side filename) and ETA show as the row's
+//     secondary text — gives the user concrete progress signal.
+//
+// The thumb on the left reuses .cx-pair-thumb.file with a pulsing
+// "···" indicator so the user understands this slot is in motion.
+// ─────────────────────────────────────────────────────────────────────
+
+function formatEta(seconds: number | null): string | null {
+  if (seconds == null || seconds <= 0) return null;
+  if (seconds < 60) return `${seconds}s left`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min left`;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.round((seconds % 3600) / 60);
+  return m > 0 ? `${h}h ${m}m left` : `${h}h left`;
+}
+
+function formatBytes(n: number | null): string | null {
+  if (n == null || n <= 0) return null;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(0)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function statusLabel(status: string): string {
+  switch (status) {
+    case 'queued':       return 'Queued';
+    case 'searching':    return 'Searching';
+    case 'downloading':  return 'Downloading';
+    case 'importing':    return 'Importing';
+    case 'completed':    return 'Imported';
+    case 'failed':       return 'Failed';
+    case 'warning':      return 'Warning';
+    default:             return status;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// ForceImportConfirmModal — preview-then-commit confirmation for the
+// Force Import button on a stuck Sonarr queue entry.
+//
+// Why it exists: a "Force import" click previously fired the import
+// command immediately with importMode="Move". On a cross-device move
+// where copy-then-delete-source can partially fail, Sonarr ended up
+// deleting the source while the destination was incomplete or at a
+// different path than expected. Two real episodes vanished (AoT
+// S01E05 + E06) before this modal landed. Now: the user sees
+// EXACTLY where Sonarr plans to write the file + can pick Copy
+// (safer, source stays) or Move (Sonarr's default, source gone).
+// ─────────────────────────────────────────────────────────────────────
+
+interface ForceImportConfirmModalProps {
+  candidates: Array<{
+    source_path: string;
+    destination_root: string;
+    series_title: string;
+    series_id: number;
+    episode_labels: string[];
+    episode_ids: number[];
+    quality_name: string | null;
+    release_group: string | null;
+    rejection_reasons: string[];
+  }>;
+  importMode: 'Copy' | 'Move';
+  onChangeMode: (m: 'Copy' | 'Move') => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+  confirming: boolean;
+}
+
+function ForceImportConfirmModal({
+  candidates, importMode, onChangeMode, onCancel, onConfirm, confirming,
+}: ForceImportConfirmModalProps) {
+  const importableCount = candidates.filter(c => c.rejection_reasons.length === 0).length;
+  const blockedCount = candidates.length - importableCount;
+
+  // Portal to document.body so the modal escapes the DownloadProgressRow's
+  // stacking context. The row sits deep inside cx-shell → cx-main →
+  // cx-body → cx-col → cx-row; the popup's transform on cx-shell creates
+  // a stacking context that traps any descendant regardless of z-index.
+  // Portaling to body lets the modal stack above the entire popup like
+  // the Dupes / Delete modals do (those are rendered at the popup root
+  // and so naturally escape — same goal, different mechanism).
+  return createPortal(
+    <div
+      onClick={onCancel}
+      style={{
+        position: 'fixed', inset: 0,
+        background: 'rgba(7, 6, 12, 0.78)',
+        backdropFilter: 'blur(6px)',
+        WebkitBackdropFilter: 'blur(6px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        zIndex: 12000,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#14121b',
+          color: 'var(--ink)',
+          borderRadius: 14,
+          padding: 24,
+          maxWidth: 760,
+          width: '92%',
+          maxHeight: '86vh',
+          overflow: 'hidden',
+          display: 'flex', flexDirection: 'column',
+          border: '1px solid var(--line-strong)',
+          boxShadow: '0 24px 60px rgba(0, 0, 0, 0.6)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14, marginBottom: 16 }}>
+          <span style={{
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            width: 40, height: 40, borderRadius: 8,
+            background: 'rgba(255, 201, 74, 0.15)',
+            color: 'var(--conf-mid)',
+            flexShrink: 0,
+          }}>
+            <IcAlertTri />
+          </span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <h3 style={{ margin: 0, fontSize: 17, fontWeight: 600 }}>
+              Confirm manual import
+            </h3>
+            <div style={{ fontSize: 13, color: 'var(--ink-2)', marginTop: 4, lineHeight: 1.45 }}>
+              Sonarr will write {importableCount} file
+              {importableCount === 1 ? '' : 's'} to your library using
+              the mapping below.
+              {blockedCount > 0 ? (
+                <span style={{ color: 'var(--conf-low)', marginLeft: 6 }}>
+                  {blockedCount} file{blockedCount === 1 ? '' : 's'} blocked by Sonarr rejections.
+                </span>
+              ) : null}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ overflowY: 'auto', flex: 1, margin: '0 -8px', padding: '0 8px' }}>
+          {candidates.map((c, i) => (
+            <div
+              key={i}
+              style={{
+                marginBottom: 12,
+                padding: '12px 14px',
+                borderRadius: 10,
+                background: c.rejection_reasons.length > 0
+                  ? 'rgba(255, 91, 110, 0.06)'
+                  : 'rgba(40, 217, 160, 0.04)',
+                border: '1px solid ' + (c.rejection_reasons.length > 0
+                  ? 'rgba(255, 91, 110, 0.30)'
+                  : 'rgba(40, 217, 160, 0.24)'),
+              }}
+            >
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-1)', marginBottom: 8 }}>
+                {c.series_title}
+                {c.episode_labels.length > 0 ? (
+                  <span style={{ color: 'var(--ink-3)', fontWeight: 500, marginLeft: 8 }}>
+                    · {c.episode_labels.join(', ')}
+                  </span>
+                ) : null}
+                {c.quality_name ? (
+                  <span style={{
+                    fontSize: 11, padding: '2px 8px', borderRadius: 4,
+                    background: 'var(--glass-2)', color: 'var(--ink-2)',
+                    marginLeft: 8, fontWeight: 500,
+                  }}>{c.quality_name}</span>
+                ) : null}
+              </div>
+
+              <div style={{ fontSize: 11.5, color: 'var(--ink-3)', marginBottom: 6 }}>
+                <strong style={{ color: 'var(--ink-2)' }}>From:</strong>
+                <code style={{
+                  marginLeft: 6, color: 'var(--ink-2)', wordBreak: 'break-all',
+                }}>{c.source_path}</code>
+              </div>
+              <div style={{ fontSize: 11.5, color: 'var(--ink-3)' }}>
+                <strong style={{ color: 'var(--ink-2)' }}>To:</strong>
+                <code style={{
+                  marginLeft: 6,
+                  color: c.rejection_reasons.length > 0 ? 'var(--ink-4)' : 'var(--conf-high)',
+                  wordBreak: 'break-all',
+                }}>{c.destination_root}</code>
+                <span style={{ color: 'var(--ink-4)', marginLeft: 6, fontSize: 11 }}>
+                  (under Sonarr's series folder; exact filename via Sonarr's template)
+                </span>
+              </div>
+
+              {c.rejection_reasons.length > 0 ? (
+                <div style={{ marginTop: 8, fontSize: 11, color: 'var(--conf-low)' }}>
+                  <strong>Sonarr rejected:</strong>{' '}
+                  {c.rejection_reasons.join(' · ')}
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+
+        {/* Import-mode selector — defaults to Copy (safer). Move
+            cleans up the source but if the move partially fails the
+            source can vanish. We document the trade-off inline so
+            the user makes an informed choice. */}
+        <div
+          style={{
+            marginTop: 16,
+            padding: '12px 14px',
+            borderRadius: 8,
+            background: 'var(--glass-2)',
+            border: '1px solid var(--line)',
+            fontSize: 12.5,
+            lineHeight: 1.5,
+          }}
+        >
+          <div style={{ fontWeight: 600, marginBottom: 8, color: 'var(--ink-1)' }}>
+            Import mode
+          </div>
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 8, cursor: 'pointer' }}>
+            <input
+              type="radio"
+              name="import-mode"
+              checked={importMode === 'Copy'}
+              onChange={() => onChangeMode('Copy')}
+              style={{ accentColor: 'var(--conf-high)', marginTop: 3 }}
+            />
+            <div>
+              <div style={{ color: 'var(--ink-1)', fontWeight: 500 }}>
+                Copy <span style={{ color: 'var(--conf-high)', fontSize: 11 }}>(recommended)</span>
+              </div>
+              <div style={{ color: 'var(--ink-3)', fontSize: 11.5 }}>
+                Source file stays in the download client's folder. Safer:
+                if the import fails for any reason, the source survives.
+                Costs disk space until your download client's retention rule
+                cleans it up.
+              </div>
+            </div>
+          </label>
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+            <input
+              type="radio"
+              name="import-mode"
+              checked={importMode === 'Move'}
+              onChange={() => onChangeMode('Move')}
+              style={{ accentColor: 'var(--conf-mid)', marginTop: 3 }}
+            />
+            <div>
+              <div style={{ color: 'var(--ink-1)', fontWeight: 500 }}>
+                Move <span style={{ color: 'var(--conf-mid)', fontSize: 11 }}>(deletes source)</span>
+              </div>
+              <div style={{ color: 'var(--ink-3)', fontSize: 11.5 }}>
+                Sonarr deletes the source after the move. Saves disk space
+                but a partial-move failure on cross-device transfers can lose
+                the source while leaving the destination incomplete. The
+                AoT S01E05/E06 incident happened with this mode.
+              </div>
+            </div>
+          </label>
+        </div>
+
+        <div
+          style={{
+            marginTop: 18, paddingTop: 14,
+            borderTop: '1px solid var(--line)',
+            display: 'flex', justifyContent: 'flex-end', gap: 10,
+          }}
+        >
+          <button
+            onClick={onCancel}
+            disabled={confirming}
+            style={{
+              padding: '9px 16px', borderRadius: 8,
+              background: 'var(--glass-2)', color: 'var(--ink)',
+              border: '1px solid var(--line)',
+              fontSize: 13, fontWeight: 500,
+              cursor: confirming ? 'wait' : 'pointer',
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={confirming || importableCount === 0}
+            style={{
+              padding: '9px 18px', borderRadius: 8,
+              background: importableCount > 0 ? 'var(--conf-high)' : 'rgba(40, 217, 160, 0.25)',
+              color: importableCount > 0 ? '#022b1c' : 'var(--ink-3)',
+              border: 'none',
+              fontSize: 13, fontWeight: 600,
+              cursor: confirming
+                ? 'wait'
+                : (importableCount === 0 ? 'not-allowed' : 'pointer'),
+              opacity: importableCount === 0 ? 0.55 : 1,
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+            }}
+          >
+            <IcDownload />
+            {confirming
+              ? 'Importing…'
+              : importableCount === 0
+                ? 'Nothing to import'
+                : `Import ${importableCount} file${importableCount === 1 ? '' : 's'} (${importMode})`}
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// JustImportedRow — bridges the gap between Sonarr's "queue entry
+// disappeared" moment and Kira's auto-scan picking up the new file
+// on disk. Without this, the row would revert to "No file for this
+// episode" right after the user watched a green bar fill to 100%.
+//
+// Auto-clears when:
+//   * The real file appears on the LibraryItem (popup re-renders with
+//     a matched file, the row swaps to the proper FileRowCell content)
+//   * 5 minutes elapse (popup's recentlyImported expiry interval)
+// ─────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────
+// formatUpcomingAirDate — relative date formatter for unaired episodes
+//
+// Returns null when the date isn't in the future (so the caller
+// falls through to the generic "No file" placeholder), and a
+// human-readable label otherwise. Tiers:
+//   today                → "Airs today"
+//   tomorrow             → "Airs tomorrow"
+//   within 7 days        → "Airs Monday" / "Airs Friday"
+//   within 30 days       → "Airs in N days"
+//   farther out          → "Airs Mar 15" / "Airs Mar 15, 2027"
+// Year suffix appears only when the air date isn't this year.
+// ─────────────────────────────────────────────────────────────────────
+
+const _WEEKDAYS = [
+  'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday',
+];
+const _MONTHS = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+];
+
+function formatUpcomingAirDate(iso: string): string | null {
+  // Provider dates are typically `YYYY-MM-DD` (date only, no time).
+  // We compare against today's local-midnight so an episode airing
+  // "today" is correctly treated as today even though its parsed
+  // Date object lands at 00:00 UTC. Off-by-one timezone bugs in
+  // this comparison would either show today's episode as "Airs
+  // today" the day before it actually airs (annoying) or miss
+  // calling out today's episode at all (worse).
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return null;
+
+  // Truncate both sides to midnight of their respective local day.
+  const air = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const dayMs = 86_400_000;
+  const daysAhead = Math.round((air.getTime() - today.getTime()) / dayMs);
+
+  if (daysAhead < 0) return null;     // already aired — caller uses "No file"
+  if (daysAhead === 0) return 'Airs today';
+  if (daysAhead === 1) return 'Airs tomorrow';
+  if (daysAhead <= 7) return `Airs ${_WEEKDAYS[air.getDay()]}`;
+  if (daysAhead <= 30) return `Airs in ${daysAhead} days`;
+  const monthName = _MONTHS[air.getMonth()];
+  const day = air.getDate();
+  const includeYear = air.getFullYear() !== today.getFullYear();
+  return includeYear
+    ? `Airs ${monthName} ${day}, ${air.getFullYear()}`
+    : `Airs ${monthName} ${day}`;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────
+// UpcomingEpisodeRow — placeholder for unaired episodes. Renders
+// the air date prominently so the user understands the gap is
+// "not yet aired" rather than "I forgot to download this".
+// ─────────────────────────────────────────────────────────────────────
+
+interface UpcomingEpisodeRowProps {
+  episode: LibEpisode;
+  airDateLabel: string;
+}
+
+function UpcomingEpisodeRow({ episode, airDateLabel }: UpcomingEpisodeRowProps) {
+  return (
+    <div className="cx-row blank cx-row-upcoming">
+      <div className="cx-file-row">
+        <div
+          className="cx-pair-thumb file undetected"
+          style={{
+            borderColor: 'rgba(110, 168, 254, 0.35)',
+            background: 'rgba(110, 168, 254, 0.08)',
+            color: '#9ec5ff',
+          }}
+        >
+          <span className="ep-prefix" style={{ color: '#9ec5ff' }}>EP</span>
+          <span className="ep-num" style={{ color: '#9ec5ff' }}>
+            {String(episode.episode).padStart(2, '0')}
+          </span>
+        </div>
+        <div className="cx-row-content blank-content">
+          <span className="lbl" style={{ color: 'var(--ink-2)' }}>
+            <span style={{ color: '#9ec5ff', fontWeight: 600 }}>{airDateLabel}</span>
+            <span style={{ color: 'var(--ink-3)', marginLeft: 8 }}>
+              · upcoming · no file yet
+            </span>
+          </span>
+        </div>
+        <div className="cx-row-aside">
+          <span
+            className="cx-row-conf"
+            style={{
+              background: 'rgba(110, 168, 254, 0.14)',
+              color: '#9ec5ff',
+              border: '1px solid rgba(110, 168, 254, 0.32)',
+              fontSize: 11,
+              fontWeight: 600,
+            }}
+          >
+            Upcoming
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+interface JustImportedRowProps {
+  episode: LibEpisode | null;
+}
+
+function JustImportedRow({ episode }: JustImportedRowProps) {
+  return (
+    <div className="cx-row dl dl-completed">
+      <div className="cx-row-dl-fill" style={{ width: '100%', opacity: 0.10 }} />
+      <div className="cx-file-row" style={{ position: 'relative', zIndex: 1 }}>
+        <div className="cx-pair-thumb file undetected dl-thumb dl-thumb-importing">
+          {episode ? (
+            <>
+              <span className="ep-prefix">EP</span>
+              <span className="ep-num">{String(episode.episode).padStart(2, '0')}</span>
+            </>
+          ) : (
+            <span className="ep-num">···</span>
+          )}
+        </div>
+        <div className="cx-row-content">
+          <div className="cx-row-title">
+            <span style={{ color: 'var(--ink)' }}>Imported by Sonarr</span>
+            <span style={{ color: 'var(--ink-3)', marginLeft: 8, fontSize: 12 }}>
+              · scanning to pick up the file…
+            </span>
+          </div>
+          <div className="cx-row-sub mono">
+            <span className="seg" style={{ color: 'var(--ink-3)' }}>
+              Kira is rescanning the library — the file should appear here in a few seconds.
+            </span>
+          </div>
+        </div>
+        <div className="cx-row-aside">
+          <span className="cx-row-conf dl-pill dl-pill-completed">
+            <IcCheck /> Imported
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface DownloadProgressRowProps {
+  queueEntry: SonarrQueueEntry;
+  episode: LibEpisode | null;
+  pushToast?: (toast: { title: string; sub?: string; kind?: 'success' | 'error' }) => void;
+}
+
+function DownloadProgressRow({ queueEntry, episode, pushToast }: DownloadProgressRowProps) {
+  const pct = Math.max(0, Math.min(100, queueEntry.progress_pct));
+  const status = queueEntry.status;
+  // Whole-row classes drive the progress-fill colour + pulse animation.
+  // `cx-row.dl` is the base; `dl-<status>` modifies per-state colouring.
+  const rowClass = `cx-row dl dl-${status}`;
+  const sizeText = formatBytes(queueEntry.size_bytes);
+  const isLive = status === 'downloading' && pct > 0;
+  const showShimmer = status === 'queued' || status === 'searching' || status === 'importing';
+
+  // ── Smooth-fill via requestAnimationFrame ───────────────────────
+  // Without extrapolation the bar only moves on poll ticks (every
+  // 1.5s) — even a fast download "looks stuck" because the bar might
+  // shift 1-2% then sit still for a second. Worse for slow downloads
+  // where one poll tick reveals 0.1% movement.
+  //
+  // Fix: every animation frame, compute where the bar WOULD be based
+  // on the last known baseline (pct + ETA at poll time) extrapolated
+  // forward by elapsed time. Refs + direct DOM writes — no React
+  // re-render storm at 60fps. When a new poll arrives, the baseline
+  // resets and any drift between prediction and reality manifests as
+  // at most a single small snap (usually invisible).
+  //
+  // ETA-driven rate: at baseline (pct=B, eta=E), the bar should reach
+  // 100% in E seconds. So per-second rate = (100 - B) / E. After
+  // elapsed seconds since baseline, extrapolated pct = B + rate * elapsed.
+  const fillRef = useRef<HTMLDivElement>(null);
+  const pctTextRef = useRef<HTMLSpanElement>(null);
+  const etaTextRef = useRef<HTMLSpanElement>(null);
+  const baselineRef = useRef({
+    pct,
+    eta: queueEntry.eta_seconds,
+    timestamp: Date.now(),
+  });
+  // Re-anchor baseline whenever new data arrives. Both pct and ETA
+  // matter — Sonarr might revise downward (release switch) or upward
+  // (throttle change) at any poll. timestamp captures "when this
+  // baseline was true" for the rAF math.
+  useEffect(() => {
+    baselineRef.current = {
+      pct: Math.max(0, Math.min(100, queueEntry.progress_pct)),
+      eta: queueEntry.eta_seconds,
+      timestamp: Date.now(),
+    };
+    // Snap the DOM to the freshly-baselined value immediately so the
+    // next rAF tick extrapolates from accurate ground truth.
+    if (fillRef.current) fillRef.current.style.width = `${baselineRef.current.pct}%`;
+    if (pctTextRef.current) pctTextRef.current.textContent = `${baselineRef.current.pct.toFixed(0)}%`;
+    if (etaTextRef.current) {
+      const e = formatEta(queueEntry.eta_seconds);
+      etaTextRef.current.textContent = e ? `· ${e}` : '';
+      etaTextRef.current.style.display = e ? '' : 'none';
+    }
+  }, [queueEntry.progress_pct, queueEntry.eta_seconds]);
+
+  // rAF extrapolation loop — only runs while status === 'downloading'
+  // and we have a usable ETA. For other statuses (queued / importing /
+  // completed / failed) the bar is static and the CSS handles it.
+  useEffect(() => {
+    if (status !== 'downloading') return;
+    if (queueEntry.eta_seconds == null || queueEntry.eta_seconds <= 0) return;
+
+    let raf = 0;
+    let lastWrittenPct = -1;
+    let lastWrittenEta = -1;
+    const loop = () => {
+      const baseline = baselineRef.current;
+      const baseEta = baseline.eta ?? 0;
+      let extrapolated = baseline.pct;
+      let etaNow = baseEta;
+      if (baseEta > 0) {
+        const elapsedSec = (Date.now() - baseline.timestamp) / 1000;
+        const remainingPct = 100 - baseline.pct;
+        extrapolated = Math.min(100, baseline.pct + (remainingPct * elapsedSec / baseEta));
+        etaNow = Math.max(0, baseEta - elapsedSec);
+      }
+      // Only write to the DOM when the rendered value actually changes
+      // by a perceptible amount. Saves the browser from re-layouting a
+      // hundred times per second on a slow download where extrapolation
+      // moves 0.001% per frame.
+      if (Math.abs(extrapolated - lastWrittenPct) >= 0.1) {
+        if (fillRef.current) fillRef.current.style.width = `${extrapolated}%`;
+        if (pctTextRef.current) pctTextRef.current.textContent = `${extrapolated.toFixed(0)}%`;
+        lastWrittenPct = extrapolated;
+      }
+      // ETA text updates once per second visually — only re-write when
+      // the rounded value changes. Otherwise we'd re-render "12 min left"
+      // every frame, which is wasted work and a visual flicker risk.
+      const roundedEta = Math.round(etaNow);
+      if (roundedEta !== lastWrittenEta) {
+        if (etaTextRef.current) {
+          const txt = formatEta(roundedEta);
+          etaTextRef.current.textContent = txt ? `· ${txt}` : '';
+          etaTextRef.current.style.display = txt ? '' : 'none';
+        }
+        lastWrittenEta = roundedEta;
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [status, queueEntry.eta_seconds]);
+
+  // Compose the visible "subtitle" text. Priority order:
+  //   1. error_message (failed/warning states) — that's the most
+  //      important info.
+  //   2. release_title (downloading/queued) — the concrete release
+  //      Sonarr is grabbing.
+  //   3. fallback "Waiting for Sonarr…" — generic placeholder.
+  let subText: string | null = null;
+  if (queueEntry.error_message) {
+    subText = queueEntry.error_message;
+  } else if (queueEntry.release_title) {
+    subText = queueEntry.release_title;
+  } else {
+    subText = 'Waiting for Sonarr…';
+  }
+
+  // Initial-render ETA text — the rAF loop will overwrite this once
+  // it starts ticking, but for the first paint we need something.
+  const initialEtaText = formatEta(queueEntry.eta_seconds);
+
+  // Stuck-import retry — two-step flow as of the AoT S01E05/E06
+  // incident:
+  //   1. User clicks "Force import" → preview modal opens showing
+  //      source path, destination path, episode mapping, import mode
+  //   2. User confirms → actual import command fires
+  // This prevents data-loss surprises: the user knows exactly what
+  // Sonarr is about to do BEFORE Sonarr does it. Default mode is
+  // "Copy" not "Move" — keeps source intact so a failed import never
+  // takes the user's file with it. Cost: disk space until the user
+  // (or their download client retention rule) cleans the source.
+  const [retrying, setRetrying] = useState(false);
+  const [previewState, setPreviewState] = useState<
+    | { kind: 'idle' }
+    | { kind: 'loading' }
+    | { kind: 'shown'; candidates: Array<{
+        source_path: string;
+        destination_root: string;
+        series_title: string;
+        series_id: number;
+        episode_labels: string[];
+        episode_ids: number[];
+        quality_name: string | null;
+        release_group: string | null;
+        rejection_reasons: string[];
+      }> }
+  >({ kind: 'idle' });
+  const [importMode, setImportMode] = useState<'Copy' | 'Move'>('Copy');
+
+  const handleRetryImport = useCallback(async () => {
+    if (retrying || previewState.kind === 'loading') return;
+    if (!queueEntry.download_id) {
+      pushToast?.({
+        title: 'Cannot retry import',
+        sub: "Sonarr didn't expose a download id for this entry.",
+        kind: 'error',
+      });
+      return;
+    }
+    setPreviewState({ kind: 'loading' });
+    try {
+      const r = await api.sonarrPreviewImport(queueEntry.download_id);
+      if (r.ok && r.candidates.length > 0) {
+        setPreviewState({ kind: 'shown', candidates: r.candidates });
+      } else {
+        setPreviewState({ kind: 'idle' });
+        pushToast?.({
+          title: "Sonarr has nothing to import",
+          sub: r.detail ?? 'The queue entry is stale or files were moved.',
+          kind: 'error',
+        });
+        // Rescan in case the file IS already in the library.
+        window.dispatchEvent(new CustomEvent('kira:request-rescan'));
+      }
+    } catch (e) {
+      setPreviewState({ kind: 'idle' });
+      pushToast?.({ title: 'Preview failed', sub: (e as Error).message, kind: 'error' });
+    }
+  }, [retrying, previewState.kind, queueEntry.download_id, pushToast]);
+
+  const handleConfirmImport = useCallback(async () => {
+    if (retrying || !queueEntry.download_id) return;
+    setRetrying(true);
+    try {
+      const r = await api.sonarrRetryImport({
+        download_id: queueEntry.download_id,
+        import_mode: importMode,
+      });
+      if (r.ok) {
+        // Toast shows ACTUAL destination paths from Sonarr's history
+        // check (run server-side after the import command processes).
+        // If Sonarr ran the command but didn't write a history row,
+        // surface the warning so the user knows to verify in Sonarr.
+        const destLine = r.destinations && r.destinations.length > 0
+          ? `Landed at: ${r.destinations.join(' · ')}`
+          : (r.history_warning
+              ? `Sonarr accepted but history is silent — verify in Sonarr UI. (${r.history_warning})`
+              : 'Sonarr accepted — verify location in Sonarr UI.');
+        pushToast?.({
+          title: `Sonarr imported ${r.imported_count} file${r.imported_count === 1 ? '' : 's'}`,
+          sub: destLine,
+          kind: r.history_warning ? 'error' : 'success',
+        });
+        window.dispatchEvent(new CustomEvent('kira:request-rescan'));
+      } else {
+        const isStaleQueue = (r.detail ?? '').toLowerCase().includes("couldn't find");
+        pushToast?.({
+          title: "Sonarr couldn't import",
+          sub: r.detail ?? 'Check Sonarr UI for the rejection reason.',
+          kind: 'error',
+        });
+        if (isStaleQueue) {
+          window.dispatchEvent(new CustomEvent('kira:request-rescan'));
+        }
+      }
+    } catch (e) {
+      pushToast?.({ title: 'Import failed', sub: (e as Error).message, kind: 'error' });
+    } finally {
+      setRetrying(false);
+      setPreviewState({ kind: 'idle' });
+    }
+  }, [retrying, queueEntry.download_id, importMode, pushToast]);
+
+  return (
+    <div className={rowClass}>
+      {/* Confirmation modal — shown when the user clicks Force Import.
+          Two-step interaction: preview-then-commit. Reduces data-loss
+          surprises by showing source + destination paths BEFORE
+          Sonarr touches anything. */}
+      {previewState.kind === 'shown' ? (
+        <ForceImportConfirmModal
+          candidates={previewState.candidates}
+          importMode={importMode}
+          onChangeMode={setImportMode}
+          onCancel={() => setPreviewState({ kind: 'idle' })}
+          onConfirm={handleConfirmImport}
+          confirming={retrying}
+        />
+      ) : null}
+
+      {/* Progress-fill bar — width controlled inline + via rAF ref.
+          When status === 'downloading' the rAF loop writes width
+          directly to the DOM at 60fps. For other statuses the inline
+          width snaps via the useEffect baseline reset. */}
+      <div
+        ref={fillRef}
+        className={`cx-row-dl-fill ${status === 'downloading' ? 'live' : ''}`}
+        style={{
+          width: `${pct}%`,
+          opacity: isLive ? 0.18 : showShimmer ? 0.12 : 0.10,
+        }}
+      />
+      <div className="cx-file-row" style={{ position: 'relative', zIndex: 1 }}>
+        <div className={`cx-pair-thumb file undetected dl-thumb dl-thumb-${status}`}>
+          {episode ? (
+            <>
+              <span className="ep-prefix">EP</span>
+              <span className="ep-num">{String(episode.episode).padStart(2, '0')}</span>
+            </>
+          ) : (
+            <span className="ep-num">···</span>
+          )}
+        </div>
+        <div className="cx-row-content">
+          <div className="cx-row-title">
+            <span style={{ color: 'var(--ink)' }}>
+              {queueEntry.needs_manual_import ? 'Stuck — manual import needed' : statusLabel(status)}
+            </span>
+            {isLive ? (
+              <span style={{ color: 'var(--ink-2)', fontWeight: 500, marginLeft: 8 }}>
+                · <span ref={pctTextRef}>{pct.toFixed(0)}%</span>
+              </span>
+            ) : null}
+            <span
+              ref={etaTextRef}
+              style={{
+                color: 'var(--ink-3)', fontWeight: 500, marginLeft: 8, fontSize: 12,
+                display: initialEtaText ? '' : 'none',
+              }}
+            >
+              {initialEtaText ? `· ${initialEtaText}` : ''}
+            </span>
+          </div>
+          <div className="cx-row-sub mono" title={subText ?? undefined}>
+            <span className="seg" style={{
+              display: 'inline-block',
+              maxWidth: '100%',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}>{subText}</span>
+          </div>
+          <div className="cx-row-tags">
+            {sizeText ? <span className="cx-row-tag">{sizeText}</span> : null}
+            {queueEntry.protocol ? <span className="cx-row-tag">{queueEntry.protocol}</span> : null}
+            {queueEntry.download_client ? <span className="cx-row-tag">{queueEntry.download_client}</span> : null}
+            {/* Stuck-import action button. Renders alongside the
+                regular tags so it sits inline with the row's existing
+                metadata pills. Sonarr already knows the (series,
+                episode) mapping; this just forces the import to
+                proceed via the manual-import API. */}
+            {queueEntry.needs_manual_import && queueEntry.download_id ? (
+              <button
+                onClick={handleRetryImport}
+                disabled={retrying}
+                className="cx-blank-btn"
+                style={{
+                  padding: '3px 10px',
+                  fontSize: 11,
+                  fontWeight: 600,
+                  background: 'rgba(40, 217, 160, 0.16)',
+                  color: 'var(--conf-high)',
+                  border: '1px solid rgba(40, 217, 160, 0.36)',
+                  borderRadius: 999,
+                  cursor: retrying ? 'wait' : 'pointer',
+                }}
+                title="Force Sonarr to import using the (series, episode) mapping it already computed during grab. This is the same action as clicking the file in Sonarr's queue → Import → confirm."
+              >
+                <IcDownload /> {retrying ? 'Importing…' : 'Force import'}
+              </button>
+            ) : null}
+          </div>
+        </div>
+        <div className="cx-row-aside">
+          <span className={`cx-row-conf dl-pill dl-pill-${status}`}>
+            {(status === 'failed' || status === 'warning' || queueEntry.needs_manual_import)
+              ? <IcAlertTri /> : null}
+            {queueEntry.needs_manual_import ? 'Stuck' : statusLabel(status)}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EpisodeRowCellImpl({ row, item, updateFile, onManualSearch, onOpenDupeModal, queueEntry, justImported }: RowCellProps) {
   void onOpenDupeModal;
   // Right column is one row per left-column row; no special handling for
   // dupes here — the left column emits a single `dupe-primary` row that
@@ -1932,6 +3561,22 @@ function EpisodeRowCellImpl({ row, item, updateFile, onManualSearch, onOpenDupeM
       ? `Episode ${String(episode.absolute).padStart(2, '0')}`
       : `S${String(episode.season).padStart(2, '0')}E${String(episode.episode).padStart(2, '0')}`;
 
+  // When no file is matched AND Sonarr is downloading this episode,
+  // surface a small status pill in the aside instead of the bare "—"
+  // confidence placeholder. Keeps the right column visually aligned
+  // with the left column's DownloadProgressRow — both halves of the
+  // row now indicate "Sonarr is working on this" instead of half the
+  // row going dark/silent. justImported gets the same treatment so
+  // both columns stay synchronised during the post-download window.
+  // For unaired episodes the right aside mirrors the left's
+  // "Upcoming" placeholder.
+  const showQueueAside = !file && queueEntry != null;
+  const showImportedAside = !file && queueEntry == null && justImported;
+  const upcomingAsideText = !file && queueEntry == null && !justImported && episode.airDate
+    ? formatUpcomingAirDate(episode.airDate)
+    : null;
+  const showUpcomingAside = upcomingAsideText != null;
+
   return (
     <div className={`cx-row ${file?.status === 'approved' ? 'approved' : ''} ${file?.status === 'rejected' ? 'rejected' : ''} ${file?.matchedWrong ? 'wrong' : ''}`}>
       <div className="cx-ep-row">
@@ -1943,14 +3588,19 @@ function EpisodeRowCellImpl({ row, item, updateFile, onManualSearch, onOpenDupeM
           <span className="ep-num">{thumbNum}</span>
         </div>
         <div className="cx-row-content">
-          <div className="cx-row-title">
-            {episode.title || (isAlbum ? `Track ${episode.track}` : `Episode ${episode.episode}`)}
+          {/* Long episode titles like "All My Life, My Heart Has
+              Yearned for a Thing I Cannot Name" overflow the same
+              way filenames do. Same marquee treatment. */}
+          <MarqueeText className="cx-row-title">
+            <span title={episode.title || undefined}>
+              {episode.title || (isAlbum ? `Track ${episode.track}` : `Episode ${episode.episode}`)}
+            </span>
             {isAlbum && episode.duration ? (
               <span style={{ color: 'var(--ink-3)', fontWeight: 500, marginLeft: 8, fontSize: 12 }}>
                 · {episode.duration}
               </span>
             ) : null}
-          </div>
+          </MarqueeText>
           <div className="cx-row-sub">
             <span>{fullTag}</span>
             {episode.airDate && !isAlbum ? <><span className="dot-sep" /><span>{episode.airDate}</span></> : null}
@@ -1972,7 +3622,45 @@ function EpisodeRowCellImpl({ row, item, updateFile, onManualSearch, onOpenDupeM
           ) : null}
         </div>
         <div className="cx-row-aside" onClick={(e) => e.stopPropagation()}>
-          <span className={`cx-row-conf ${confT}`}>{file ? `${conf}%` : '—'}</span>
+          {showQueueAside ? (
+            <span
+              className={`cx-row-conf dl-pill dl-pill-${queueEntry.status}`}
+              title={
+                queueEntry.error_message
+                  ? queueEntry.error_message
+                  : queueEntry.release_title
+                    ? `Sonarr: ${queueEntry.release_title}`
+                    : `Sonarr status: ${queueEntry.status}`
+              }
+            >
+              {queueEntry.status === 'downloading'
+                ? `${Math.round(queueEntry.progress_pct)}%`
+                : statusLabel(queueEntry.status)}
+            </span>
+          ) : showImportedAside ? (
+            <span
+              className="cx-row-conf dl-pill dl-pill-completed"
+              title="Sonarr finished downloading. Kira is scanning to pick up the file."
+            >
+              Imported
+            </span>
+          ) : showUpcomingAside ? (
+            <span
+              className="cx-row-conf"
+              style={{
+                background: 'rgba(110, 168, 254, 0.14)',
+                color: '#9ec5ff',
+                border: '1px solid rgba(110, 168, 254, 0.32)',
+                fontSize: 11,
+                fontWeight: 600,
+              }}
+              title={`This episode hasn't aired yet — ${upcomingAsideText?.toLowerCase()}.`}
+            >
+              {upcomingAsideText}
+            </span>
+          ) : (
+            <span className={`cx-row-conf ${confT}`}>{file ? `${conf}%` : '—'}</span>
+          )}
           <div className="cx-row-actions">
             <button
               className="cx-row-act approve"

@@ -15,6 +15,10 @@ export interface MatchData {
    *  series-card clustering — beats parser heuristics. */
   provider?: string;
   providerId?: string;
+  /** Backend Match row id — the server-side handle cluster actions need
+   *  (Sonarr "send missing", future NFO writers). Null for synthesized
+   *  matches built from parsed data when no provider hit. */
+  matchId?: number | null;
   /** Franchise identity for visual grouping on the Review page.
    *  Cards sharing this value sit together under a sub-heading. */
   seriesGroupId?: string;
@@ -123,17 +127,6 @@ export interface MediaFile {
   seriesKey?: string | null;
 }
 
-export interface HistoryEntry {
-  id: string;
-  when: string;
-  mediaType: MediaType;
-  poster: PosterData;
-  title: string;
-  op: string;
-  from: string;
-  to: string;
-}
-
 export interface SearchResult {
   title?: string;
   titleRomaji?: string;
@@ -176,8 +169,6 @@ export interface NamingProfile {
   music: string;
 }
 
-export interface NamingToken { k: string; d: string; }
-
 export interface ContentTypes {
   movies: boolean;
   tv: boolean;
@@ -198,6 +189,10 @@ export interface AppState {
   scanProgress: number;
   scanFound: number;
   scanMessage: string;
+  /** Which phase the live scan is in, so the banner can show two distinct
+   *  full-range bars: an indeterminate sweep while DISCOVERING files (no
+   *  total is known yet), then a real 0–100% bar while MATCHING. */
+  scanPhase: 'idle' | 'scanning' | 'matching' | 'done';
   /** False until the first /files fetch resolves (success OR failure).
    *  Pages use this to suppress empty-state UIs during the initial load
    *  window — without it, the user sees "No library scanned yet" / "Library
@@ -247,6 +242,11 @@ export interface LibFile {
   // back in the pending queue.
   status: 'pending' | 'matching' | 'approved' | 'rejected' | 'no_match' | 'renamed';
   confidence: number;
+  /** Backend Match row id for the selected match on this file. Used by
+   *  cluster-level actions that need a server-side handle to the match
+   *  (Sonarr "send missing", future Radarr / NFO writers). Null when
+   *  the file has no real provider match (synthesised no_match cards). */
+  matchId?: number | null;
 }
 
 /** One episode/track entry on a series or album item. */
@@ -293,6 +293,10 @@ export interface LibraryItem {
   /** Franchise identity — cards sharing this value cluster under one
    *  sub-heading inside their media-type section on the Review page. */
   seriesGroupId?: string | null;
+  /** Per-cluster key from the backend (`tv|breaking bad|1`). Distinct from
+   *  the franchise `seriesGroupId`; used to re-find the same item after a
+   *  re-match shifts its synthesized `id`. */
+  seriesKey?: string | null;
   /** Canonical season number from the matched provider (AniDB Fribb
    *  cross-ref or TMDB/TVDB season layout). Displayed as "Season N" on
    *  the card meta row when ≥ 1. Authoritative — replaces the old

@@ -43,6 +43,8 @@ export function FolderPickerModal({
 
   useEffect(() => { void load(initialPath); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
 
+  const CTL_BTN = 'inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-line bg-glass px-3 py-2 text-[13px] font-medium text-ink-muted transition-colors hover:bg-glass-2 hover:text-ink disabled:opacity-40 [&_svg]:size-[14px]';
+
   return (
     <Modal
       title="Choose a folder"
@@ -51,75 +53,68 @@ export function FolderPickerModal({
       size="lg"
       footer={
         <>
-          <span className="text-mono text-sm" style={{ color: 'var(--ink-3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>
-            {cwd || '—'}
-          </span>
-          <div className="right">
-            <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-            <button className="btn btn-primary" disabled={!cwd} onClick={() => { onPick(cwd); onClose(); }}>
+          <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink-soft">{cwd || '—'}</span>
+          <div className="flex gap-2">
+            <button className="rounded-xl border border-line bg-glass px-4 py-2 text-[13px] font-medium text-ink-muted transition-colors hover:bg-glass-2 hover:text-ink" onClick={onClose}>Cancel</button>
+            <button
+              className="inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-[13px] font-semibold text-white transition-transform active:translate-y-px disabled:opacity-40 [&_svg]:size-[14px]"
+              style={{ background: 'linear-gradient(135deg, var(--brand-a), var(--brand-b))', boxShadow: '0 8px 22px -10px rgba(229,75,186,0.6)' }}
+              disabled={!cwd}
+              onClick={() => { onPick(cwd); onClose(); }}
+            >
               <IcCheck /> Use this folder
             </button>
           </div>
         </>
       }
     >
-      <div className="flex items-center gap-2" style={{ marginBottom: 12 }}>
-        <button
-          className="btn btn-sm"
-          disabled={parent === null}
-          onClick={() => parent !== null && void load(parent)}
-        >
-          ← Up
-        </button>
+      {/* Path bar */}
+      <div className="mb-3 flex items-center gap-2">
+        <button className={CTL_BTN} disabled={parent === null} onClick={() => parent !== null && void load(parent)}>← Up</button>
         <input
-          className="input mono"
-          style={{ flex: 1 }}
+          className="min-w-0 flex-1 rounded-xl border border-line bg-glass px-3.5 py-2 font-mono text-[12.5px] text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-accent-line focus:bg-glass-2"
           value={cwd}
           onChange={e => setCwd(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter') void load(cwd); }}
           placeholder="Type a path and press Enter…"
+          spellCheck={false}
         />
-        <button className="btn btn-sm" onClick={() => void load(cwd)} disabled={loading}>
+        <button className={CTL_BTN} onClick={() => void load(cwd)} disabled={loading}>
           {loading ? <IcSpin /> : <IcArrowRight />} Go
         </button>
       </div>
 
       {error ? (
-        <div className="onboarding-state error" style={{ marginBottom: 12 }}>
+        <div className="mb-3 flex items-start gap-2 rounded-xl border border-[rgba(255,91,110,0.25)] bg-[var(--conf-low-bg)] px-3 py-2.5 text-[12.5px] text-ink-muted [&_svg]:mt-0.5 [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-conf-low">
           <IcAlertTri /><span>{error}</span>
         </div>
       ) : null}
 
-      <div style={{
-        border: '1px solid var(--line)', borderRadius: 10,
-        maxHeight: 360, overflowY: 'auto', background: 'rgba(0,0,0,0.18)',
-      }}>
+      {/* Folder list */}
+      <div className="max-h-[360px] overflow-y-auto rounded-xl border border-line bg-black/20 [scrollbar-width:thin]">
         {entries.length === 0 && !loading ? (
-          <div style={{ padding: 20, textAlign: 'center', color: 'var(--ink-3)', fontSize: 13 }}>
-            {cwd ? 'No subfolders here.' : 'Loading drives...'}
-          </div>
+          <div className="px-5 py-8 text-center text-[13px] text-ink-soft">{cwd ? 'No subfolders here.' : 'Loading drives…'}</div>
         ) : null}
-        {entries.map(e => (
+        {entries.map((e) => (
           <button
             key={e.path}
-            className="nav-item"
-            style={{ margin: 0, padding: '8px 12px', borderRadius: 0, width: '100%' }}
+            className="group flex w-full items-center gap-2.5 border-b border-line/60 px-3.5 py-2.5 text-left transition-colors last:border-b-0 hover:bg-glass-2"
             onDoubleClick={() => void load(e.path)}
             onClick={() => setCwd(e.path)}
           >
-            <IcFolder style={{ width: 14, height: 14 }} />
-            <span className="text-mono text-sm" style={{ flex: 1, textAlign: 'left' }}>{e.name}</span>
+            <IcFolder style={{ width: 15, height: 15 }} className="shrink-0 text-accent" />
+            <span className="flex-1 truncate font-mono text-[13px] text-ink-muted group-hover:text-ink">{e.name}</span>
             {e.file_count != null ? (
-              <span className="text-xs text-muted">{e.file_count.toLocaleString()} items</span>
+              <span className="shrink-0 text-[11px] text-ink-faint">{e.file_count.toLocaleString()} items</span>
             ) : (
-              <span className="text-xs" style={{ color: 'var(--conf-low)' }}>locked</span>
+              <span className="shrink-0 text-[11px] text-conf-low">locked</span>
             )}
           </button>
         ))}
       </div>
 
-      <div className="text-xs text-muted" style={{ marginTop: 8 }}>
-        Tip: click to preview, double-click to enter. Hit "Use this folder" when you're in the right place.
+      <div className="mt-2.5 text-[11.5px] text-ink-soft">
+        Tip: click to preview, double-click to enter. Hit “Use this folder” when you’re in the right place.
       </div>
     </Modal>
   );

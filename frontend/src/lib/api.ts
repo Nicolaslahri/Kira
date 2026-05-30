@@ -121,8 +121,13 @@ export interface ApiSearchResponse {
 }
 
 export class ApiError extends Error {
-  constructor(message: string, public status: number) {
+  // Explicit field + assignment rather than a parameter property, so the
+  // class is fully type-erasable (parameter properties emit runtime code,
+  // which `erasableSyntaxOnly` disallows).
+  status: number;
+  constructor(message: string, status: number) {
     super(message);
+    this.status = status;
   }
 }
 
@@ -138,10 +143,27 @@ export const api = {
   },
   listScans: () => request<ApiScan[]>('/scans'),
   getScan: (id: number) => request<ApiScan>(`/scans/${id}`),
-  createScan: (root_path: string) =>
-    request<ApiScan>('/scans', { method: 'POST', body: JSON.stringify({ root_path }) }),
+  // Bug A: optional `root_paths` lets callers walk multiple library
+  // roots in one scan (library_root + every watch folder). When
+  // omitted, the backend falls back to walking only `root_path`.
+  // The first entry of `root_paths` becomes the Scan history row's
+  // primary display path; all entries get walked.
+  createScan: (root_path: string, root_paths?: string[]) =>
+    request<ApiScan>('/scans', {
+      method: 'POST',
+      body: JSON.stringify(root_paths && root_paths.length > 0
+        ? { root_path, root_paths }
+        : { root_path }),
+    }),
   rematchFile: (fileId: number) =>
     request<ApiMediaFile>(`/files/${fileId}/rematch`, { method: 'POST' }),
+  /** Re-parse the EXISTING library in place and re-match it. A normal scan
+   *  skips already-indexed files, so parser + folder-lock improvements only
+   *  reach NEW files; this re-runs the parser on every stored file so they
+   *  apply to the current library without a destructive DB reset. Manual
+   *  pins + rename history are preserved. Returns a Scan row to poll. */
+  reparseLibrary: () =>
+    request<ApiScan>('/scans/reparse', { method: 'POST' }),
   /** Hard-delete a MediaFile and remove the underlying file from disk.
    *  Irreversible. UI must show a confirm dialog before calling this —
    *  the backend also requires ?confirm=true as a second guard. */
@@ -201,6 +223,7 @@ export const api = {
         title: string | null;
         air_date: string | null;
         overview: string | null;
+        runtime: number | null;
       }[];
     }>(`/series/${provider}/${providerId}/episodes${q}`);
   },
@@ -266,6 +289,198 @@ export const api = {
       { method: 'POST' },
     ),
 
+  /** Sonarr integration: validate URL+API key AND fetch the user's
+   *  quality profiles + root folders in one call. Used by the Settings
+   *  → Integrations panel both when the user clicks "Test connection"
+   *  (passes url+api_key inline) and on initial settings-page load
+   *  (omits both — backend reads from saved settings).
+   *
+   *  Returns ok=true on success with `quality_profiles` and `root_folders`
+   *  populated for dropdown UI; ok=false with `detail` for any failure
+   *  (unreachable, bad API key, sonarr-side 5xx, etc.). */
+  testSonarr: (body?: { url?: string; api_key?: string }) =>
+    request<{
+      ok: boolean;
+      detail: string | null;
+      version: string | null;
+      quality_profiles: Array<{ id: number; name: string }> | null;
+      root_folders: Array<{ path: string; freeSpace?: number | null }> | null;
+    }>('/integrations/sonarr/test', {
+      method: 'POST',
+      body: JSON.stringify(body ?? {}),
+    }),
+
+  /** Send Kira's missing-episode list to Sonarr in one round-trip.
+   *  The backend resolves the TVDB id from the Match row (cross-refs
+   *  Fribb for AniDB matches) and decides anime-vs-standard series
+   *  type — frontend just supplies the Match id + season + episode
+   *  numbers Kira computed as missing from the cluster.
+   *
+   *  Throws on 4xx (e.g. "Sonarr not configured" or "TMDB-only match")
+   *  so the caller's catch shows the backend's detail in a toast. */
+  sonarrSendMissing: (body: {
+    match_id: number;
+    season: number;
+    episode_numbers: number[];
+  }) =>
+    request<{
+      ok: boolean;
+      detail: string | null;
+      queued: number;
+      series_was_added: boolean;
+      sonarr_series_title: string | null;
+      skipped_episodes: number[] | null;
+    }>('/integrations/sonarr/send-missing', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** Tier 1.5 live template preview: render naming templates against the
+   *  user's own recent matched files using the REAL backend engine, so the
+   *  Settings → Naming preview is a true mirror of what a rename writes. Any
+   *  omitted per-type template falls back to the backend's Plex default. */
+  previewTemplate: (body: {
+    movie?: string; tv?: string; anime?: string; music?: string; samples_per_type?: number;
+  }) =>
+    request<{
+      samples: { media_type: string; filename: string; rendered: string; error: string | null }[];
+    }>('/rename/preview-template', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** Phase 2 live progress: poll Sonarr's `/queue` and surface what
+   *  it's currently downloading. With no match_id, returns every in-
+   *  flight download (used by library-grid cover-card status pills);
+   *  with match_id, filters to one series + season so the popup can
+   *  paint per-row progress bars on the missing-episode rows.
+   *
+   *  Backend caches the raw queue for 4s in-process, so calling this
+   *  every 4s from a popup AND every 12s from the library grid
+   *  produces only ~1 Sonarr round-trip per 4s window in steady state.
+   *
+   *  Throws on 4xx — typically "Sonarr URL isn't configured." Callers
+   *  should treat that as "feature not enabled" and stop polling. */
+  /** Ask the backend to look at every unmatched / low-confidence file
+   *  and pin a match using Sonarr's authoritative metadata when the
+   *  file lives under a Sonarr-managed folder.
+   *
+   *  No body → heal everything Kira couldn't match. Pass `file_ids`
+   *  to scope to a specific cluster (the popup's "Sync from Sonarr"
+   *  button does this so the user only heals what they're looking at).
+   *
+   *  Returns counts: `healed` files actually pinned, `no_sonarr_match`
+   *  files Kira couldn't tie to any Sonarr series, `series_pinned`
+   *  distinct shows that contributed at least one heal.
+   *
+   *  Throws on 4xx (Sonarr unreachable). Empty heal returns ok=true
+   *  with healed=0; caller decides whether to toast or stay silent. */
+  sonarrHealUnmatched: (body?: { file_ids?: number[]; confidence_threshold?: number }) =>
+    request<{
+      ok: boolean;
+      healed: number;
+      skipped: number;
+      no_sonarr_match: number;
+      series_pinned: number;
+      detail: string | null;
+    }>('/integrations/sonarr/heal-unmatched', {
+      method: 'POST',
+      body: JSON.stringify(body ?? {}),
+    }),
+
+  sonarrQueue: (params?: { match_id?: number | null }) => {
+    const q = new URLSearchParams();
+    if (params?.match_id != null) q.set('match_id', String(params.match_id));
+    const qs = q.toString();
+    return request<{
+      items: Array<{
+        tvdb_id: number;
+        // Reverse cross-ref via Fribb — null for non-anime or when Fribb
+        // has no entry for this (tvdb_id, season). Lets the library-grid
+        // cover-card pills match AniDB-only cards (which don't carry
+        // their own TVDB id on `item.providers`).
+        anidb_aid: number | null;
+        season: number;
+        episode_number: number;
+        episode_title: string | null;
+        // "queued" | "searching" | "downloading" | "importing" |
+        // "completed" | "failed" | "warning" — see _normalize_status
+        // in backend/kira/integrations/sonarr.py for the source of truth.
+        status: string;
+        progress_pct: number;   // 0..100
+        eta_seconds: number | null;
+        size_bytes: number | null;
+        size_left_bytes: number | null;
+        release_title: string | null;
+        protocol: string | null;
+        error_message: string | null;
+        download_client: string | null;
+        // Sonarr's own identifiers — opaque tokens we pass back to
+        // /retry-import when the user clicks "Force import" on a stuck
+        // entry. queue_id is the row id; download_id is the torrent
+        // hash / NZB id.
+        queue_id: number | null;
+        download_id: string | null;
+        // True when Sonarr's status messages indicate the "Downloaded
+        // - Unable to Import Automatically" trap. The popup uses this
+        // to render a distinct "Stuck — manual import needed" banner
+        // + "Force import" button instead of the generic Warning UI.
+        needs_manual_import: boolean;
+      }>;
+      cached_at: number;  // Unix seconds; the snapshot's freshness moment
+    }>(`/integrations/sonarr/queue${qs ? `?${qs}` : ''}`);
+  },
+
+  /** Preview what Sonarr would do for a stuck import — surfaces the
+   *  source path, destination root, and episode mapping BEFORE the
+   *  user authorises the import. The Force Import confirmation modal
+   *  calls this so the user knows exactly what's about to happen
+   *  physically on disk (preventing data-loss surprises like the
+   *  AoT S01E05/E06 incident). */
+  sonarrPreviewImport: (downloadId: string) =>
+    request<{
+      ok: boolean;
+      candidates: Array<{
+        source_path: string;
+        destination_root: string;
+        series_title: string;
+        series_id: number;
+        episode_labels: string[];
+        episode_ids: number[];
+        quality_name: string | null;
+        release_group: string | null;
+        rejection_reasons: string[];
+      }>;
+      detail: string | null;
+    }>(`/integrations/sonarr/preview-import?download_id=${encodeURIComponent(downloadId)}`),
+
+  /** Force Sonarr past a "Downloaded - Unable to Import Automatically"
+   *  state. Sonarr's grab history already knows the right (series,
+   *  episode) mapping; its automatic-import safety check refused to
+   *  act on it. This call hits Sonarr's manual-import API with the
+   *  mapping Sonarr ALREADY computed — Sonarr accepts and processes
+   *  the import.
+   *
+   *  Returns `imported_count` files Sonarr accepted (usually 1 per
+   *  call), `command_id` for Sonarr's async-command tracking, a
+   *  `detail` field with the human-readable outcome, and (when
+   *  Sonarr's history confirms the import within ~2s) a
+   *  `destinations` list of actual destination paths the file
+   *  landed at. If Sonarr accepted but no history record appears,
+   *  `history_warning` carries the diagnostic. */
+  sonarrRetryImport: (body: { download_id: string; import_mode?: 'Copy' | 'Move' | 'Hardlink' | 'Auto' }) =>
+    request<{
+      ok: boolean;
+      imported_count: number;
+      command_id: number | null;
+      detail: string | null;
+      destinations: string[] | null;
+      history_warning: string | null;
+    }>('/integrations/sonarr/retry-import', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
   rename: (body: { file_ids: number[]; profile: string; op: string; library_root?: string; dry_run?: boolean; overwrite?: boolean }) =>
     request<{
       succeeded: number;
@@ -323,6 +538,7 @@ export interface ApiHistoryEntry {
   operation: string;
   media_type: string | null;
   title: string | null;
+  episode_title: string | null;
   poster_url: string | null;
   created_at: string;
   undone_at: string | null;

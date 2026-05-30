@@ -175,3 +175,73 @@ def route_file_to_cour(
         if c_start <= file_episode <= c_end:
             return c_aid, file_episode - c_offset
     return None
+
+
+async def route_file_to_cour_precise(
+    table: list[tuple[int, int, int, int]] | None,
+    file_episode: int | None,
+    *,
+    provider: str = "",
+    top_provider_id: str = "",
+    parsed_season: int | None = None,
+) -> tuple[int, int] | None:
+    """Cour routing: summed-count table FIRST, ScudLee only to fill gaps.
+
+    The summed-episode-count offset table (`route_file_to_cour`) is authoritative
+    for CONTIGUOUS cours — which is the overwhelmingly common case (Bleach TYBW,
+    AoT Final Season, etc.: Cour 1 = eps 1-13, Cour 2 = 14-26, …). We trust it
+    first.
+
+    ScudLee's `anime-lists` XML is consulted ONLY when the table can't place the
+    episode (it falls outside every contiguous cour range — a mid-season special
+    insert or an offset cour the summed-count math doesn't model). Even then we
+    accept ScudLee's answer only when it lands on one of THIS franchise's sibling
+    cours already in `table`.
+
+    Why not ScudLee-first: ScudLee maps many cours via a FLAT
+    `defaulttvdbseason + episodeoffset` form with no end bound, so when several
+    cours share one TVDB season its resolver returns the FIRST cour's AID for
+    EVERY episode — which silently collapsed all of Bleach/AoT onto Cour 1 and
+    orphaned everything past Cour 1's episode count. Table-first makes this a
+    strict, safe refinement: it can only place episodes the table left None,
+    never override a correct contiguous routing.
+
+    In-memory after first use (ScudLee XML cached 24 h on disk); sourced from
+    GitHub, not AniDB → safe during an AniDB ban. `resolve_tvdb_to_anidb` never
+    raises.
+    """
+    # 1. Authoritative summed-count routing for contiguous cours.
+    base = route_file_to_cour(table, file_episode)
+    if base is not None:
+        return base
+
+    # 2. Only reached when the table couldn't place the episode. ScudLee may
+    #    have an explicit mapping for it (special insert / offset cour).
+    if (
+        table
+        and provider == "anidb"
+        and parsed_season is not None
+        and file_episode is not None
+    ):
+        try:
+            top_aid = int(top_provider_id)
+        except (ValueError, TypeError):
+            top_aid = None
+        if top_aid is not None:
+            try:
+                from kira.providers.anime_mappings import AnimeMappings
+                tvdb_id = await AnimeMappings.tvdb_id(top_aid)
+            except Exception:
+                tvdb_id = None
+            if tvdb_id is not None:
+                try:
+                    from kira.providers.anime_lists import resolve_tvdb_to_anidb
+                    scud = await resolve_tvdb_to_anidb(tvdb_id, parsed_season, file_episode)
+                except Exception:
+                    scud = None
+                if scud is not None:
+                    s_aid, s_ep = scud
+                    table_aids = {c_aid for _, _, c_aid, _ in table}
+                    if s_aid in table_aids and s_ep >= 1:
+                        return s_aid, s_ep
+    return None

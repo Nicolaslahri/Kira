@@ -6,6 +6,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class ScanCreate(BaseModel):
     root_path: str
+    # Bug A fix: optional list of additional roots to walk in the same
+    # scan. When non-empty, the worker walks `root_paths`; when empty/
+    # null, it walks only `root_path` (preserves the pre-Bug-A API
+    # contract). The primary `root_path` is the one stored on the
+    # Scan history row for display — the worker still walks the full
+    # set so files under any configured watch folder land in the same
+    # scan. Callers should include `root_path` as the first element of
+    # `root_paths` when both are sent.
+    root_paths: list[str] | None = None
 
 
 class ScanOut(BaseModel):

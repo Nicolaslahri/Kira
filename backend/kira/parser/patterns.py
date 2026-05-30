@@ -23,6 +23,10 @@ class SxEMatch:
     # (e.g. P3b `YEAR-NN`), surface it here so parse_filename can promote it
     # into ParsedFile.year. None for patterns that don't embed a year.
     year_hint: int | None = None
+    # When the matched pattern carried an anime "Part N" / "Cour N" token
+    # (e.g. PB `Part 3 - 01`), surface the cour so parse_filename can route
+    # split-cour anime to the right sibling AID. None for non-cour patterns.
+    cour: int | None = None
 
 
 # 1. Standard SxxExx (highest confidence, handles multi-episode).
@@ -46,6 +50,52 @@ _P2_X = re.compile(r"\b(\d{1,2})x(\d{1,3})\b", re.IGNORECASE)
 
 # 3. Verbose "Season N Episode M".
 _P3_VERBOSE = re.compile(r"\bSeason\s*(\d{1,2}).*?Episode\s*(\d{1,3})\b", re.IGNORECASE)
+
+# 3c. Named-season dash-episode "Season N-MM" / "Season N - MM".
+#     The bare "2-06" in "Attack on Titan Season 2-06" matches NO existing
+#     SxE pattern: P4 (anime dash) needs a space or letter before the dash
+#     ("- 06" or "Title-06"), but "2-06" has a digit before the dash; P6
+#     (compressed) needs 3-4 contiguous digits. So the file parsed with
+#     episode=None and the matcher fell back to the most-similar AoT entry,
+#     scattering Season-2 files into the Season-1 card. The literal "Season"
+#     keyword makes this an unambiguous (season, episode) signal. We deliver
+#     a real season number too, which the AnimeSeasonOrdinalMetric then uses
+#     to route the file to the correct per-season AID.
+_PA_SEASON_DASH = re.compile(
+    r"\bSeason\s+(\d{1,2})\s*-\s*(\d{1,3})\b",
+    re.IGNORECASE,
+)
+
+# 3d. Anime cour dash-episode "Part N-MM" / "Cour N - MM".
+#     "Shingeki no Kyojin - The Final Season Part 3 - 01" / "...Part 3-01".
+#     "Part N" / "Cour N" is anime's sub-season chunk — AniDB splits it into
+#     its own AID while TVDB lumps the parts under one season. We capture the
+#     episode AND the cour (so cour_routing can pick the right sibling AID),
+#     and anchor match_span at "Part"/"Cour" so _extract_title cuts the noise
+#     but keeps the real title qualifier (e.g. "The Final Season" survives —
+#     it's AniDB's actual title for that AID and trigram-matches it directly).
+#     season is left None: we don't know the franchise's season count here;
+#     Fribb / the episode-list gate resolves the AID.
+_PB_PART_DASH = re.compile(
+    r"\b(?:Part|Cour)\s+(\d{1,2})\s*-\s*(\d{1,3})\b",
+    re.IGNORECASE,
+)
+
+# Specials / OVA / OAV / ONA / SP → season 0 (Plex / Jellyfin "Specials").
+#   "Bleach Special 05", "Attack on Titan OVA", "Naruto SP01", "Show OAV-3".
+#   NOTE: "S00E01" is already handled by P1 (season 0); these cover the
+#   word/abbreviation forms the reference renamer recognizes that no other pattern catches.
+#
+# Two regexes so we can require a NUMBER after the high-collision word
+# "Special" (blocks "Special Edition" / "Special Forces" / the movie
+# "Special 26") while still accepting a bare "OVA"/"OAV"/"ONA" (those are
+# almost never real title words). A title-before guard in extract_sxe rejects
+# a leading marker so "Special 26" the movie isn't read as a special episode.
+_PSPECIAL_NUM = re.compile(
+    r"\b(?:Specials?|OVA|OAV|ONA|SP)\s*[-:]?\s*(\d{1,3})\b",
+    re.IGNORECASE,
+)
+_PSPECIAL_BARE = re.compile(r"\b(?:OVA|OAV|ONA)\b", re.IGNORECASE)
 
 # 3b. Release-year + episode in `YEAR-NN` form (e.g. `[aL].Sousou.no.Frieren.2023-01`).
 #     Some BD reissue groups (notably `[aL]`, certain `[Erai-raws]` re-encodes,
@@ -100,6 +150,16 @@ _P4_ANIME_DASH = re.compile(r"(?:(?:^|\s)-\s*|(?<=[A-Za-z])-)(\d{1,4})(?:v\d+)?(
 #    series (e.g. One Piece live-action 2023 instead of the 1999 anime).
 _P5_EPISODE_ONLY = re.compile(r"\b[Ee][Pp]?\s*(\d{1,4})\b")
 
+# 5b. Bracketed absolute episode: `[1158]`, `[03]`, `[247]`.
+#     Anime fansubs use this shape for absolute episode numbers on
+#     long-runners and standalone OVAs (`[SubsPlease] Frieren - [1158].mkv`).
+#     The format-stripper's `_looks_like_metadata` preserves pure 2-4
+#     digit brackets so they survive into the cleaned name; without
+#     this pattern they'd still be discarded by `_extract_title` as
+#     bracket noise. Confidence parity with P4 (anime-dash) since both
+#     are explicit absolute markers.
+_P5B_BRACKET_ABS = re.compile(r"\[(\d{2,4})\]")
+
 # 6. Compressed 3-4 digit (105 → S1E05). Lowest-confidence pattern;
 #    anchored to END-of-cleaned-name so a year-like number mid-title
 #    ("The 1492 Project", "Cyberpunk 2077") doesn't get mis-parsed as SxE.
@@ -108,6 +168,18 @@ _P6_COMPRESSED = re.compile(r"(?:^|[\s._\-])(\d{3,4})\s*$")
 
 # 7. "1 of 12" fractional.
 _P7_OF = re.compile(r"\b(\d{1,3})\s*of\s*(\d{1,3})\b", re.IGNORECASE)
+
+
+def _has_title_before(name: str, start: int) -> bool:
+    """True when there's real title text before position `start`.
+
+    Used to reject a leading special-marker that's actually a title word —
+    "Special 26" (the movie) / "OVA" as a standalone name should NOT be read
+    as a season-0 episode. A genuine special is "<Series> Special 05", where
+    "Special" follows the series name.
+    """
+    before = name[:start].strip(" .-_[]()")
+    return len(before) >= 2 and any(c.isalpha() for c in before)
 
 
 def extract_sxe(name: str) -> SxEMatch | None:
@@ -138,6 +210,48 @@ def extract_sxe(name: str) -> SxEMatch | None:
         if _sane(s, e):
             return SxEMatch(s, e, confidence=0.85, pattern="Season X Episode Y", match_span=m.span())
 
+    # PA — "Season N-MM" dash-episode (named-season form). Runs before P4 so
+    # the match_span covers the whole "Season N-MM" token and _extract_title
+    # cuts the title cleanly. High confidence — the literal "Season" keyword
+    # plus a dash-episode is unambiguous.
+    m = _PA_SEASON_DASH.search(name)
+    if m:
+        s = int(m.group(1))
+        e = int(m.group(2))
+        if _sane(s, e):
+            return SxEMatch(s, e, confidence=0.88, pattern="Season N-MM", match_span=m.span())
+
+    # PB — "Part N-MM" / "Cour N-MM" anime cour dash-episode. Runs before P4
+    # so "Part 3 - 01" is consumed as (episode=1, cour=3) instead of P4
+    # grabbing just "- 01" and leaving "Part 3" glued into the title.
+    # Reject an unpadded single-digit episode ("Part 2 - 5") the same way P4
+    # does — anime fansubs pad ("- 05"), and a bare "- 5" after "Part 2" is
+    # more likely a movie-title fragment than a cour episode.
+    m = _PB_PART_DASH.search(name)
+    if m:
+        cour = int(m.group(1))
+        e_str = m.group(2)
+        e = int(e_str)
+        if 1 <= e <= 2000 and 1 <= cour <= 10 and not (len(e_str) == 1 and e < 10):
+            return SxEMatch(None, e, cour=cour, confidence=0.80,
+                            pattern="Part N-MM", match_span=m.span())
+
+    # PSPECIAL — Specials / OVA / OAV / ONA / SP → season 0. Runs after the
+    # standard + named-season patterns (a real SxE wins) but before P4/P5/P6
+    # so "Special 105" isn't read as compressed S1E05 and "OVA 3" isn't
+    # grabbed as absolute 3. The title-before guard rejects a leading marker
+    # (a bare "Special 26" / "OVA" at position 0 is a title, not an episode).
+    m = _PSPECIAL_NUM.search(name)
+    if m and _has_title_before(name, m.start()):
+        e = int(m.group(1))
+        if 1 <= e <= 500:
+            return SxEMatch(season=0, episode=e, confidence=0.68,
+                            pattern="special", match_span=m.span())
+    m = _PSPECIAL_BARE.search(name)
+    if m and _has_title_before(name, m.start()):
+        return SxEMatch(season=0, episode=1, confidence=0.60,
+                        pattern="special bare", match_span=m.span())
+
     # P3b — `<year>-<episode>` ([aL] style: `Sousou.no.Frieren.2023-01`).
     # Runs before P4 (anime dash) so a file with both a year-ep tail and a
     # dash-number elsewhere prefers the more specific signal. Only one
@@ -160,11 +274,25 @@ def extract_sxe(name: str) -> SxEMatch | None:
     # anime fansubs almost universally pad to at least 2 digits ("- 04"),
     # while movie titles do not. Reject unpadded single digits here so a
     # franchise sequel doesn't get force-classified as anime episode 4.
+    #
+    # Year-range guard: "Toy Story - 1995", "Tron - 1982", "Twilight -
+    # New Moon - 2009" use the dash-year suffix as a Radarr-style
+    # release-year decorator, NOT as an episode marker. 4-digit values
+    # in the year window are rejected so the extract_year pass can
+    # pick them up as the release year and the matcher routes the file
+    # as a movie. Real long-running anime never hits the 1900-2099
+    # window (One Piece ~1100, Pokémon ~1200 — multiple decades of
+    # headroom). Same logic mirrors the P5B bracket-abs and P6
+    # compressed-SxE year guards we already apply elsewhere.
     m = _P4_ANIME_DASH.search(name)
     if m:
         digit_str = m.group(1)
         abs_ep = int(digit_str)
-        if 1 <= abs_ep <= 9999 and not (len(digit_str) == 1 and abs_ep < 10):
+        if (
+            1 <= abs_ep <= 9999
+            and not (len(digit_str) == 1 and abs_ep < 10)
+            and not (1900 <= abs_ep <= 2099)
+        ):
             return SxEMatch(None, abs_ep, absolute=abs_ep, confidence=0.70,
                             pattern="anime -NN", match_span=m.span())
 
@@ -182,22 +310,55 @@ def extract_sxe(name: str) -> SxEMatch | None:
             return SxEMatch(None, e, absolute=abs_hint, confidence=0.60,
                             pattern="EpNN", match_span=m.span())
 
+    # P5B — bracketed absolute episode `[1158]` (anime fansub convention).
+    # Year-range guard: 1900-2049 four-digit values are almost certainly
+    # release years (`[YTS] Dune [2021].mkv`, `[aL] Akira [1988].mkv`) NOT
+    # episode 2021 or 1988. Skipping that range loses no legitimate
+    # episodes — One Piece is the longest at ~1100, Pokémon ~1200, real
+    # absolute-numbered anime never reaches the 1900-2049 window. Lets
+    # `extract_year` later consume `[2021]` as the release year cleanly.
+    m = _P5B_BRACKET_ABS.search(name)
+    if m:
+        e = int(m.group(1))
+        if 1 <= e <= 9999 and not (1900 <= e <= 2049):
+            return SxEMatch(None, e, absolute=e, confidence=0.70,
+                            pattern="bracket abs", match_span=m.span())
+
     # P7 — "N of M"
     m = _P7_OF.search(name)
     if m:
         e = int(m.group(1))
         return SxEMatch(None, e, confidence=0.55, pattern="N of M", match_span=m.span())
 
-    # P6 — compressed 105 → S1E05 (last resort, lowest confidence)
+    # P6 — compressed 105 → S1E05 (last resort, lowest confidence).
+    #
+    # Year-as-title guard for 4-digit values: numbers ≥ 1900 at the
+    # end of a cleaned name are almost always release years embedded
+    # mid-title OR sci-fi title-years, NOT compressed SxE codes:
+    #   - `3022.mkv` → would parse as S30E22 (a movie titled "3022")
+    #   - `Dracula 3000.mkv` → would parse as S30E0
+    #   - `The.Year.3000.mkv` → would parse as S30E0
+    #   - `Cyborg 2087.mkv` → would parse as S20E87
+    #   - `Show.1984.mkv` → would parse as S19E84 (historical title)
+    # The strict `_sane` cap of `season ≤ 30` was too permissive: S30
+    # was accepted even though no TV show actually uses compressed
+    # `SS|EE` notation at 30 seasons (they'd use explicit SxxExx).
+    # Real compressed 4-digit SxE files sit below 1900 (rare anyway —
+    # the natural ceiling is `S18E99` = 1899 for a hypothetical 18-
+    # season run; most users write `S08E12` not `0812`). When the
+    # guard fires, the file falls through to no-SxE-match → the year
+    # extractor downstream gets first crack at the 4-digit number,
+    # which is what we want.
     m = _P6_COMPRESSED.search(name)
     if m:
         digits = m.group(1)
+        parsed: tuple[int, int] | None = None
         if len(digits) == 3:
-            s, e = int(digits[0]), int(digits[1:])
-        else:  # 4 digits
-            s, e = int(digits[:2]), int(digits[2:])
-        if _sane(s, e, strict=True):
-            return SxEMatch(s, e, confidence=0.35, pattern="compressed", match_span=m.span())
+            parsed = (int(digits[0]), int(digits[1:]))
+        elif len(digits) == 4 and int(digits) < 1900:
+            parsed = (int(digits[:2]), int(digits[2:]))
+        if parsed is not None and _sane(*parsed, strict=True):
+            return SxEMatch(*parsed, confidence=0.35, pattern="compressed", match_span=m.span())
 
     return None
 

@@ -7,7 +7,7 @@ their normalized titles, that's a much stronger identity signal than any
 individual filename. Score the *cluster signal* against candidates, not
 each file independently.
 
-Algorithm (inspired by FileBot's CommonSequenceMatcher.firstCommonSequence,
+Algorithm (inspired by the reference renamer's CommonSequenceMatcher.firstCommonSequence,
 re-implemented from the algorithmic description — no Java code copy):
 
   1. Normalize every input title (lowercase, strip punctuation, collapse

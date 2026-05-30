@@ -38,11 +38,3 @@ export function cacheSet<T>(key: string, value: T): void {
     // get the instant-paint benefit. Don't disturb the UI.
   }
 }
-
-export function cacheRemove(key: string): void {
-  try {
-    localStorage.removeItem(PREFIX + key);
-  } catch {
-    /* */
-  }
-}

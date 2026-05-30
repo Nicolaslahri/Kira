@@ -101,6 +101,12 @@ async def init_db() -> None:
         # Default null means "no variant"; backfill happens lazily as files
         # are re-scanned or auto-healed.
         await _ensure_column(conn, "media_files", "variant_key", "VARCHAR")
+        # Tier 1.2: `parent_id` on rename_history — links sidecar rows
+        # (subtitles, etc.) back to their parent video's history row so
+        # cascading undo restores the whole bundle together. Pre-1.2
+        # rows stay NULL (interpreted as "standalone"), perfectly
+        # backward-compatible.
+        await _ensure_column(conn, "rename_history", "parent_id", "INTEGER")
         # Idempotent backfills: cheap when there's nothing to fix, so we run
         # them every boot rather than gating on "just-added the column".
         await _backfill_series_keys(conn)

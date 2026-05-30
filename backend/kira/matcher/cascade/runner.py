@@ -15,6 +15,8 @@ non-anime TVDB results from anime search results.
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,7 +27,10 @@ from kira.matcher.cascade.types import (
     Metric,
     MetricResult,
     MetricTier,
+    clamp_to_tier,
 )
+
+_funnel_log = logging.getLogger("kira.matcher.funnel")
 
 
 # Tied candidates within this delta at the top of the tier-1 band are
@@ -42,6 +47,58 @@ _AMBIGUITY_EPSILON = 0.01
 # identified candidates collide, which is the dangerous case (Bleach
 # umbrella AID vs the correct cour AID before the Fribb veto landed).
 _AMBIGUITY_FLOOR = TIER_BANDS[MetricTier.IDENTITY][0]
+
+
+# ── M3 Observer Mode (Pattern A) ────────────────────────────────────────────
+# Scoring changes touch every file, so instead of flipping the funnel blind we
+# compute a CANDIDATE rebalanced score side-by-side and log where it would
+# change the top pick — without ever using it. Enable with KIRA_FUNNEL_OBSERVER.
+# Read per-call (cheap dict lookup) so tests + ops can toggle without reimport.
+_OBSERVER_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _observer_on() -> bool:
+    return os.environ.get("KIRA_FUNNEL_OBSERVER", "").strip().lower() in _OBSERVER_TRUTHY
+
+
+# String-distance metrics overlap (all measure edit distance over the same two
+# strings), so the current MAX-per-tier is correct FOR THEM. The hypothesis the
+# shadow tests: metrics from DIFFERENT families that independently agree should
+# nudge confidence up — the reference renamer's funnel rewards corroboration, ours doesn't.
+_STRING_FAMILY = {"trigram", "levenshtein", "lcs"}
+_AGREEMENT_BONUS = 0.15  # fraction of the 2nd-best independent signal added
+
+
+def _shadow_tier2_raw(results: list[MetricResult]) -> float:
+    """Rebalanced tier-2 raw: the string-distance metrics collapse to one family
+    vote; every other tier-2 metric is an independent vote. A second independent
+    vote adds a bounded bonus. Output is still clamped below the tier-1 floor by
+    the caller, so the tier hierarchy is preserved."""
+    t2 = [r for r in results if r.tier == MetricTier.SIMILARITY and r.raw > 0]
+    if not t2:
+        return 0.0
+    string_max = max((r.raw for r in t2 if r.metric in _STRING_FAMILY), default=0.0)
+    votes = [r.raw for r in t2 if r.metric not in _STRING_FAMILY]
+    if string_max > 0:
+        votes.append(string_max)
+    votes.sort(reverse=True)
+    top = votes[0]
+    second = votes[1] if len(votes) > 1 else 0.0
+    return min(1.0, top + _AGREEMENT_BONUS * second)
+
+
+def _shadow_final(results: list[MetricResult], tier_1_max: float, tier_3_max: float) -> float:
+    """The score the rebalanced funnel WOULD produce. Tier-1 still wins outright
+    (identity is identity); only the tier-2/3 blend changes via the agreement
+    bonus. Never used to drive behavior — logged for comparison only."""
+    if tier_1_max > 0:
+        return min(1.0, tier_1_max)
+    s_t2 = clamp_to_tier(_shadow_tier2_raw(results), MetricTier.SIMILARITY)
+    if s_t2 > 0 or tier_3_max > 0:
+        weighted = (0.7 * s_t2 + 0.3 * tier_3_max) if tier_3_max > 0 else s_t2
+    else:
+        weighted = 0.0
+    return min(1.0, weighted)
 
 
 @dataclass
@@ -132,11 +189,13 @@ class Cascade:
                 metrics=results,
             )
 
+        shadow = _shadow_final(results, tier_1_max, tier_3_max) if _observer_on() else None
         return CascadeTrace(
             final_score=min(1.0, final),
             dominant_metric=dom.metric,
             dominant_tier=dom.tier,
             metrics=results,
+            shadow_score=shadow,
         )
 
     async def score_all(
@@ -188,6 +247,33 @@ class Cascade:
                 for t in tied:
                     t.is_ambiguous = True
 
+        # ── M3 Observer Mode: log when the rebalanced funnel WOULD have chosen
+        # a different top candidate. Behavior is unchanged — `final_score`
+        # still drives the ranking; we only record the disagreement so a future
+        # flip can be justified by real data rather than a guess.
+        if _observer_on() and len(traces) >= 2:
+            try:
+                cur_i = max(range(len(traces)), key=lambda i: traces[i].final_score)
+                sh_i = max(
+                    range(len(traces)),
+                    key=lambda i: (
+                        traces[i].shadow_score if traces[i].shadow_score is not None else -1.0
+                    ),
+                )
+                if cur_i != sh_i and (traces[sh_i].shadow_score or 0.0) > 0.0:
+                    cc, sc = candidates[cur_i], candidates[sh_i]
+                    _funnel_log.info(
+                        "funnel_diverge media=%s current=%s:%r(%.3f) "
+                        "shadow=%s:%r(now=%.3f shadow=%.3f)",
+                        getattr(ctx.parsed, "media_type", "?"),
+                        getattr(cc, "provider_id", "?"), (getattr(cc, "title", "") or "")[:40],
+                        traces[cur_i].final_score,
+                        getattr(sc, "provider_id", "?"), (getattr(sc, "title", "") or "")[:40],
+                        traces[sh_i].final_score, traces[sh_i].shadow_score or 0.0,
+                    )
+            except Exception:
+                pass
+
         return traces
 
 
@@ -208,6 +294,10 @@ def build_default_cascade(provider_key: str, media_type: str) -> Cascade:
     from kira.matcher.cascade.metrics.anime_tvdb_jp import AnimeTVDBJPMetric
     from kira.matcher.cascade.metrics.anime_season_ordinal import AnimeSeasonOrdinalMetric
     from kira.matcher.cascade.metrics.trigram import TrigramMetric
+    from kira.matcher.cascade.metrics.text_metrics import (
+        LevenshteinMetric, LCSMetric, NumericDistanceMetric,
+    )
+    from kira.matcher.cascade.metrics.acronym import AcronymMetric
     from kira.matcher.cascade.metrics.year_rank import YearMetric, RankMetric
 
     metrics: list[Metric] = []
@@ -232,9 +322,16 @@ def build_default_cascade(provider_key: str, media_type: str) -> Cascade:
     if media_type == "anime":
         metrics.append(FribbAuthorityMetric())
 
-    # Tier 2 — strong similarity.
+    # Tier 2 — strong similarity. The runner takes the MAX across these, so
+    # the extra string metrics (Phase 7) only help when they detect a
+    # similarity trigram missed (typos, word-order, numeric titles); they
+    # never double-count or inflate.
     metrics.append(ClusterSignalMetric())
     metrics.append(TrigramMetric())
+    metrics.append(LevenshteinMetric())
+    metrics.append(LCSMetric())
+    metrics.append(NumericDistanceMetric())
+    metrics.append(AcronymMetric())
     if media_type == "anime" and provider_key == "tvdb":
         metrics.append(AnimeTVDBJPMetric())
     if media_type == "anime":

@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import math
 import re as _engine_re
 from dataclasses import dataclass
 from pathlib import Path as _EnginePath
 
 import httpx
 
-from kira.matcher.similarity import trigram_similarity
+from kira.matcher.acronyms import KNOWN_ACRONYMS, is_acronym_shaped
+from kira.matcher.similarity import normalize, trigram_similarity
 from kira.parser import ParsedFile
 from kira.providers import build_provider
 from kira.providers.base import (
@@ -172,73 +172,6 @@ class ProviderRegistry:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Scoring
-# ──────────────────────────────────────────────────────────────────────────
-
-
-def score_match(
-    parsed: ParsedFile,
-    result: MovieResult | TVResult,
-    rank: int,
-    total_results: int,
-) -> float:
-    """Weighted-sum confidence in [0, 1].
-
-    Weighting redistributes when the year signal is unavailable: rather
-    than charging a 0.125 "neutral year" penalty (0.5 × 0.25 weight),
-    the title weight expands to absorb the missing slice. A perfectly-
-    matched title with no year-in-filename now scores ~0.95 instead of
-    capping at 0.875.
-    """
-
-    # 1. Title similarity (trigram) — score against EVERY known title for the
-    #    result (display name + aliases) and keep the best. Without this, an
-    #    anime whose canonical English display title doesn't share much with
-    #    the parsed filename (e.g. "Rent-a-Girlfriend") loses to a worse
-    #    series whose display title coincidentally resembles the parsed text
-    #    ("Kanojo x Kanojo x Kanojo" matched against "Kanojo Okarishimasu").
-    candidates: list[str] = [result.title]
-    aliases = getattr(result, "aliases", None) or []
-    candidates.extend(aliases)
-    title_sim = max(trigram_similarity(parsed.title, c) for c in candidates if c)
-
-    # 2. Rank — first result gets full credit, decays gently.
-    rank_score = 1.0 / math.log2(rank + 2)  # rank=0 → 1.0, rank=1 → 0.63, rank=4 → 0.39
-
-    # 3. Year — only weight it when both sides have one. Otherwise the
-    #    missing-year penalty unfairly clips high-quality matches.
-    if parsed.year is None or result.year is None:
-        return min(1.0, 0.80 * title_sim + 0.20 * rank_score)
-
-    year_diff = abs(parsed.year - result.year)
-    if year_diff == 0:
-        year_score = 1.0
-    elif year_diff == 1:
-        year_score = 0.6
-    elif year_diff == 2:
-        year_score = 0.2
-    else:
-        year_score = 0.0
-
-    score = 0.55 * title_sim + 0.25 * year_score + 0.20 * rank_score
-
-    # HARD year-gap reject for movies: a "Wuthering Heights 2026" file
-    # matching to "Wuthering Heights 2011" (15-year gap) is almost
-    # certainly wrong — usually means the newer release isn't on TMDB yet
-    # and we fell back to an old version with the same name. The 0.55
-    # MIN_CONFIDENCE floor in MatchEngine.match() then drops it cleanly.
-    # TV gets a more lenient cap (3-year gap) because production year
-    # vs first-aired year drift legitimately exists for international
-    # releases (Japanese anime aired in JP in year X, TMDB index year X+2).
-    if parsed.media_type == "movie" and year_diff >= 3:
-        score = min(score, 0.40)
-    elif parsed.media_type in ("tv", "anime") and year_diff >= 5:
-        score = min(score, 0.40)
-
-    return min(1.0, score)
-
-
-# ──────────────────────────────────────────────────────────────────────────
 # Engine
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -248,6 +181,12 @@ class MatchEngine:
 
     def __init__(self, registry: ProviderRegistry):
         self.registry = registry
+        # Scan.4: provider failures seen during this engine's lifetime (one
+        # entry per provider — FIRST error wins so we don't spam). The scan
+        # worker reads this after matching and raises a Notification, so a
+        # bad/missing API key or a down provider shows up as a clear warning
+        # instead of silently marking every file no_match.
+        self.provider_errors: dict[str, str] = {}
 
     # Confidence above which we trust the preferred provider's top hit and
     # stop trying fallbacks. Below this, we keep going and merge results
@@ -277,19 +216,45 @@ class MatchEngine:
     async def match(self, parsed: ParsedFile, limit: int = 5) -> list[ScoredMatch]:
         if parsed.media_type == "music":
             return []  # handled by separate AudioProvider path (future)
+
+        provider_order = PROVIDER_PREFERENCE.get(parsed.media_type, [])
+
+        # Phase 14: explicit embedded provider ID → resolve directly, skip
+        # title search entirely. Runs BEFORE the title guard because an
+        # ID-tagged file may have a junk/empty title (that's WHY it carries
+        # an ID). Only directly-resolvable providers (tmdb/tvdb/anidb); an
+        # imdb-only tag is recorded but needs a /find call we don't do yet.
+        ids = getattr(parsed, "provider_ids", None) or {}
+        if ids:
+            bypass = await self._match_by_embedded_id(parsed, provider_order, ids)
+            if bypass:
+                return bypass[:limit]
+
         if not parsed.title:
             return []
 
         all_scored: list[ScoredMatch] = []
-        provider_order = PROVIDER_PREFERENCE.get(parsed.media_type, [])
         for key in provider_order:
             if not self.registry.has(key):
                 continue
             try:
                 scored = await self._match_with(key, parsed)
+            except ProviderPermanentError as e:
+                # Bad/missing key or invalid request — config problem the user
+                # must fix. Record it (first wins) so the scan worker surfaces
+                # a notification instead of leaving silent no-matches.
+                self.provider_errors.setdefault(key, f"authentication / configuration error ({e})")
+                print(f"matcher: provider {key} permanent error: {e!r}")
+                continue
+            except ProviderTransientError as e:
+                # Retries exhausted — provider unreachable / timing out / down.
+                self.provider_errors.setdefault(key, f"unreachable or timing out ({e})")
+                print(f"matcher: provider {key} transient error: {e!r}")
+                continue
             except Exception as e:
-                # Provider raised — keep trying the others. We do NOT
-                # discard previously-gathered scored matches here.
+                # Provider raised something else — keep trying the others. We do
+                # NOT discard previously-gathered scored matches here.
+                self.provider_errors.setdefault(key, f"unexpected error ({type(e).__name__})")
                 print(f"matcher: provider {key} raised: {e!r}")
                 continue
             if not scored:
@@ -337,6 +302,33 @@ class MatchEngine:
             return []
 
         return all_scored[:limit]
+
+    async def _match_by_embedded_id(
+        self, parsed: ParsedFile, provider_order: list[ProviderKey],
+        ids: dict[str, str],
+    ) -> list[ScoredMatch]:
+        """Phase 14: resolve a file by an embedded provider ID, bypassing
+        title search. Returns a single confidence-1.0 ScoredMatch (the ID is
+        authoritative) or [] when no directly-resolvable ID is configured."""
+        is_episode = parsed.media_type in ("tv", "anime")
+        mt = "tv_episode" if is_episode else "movie"
+        for key in provider_order:
+            pid = ids.get(key)
+            if not pid or not self.registry.has(key):
+                continue
+            meta = await _basic_meta_by_id(key, str(pid), mt, self.registry)
+            title = (meta or {}).get("title") or parsed.title or f"{key}:{pid}"
+            print(f"matcher: embedded-id match {key}:{pid} -> {title!r}")
+            return [ScoredMatch(
+                provider=key, provider_id=str(pid), match_type=mt,
+                confidence=1.0, title=title,
+                year=(meta or {}).get("year"),
+                poster_url=(meta or {}).get("poster_url"),
+                overview=(meta or {}).get("overview"),
+                aliases=(meta or {}).get("aliases"),
+                raw={"embedded_id": key},
+            )]
+        return []
 
     async def _match_with(self, key: ProviderKey, parsed: ParsedFile) -> list[ScoredMatch]:
         provider = self.registry.build(key)
@@ -1007,6 +999,54 @@ async def _route_anime_absolute_to_aid(
     return [rewritten] + scored[1:]
 
 
+async def _basic_meta_by_id(
+    provider_key: ProviderKey,
+    provider_id: str,
+    match_type: str,
+    registry: "ProviderRegistry",
+) -> dict | None:
+    """Best-effort `{title, year, poster_url, overview, aliases}` for an
+    explicit provider ID — feeds the Phase 14 embedded-ID bypass.
+
+    AniDB: pure in-memory (display title + alt-titles from the loaded dump;
+    None when the dump isn't loaded — caller falls back to the parsed title).
+    TMDB / TVDB: one get-by-id details call (the detail methods now surface
+    title/year/poster_url). Returns None on any failure.
+    """
+    try:
+        provider = registry.build(provider_key)
+    except Exception:
+        return None
+    try:
+        if provider_key == "anidb":
+            from kira.providers.anidb import AniDBProvider
+            try:
+                aid = int(provider_id)
+            except (TypeError, ValueError):
+                return None
+            title = AniDBProvider._pick_display_title(aid)
+            ents = (AniDBProvider._titles or {}).get(aid) or []
+            aliases = [t for _ty, _lang, t in ents] or None
+            return {"title": title, "year": None, "poster_url": None,
+                    "overview": None, "aliases": aliases}
+        d: dict | None = None
+        if match_type == "movie" and hasattr(provider, "get_movie_details"):
+            d = await provider.get_movie_details(provider_id)
+        elif hasattr(provider, "get_tv_details"):
+            d = await provider.get_tv_details(provider_id)
+        elif hasattr(provider, "get_series_extended"):
+            d = await provider.get_series_extended(provider_id)
+        if not d:
+            return None
+        return {
+            "title": d.get("title"), "year": d.get("year"),
+            "poster_url": d.get("poster_url"), "overview": d.get("overview"),
+            "aliases": d.get("aliases"),
+        }
+    except Exception:
+        return None
+
+
 async def fetch_match_metadata(
     provider_key: ProviderKey,
     provider_id: str,
@@ -1187,6 +1227,36 @@ def _query_ladder(parsed: ParsedFile) -> list[tuple[str, bool]]:
         if q and key not in seen:
             ladder.append((q, with_year))
             seen.add(key)
+
+    # 0. Phase 12 — cluster-wide common token sequence FIRST. This is the
+    # longest run shared across EVERY filename in the batch (the reference renamer's
+    # getSeriesName behavior); it's far more robust than any single file's
+    # parsed title when some filenames are mangled ("…Final Season Part
+    # 3-01 [ ]"). Stashed on the rep parsed object by `_match_cluster`;
+    # absent for singletons (they fall straight through to the title rungs).
+    # Falls through to the per-file title rungs below if it returns nothing.
+    cluster_signal = getattr(parsed, "_cluster_signal", None)
+    if isinstance(cluster_signal, str):
+        cs = cluster_signal.strip()
+        if len(cs) >= 3:
+            if parsed.year:
+                add(cs, with_year=True)
+            add(cs, with_year=False)
+
+    # 0b. Acronym expansion (M2). A file titled just "LotR" / "GoT" / "AoT"
+    # can't be resolved by TMDB/TVDB network search — they don't expand
+    # initialisms. Add the curated full name as an early, high-priority rung.
+    # (AniDB expands acronyms itself inside search_tv via its offline index;
+    # this rung is what carries the non-anime acronyms to the other providers.)
+    for _raw in (cluster_signal, title):
+        if not isinstance(_raw, str):
+            continue
+        _rn = normalize(_raw)
+        if is_acronym_shaped(_rn) and _rn in KNOWN_ACRONYMS:
+            _exp = KNOWN_ACRONYMS[_rn]
+            if parsed.year:
+                add(_exp, with_year=True)
+            add(_exp, with_year=False)
 
     # 1. Full title + year (most specific).
     add(title, with_year=True)

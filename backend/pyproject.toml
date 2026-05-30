@@ -1,6 +1,6 @@
 [project]
 name = "kira"
-version = "0.1.0"
+version = "0.5.0"
 description = "Self-hosted, Docker-native media metadata fixer"
 requires-python = ">=3.12"
 dependencies = [
@@ -26,6 +26,17 @@ dependencies = [
     # enforces both a max entry count AND a per-entry TTL, with proper
     # async-safe access via an asyncio.Lock at the call site.
     "cachetools>=5.5",
+    # Naming-template engine (Tier 1.5). SandboxedEnvironment renders the
+    # rename templates — pipe filters, conditionals, defaults — replacing the
+    # old str.replace() loop. Sandboxed so user-authored templates can't reach
+    # Python internals.
+    "jinja2>=3.1",
+    # Phase 16: true file metadata (real resolution / codec / HDR / audio
+    # channels) read from the container headers, powering authoritative
+    # {vc}/{hdr}/{channels} naming tokens. The win_amd64 / manylinux wheels
+    # bundle the native libmediainfo; the code degrades to filename-only when
+    # the lib can't load, so this stays optional-at-runtime.
+    "pymediainfo>=6.1",
 ]
 
 [project.optional-dependencies]

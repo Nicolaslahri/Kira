@@ -26,6 +26,8 @@ from typing import Any, ClassVar
 
 import httpx
 
+from kira.providers.base import KIRA_USER_AGENT
+
 _CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache"
 _MAPPING_FILE = _CACHE_DIR / "anime-mappings.json"
 _MAPPING_URL = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json"
@@ -146,7 +148,25 @@ class AnimeMappings:
         if client is None:
             client = httpx.AsyncClient()
         try:
-            r = await client.get(_MAPPING_URL, timeout=60.0, follow_redirects=True)
+            # KI-13: GitHub's raw CDN (raw.githubusercontent.com) throttles
+            # or 403s the default `python-httpx/x.y` UA when aggregate
+            # traffic from a single IP spikes. Anidb.py learned this the
+            # hard way; the Fribb path was overlooked when the defensive
+            # header was added there. A failure here on a fresh install
+            # (no disk cache yet) means zero anime cross-reference data,
+            # which breaks AniDB → TVDB/TMDB poster cross-ref AND the
+            # Fribb-season override for anime AND the anime-rerank
+            # pipeline. Same User-Agent constant as AniDB so the two
+            # external surfaces stay in lockstep.
+            r = await client.get(
+                _MAPPING_URL,
+                headers={
+                    "User-Agent": KIRA_USER_AGENT,
+                    "Accept-Encoding": "gzip",
+                },
+                timeout=60.0,
+                follow_redirects=True,
+            )
             r.raise_for_status()
             body = r.content
 

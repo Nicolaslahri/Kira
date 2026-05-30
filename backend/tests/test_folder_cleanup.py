@@ -1,0 +1,522 @@
+"""Issue #4 from the friction audit: Plex/Jellyfin/Kodi media-server
+artifacts left in source folders after a rename used to block the
+empty-parent cleanup walk and litter the library with dangling folders.
+
+These tests exercise the artifact-cleanup helpers against the layouts
+Plex / Jellyfin / Kodi actually create. Pure filesystem operations
+against `tmp_path` — no DB, no async.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from kira.renamer.operations import (
+    FileOp,
+    _cleanup_empty_source_parents,
+    _cleanup_media_server_artifacts,
+    _is_artifact_dir,
+    _is_artifact_file,
+    execute_op,
+)
+
+
+def _touch(p: Path, content: str = "") -> Path:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    return p
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Predicate helpers — the cheapest, fastest signal that the allow-lists
+# match real-world naming.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_is_artifact_file_known_names() -> None:
+    """Every name on the curated list of Plex/Jellyfin/Kodi artwork +
+    NFO files should be recognized — case-insensitively, since Plex on
+    Windows happily writes 'Poster.jpg' with title-case."""
+    yes = [
+        "poster.jpg", "Poster.jpg", "POSTER.JPG",
+        "banner.png", "fanart.jpeg", "clearart.png", "clearlogo.png",
+        "landscape.jpg", "thumb.png", "logo.jpg",
+        "disc.jpg", "keyart.png", "characterart.jpg",
+        "folder.jpg", "cover.png",
+        "tvshow.nfo", "Tvshow.NFO",
+        "season.nfo", "movie.nfo", "show.nfo",
+        "album.nfo", "artist.nfo",
+        # Season-numbered artwork patterns
+        "season01-poster.jpg", "Season02-banner.png",
+        "season-specials-poster.jpg", "season-all-fanart.jpg",
+    ]
+    for name in yes:
+        assert _is_artifact_file(name), f"expected artifact: {name}"
+
+
+def test_is_artifact_file_keeps_user_content() -> None:
+    """User content should never be on the artifact list — these are
+    the false positives we'd be most worried about. The episode .nfo
+    case is deliberately NOT on the list (those arguably travel with
+    the video as sidecars in a future iteration)."""
+    no = [
+        # Generic media
+        "Show.S01E01.mkv", "Movie.mkv", "audio.flac",
+        # Subtitle sidecars (Kira already handles these separately)
+        "Show.S01E01.srt", "Show.S01E01.eng.ass",
+        # Per-episode NFO (different semantic from show-level tvshow.nfo)
+        "Show.S01E01.nfo",
+        # Random user files
+        "readme.txt", "notes.md", "playlist.m3u",
+        # Anything that LOOKS like a poster but isn't on the list
+        "fan_art_compilation.jpg",
+        "movieposter.jpg",  # no underscore-separation; not standard naming
+        "season1poster.jpg",  # no dash between "season1" and "poster"
+        "season01poster.jpg",  # same
+    ]
+    for name in no:
+        assert not _is_artifact_file(name), f"should not be artifact: {name}"
+
+
+def test_is_artifact_dir_known_caches() -> None:
+    """Kodi/Plex/Jellyfin cache directories that are safe to nuke."""
+    yes = [
+        ".actors", ".Actors", ".ACTORS",
+        ".metadata", "extrafanart", "extrathumbs",
+        "backdrops", "Backdrops", "metadata",
+    ]
+    for name in yes:
+        assert _is_artifact_dir(name), f"expected cache dir: {name}"
+
+
+def test_is_artifact_dir_keeps_user_dirs() -> None:
+    """Directories that could plausibly hold user content stay
+    untouched — Subs/ (manually downloaded subtitles), Extras/ /
+    Featurettes/ / Trailers/ (could be user-curated), etc."""
+    no = [
+        "Season 01", "Season 1", "Specials",
+        "Subs", "Subtitles",
+        "Extras", "Featurettes", "Trailers", "Behind The Scenes",
+        "Bonus", "Movies", "TV",
+    ]
+    for name in no:
+        assert not _is_artifact_dir(name), f"should not be cache dir: {name}"
+
+
+def test_is_artifact_file_per_episode_thumbs() -> None:
+    """The most common form of leftover garbage in real libraries:
+    per-episode/per-file artwork following the `<stem>-<type>.<ext>`
+    convention that Sonarr/Jellyfin/Plex/Kodi all use.
+
+    The first entry is the EXACT filename from the user's screenshot —
+    the regression test for the audit's Issue #4 expansion."""
+    yes = [
+        # User's actual screenshot — Sonarr per-episode thumb
+        "Frieren.Beyond.Journeys.End.S02E01.2026.2160p.IQ.WEB-DL.DDP2.0.H.265-HDSWEB-thumb.jpg",
+        # Shorter forms
+        "Show.S01E05-thumb.jpg",
+        "Show.S01E05-thumb.png",
+        "Movie (2023)-poster.jpg",
+        "Album-fanart.png",
+        "Episode-landscape.jpg",
+        "ShowName-clearart.png",
+        "Anything-clearlogo.png",
+        "Anything-keyart.jpg",
+        "Anything-characterart.jpg",
+        # Numbered alternate artwork (e.g. `-fanart-2.jpg`)
+        "Show.S01E01-fanart-2.jpg",
+        "Show.S01E01-poster-3.png",
+        # Case variants
+        "MOVIE-POSTER.JPG",
+        "Show-Thumb.PNG",
+    ]
+    for name in yes:
+        assert _is_artifact_file(name), f"expected per-file artifact: {name}"
+
+
+def test_is_artifact_file_per_file_pattern_keeps_user_content() -> None:
+    """The per-file regex is the broadest in the system — risk of
+    false positives is real. These names look related but MUST be
+    preserved. The user's stray photos / personal images live here."""
+    no = [
+        # No dash before the artwork suffix → not the convention
+        "movieposter.jpg",
+        "season01poster.jpg",
+        "fanartshot.jpg",
+        # Different extension → user's edited preview, not media-server output
+        "Movie-poster.jpg.bak",
+        "Show-thumb.jpg.tmp",
+        # Suffix is BEFORE the dash, not after → user named it weirdly
+        # but the convention is `-suffix-as-ending`
+        "thumb-extra.jpg",
+        "poster-edit.jpg",
+        # Empty stem before the dash (regex requires .+ = 1+ chars)
+        "-thumb.jpg",
+        # Title contains an artwork word but isn't the suffix
+        "fan-art.jpg",          # "art" alone isn't a recognized suffix
+        "thumbnail-list.jpg",   # "list" isn't a suffix
+        # Generic user files that happen to be jpg
+        "screenshot.jpg",
+        "vacation.jpg",
+        "DCIM_0001.jpg",
+    ]
+    for name in no:
+        assert not _is_artifact_file(name), f"should not match: {name}"
+
+
+def test_is_artifact_file_tbn_catchall() -> None:
+    """Kodi's legacy `.tbn` (binary thumbnail) format. Always an
+    artifact regardless of basename — there's no legitimate non-Kodi
+    use of `.tbn` in media libraries."""
+    yes = [
+        "Show.S01E01.tbn",
+        "Movie.tbn",
+        "Anything.TBN",   # case-insensitive
+        "x.tbn",          # bare minimum
+    ]
+    for name in yes:
+        assert _is_artifact_file(name), f"expected .tbn artifact: {name}"
+    # Wrong extension should NOT match
+    assert not _is_artifact_file("Show.S01E01.tbn.bak")
+    assert not _is_artifact_file("Show.tbnsomething.jpg")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# _cleanup_media_server_artifacts — single-directory sweep, no
+# parent-walk yet. Tests the surgical "what gets deleted in one dir"
+# behaviour.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_cleanup_single_dir_removes_artifacts(tmp_path: Path) -> None:
+    """Standard Plex-touched show folder: poster + banner + tvshow.nfo
+    + an .actors/ subdir. All four should be deleted; user content
+    (the .mkv) stays."""
+    folder = tmp_path / "Old Show"
+    _touch(folder / "poster.jpg")
+    _touch(folder / "banner.jpg")
+    _touch(folder / "tvshow.nfo", "<show>...</show>")
+    _touch(folder / ".actors" / "actor1.jpg")
+    _touch(folder / ".actors" / "actor2.jpg")
+    user_file = _touch(folder / "Show.S01E01.mkv")
+
+    count = _cleanup_media_server_artifacts(folder)
+
+    assert count == 4   # 3 files + 1 dir-as-unit
+    assert user_file.exists()
+    assert not (folder / "poster.jpg").exists()
+    assert not (folder / "banner.jpg").exists()
+    assert not (folder / "tvshow.nfo").exists()
+    assert not (folder / ".actors").exists()
+
+
+def test_cleanup_single_dir_keeps_user_subdirs(tmp_path: Path) -> None:
+    """User-curated subfolders MUST stay even when the parent contains
+    artifacts. Subs/ is the classic case — a user's manually-acquired
+    subtitle library; deleting it would be catastrophic."""
+    folder = tmp_path / "Show"
+    _touch(folder / "poster.jpg")
+    user_subs = _touch(folder / "Subs" / "manual.srt")
+    user_extras = _touch(folder / "Featurettes" / "behind.mkv")
+
+    count = _cleanup_media_server_artifacts(folder)
+
+    assert count == 1   # only poster.jpg
+    assert user_subs.exists()
+    assert user_extras.exists()
+
+
+def test_cleanup_season_numbered_artwork(tmp_path: Path) -> None:
+    """Kodi's season-NN artwork lives in the SHOW root, not the season
+    subfolder. The regex pattern needs to catch them all."""
+    folder = tmp_path / "Show"
+    season_arts = [
+        _touch(folder / "season01-poster.jpg"),
+        _touch(folder / "season02-banner.jpg"),
+        _touch(folder / "season-specials-poster.jpg"),
+        _touch(folder / "Season03-Fanart.png"),  # mixed case
+    ]
+
+    count = _cleanup_media_server_artifacts(folder)
+
+    assert count == len(season_arts)
+    for art in season_arts:
+        assert not art.exists(), f"should have been deleted: {art.name}"
+
+
+def test_cleanup_missing_dir_is_safe(tmp_path: Path) -> None:
+    """Pointing the helper at a nonexistent dir returns 0, no exception.
+    Belt-and-braces: the rename engine might call us on a path that's
+    already been rmdir'd by a sibling worker."""
+    fake = tmp_path / "does-not-exist"
+    assert _cleanup_media_server_artifacts(fake) == 0
+
+
+def test_cleanup_empty_dir_is_noop(tmp_path: Path) -> None:
+    """An empty directory has no artifacts to clean → returns 0."""
+    folder = tmp_path / "empty"
+    folder.mkdir()
+    assert _cleanup_media_server_artifacts(folder) == 0
+    assert folder.exists()  # we don't touch the dir itself
+
+
+# ─────────────────────────────────────────────────────────────────────
+# _cleanup_empty_source_parents — the parent-walk, integrating artifact
+# sweep + rmdir. This is the function that was broken before this
+# iteration: rmdir refused dirs containing artifacts, the walk stopped,
+# the user saw dangling folders.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_cleanup_per_episode_thumbs_real_scenario(tmp_path: Path) -> None:
+    """The user's actual problem: 7 per-episode `*-thumb.jpg` files left
+    behind in a season folder after the videos moved out. Pre-fix, the
+    cleanup helper didn't recognize the `<stem>-thumb.jpg` pattern, so
+    these stayed forever and prevented `rmdir` from removing the
+    parent folders.
+
+    This test uses the exact filenames from the user's screenshot."""
+    folder = tmp_path / "Frieren - Beyond Journey's End" / "Season 2"
+    folder.mkdir(parents=True)
+    real_filenames = [
+        "Frieren.Beyond.Journeys.End.S02E01.2026.2160p.IQ.WEB-DL.DDP2.0.H.265-HDSWEB-thumb.jpg",
+        "Frieren.Beyond.Journeys.End.S02E02.2026.2160p.IQ.WEB-DL.DDP2.0.H.265-HDSWEB-thumb.jpg",
+        "Frieren.Beyond.Journeys.End.S02E04.2026.2160p.IQ.WEB-DL.DDP2.0.H.265-HDSWEB-thumb.jpg",
+        "Frieren.Beyond.Journeys.End.S02E05.2026.2160p.IQ.WEB-DL.DDP2.0.H.265-HDSWEB-thumb.jpg",
+        "Frieren.Beyond.Journeys.End.S02E06.2026.2160p.IQ.WEB-DL.DDP2.0.H.265-HDSWEB-thumb.jpg",
+        "Frieren.Beyond.Journeys.End.S02E07.2026.2160p.IQ.WEB-DL.DDP2.0.H.265-HDSWEB-thumb.jpg",
+        "Frieren.Beyond.Journeys.End.S02E08.2026.2160p.IQ.WEB-DL.DDP2.0.H.265-HDSWEB-thumb.jpg",
+    ]
+    for fn in real_filenames:
+        _touch(folder / fn)
+
+    count = _cleanup_media_server_artifacts(folder)
+
+    assert count == 7
+    for fn in real_filenames:
+        assert not (folder / fn).exists(), f"should have been deleted: {fn}"
+
+
+def test_parent_walk_unwinds_through_artifacts(tmp_path: Path) -> None:
+    """The bug: `Z:\\media\\TV\\Old Show\\Season 01\\` had only
+    artifacts left after the videos moved out. Pre-fix, rmdir failed on
+    `poster.jpg`, walk stopped, the show folder stranded forever.
+    Post-fix: artifacts get swept, rmdir succeeds, walk continues up."""
+    library = tmp_path / "media"
+    show = library / "TV" / "Old Show"
+    season = show / "Season 01"
+    # Both show and season hold Plex artifacts
+    _touch(show / "poster.jpg")
+    _touch(show / "tvshow.nfo")
+    _touch(show / ".actors" / "actor.jpg")
+    _touch(season / "season01-poster.jpg")
+    # The video that started the rename is gone (simulating post-move);
+    # season folder has only its season artwork now.
+
+    count = _cleanup_empty_source_parents(
+        season, stop_at=library, max_levels=2,
+    )
+
+    # 1 (season-poster) + 2 (show files: poster.jpg + tvshow.nfo)
+    # + 1 (.actors dir) = 4
+    assert count == 4
+    assert not season.exists()
+    assert not show.exists()
+    # But the library root and TV genre folder stay (stop_at + non-empty)
+    assert library.exists()
+
+
+def test_parent_walk_stops_at_user_content(tmp_path: Path) -> None:
+    """A folder with a poster + a user file → sweep removes the poster
+    but rmdir fails because the user file remains. Walk stops there,
+    counts what it cleaned."""
+    library = tmp_path / "media"
+    show = library / "Show"
+    _touch(show / "poster.jpg")
+    user_file = _touch(show / "user-notes.txt")
+
+    count = _cleanup_empty_source_parents(
+        show, stop_at=library, max_levels=2,
+    )
+
+    assert count == 1  # poster.jpg got swept
+    assert show.exists()        # rmdir refused (still has user-notes.txt)
+    assert user_file.exists()    # never touched
+    assert not (show / "poster.jpg").exists()  # artifact gone
+
+
+def test_parent_walk_stops_at_library_root(tmp_path: Path) -> None:
+    """The walk MUST stop at the stop_at boundary — we never want to
+    rmdir the user's library root even if it happens to be empty."""
+    library = tmp_path / "media"
+    show = library / "Show"
+    _touch(show / "poster.jpg")
+    # No user files anywhere — library would technically be rmdir-able
+    # all the way up if the boundary check failed.
+
+    count = _cleanup_empty_source_parents(
+        show, stop_at=library, max_levels=5,
+    )
+
+    assert count == 1
+    assert not show.exists()
+    assert library.exists()  # CRITICAL: we never touched the library root
+
+
+def test_parent_walk_max_levels_cap(tmp_path: Path) -> None:
+    """`max_levels=1` means clean exactly one parent and stop, even if
+    the next one up would also be empty."""
+    library = tmp_path / "media"
+    show = library / "Show"
+    season = show / "Season 01"
+    _touch(season / "season01-poster.jpg")
+    _touch(show / "poster.jpg")
+
+    count = _cleanup_empty_source_parents(
+        season, stop_at=library, max_levels=1,
+    )
+
+    # Only the season level got walked + cleaned
+    assert count == 1
+    assert not season.exists()
+    # Show level stayed despite being now-empty after season's removal
+    # — the level cap prevented the walk from continuing.
+    assert show.exists()
+    assert (show / "poster.jpg").exists()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# execute_op end-to-end — proves the artifact count threads back from
+# the rename engine to the caller (used by rename.py to surface in the
+# result toast).
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_execute_op_move_returns_artifact_count(tmp_path: Path) -> None:
+    """Move with cleanup_empty_source=True returns the count of
+    artifacts cleaned during the parent-walk. This is what rename.py
+    forwards into the [ARTIFACTS] note in the result message."""
+    library = tmp_path / "media"
+    show = library / "Show"
+    season = show / "Season 01"
+    src = _touch(season / "Show.S01E01.mkv", "video bytes")
+    # Plex artifacts in both season and show folders
+    _touch(season / "season01-poster.jpg")
+    _touch(show / "poster.jpg")
+    _touch(show / "tvshow.nfo")
+
+    dst = library / "library" / "Show (2020)" / "Season 01" / "Show - S01E01.mkv"
+
+    cleaned = execute_op(
+        FileOp.MOVE, src, dst,
+        cleanup_empty_source=True,
+        cleanup_stop_at=library,
+        cleanup_max_levels=2,
+    )
+
+    assert cleaned == 3  # season-poster + show-poster + tvshow.nfo
+    assert dst.exists()
+    assert not src.exists()
+    assert not season.exists()
+    assert not show.exists()
+    assert library.exists()
+
+
+def test_execute_op_returns_zero_when_cleanup_disabled(tmp_path: Path) -> None:
+    """With cleanup_empty_source=False the cleanup walker never runs,
+    no artifacts get swept, return value is 0. The artifacts stay
+    intact on disk (we don't surprise-delete metadata)."""
+    src = _touch(tmp_path / "src" / "Movie.mkv")
+    _touch(tmp_path / "src" / "poster.jpg")
+    dst = tmp_path / "dst" / "Movie.mkv"
+
+    cleaned = execute_op(
+        FileOp.MOVE, src, dst,
+        cleanup_empty_source=False,
+    )
+
+    assert cleaned == 0
+    assert (tmp_path / "src" / "poster.jpg").exists()  # untouched
+
+
+def test_execute_op_cleanup_without_artifact_sweep(tmp_path: Path) -> None:
+    """Settings sub-toggle off: master `cleanup_empty_source=True` but
+    `cleanup_artifacts=False`. The walker still runs but doesn't sweep
+    media-server artifacts — only truly-empty folders get rmdir'd.
+    User keeps Plex/Jellyfin cache files in place (their choice)."""
+    library = tmp_path / "media"
+    show = library / "Show"
+    season = show / "Season 01"
+    src = _touch(season / "Show.S01E01.mkv")
+    poster = _touch(show / "poster.jpg")
+    dst = library / "library" / "Show (2020)" / "Season 01" / "Show - S01E01.mkv"
+
+    cleaned = execute_op(
+        FileOp.MOVE, src, dst,
+        cleanup_empty_source=True,
+        cleanup_artifacts=False,  # sub-toggle OFF
+        cleanup_stop_at=library,
+        cleanup_max_levels=2,
+    )
+
+    # Season folder was genuinely empty after the move → rmdir succeeds
+    # → walk continues to show folder → poster.jpg still there → rmdir
+    # fails → walk stops. No artifacts deleted because sweep is off.
+    assert cleaned == 0
+    assert not season.exists()       # was empty, rmdir'd
+    assert show.exists()             # still has poster.jpg
+    assert poster.exists()           # user-protected by the sub-toggle
+
+
+def test_execute_op_copy_returns_zero(tmp_path: Path) -> None:
+    """COPY doesn't trigger the source-cleanup walk (the source still
+    exists), so artifact count stays 0 regardless of cleanup flag."""
+    src = _touch(tmp_path / "src" / "Movie.mkv")
+    _touch(tmp_path / "src" / "poster.jpg")
+    dst = tmp_path / "dst" / "Movie.mkv"
+
+    cleaned = execute_op(
+        FileOp.COPY, src, dst,
+        cleanup_empty_source=True,  # ignored for COPY
+    )
+
+    assert cleaned == 0
+    assert src.exists()
+    assert dst.exists()
+    assert (tmp_path / "src" / "poster.jpg").exists()
+
+
+def test_execute_op_hardlink_with_same_inode_unlinks_and_cleans(tmp_path: Path) -> None:
+    """The MOVE + already-hardlinked branch: source and dest are
+    different paths sharing one inode. execute_op unlinks the source
+    and runs the same parent-cleanup walk."""
+    # Skip on Windows/non-NTFS where hardlinks across paths can fail
+    if not hasattr(os, "link"):
+        return  # pragma: no cover
+
+    library = tmp_path / "media"
+    show = library / "Show"
+    src = _touch(show / "Show.S01E01.mkv")
+    _touch(show / "poster.jpg")
+    dst_parent = library / "library" / "Show (2020)"
+    dst_parent.mkdir(parents=True)
+    dst = dst_parent / "Show - S01E01.mkv"
+    try:
+        os.link(str(src), str(dst))
+    except OSError:
+        return  # filesystem doesn't support hardlinks (Windows ReFS,
+                # network share, etc.) — skip gracefully
+
+    cleaned = execute_op(
+        FileOp.MOVE, src, dst,
+        cleanup_empty_source=True,
+        cleanup_stop_at=library,
+        cleanup_max_levels=2,
+    )
+
+    # The original source is gone, hardlink at dst keeps the bytes,
+    # show/poster.jpg got swept during the unwind.
+    assert not src.exists()
+    assert dst.exists()
+    assert cleaned == 1
+    assert not show.exists()

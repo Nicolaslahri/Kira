@@ -393,18 +393,18 @@ export function ManualSearchModal({ file, onClose, onSelect }: {
             // Show a shimmer skeleton until each arrives so the grid doesn't
             // look broken with blank cells.
             const showAniDBShimmer = provider === 'AniDB' && !r.poster_url && !anidbApiError;
-            // Pick the 2 most-readable aliases:
-            //   1) drop ones that equal the displayed title (no echo)
-            //   2) sort by "ASCII-ness" — fraction of chars that are plain
-            //      ASCII letters — so English / romaji titles ("Kanojo,
-            //      Okarishimasu") beat localized scripts that the user
-            //      probably can't read ("Dziewczyna do wynajęcia", "辉夜大小姐").
-            const aliases = (r.aliases || [])
-              .filter(a => a && a.trim().toLowerCase() !== (r.title || '').trim().toLowerCase())
-              .map(a => ({ a, score: asciiness(a) }))
-              .sort((x, y) => y.score - x.score)
-              .slice(0, 2)
-              .map(x => x.a);
+            // Show a short overview snippet under the title instead of the
+            // old "a.k.a." alias dump. Aliases were dense and unreadable
+            // (Polish / Kanji titles for the same show); overview tells
+            // you what the show IS, which is what disambiguates "is this
+            // the right result?". Falls back to nothing when the
+            // provider didn't return an overview — cleaner cards in
+            // that case rather than a stub line.
+            const overviewSnippet = r.overview
+              ? r.overview.length > 120
+                ? r.overview.slice(0, 117).trimEnd() + '…'
+                : r.overview
+              : null;
             return (
               <div key={`${r.provider_id}-${i}`}
                 className={`search-result ${sel === r ? 'selected' : ''}`}
@@ -423,9 +423,23 @@ export function ManualSearchModal({ file, onClose, onSelect }: {
                 )}
                 <div style={{ minWidth: 0 }}>
                   <div className="search-result-title">{r.title || '—'}</div>
-                  {aliases.length > 0 ? (
-                    <div className="search-result-aliases" title={aliases.join(' · ')}>
-                      a.k.a. {aliases.join(' · ')}
+                  {overviewSnippet ? (
+                    <div
+                      className="search-result-overview"
+                      title={r.overview ?? undefined}
+                      style={{
+                        fontSize: 11.5,
+                        color: 'var(--ink-3)',
+                        lineHeight: 1.4,
+                        marginTop: 2,
+                        marginBottom: 4,
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      {overviewSnippet}
                     </div>
                   ) : null}
                   <div className="search-result-meta">
@@ -472,6 +486,30 @@ export function RenamePreviewModal({ files, onClose, onApply, defaultProfile = '
 
   const firstType = eligible[0]?.mediaType;
   const templateKey = firstType === 'tv' ? 'tv' : firstType === 'anime' ? 'anime' : firstType === 'music' ? 'music' : 'movie';
+
+  // Real dry-run preview: render the EXACT path the backend rename would
+  // write (Jinja2 engine + franchise-collapse + in-place rooting), keyed by
+  // file id. Replaces the old client-side formatPath() which used legacy
+  // {n} syntax and could disagree with what actually lands on disk. Reuses
+  // the rename endpoint with dry_run:true → same code path = guaranteed
+  // consistency. Recomputes when the shown files / profile / op change.
+  const [targets, setTargets] = useState<Record<string, string>>({});
+  const [previewLoading, setPreviewLoading] = useState(false);
+  useEffect(() => {
+    if (preview.length === 0) { setTargets({}); return; }
+    let cancelled = false;
+    setPreviewLoading(true);
+    api.rename({ file_ids: preview.map(f => Number(f.id)), profile, op, dry_run: true })
+      .then(res => {
+        if (cancelled) return;
+        const next: Record<string, string> = {};
+        for (const it of res.items) if (it.new_path) next[String(it.file_id)] = it.new_path;
+        setTargets(next);
+      })
+      .catch(() => { if (!cancelled) setTargets({}); })
+      .finally(() => { if (!cancelled) setPreviewLoading(false); });
+    return () => { cancelled = true; };
+  }, [preview, profile, op]);
 
   return (
     <Modal
@@ -527,7 +565,13 @@ export function RenamePreviewModal({ files, onClose, onApply, defaultProfile = '
           <div className="preview-arrow"><IcArrowRight /></div>
           <div className="preview-side new">
             <div className="preview-side-label">To</div>
-            <div className="preview-path">{highlightPath(formatPath(f, profile))}</div>
+            <div className="preview-path">
+              {targets[String(f.id)]
+                ? highlightPath(targets[String(f.id)].replace(/\\/g, '/'))
+                : previewLoading
+                  ? <span style={{ color: 'var(--ink-3)' }}>Computing…</span>
+                  : highlightPath(formatPath(f, profile))}
+            </div>
           </div>
         </div>
       ))}

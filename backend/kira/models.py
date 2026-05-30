@@ -12,6 +12,10 @@ class Scan(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     root_path: Mapped[str] = mapped_column(String)
+    # Who triggered this scan: "manual" (user clicked Scan) or "auto" (the
+    # watched-folders daemon). Default "manual" for back-compat with rows
+    # created before the column existed.
+    source: Mapped[str] = mapped_column(String, default="manual", server_default="manual")
     # Phases: scanning → matching → completed | completed_partial | failed: <reason>
     status: Mapped[str] = mapped_column(String, default="pending")
     file_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -130,6 +134,18 @@ class RenameHistory(Base):
     )
     match_id: Mapped[int | None] = mapped_column(
         ForeignKey("matches.id", ondelete="SET NULL"), nullable=True,
+    )
+    # ── Tier 1.2: subtitle / sidecar co-renaming ─────────────────────
+    # When a video rename brings sidecar files along (.srt, .ass, etc.),
+    # each sidecar gets its OWN RenameHistory row so the History tab
+    # accurately reflects every file that moved. The sidecar rows point
+    # back at the video's row via parent_id so undoing the video also
+    # undoes its sidecars in one shot — keeping the disk + DB picture
+    # consistent. ON DELETE SET NULL because deleting the video row
+    # shouldn't break the sidecar rows; they just become standalone
+    # entries the user can still individually undo or export.
+    parent_id: Mapped[int | None] = mapped_column(
+        ForeignKey("rename_history.id", ondelete="SET NULL"), nullable=True,
     )
     old_path: Mapped[str] = mapped_column(String)
     new_path: Mapped[str] = mapped_column(String)

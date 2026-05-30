@@ -1,0 +1,96 @@
+/* Kira global styles — Untitled UI (Tailwind v4) + coexisting legacy CSS.
+ *
+ * Layer order matters: `legacy` sits ABOVE Tailwind's preflight (`base`) so the
+ * existing hand-written screens keep their styling, but BELOW `utilities` so new
+ * Untitled UI utility classes always win on any collision (e.g. icon sizing).
+ * As each screen migrates off index.css, its section is deleted there; once
+ * index.css is empty we drop this import + the legacy layer and re-enable a
+ * plain `@import "tailwindcss"`. */
+@layer theme, base, legacy, components, utilities;
+
+@import "tailwindcss";
+@import "../index.css" layer(legacy);
+@import "./theme.css";
+@import "./typography.css";
+
+@plugin "@tailwindcss/typography";
+@plugin "tailwindcss-react-aria-components";
+@plugin "tailwindcss-animate";
+
+/* Legacy token bridge — the not-yet-migrated screens (and the current
+ * Dashboard/Topbar) use these Tailwind color utilities, which used to be
+ * mapped in tailwind.config.js. Re-declare them as v4 @theme colors pointing
+ * at the same index.css CSS vars so `bg-glass`, `text-ink`, `border-line`,
+ * `text-accent`, `text-conf-low`, etc. keep generating. Removed per-screen as
+ * each migrates to Untitled UI's own tokens. */
+@theme {
+    --color-bg: var(--bg);
+    --color-ink: var(--ink);
+    --color-ink-muted: var(--ink-2);
+    --color-ink-soft: var(--ink-3);
+    --color-ink-faint: var(--ink-4);
+    --color-line: var(--line);
+    --color-line-strong: var(--line-strong);
+    --color-glass: var(--glass);
+    --color-glass-2: var(--glass-2);
+    --color-glass-3: var(--glass-3);
+    --color-accent: var(--accent);
+    --color-accent-soft: var(--accent-soft);
+    --color-accent-line: var(--accent-line);
+    --color-accent-deep: var(--accent-deep);
+    --color-brand-a: var(--brand-a);
+    --color-brand-b: var(--brand-b);
+    --color-conf-high: var(--conf-high);
+    --color-conf-mid: var(--conf-mid);
+    --color-conf-low: var(--conf-low);
+    --color-info: var(--info);
+}
+
+@custom-variant dark (&:where(.dark-mode, .dark-mode *));
+@custom-variant label (& [data-label]);
+@custom-variant focus-input-within (&:has(input:focus));
+
+@utility scrollbar-hide {
+    /* For Webkit-based browsers (Chrome, Safari and Opera) */
+    &::-webkit-scrollbar {
+        display: none;
+        -webkit-appearance: none;
+    }
+
+    /* For IE, Edge and Firefox */
+    -ms-overflow-style: none; /* IE and Edge */
+    scrollbar-width: none; /* Firefox */
+}
+
+@utility transition-inherit-all {
+    transition-property: inherit;
+    transition-duration: inherit;
+    transition-timing-function: inherit;
+}
+
+/* Hide the default expand arrow on Safari.  */
+details summary::-webkit-details-marker {
+    display: none;
+}
+
+/* Hide default arrows from number inputs. */
+input::-webkit-outer-spin-button,
+input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+input[type="number"] {
+    -moz-appearance: textfield;
+}
+
+/* Hide the default clear button (X) from search inputs. */
+input[type="search"]::-webkit-search-cancel-button {
+    -webkit-appearance: none;
+}
+
+/* Hide the default outline on chart elements. */
+.recharts-surface,
+.recharts-surface g,
+.recharts-surface path {
+    outline: none;
+}

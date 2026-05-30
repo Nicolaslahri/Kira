@@ -1,6 +1,6 @@
 """Cascade type definitions — Metric protocol, MetricResult, CascadeTrace.
 
-Tier semantics (locked by user decision after the FileBot audit):
+Tier semantics (locked by user decision after the the reference renamer audit):
 
   Tier 1 (structural identity) → output band [0.85, 1.00]
       "This IS the show." Substring-of-alias, Fribb authority,
@@ -107,6 +107,12 @@ class CascadeTrace:
     # ambiguous and surface a "needs manual resolution" affordance to
     # the user instead of silently committing a coin-flip pick.
     is_ambiguous: bool = False
+    # M3 Observer Mode (Pattern A). When the funnel observer is enabled
+    # (`KIRA_FUNNEL_OBSERVER`), this carries the score a CANDIDATE rebalanced
+    # funnel would produce — computed side-by-side but NEVER used to drive
+    # behavior. The runner logs when current vs shadow would change the top
+    # pick, so a future weight flip is evidence-based. None when off (default).
+    shadow_score: float | None = None
 
     @property
     def tier_confidence(self) -> float:
@@ -126,7 +132,7 @@ class CascadeTrace:
         return max(0.0, min(1.0, (self.final_score - lo) / (hi - lo)))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "final_score": self.final_score,
             "dominant_metric": self.dominant_metric,
             "dominant_tier": int(self.dominant_tier),
@@ -144,6 +150,9 @@ class CascadeTrace:
                 for m in self.metrics
             ],
         }
+        if self.shadow_score is not None:
+            out["shadow_score"] = round(self.shadow_score, 4)
+        return out
 
 
 @dataclass

@@ -1,0 +1,11 @@
+Drop official provider logos here as <slug>.svg so Settings → Connections can
+render them. Expected filenames (transparent SVG preferred; square-ish marks
+look best in the 36px chip):
+
+  tmdb.svg
+  tvdb.svg
+  anidb.svg
+  musicbrainz.svg
+  acoustid.svg
+
+Any missing file gracefully falls back to a brand-colored media icon.

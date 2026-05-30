@@ -13,12 +13,14 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kira import scanner
+from kira.api.match_cleanup import detach_and_delete_matches
 from kira.database import SessionLocal, get_session
 from kira.matcher import MatchEngine
 from kira.matcher.engine import compute_series_group_id, fetch_match_metadata, registry_from_settings, resolve_canonical_season
 from kira.matcher.similarity import normalize
 from kira.models import Match, MediaFile, Scan
 from kira.parser import ParsedFile, parse as parse_path
+from kira.parser import mediainfo as _mediainfo
 from kira.schemas import ScanCreate, ScanOut
 
 router = APIRouter(prefix="/scans", tags=["scans"])
@@ -54,6 +56,33 @@ _SCAN_LOCK = asyncio.Lock()
 _SCAN_LOCK_MAX_AGE_SEC = 6 * 3600
 
 
+async def _read_mediainfo_setting(session) -> bool:
+    """Whether to backfill missing quality/codec/HDR from real file metadata
+    (Phase 16). Default True; a no-op anyway unless pymediainfo is installed."""
+    try:
+        from kira.models import Setting
+        row = await session.get(Setting, "parsing.read_mediainfo")
+        if row is None:
+            return True
+        return bool(row.value)
+    except Exception:
+        return True
+
+
+async def _maybe_enrich_mediainfo(parsed: ParsedFile, path: str, enabled: bool) -> None:
+    """Phase 16: fill missing quality/codec/HDR from the file's real metadata.
+    Fallback only — fires solely when the FILENAME yielded no quality (bounds
+    the per-file I/O) and pymediainfo is available. Read runs off the event
+    loop. Fully no-op when the lib is absent."""
+    if not enabled or parsed.quality is not None or not _mediainfo.available():
+        return
+    try:
+        mi = await asyncio.to_thread(_mediainfo.read_media_info, path)
+        _mediainfo.enrich_parsed(parsed, mi)
+    except Exception as e:
+        print(f"_maybe_enrich_mediainfo failed for {path}: {e!r}")
+
+
 async def _match_singleton(session, engine, fid: int) -> None:
     """Match one file independently — used for movies and unclustered files.
 
@@ -80,25 +109,27 @@ async def _match_singleton(session, engine, fid: int) -> None:
     # prefers TVDB cross-ref over AniDB direct calls — AniDB-ban hardening.
     ep_title: str | None = None
     if scored and scored[0].match_type == "tv_episode":
+        # Phase 4 validation gate: fetch the top's episode list and, for a
+        # western-TV singleton whose TVDB/TMDB match doesn't contain the
+        # file's episode, re-rank to a better-fitting alternate. No-op for
+        # anime/AniDB. May reorder `scored`, so the metadata/poster fetch
+        # below (which reads scored[0]) picks up the corrected top.
+        try:
+            scored, episodes_by_key, _ep_dicts = await _validate_and_rerank_by_episodes(
+                scored, [(fid, parsed)], parsed.season, parsed.media_type, engine.registry,
+            )
+        except Exception as e:
+            print(f"_match_singleton: episode validation failed for file {fid}: {e!r}")
+            episodes_by_key = {}
         ep_num = parsed.absolute_episode if parsed.absolute_episode is not None else parsed.episode
-        if ep_num is not None:
-            try:
-                ep_results = await _fetch_episodes_for_match(
-                    scored[0].provider, scored[0].provider_id, parsed.season, engine.registry,
-                )
-                episodes_by_key: dict[tuple[int, int], str | None] = {
-                    (ep.season, ep.episode): ep.title for ep in ep_results
-                }
-                # When Phase 4 rerouted this match to a different AID,
-                # the matcher stashed the per-AID local episode on
-                # scored[0].raw. Pass it through so tier 3 can use it.
-                local_ep = (scored[0].raw or {}).get("local_episode") if scored[0].raw else None
-                ep_title = _lookup_episode_title(
-                    episodes_by_key, scored[0].provider, parsed, ep_num,
-                    local_episode=local_ep,
-                )
-            except Exception as e:
-                print(f"_match_singleton: get_episodes failed for file {fid}: {e!r}")
+        if ep_num is not None and episodes_by_key:
+            # When the absolute→AID reroute fired, the matcher stashed the
+            # per-AID local episode on scored[0].raw. Pass it to tier 3.
+            local_ep = (scored[0].raw or {}).get("local_episode") if scored[0].raw else None
+            ep_title = _lookup_episode_title(
+                episodes_by_key, scored[0].provider, parsed, ep_num,
+                local_episode=local_ep,
+            )
 
     # Rich metadata for the top match only (one extra call per file).
     top_metadata = None
@@ -111,7 +142,7 @@ async def _match_singleton(session, engine, fid: int) -> None:
     # description, but the TVDB/TMDB cross-ref does).
     top_overview_fallback = (top_metadata or {}).get("overview") if top_metadata else None
 
-    await session.execute(delete(Match).where(Match.media_file_id == fid))
+    await detach_and_delete_matches(session, media_file_id=fid)
     for rank, m in enumerate(scored):
         gid = await compute_series_group_id(m.provider, m.provider_id, engine.registry)
         canonical_season = await resolve_canonical_season(m.provider, m.provider_id, parsed.season)
@@ -209,7 +240,7 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
         # Successful call, zero results — that IS legitimate "no match", so
         # clear the cluster (it'll render as no_match in the UI).
         for fid, _ in files:
-            await session.execute(delete(Match).where(Match.media_file_id == fid))
+            await detach_and_delete_matches(session, media_file_id=fid)
         return
 
     top = scored[0]
@@ -228,16 +259,22 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
     # Fribb cross-ref exists. This is the SAME pattern series.py uses
     # for the popup; doing it here means the scan-time matcher doesn't
     # burn AniDB calls just to populate episode_title fields.
+    # Phase 4 validation gate: fetch the top's episode list AND, for western
+    # TV with a poor-coverage TVDB/TMDB incumbent, re-rank to a better-fitting
+    # alternate before we commit to `top`. No-op for anime/AniDB/cour paths
+    # (handled by EpisodeCountSanityMetric + cour routing). The gate may
+    # reorder `scored`, so re-read `top` afterwards — everything downstream
+    # (cour routing, metadata, poster, group id) keys off the corrected top.
     episodes_by_key: dict[tuple[int, int], str | None] = {}
+    ep_dicts: list[dict] = []
     if top.match_type == "tv_episode":
         try:
-            ep_results = await _fetch_episodes_for_match(
-                top.provider, top.provider_id, rep_parsed.season, engine.registry,
+            scored, episodes_by_key, ep_dicts = await _validate_and_rerank_by_episodes(
+                scored, files, rep_parsed.season, rep_parsed.media_type, engine.registry,
             )
-            for ep in ep_results:
-                episodes_by_key[(ep.season, ep.episode)] = ep.title
+            top = scored[0]
         except Exception as e:
-            print(f"_match_cluster: get_episodes failed: {e!r}")  # non-fatal
+            print(f"_match_cluster: episode validation/fetch failed: {e!r}")  # non-fatal
 
     # ── Per-file cour routing (Platinum solution) ──────────────────
     # When the cluster's top match is a Fribb-confirmed cour of a
@@ -352,21 +389,54 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
         and len(files) >= MIN_CLUSTER_FOR_BIPARTITE
         and episodes_by_key
     ):
-        # Reconstruct an episode list for bipartite to iterate. Use the
-        # episodes_by_key dict we already populated above — each entry
-        # is (season, episode) → title; the bipartite helper accepts
-        # dict-style episodes.
-        ep_list = [
+        # Use the rich episode dicts from the validation gate — they carry
+        # air_date (Phase 9's bipartite air-date pass needs it), which the
+        # title-only episodes_by_key map drops. Fall back to reconstructing
+        # from episodes_by_key if the gate returned none.
+        ep_list = ep_dicts or [
             {"season": s, "episode": e, "title": t}
             for (s, e), t in episodes_by_key.items()
         ]
         bipartite_assignments = assign_files_to_episodes(files, ep_list)
 
+        # Phase 18: DVD-order retry. Anime fansubs sometimes follow DVD order,
+        # which the aired-order episode list pairs wrong. For a TVDB-matched
+        # anime cluster with files the aired pass left orphaned, fetch the DVD
+        # ordering ONCE and re-pair only those files. Bounded + best-effort;
+        # AniDB-matched clusters (the common case) never reach here.
+        if (
+            rep_parsed.media_type == "anime"
+            and top.provider == "tvdb"
+            and bipartite_assignments
+        ):
+            unpaired = [
+                (fid, p) for fid, p in files
+                if (fid not in bipartite_assignments
+                    or bipartite_assignments[fid].matched_via == "unpaired")
+            ]
+            if unpaired and engine.registry.has("tvdb"):
+                try:
+                    tvdb = engine.registry.build("tvdb")
+                    dvd_eps = await tvdb.get_episodes(
+                        top.provider_id, rep_parsed.season or 1, order="dvd",
+                    )
+                    dvd_dicts = [
+                        {"season": e.season, "episode": e.episode,
+                         "title": e.title, "air_date": getattr(e, "air_date", None)}
+                        for e in dvd_eps
+                    ]
+                    if dvd_dicts:
+                        for fid, a in assign_files_to_episodes(unpaired, dvd_dicts).items():
+                            if a.matched_via != "unpaired":
+                                bipartite_assignments[fid] = a
+                except Exception as e:
+                    print(f"_match_cluster: DVD-order retry failed: {e!r}")
+
     # Write one Match per file. Same series identity for all; per-file
     # episode info from each file's own parsed_data OR the bipartite
     # assignment (which may have resolved a season/episode disagreement).
     for fid, parsed in files:
-        await session.execute(delete(Match).where(Match.media_file_id == fid))
+        await detach_and_delete_matches(session, media_file_id=fid)
 
         # ── Per-file cour routing (Platinum solution, step 2) ────────
         # When the cluster top match is a Fribb-pinned cour AND we built
@@ -634,6 +704,109 @@ async def _fetch_episodes_for_match(
         return []
 
 
+async def _validate_and_rerank_by_episodes(
+    scored: list,
+    files: list[tuple[int, ParsedFile]],
+    season: int | None,
+    media_type: str,
+    registry,
+) -> tuple[list, dict[tuple[int, int], str | None], list[dict]]:
+    """Phase 4 episode-list validation gate.
+
+    Returns ``(possibly_reordered_scored, top_episodes_by_key)``. The top
+    candidate's episode list is always fetched (the caller needs it for
+    title lookup anyway), so this is a drop-in replacement for the old
+    "fetch the top's episode list" block — with one addition:
+
+    For a **western-TV** cluster (``media_type == "tv"``) whose TOP candidate
+    is **TVDB/TMDB**, verify the cluster's episodes actually EXIST in that
+    candidate's episode list. When coverage is very low AND an alternate
+    TVDB/TMDB candidate covers materially better, promote the alternate to
+    rank 0 and return ITS episode list.
+
+    Deliberately scoped OUT of the anime / AniDB / cour paths: there,
+    per-cour coverage is *legitimately* partial (a 13-ep cour against a
+    40-file franchise cluster), and ``EpisodeCountSanityMetric`` + cour
+    routing + the absolute→AID reroute already do the resolution. Running a
+    naive coverage gate there would wrongly promote the umbrella AID. The
+    gate also no-ops unless there are ≥2 candidates and the top actually
+    returned a non-empty episode list.
+
+    Ban-safe: ``_fetch_episodes_for_match`` prefers the TVDB/TMDB cross-ref
+    and consults the AniDB circuit breaker, and alternates are only probed
+    when the incumbent's coverage is already below the floor (rare).
+    """
+    from kira.matcher.episode_validation import coverage, should_promote
+
+    def _to_dicts(eps) -> list[dict]:
+        # Rich episode dicts (incl. air_date) for the bipartite pairing —
+        # Phase 9's air-date pass needs air_date, which the title-only
+        # `by_key` map drops.
+        return [
+            {"season": e.season, "episode": e.episode,
+             "title": e.title, "air_date": getattr(e, "air_date", None)}
+            for e in eps
+        ]
+
+    if not scored:
+        return scored, {}, []
+    top = scored[0]
+
+    top_eps = await _fetch_episodes_for_match(top.provider, top.provider_id, season, registry)
+    top_by_key: dict[tuple[int, int], str | None] = {
+        (ep.season, ep.episode): ep.title for ep in top_eps
+    }
+    top_dicts = _to_dicts(top_eps)
+
+    # Gate scope — only western TV with a TVDB/TMDB incumbent.
+    if (
+        top.match_type != "tv_episode"
+        or media_type != "tv"
+        or top.provider not in ("tvdb", "tmdb")
+        or len(scored) < 2
+        or not top_by_key
+    ):
+        return scored, top_by_key, top_dicts
+
+    file_eps = [
+        (p.season, (p.episode if p.episode is not None else p.absolute_episode))
+        for _fid, p in files
+    ]
+    top_cov = coverage(file_eps, top_by_key)
+    from kira.matcher.episode_validation import COVERAGE_FLOOR
+    if top_cov >= COVERAGE_FLOOR:
+        return scored, top_by_key, top_dicts  # incumbent fits — no probing
+
+    # Incumbent is suspicious. Probe alternate TVDB/TMDB candidates.
+    best_idx = 0
+    best_cov = top_cov
+    best_by_key = top_by_key
+    best_eps = top_eps
+    for i in range(1, len(scored)):
+        alt = scored[i]
+        if alt.match_type != "tv_episode" or alt.provider not in ("tvdb", "tmdb"):
+            continue
+        alt_eps = await _fetch_episodes_for_match(alt.provider, alt.provider_id, season, registry)
+        alt_by_key = {(ep.season, ep.episode): ep.title for ep in alt_eps}
+        if not alt_by_key:
+            continue
+        alt_cov = coverage(file_eps, alt_by_key)
+        if alt_cov > best_cov:
+            best_cov, best_idx, best_by_key, best_eps = alt_cov, i, alt_by_key, alt_eps
+
+    if best_idx != 0 and should_promote(top_cov, best_cov):
+        promoted = scored[best_idx]
+        print(
+            f"_validate: episode-coverage re-rank — promoted "
+            f"{promoted.provider}:{promoted.provider_id} (cov {best_cov:.2f}) over "
+            f"{top.provider}:{top.provider_id} (cov {top_cov:.2f})"
+        )
+        reordered = [scored[best_idx]] + [s for i, s in enumerate(scored) if i != best_idx]
+        return reordered, best_by_key, _to_dicts(best_eps)
+
+    return scored, top_by_key, top_dicts
+
+
 def _lookup_episode_title(
     episodes_by_key: dict[tuple[int, int], str | None],
     provider: str,
@@ -673,6 +846,62 @@ def _lookup_episode_title(
         if hit is not None:
             return hit
     return None
+
+
+async def _apply_folder_series_lock(session, all_new: list[int]) -> int:
+    """Phase 11: pull outlier files into their leaf folder's majority series.
+
+    One mangled filename parses to a different title than its folder-mates and
+    splinters into its own cluster (or matches the franchise's base AID) — the
+    Attack on Titan "Final Season Part 3-01" / "Special 05" scattering. We
+    follow FileBot's "one folder = one series" rule, conservatively: within a
+    leaf folder, if a strict majority of TV/anime files agree on a series, the
+    outliers are relocked to it (title + disambig unified, each file's own
+    season preserved). The pure decision lives in ``matcher/folder_lock.py``.
+
+    Returns the number of files relocked. Movies / music are never touched.
+    """
+    from collections import defaultdict as _dd
+
+    from kira.matcher.folder_lock import FolderFile, compute_relocks
+
+    by_folder: dict[str, list[tuple[int, MediaFile, FolderFile]]] = _dd(list)
+    for fid in all_new:
+        mf = await session.get(MediaFile, fid)
+        if mf is None or not mf.file_path or mf.media_type not in ("tv", "anime"):
+            continue
+        season: int | None = None
+        if mf.parsed_data:
+            try:
+                season = ParsedFile(**mf.parsed_data).season
+            except Exception:
+                season = None
+        folder = str(Path(mf.file_path).parent).lower()
+        by_folder[folder].append(
+            (fid, mf, FolderFile(fid=fid, media_type=mf.media_type,
+                                 series_key=mf.series_key, season=season))
+        )
+
+    relocked = 0
+    for _folder, members in by_folder.items():
+        if len(members) < 2:
+            continue
+        relocks = compute_relocks([ff for _fid, _mf, ff in members])
+        if not relocks:
+            continue
+        mf_by_fid = {fid: mf for fid, mf, _ff in members}
+        for fid, new_key in relocks.items():
+            mf = mf_by_fid.get(fid)
+            if mf is not None and mf.series_key != new_key:
+                print(
+                    f"_folder_lock: relock file {fid} "
+                    f"{mf.series_key!r} → {new_key!r}"
+                )
+                mf.series_key = new_key
+                relocked += 1
+    if relocked:
+        await session.commit()
+    return relocked
 
 
 def _compute_series_key(parsed: ParsedFile, file_path: str | None = None) -> str | None:
@@ -790,12 +1019,75 @@ def _compute_variant_key(parsed: ParsedFile) -> str:
     return "-".join(parts)
 
 
-async def _scan_worker(scan_id: int, root_path: str) -> None:
+async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
+    """Cluster `fids` by series_key, then match each cluster (≥2 files) or
+    singleton, updating the Scan row's live progress. Returns the number of
+    files that ended with at least one Match row.
+
+    Shared by the scan worker (new files) and the re-parse worker (existing
+    files) so both paths cluster + match identically.
+    """
+    clusters: dict[str | int, list[int]] = defaultdict(list)
+    for fid in fids:
+        mf = await session.get(MediaFile, fid)
+        if mf is None or not mf.parsed_data:
+            continue
+        bucket = mf.series_key if mf.series_key else fid
+        clusters[bucket].append(fid)
+
+    matched = 0
+    for bucket_key, cfids in clusters.items():
+        # Shimmer the cluster's rows while it resolves.
+        for fid in cfids:
+            mf = await session.get(MediaFile, fid)
+            if mf:
+                mf.status = "matching"
+        await session.commit()
+        await asyncio.sleep(0)
+
+        if isinstance(bucket_key, str) and len(cfids) >= 2:
+            await _match_cluster(session, engine, cfids)
+        else:
+            await _match_singleton(session, engine, cfids[0])
+
+        for fid in cfids:
+            has_match = await session.scalar(
+                select(Match.id).where(Match.media_file_id == fid).limit(1)
+            )
+            mf = await session.get(MediaFile, fid)
+            if has_match:
+                matched += 1
+                if mf and mf.status == "matching":
+                    mf.status = "matched"
+            elif mf and mf.status == "matching":
+                mf.status = "no_match"
+
+        scan = await session.get(Scan, scan_id)
+        if scan:
+            scan.matched_count = matched
+            last_mf = await session.get(MediaFile, cfids[-1])
+            scan.current_path = last_mf.file_path if last_mf else None
+        await session.commit()
+        await asyncio.sleep(0)
+    return matched
+
+
+async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> None:
     """Walk the tree, parse each file, then match each new file in turn.
 
     Two distinct phases, both reported via Scan.status:
       'scanning' → 'matching' → 'completed' (or 'failed: ...').
+
+    Bug A: accepts a list of roots and walks each one sequentially in
+    Phase 1, accumulating all discovered files into a single Phase 2
+    matching pass. A bare string is promoted to `[string]` for
+    back-compat with internal callers that haven't been updated.
     """
+    # Defensive normalization — `_scan_worker_locked` already promotes
+    # single strings to lists, but a hand-spawned task or test could
+    # still pass a string directly.
+    if isinstance(root_paths, str):
+        root_paths = [root_paths]
     async with SessionLocal() as session:
         # Track the MediaFile ORM objects directly instead of trying to
         # capture .id mid-flight (placeholders + re-query was a workaround
@@ -855,7 +1147,40 @@ async def _scan_worker(scan_id: int, root_path: str) -> None:
             # here (not inside scanner.walk) because walk() recurses on
             # symlinked dirs and a per-call reset would erase parent state.
             scanner.reset_walk_errors()
-            for path in scanner.walk(root_path):
+            # Bug A: walk every configured root in sequence. All
+            # discovered files land in the same `new_files` list →
+            # one Phase 2 pass matches them all together so clusters
+            # spanning multiple watch folders still resolve correctly
+            # (e.g. half a season on the main library + the rest on
+            # an external drive that's mounted as a watch folder).
+            # Reset walk-errors stays outside this outer loop so a
+            # single error list spans the whole scan.
+            #
+            # Bug A safety net: track every file path we've already
+            # added in THIS scan. Without this, overlapping roots
+            # (e.g. library_root=`Z:\media` AND watch_folder=`Z:\media`
+            # with subtle string differences that defeat the upstream
+            # dedup — trailing slash, case, forward vs backslash)
+            # would cause the same file to enter `new_files` twice,
+            # hit the UNIQUE constraint on `media_files.file_path` at
+            # commit time, and trigger the outer scan-worker
+            # exception handler which DELETES every row from this
+            # scan. The user then sees "scan completed" and an empty
+            # Review page. Path-set dedup keeps the inner loop
+            # idempotent regardless of how many roots overlap.
+            walked_paths_this_scan: set[str] = set()
+            # Phase 16: read the mediainfo-backfill toggle once for the scan.
+            read_mi = await _read_mediainfo_setting(session)
+            for root_path in root_paths:
+              for path in scanner.walk(root_path):
+                spath_str = str(path)
+                # Skip-if-already-walked-this-scan. Lowercase + both
+                # slash forms so trailing-slash / case / separator
+                # noise can't sneak duplicates past us.
+                spath_norm = spath_str.lower().replace("/", "\\")
+                if spath_norm in walked_paths_this_scan:
+                    continue
+                walked_paths_this_scan.add(spath_norm)
                 # Skip files that ARE the result of a previous rename
                 # (or are already tracked as MediaFiles).
                 #
@@ -873,6 +1198,9 @@ async def _scan_worker(scan_id: int, root_path: str) -> None:
                 except OSError:
                     file_size = None
                 parsed = parse_path(path)
+                # Phase 16: backfill missing quality/codec/HDR from the file
+                # itself (no-op without pymediainfo / when the filename had tags).
+                await _maybe_enrich_mediainfo(parsed, str(path), read_mi)
                 mf = MediaFile(
                     scan_id=scan_id,
                     file_path=str(path),
@@ -913,6 +1241,18 @@ async def _scan_worker(scan_id: int, root_path: str) -> None:
             # whole scan_id (the old "all_new" query scaled with library size).
             all_new = [mf.id for mf in new_files if mf.id is not None]
 
+            # Phase 11: folder-level series lock. Pull outlier files (a
+            # mangled "Final Season Part 3-01" / "Special 05") into their
+            # leaf folder's majority series BEFORE clustering, so one bad
+            # filename can't escape its season's card. No-op for folders
+            # without a clear majority (mixed folders stay split).
+            try:
+                relocked = await _apply_folder_series_lock(session, all_new)
+                if relocked:
+                    print(f"_scan_worker: folder-lock relocked {relocked} outlier file(s)")
+            except Exception as e:
+                print(f"_scan_worker: folder-lock pass failed (non-fatal): {e!r}")
+
             # ── Phase 2: match. Cluster by series_key first so a 26-episode
             # anime fires 2 API calls (one search + one episode list) instead
             # of 26. Singletons (movies, null series_key) take the per-file path.
@@ -920,59 +1260,9 @@ async def _scan_worker(scan_id: int, root_path: str) -> None:
                 registry = await registry_from_settings(client)
                 engine = MatchEngine(registry)
 
-                # Bucket: series_key (None for singletons) → list of file IDs.
-                # Singletons get their own bucket per file id.
-                clusters: dict[str | int, list[int]] = defaultdict(list)
-                for fid in all_new:
-                    mf = await session.get(MediaFile, fid)
-                    if mf is None or not mf.parsed_data:
-                        continue
-                    bucket = mf.series_key if mf.series_key else fid
-                    clusters[bucket].append(fid)
-
-                matched = 0
-                processed = 0
-
-                for bucket_key, fids in clusters.items():
-                    # Mark all files in this cluster as 'matching' so the UI
-                    # can shimmer their match cells.
-                    for fid in fids:
-                        mf = await session.get(MediaFile, fid)
-                        if mf:
-                            mf.status = "matching"
-                    await session.commit()
-                    await asyncio.sleep(0)
-
-                    is_cluster = isinstance(bucket_key, str) and len(fids) >= 2
-                    if is_cluster:
-                        await _match_cluster(session, engine, fids)
-                    else:
-                        await _match_singleton(session, engine, fids[0])
-
-                    # Count how many files now have at least one Match row.
-                    for fid in fids:
-                        has_match = await session.scalar(
-                            select(Match.id).where(Match.media_file_id == fid).limit(1)
-                        )
-                        if has_match:
-                            matched += 1
-                            mf = await session.get(MediaFile, fid)
-                            if mf and mf.status == "matching":
-                                mf.status = "matched"
-                        else:
-                            mf = await session.get(MediaFile, fid)
-                            if mf and mf.status == "matching":
-                                mf.status = "no_match"
-                        processed += 1
-
-                    # Live progress push after each cluster.
-                    scan = await session.get(Scan, scan_id)
-                    if scan:
-                        scan.matched_count = matched
-                        last_mf = await session.get(MediaFile, fids[-1])
-                        scan.current_path = last_mf.file_path if last_mf else None
-                    await session.commit()
-                    await asyncio.sleep(0)
+                # Cluster by series_key + match each cluster/singleton,
+                # pushing live progress. Shared with the re-parse worker.
+                matched = await _match_phase(session, engine, all_new, scan_id)
 
             # EE-2: did the directory walk hit any unreachable paths?
             # If so, the scan technically completed but is INCOMPLETE.
@@ -1038,7 +1328,7 @@ async def _release_db_scan_lock() -> None:
         await sess.commit()
 
 
-async def _scan_worker_locked(scan_id: int, root_path: str) -> None:
+async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None:
     """EE-3: Process-locked wrapper around `_scan_worker` with orphan cleanup.
 
     Holds `_SCAN_LOCK` for the duration so a second background task can't
@@ -1051,11 +1341,18 @@ async def _scan_worker_locked(scan_id: int, root_path: str) -> None:
 
     Autopsy 6: the finally block always releases the DB-level lock so
     sibling uvicorn workers can spawn a new scan once this one ends.
+
+    Bug A: signature widened to accept a list of roots. A bare string is
+    promoted to `[string]` for back-compat with any internal caller that
+    hasn't been updated. The endpoint always passes a list now; this
+    fallback is defensive for tests / hand-spawned tasks.
     """
+    if isinstance(root_paths, str):
+        root_paths = [root_paths]
     async with _SCAN_LOCK:
         try:
             try:
-                await _scan_worker(scan_id, root_path)
+                await _scan_worker(scan_id, root_paths)
             except Exception:
                 async with SessionLocal() as cleanup:
                     await cleanup.execute(
@@ -1071,6 +1368,236 @@ async def _scan_worker_locked(scan_id: int, root_path: str) -> None:
                 await _release_db_scan_lock()
             except Exception as e:
                 print(f"_scan_worker_locked: failed to release scan lock: {e!r}")
+
+
+async def _reparse_worker(scan_id: int) -> None:
+    """In-place re-parse of the EXISTING library.
+
+    A normal re-scan SKIPS files already in the DB, so parser improvements
+    (named-season parsing, specials, title cleanup) and folder-level series
+    locking never reach an already-indexed library. This re-runs the parser
+    on every stored MediaFile from its current path, re-applies the folder
+    lock, then re-matches NON-manual files. Manual pins + rename history are
+    preserved (manual files are excluded from the match phase). Reuses the
+    Scan row for progress so the frontend's scan banner shows it like a scan.
+    """
+    async with SessionLocal() as session:
+        try:
+            all_ids = list((await session.scalars(select(MediaFile.id))).all())
+            total = len(all_ids)
+            scan = await session.get(Scan, scan_id)
+            if scan:
+                scan.status = "scanning"
+                scan.file_count = 0
+                scan.estimated_total = total
+            await session.commit()
+
+            # ── Re-parse every file in place. parse_path is pure string work
+            # (name + parent), no disk I/O, so this is fast even for large
+            # libraries. file_size already lives on the row — don't re-stat.
+            for i, fid in enumerate(all_ids):
+                mf = await session.get(MediaFile, fid)
+                if mf is None or not mf.file_path:
+                    continue
+                try:
+                    parsed = parse_path(mf.file_path)
+                except Exception as e:
+                    print(f"_reparse_worker: parse failed for {fid}: {e!r}")
+                    continue
+                mf.parsed_data = parsed.to_dict()
+                mf.media_type = parsed.media_type
+                mf.series_key = _compute_series_key(parsed, file_path=mf.file_path)
+                mf.variant_key = _compute_variant_key(parsed)
+                if (i + 1) % SCAN_COMMIT_EVERY == 0:
+                    scan = await session.get(Scan, scan_id)
+                    if scan:
+                        scan.file_count = i + 1
+                        scan.current_path = mf.file_path
+                    await session.commit()
+                    await asyncio.sleep(0)
+            await session.commit()
+
+            # ── Folder-level series lock (Phase 11) on the fresh parses ──
+            try:
+                relocked = await _apply_folder_series_lock(session, all_ids)
+                if relocked:
+                    print(f"_reparse_worker: folder-lock relocked {relocked} file(s)")
+            except Exception as e:
+                print(f"_reparse_worker: folder-lock failed (non-fatal): {e!r}")
+
+            # ── Re-match, preserving manual pins ──
+            scan = await session.get(Scan, scan_id)
+            if scan:
+                scan.status = "matching"
+                scan.current_path = None
+            await session.commit()
+
+            manual_fids = set((await session.scalars(
+                select(Match.media_file_id).where(
+                    Match.is_manual.is_(True), Match.is_selected.is_(True),
+                )
+            )).all())
+            to_match = [fid for fid in all_ids if fid not in manual_fids]
+
+            async with httpx.AsyncClient() as client:
+                registry = await registry_from_settings(client)
+                engine = MatchEngine(registry)
+                await _match_phase(session, engine, to_match, scan_id)
+
+            scan = await session.get(Scan, scan_id)
+            if scan:
+                scan.status = "completed"
+                scan.current_path = None
+                scan.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            await session.commit()
+        except Exception as e:
+            print(f"_reparse_worker failed: {e!r}")
+            scan = await session.get(Scan, scan_id)
+            if scan:
+                scan.status = f"failed: {e}"[:200]
+                scan.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            await session.commit()
+
+
+async def _reparse_worker_locked(scan_id: int) -> None:
+    """Process-locked wrapper around `_reparse_worker`.
+
+    Unlike `_scan_worker_locked` it NEVER deletes MediaFile rows on failure —
+    re-parse runs against the EXISTING library, so a mid-run crash must leave
+    the user's files + matches intact. Always releases the DB scan lock.
+    """
+    async with _SCAN_LOCK:
+        try:
+            await _reparse_worker(scan_id)
+        finally:
+            try:
+                await _release_db_scan_lock()
+            except Exception as e:
+                print(f"_reparse_worker_locked: failed to release scan lock: {e!r}")
+
+
+@router.post("/reparse", response_model=ScanOut, status_code=201)
+async def reparse_library(
+    background: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+) -> Scan:
+    """Re-parse the EXISTING library in place and re-match it.
+
+    A scan skips already-indexed files; this re-runs the parser on every
+    stored file so parser + folder-lock improvements apply WITHOUT a
+    destructive DB reset. Manual pins + rename history are preserved. Uses
+    the same single-scan lock as create_scan (409 if a scan is running).
+    """
+    if _SCAN_LOCK.locked():
+        raise HTTPException(409, "A scan is already running. Please wait for it to complete.")
+
+    import time as _time
+    from sqlalchemy import or_, update as sql_update
+    from kira.models import Setting
+    now_ts = int(_time.time())
+    stale_cutoff = now_ts - _SCAN_LOCK_MAX_AGE_SEC
+    res = await session.execute(
+        sql_update(Setting)
+        .where(Setting.key == "system.scan_running")
+        .where(or_(Setting.value == 0, Setting.value < stale_cutoff))
+        .values(value=now_ts)
+    )
+    await session.commit()
+    if (res.rowcount or 0) == 0:
+        raise HTTPException(409, "A scan is already running. Please wait for it to complete.")
+
+    try:
+        scan = Scan(root_path="(re-parse existing library)", status="scanning")
+        session.add(scan)
+        await session.commit()
+        await session.refresh(scan)
+        background.add_task(_reparse_worker_locked, scan.id)
+        return scan
+    except Exception:
+        try:
+            await _release_db_scan_lock()
+        except Exception as e:
+            print(f"reparse_library: lock release after failure also failed: {e!r}")
+        raise
+
+
+async def _start_scan(paths: list[str], source: str = "manual") -> int | None:
+    """Shared scan trigger: claim the locks, create a Scan row, launch the worker.
+
+    Single source of truth for kicking off a scan — used by the manual POST
+    /scans endpoint (source="manual") and the watched-folders daemon
+    (source="auto"). Respects BOTH the process-level `_SCAN_LOCK` fast-fail and
+    the multi-worker DB CAS on `system.scan_running` (same discipline as the
+    original create_scan).
+
+    `paths` must already be cleaned by the caller (the manual endpoint also
+    validates existence and returns 400s; the watcher only passes existing
+    dirs). Blank entries are defensively dropped + deduped here.
+
+    Returns the new scan id, or ``None`` if a scan is already running (caller
+    decides 409 vs silent skip). The launched worker owns the locks and
+    releases them in its finally block.
+    """
+    # Clean + dedup, preserving order.
+    seen: set[str] = set()
+    effective_roots: list[str] = []
+    for p in paths:
+        if not isinstance(p, str):
+            continue
+        stripped = p.strip()
+        if not stripped or stripped in seen:
+            continue
+        seen.add(stripped)
+        effective_roots.append(stripped)
+    if not effective_roots:
+        return None
+
+    # Fast reject: this process is already running a scan.
+    if _SCAN_LOCK.locked():
+        return None
+
+    # ── Autopsy 6: atomic DB-level scan lock (multi-worker safe) ──────
+    # A single conditional UPDATE on the `system.scan_running` setting row.
+    # The CAS allows the claim when the value is `0` (idle) OR a stale
+    # timestamp from a crashed prior scan. Only the caller whose UPDATE
+    # returns rowcount=1 proceeds.
+    import time as _time
+    from sqlalchemy import or_, update as sql_update
+    from kira.models import Setting
+    now_ts = int(_time.time())
+    stale_cutoff = now_ts - _SCAN_LOCK_MAX_AGE_SEC
+    async with SessionLocal() as session:
+        res = await session.execute(
+            sql_update(Setting)
+            .where(Setting.key == "system.scan_running")
+            .where(or_(Setting.value == 0, Setting.value < stale_cutoff))
+            .values(value=now_ts)
+        )
+        await session.commit()
+        if (res.rowcount or 0) == 0:
+            return None
+
+        # The lock is now claimed. Create the Scan row + hand off to the
+        # worker (which releases the lock in its finally block). If anything
+        # fails before hand-off, release the lock so the user can retry.
+        try:
+            scan = Scan(root_path=effective_roots[0], status="scanning", source=source)
+            session.add(scan)
+            await session.commit()
+            await session.refresh(scan)
+            scan_id = scan.id
+        except Exception:
+            try:
+                await _release_db_scan_lock()
+            except Exception as e:
+                print(f"_start_scan: lock release after failure also failed: {e!r}")
+            raise
+
+    # Launch outside the session context. asyncio.create_task keeps the worker
+    # alive for the lifetime of the event loop (same as the BackgroundTasks
+    # path), and the worker's finally block releases both locks.
+    asyncio.create_task(_scan_worker_locked(scan_id, effective_roots, source))
+    return scan_id
 
 
 @router.post("", response_model=ScanOut, status_code=201)
@@ -1092,83 +1619,55 @@ async def create_scan(
     if _SCAN_LOCK.locked():
         raise HTTPException(409, "A scan is already running. Please wait for it to complete.")
 
-    # ── Autopsy 6: atomic DB-level scan lock (multi-worker safe) ──────
-    # Previously: a `SELECT then INSERT` pair. Two uvicorn workers could
-    # both run the SELECT, both see "no running scan", and both insert
-    # — spawning two background workers walking the same disk and
-    # racing each other into SQLite UNIQUE-constraint crashes.
-    # Now: a single conditional UPDATE on the `system.scan_running`
-    # setting row. The CAS allows the claim when the value is `0`
-    # (idle) OR when the value is a stale timestamp from a crashed
-    # prior scan (older than _SCAN_LOCK_MAX_AGE_SEC). Only the worker
-    # whose UPDATE returns rowcount=1 proceeds; everyone else gets a
-    # 409. Same pattern as the heal-version CAS.
-    import time as _time
-    from sqlalchemy import or_, update as sql_update
-    from kira.models import Setting
-    now_ts = int(_time.time())
-    stale_cutoff = now_ts - _SCAN_LOCK_MAX_AGE_SEC
-    res = await session.execute(
-        sql_update(Setting)
-        .where(Setting.key == "system.scan_running")
-        .where(or_(Setting.value == 0, Setting.value < stale_cutoff))
-        .values(value=now_ts)
+    # Bug A fix: resolve the effective root list. If the client passed
+    # `root_paths`, walk all of them; otherwise fall back to the single
+    # `root_path` (preserves the original API contract). Dedup + filter
+    # empty paths so we don't walk the same dir twice.
+    raw_roots: list[str] = (
+        list(payload.root_paths) if payload.root_paths else [payload.root_path]
     )
-    await session.commit()
-    if (res.rowcount or 0) == 0:
-        raise HTTPException(409, "A scan is already running. Please wait for it to complete.")
+    seen: set[str] = set()
+    effective_roots: list[str] = []
+    for p in raw_roots:
+        if not isinstance(p, str):
+            continue
+        stripped = p.strip()
+        if not stripped or stripped in seen:
+            continue
+        seen.add(stripped)
+        effective_roots.append(stripped)
+    if not effective_roots:
+        raise HTTPException(400, "No roots to scan. Set a library root in Settings → Paths.")
 
-    # The lock is now claimed. Every exit path below MUST either:
-    #   - succeed and hand off ownership to _scan_worker_locked (which
-    #     releases the lock in its finally block), OR
-    #   - release the lock here before raising.
-    # Without this discipline, a path-validation failure or scan-row
-    # insert error would leave the lock pinned until the 6h stale
-    # timeout — bricking the Scan button for hours.
-    try:
-        # Pre-flight path check. Most common silent failure after a DB
-        # reset: the Setting table got wiped (clearing paths.library_root),
-        # the frontend falls back to the '/media' default, and the scanner
-        # walks a non-existent path returning zero files. The user sees
-        # "Scan complete · 0 files" with no clue why. Surface this as a
-        # 400 so the frontend toast says "Library folder doesn't exist —
-        # set it in Settings → Paths" instead of pretending the scan
-        # succeeded.
-        from pathlib import Path as _Path
+    # Pre-flight path check for EACH root. Most common silent failure after a
+    # DB reset: the Setting table got wiped (clearing paths.library_root), the
+    # frontend falls back to the '/media' default, and the scanner walks a
+    # non-existent path returning zero files. Surface this as a 400 so the
+    # frontend toast is honest rather than pretending the scan succeeded.
+    from pathlib import Path as _Path
+    for p in effective_roots:
         try:
-            root = _Path(payload.root_path).resolve()
+            root = _Path(p).resolve()
         except (OSError, ValueError) as e:
-            raise HTTPException(400, f"Invalid library path '{payload.root_path}': {e}")
+            raise HTTPException(400, f"Invalid library path '{p}': {e}")
         if not root.exists():
             raise HTTPException(
                 400,
-                f"Library folder doesn't exist: {payload.root_path}. "
-                f"Set it in Settings → Paths."
+                f"Library folder doesn't exist: {p}. Set it in Settings → Paths.",
             )
         if not root.is_dir():
-            raise HTTPException(
-                400,
-                f"Library path is not a folder: {payload.root_path}."
-            )
+            raise HTTPException(400, f"Library path is not a folder: {p}.")
 
-        scan = Scan(root_path=payload.root_path, status="scanning")
-        session.add(scan)
-        await session.commit()
-        await session.refresh(scan)
-        # Background task takes over lock ownership from here. The
-        # worker's finally block will release; control returns to the
-        # client immediately.
-        background.add_task(_scan_worker_locked, scan.id, payload.root_path)
-        return scan
-    except Exception:
-        # Anything before the background task hand-off must release
-        # the lock so the user can retry. Best-effort — never mask
-        # the original error.
-        try:
-            await _release_db_scan_lock()
-        except Exception as e:
-            print(f"create_scan: lock release after failure also failed: {e!r}")
-        raise
+    # Delegate to the shared trigger (claims locks + launches the worker).
+    # None means another worker grabbed the lock between our fast-fail check
+    # and the DB CAS → 409, identical to the original behaviour.
+    scan_id = await _start_scan(effective_roots, source="manual")
+    if scan_id is None:
+        raise HTTPException(409, "A scan is already running. Please wait for it to complete.")
+    scan = await session.get(Scan, scan_id)
+    if scan is None:
+        raise HTTPException(500, "Scan row vanished after creation.")
+    return scan
 
 
 @router.get("", response_model=list[ScanOut])

@@ -7,11 +7,13 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from kira.api.match_cleanup import detach_and_delete_matches
 from kira.database import SessionLocal, get_session
 from kira.matcher import MatchEngine
 from kira.matcher.engine import compute_series_group_id, fetch_match_metadata, registry_from_settings, resolve_canonical_season
-from kira.models import Match, MediaFile
+from kira.models import Match, MediaFile, Setting
 from kira.parser import ParsedFile
+from kira.providers.opensubtitles import identify_file_by_hash
 from kira.schemas import ManualMatch, MediaFileOut
 
 router = APIRouter(tags=["matches"])
@@ -304,7 +306,7 @@ async def _rematch_one(
         try:
             from kira.matcher.cour_routing import (
                 build_cour_routing_table,
-                route_file_to_cour,
+                route_file_to_cour_precise,
             )
             cour_table = await build_cour_routing_table(
                 scored[0].provider, scored[0].provider_id, parsed.season,
@@ -315,7 +317,11 @@ async def _rematch_one(
                     parsed.episode if parsed.episode is not None
                     else parsed.absolute_episode
                 )
-                routed = route_file_to_cour(cour_table, file_ep_for_routing)
+                routed = await route_file_to_cour_precise(
+                    cour_table, file_ep_for_routing,
+                    provider=scored[0].provider, top_provider_id=scored[0].provider_id,
+                    parsed_season=parsed.season,
+                )
                 if routed is not None:
                     routed_aid, routed_local_ep = routed
                     # Pre-fetch the routed cour's own episode list — used
@@ -458,13 +464,14 @@ async def _rematch_one(
         # Delete only non-manual rows when preservation is on. With force=True
         # (or no manual rows present), delete everything.
         if force or not preserved_manual:
-            await session.execute(delete(Match).where(Match.media_file_id == media_file.id))
+            # Detach rename_history back-refs first — on a DB whose
+            # rename_history.match_id FK predates ON DELETE SET NULL, a raw
+            # delete of a previously-renamed file's Match rows trips
+            # "FOREIGN KEY constraint failed" (the auto-heal crash).
+            await detach_and_delete_matches(session, media_file_id=media_file.id)
         else:
-            await session.execute(
-                delete(Match).where(
-                    Match.media_file_id == media_file.id,
-                    Match.is_manual.is_(False),
-                )
+            await detach_and_delete_matches(
+                session, media_file_id=media_file.id, manual_false_only=True,
             )
 
         # Update file status to reflect outcome — no_match when the matcher
@@ -687,6 +694,56 @@ async def select_manual_match(
     return refreshed  # type: ignore[return-value]
 
 
+@router.post("/files/{file_id}/identify-by-hash", response_model=MediaFileOut)
+async def identify_by_content_hash(
+    file_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> MediaFile:
+    """M5 — content-hash identification (filename-independent).
+
+    Hash the file's BYTES (OSDb 64-bit), ask OpenSubtitles which release that
+    hash is, and pin the resulting TMDB match. Works even when the filename is
+    total garbage — the only matching path that does. Requires an OpenSubtitles
+    API key (Settings → Connections). Reuses the hardened manual-select writer,
+    so the pinned Match is sticky across heal / rematch like any user pick.
+    """
+    media_file = await session.get(MediaFile, file_id)
+    if media_file is None:
+        raise HTTPException(404, "File not found")
+    if not media_file.file_path:
+        raise HTTPException(422, "File has no on-disk path to hash")
+
+    key_row = await session.get(Setting, "providers.opensubtitles.api_key")
+    api_key = key_row.value if key_row else None
+    if isinstance(api_key, dict):  # masked placeholder, not a usable key
+        api_key = None
+    if not api_key:
+        raise HTTPException(
+            400, "OpenSubtitles API key not configured (Settings → Connections)"
+        )
+
+    async with httpx.AsyncClient() as client:
+        ident = await identify_file_by_hash(media_file.file_path, str(api_key), client)
+    if not ident:
+        raise HTTPException(404, "No content-hash match found on OpenSubtitles")
+
+    tmdb_id = ident.get("tmdb_id")
+    if not tmdb_id:
+        raise HTTPException(422, "Hash matched but OpenSubtitles returned no TMDB id")
+
+    feature = (ident.get("feature_type") or "").lower()
+    media_type = "movie" if feature == "movie" else "tv"
+    payload = ManualMatch(
+        provider="tmdb",
+        provider_id=str(tmdb_id),
+        media_type=media_type,
+        title=ident.get("title"),
+        year=ident.get("year"),
+    )
+    # Reuse the hardened commandeer-or-append writer (sticky manual pin).
+    return await select_manual_match(file_id, payload, session)
+
+
 class BulkSelectManualPayload(ManualMatch):
     """Same ManualMatch fields PLUS the list of file IDs to apply to."""
     file_ids: list[int]
@@ -725,7 +782,7 @@ async def bulk_select_manual_match(
     # returns None and routing is a no-op — behavior matches today.
     from kira.matcher.cour_routing import (
         build_cour_routing_table,
-        route_file_to_cour,
+        route_file_to_cour_precise,
     )
     # Pre-compute the routing table ONCE for the user's pick. The table
     # depends only on (provider, provider_id, parsed.season) which is
@@ -774,7 +831,11 @@ async def bulk_select_manual_match(
                 f.parsed_data.get("episode")
                 or f.parsed_data.get("absolute_episode")
             )
-            routed = route_file_to_cour(cour_table, file_ep)
+            routed = await route_file_to_cour_precise(
+                cour_table, file_ep,
+                provider=payload.provider, top_provider_id=payload.provider_id,
+                parsed_season=rep_season,
+            )
             if routed is not None:
                 final_provider_id = str(routed[0])
                 final_episode_override = routed[1]
@@ -1210,9 +1271,8 @@ async def _cleanup_post_migration_cruft(session: AsyncSession) -> dict[str, int]
                 continue
             dup_ids_to_delete.append(mid)
     if dup_ids_to_delete:
-        await session.execute(
-            sql_delete(Match).where(Match.id.in_(dup_ids_to_delete))
-        )
+        # Detach rename_history back-refs before delete (FK-safe on old DBs).
+        await detach_and_delete_matches(session, match_ids=dup_ids_to_delete)
 
     return {"titles_nulled": nulled, "dupes_deleted": len(dup_ids_to_delete)}
 
@@ -1400,9 +1460,7 @@ async def _heal_title_mismatch_matches(session: AsyncSession) -> int:
         # for this file (not just the selected one — all candidates
         # from the same broken scoring round are equally suspect) and
         # mark the file no_match.
-        await session.execute(
-            sql_delete(Match).where(Match.media_file_id == mf.id)
-        )
+        await detach_and_delete_matches(session, media_file_id=mf.id)
         await session.execute(
             sql_update(MediaFile)
             .where(MediaFile.id == mf.id)

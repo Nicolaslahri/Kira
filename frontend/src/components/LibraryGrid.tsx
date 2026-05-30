@@ -7,11 +7,131 @@ import { useEffect, useMemo, useState } from 'react';
 import type { LibraryItem, MediaType } from '../lib/types';
 import { pluralize } from '../lib/format';
 import {
-  IcCheck, IcX, IcSearch, IcAlertTri,
-  IcTv, IcAnime, IcFilm, IcDisc, IcReview,
+  IcCheck, IcX, IcSearch, IcAlertTri, IcDownload,
+  IcTv, IcAnime, IcFilm, IcMusic, IcDisc, IcReview,
 } from '../lib/icons';
 import { MediaTypeIcon } from './ui';
 import { fetchAnidbPoster, getCachedAnidbPoster } from '../lib/posters';
+import { api } from '../lib/api';
+
+// ─────────────────────────────────────────────────────────────────────
+// Sonarr live queue — library-grid scope
+// ─────────────────────────────────────────────────────────────────────
+//
+// Polls /integrations/sonarr/queue every 12s while LibraryGrid is
+// mounted (so the Dashboard / History / Settings tabs don't pay for
+// Sonarr requests). Returns two maps so each CoverCard can find its
+// items via either provider key:
+//   * byTvdb  : tvdb_id → entries[]  (TVDB-direct cards)
+//   * byAnidb : anidb_aid → entries[] (anime cards; backend reverse-
+//               cross-refs via Fribb so AniDB-only cards get pills too)
+//
+// Stops polling on the first 4xx (Sonarr-not-configured) so we don't
+// hammer a misconfigured endpoint. Stays paused until the next time
+// the LibraryGrid remounts — user reopens Settings, configures Sonarr,
+// navigates back to Review, fresh poll begins.
+
+export interface QueueEntry {
+  tvdb_id: number;
+  anidb_aid: number | null;
+  season: number;
+  episode_number: number;
+  episode_title: string | null;
+  status: string;
+  progress_pct: number;
+  eta_seconds: number | null;
+  size_bytes: number | null;
+  size_left_bytes: number | null;
+  release_title: string | null;
+  protocol: string | null;
+  error_message: string | null;
+  download_client: string | null;
+}
+
+interface QueueMaps {
+  byTvdb: Map<number, QueueEntry[]>;
+  byAnidb: Map<number, QueueEntry[]>;
+}
+
+const EMPTY_MAPS: QueueMaps = { byTvdb: new Map(), byAnidb: new Map() };
+
+function useSonarrQueueLibrary(): QueueMaps {
+  const [maps, setMaps] = useState<QueueMaps>(EMPTY_MAPS);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let errCount = 0;
+    const tick = async () => {
+      try {
+        const r = await api.sonarrQueue();
+        if (cancelled) return;
+        const byTvdb = new Map<number, QueueEntry[]>();
+        const byAnidb = new Map<number, QueueEntry[]>();
+        for (const it of r.items) {
+          const arrT = byTvdb.get(it.tvdb_id);
+          if (arrT) arrT.push(it as QueueEntry); else byTvdb.set(it.tvdb_id, [it as QueueEntry]);
+          if (it.anidb_aid != null) {
+            const arrA = byAnidb.get(it.anidb_aid);
+            if (arrA) arrA.push(it as QueueEntry); else byAnidb.set(it.anidb_aid, [it as QueueEntry]);
+          }
+        }
+        setMaps({ byTvdb, byAnidb });
+        errCount = 0;
+        // 8s global poll for cover-card pills. Tight enough that "I
+        // just clicked Get Missing → Sonarr in the popup and now I'm
+        // back at the grid" shows the new pill within seconds, loose
+        // enough that a 50-card library doesn't spam Sonarr. Sharing
+        // the 1s backend cache with the popup's 2s poll keeps total
+        // Sonarr load under 1 req/s in steady state.
+        timer = setTimeout(tick, 8000);
+      } catch (e) {
+        if (cancelled) return;
+        errCount += 1;
+        const msg = String(e ?? '');
+        // Sonarr not configured — don't keep retrying; the pill code
+        // tolerates empty maps fine, the user just doesn't see pills.
+        if (msg.includes('Sonarr URL') || msg.includes('Sonarr API key') || msg.includes('not configured')) {
+          setMaps(EMPTY_MAPS);
+          return;
+        }
+        // Transient — slow ramp-up, eventually give up.
+        const delay = errCount <= 1 ? 12000 : errCount <= 3 ? 30000 : 60000;
+        if (errCount > 6) return;
+        timer = setTimeout(tick, delay);
+      }
+    };
+    void tick();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, []);
+  return maps;
+}
+
+/** Per-card summary computed once at render time. Drives the cover-
+ *  card status pill: total in-flight count, the highest-priority
+ *  status to label the pill, and the max progress across all entries
+ *  (the "leading" download — most visually informative number).
+ *
+ *  Status priority order (worst-first, so the pill surfaces problems):
+ *    failed > warning > downloading > importing > queued > searching > completed
+ */
+function summarizeQueue(entries: QueueEntry[]): {
+  count: number;
+  status: string;
+  maxProgress: number;
+} {
+  if (entries.length === 0) return { count: 0, status: 'queued', maxProgress: 0 };
+  const priority = ['failed', 'warning', 'downloading', 'importing', 'queued', 'searching', 'completed'];
+  let bestStatus = 'queued';
+  let bestRank = priority.length;
+  let maxProgress = 0;
+  for (const e of entries) {
+    const idx = priority.indexOf(e.status);
+    const rank = idx >= 0 ? idx : priority.length;
+    if (rank < bestRank) { bestRank = rank; bestStatus = e.status; }
+    if (e.progress_pct > maxProgress) maxProgress = e.progress_pct;
+  }
+  return { count: entries.length, status: bestStatus, maxProgress };
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Helpers (pure, no hooks)
@@ -57,11 +177,6 @@ export function confTier(v: number): 'high' | 'mid' | 'low' {
   return 'low';
 }
 
-function confColor(v: number): string {
-  if (v >= 85) return 'var(--conf-high)';
-  if (v >= 50) return 'var(--conf-mid)';
-  return 'var(--conf-low)';
-}
 
 function ccStatChipColor(s: LibStats): string {
   if (s.cardState === 'approved' || s.avgConf >= 85) return 'var(--conf-high)';
@@ -111,16 +226,26 @@ interface CoverCardProps {
    *  from the provider's canonical season_number, NOT a frontend
    *  heuristic). */
   inFranchise?: boolean;
+  /** Pre-computed franchise display title (collision-aware — keeps the
+   *  "(YYYY)" disambiguator only when two cours would read identically).
+   *  When omitted, the card strips the year itself. */
+  displayTitle?: string;
   onSelect: (id: string) => void;
   onOpen: (item: LibraryItem, coverEl: HTMLElement) => void;
   onApprove: (item: LibraryItem) => void;
   onReject: (item: LibraryItem) => void;
   onManualSearch: (item: LibraryItem) => void;
+  /** Sonarr queue entries for this card's series (resolved via
+   *  lookupQueue in the parent). Renders a status pill on the cover
+   *  with "Downloading N · 47%" / "Queued N" / "Failed" etc. when
+   *  non-empty. Empty when Sonarr is offline, not configured, or no
+   *  in-flight downloads exist for this series. */
+  sonarrQueue?: QueueEntry[];
 }
 
 export function CoverCard({
-  item, selected, anySelected, focused, index, inFranchise,
-  onSelect, onOpen, onApprove, onReject, onManualSearch,
+  item, selected, anySelected, focused, index, inFranchise, displayTitle,
+  onSelect, onOpen, onApprove, onReject, onManualSearch, sonarrQueue,
 }: CoverCardProps) {
   // Display label for the franchise context: prefer the provider's
   // canonical season number (Match.season_number, set by the backend
@@ -171,6 +296,7 @@ export function CoverCard({
 
   const cardClass = [
     'cc',
+    'cinema',  // CodePen-inspired hover-reveal cover treatment (see .cc.cinema in index.css)
     'state-' + stats.cardState,
     ringClass,
     isAnime ? 'is-anime' : '',
@@ -263,25 +389,17 @@ export function CoverCard({
             </div>
           ) : null}
 
-          {/* Hover quick actions (bottom-right) */}
-          {!item.matchingState ? (
-            <div className="cc-actions">
-              <button
-                className="cc-act approve"
-                onClick={(e) => { e.stopPropagation(); onApprove(item); }}
-                title="Approve all matched"
-              ><IcCheck /></button>
-              <button
-                className="cc-act reject"
-                onClick={(e) => { e.stopPropagation(); onReject(item); }}
-                title="Reject all"
-              ><IcX /></button>
-              <button
-                className="cc-act"
-                onClick={(e) => { e.stopPropagation(); onManualSearch(item); }}
-                title="Search manually"
-              ><IcSearch /></button>
-            </div>
+          {/* Quick actions moved into the caption's bottom row (see
+              .cc-bottom-row below) so they sit beside the season/episode
+              sub-line instead of overlapping it. */}
+
+          {/* Sonarr live activity pill (bottom-left, in front of cover
+              art). Renders only when there's at least one in-flight
+              download for this series + season. Visible above the
+              cover art (z-index above the img); doesn't shift on
+              hover so the user can read it without moving the mouse. */}
+          {sonarrQueue && sonarrQueue.length > 0 ? (
+            <CardSonarrPill entries={sonarrQueue} />
           ) : null}
         </div>
       )}
@@ -295,11 +413,12 @@ export function CoverCard({
             // so "one pace" → "One Pace" visually.
             ? (item.title || 'Unknown file')
             : (inFranchise
-                // Inside a franchise group, the heading already names the show.
-                // Drop the trailing "(YYYY)" provider artifact so the card
-                // doesn't read "Rent-a-Girlfriend (2023)" right next to
-                // "Rent-a-Girlfriend (2024)" cards under the same heading.
-                ? (item.title || '').replace(/\s*\(\d{4}\)\s*$/, '')
+                // Inside a franchise group, use the block's collision-aware
+                // display title: the heading already names the show, so the
+                // trailing "(YYYY)" is dropped — UNLESS keeping it is the only
+                // thing that distinguishes two cours of the same season
+                // (Attack on Titan "Season 3" vs "Season 3 (2019)").
+                ? (displayTitle ?? (item.title || '').replace(/\s*\(\d{4}\)\s*$/, ''))
                 : item.title)}
         </div>
         <div className="cc-bottom-row">
@@ -340,6 +459,28 @@ export function CoverCard({
               </>
             )}
           </div>
+          {/* Quick actions — right side of the caption row (sub-info on the
+              left, actions on the right via space-between), so they never
+              overlap the season/episode text. Revealed with the row on hover. */}
+          {!item.noMatch && !item.matchingState ? (
+            <div className="cc-actions">
+              <button
+                className="cc-act approve"
+                onClick={(e) => { e.stopPropagation(); onApprove(item); }}
+                title="Approve all matched"
+              ><IcCheck /></button>
+              <button
+                className="cc-act reject"
+                onClick={(e) => { e.stopPropagation(); onReject(item); }}
+                title="Reject all"
+              ><IcX /></button>
+              <button
+                className="cc-act"
+                onClick={(e) => { e.stopPropagation(); onManualSearch(item); }}
+                title="Search manually"
+              ><IcSearch /></button>
+            </div>
+          ) : null}
         </div>
       </div>
     </div>
@@ -385,6 +526,9 @@ export function LibraryGrid({
   scanRunning, scanProgress, scanMessage, scanFound,
   onOpenCover, onApprove, onReject, onManualSearch,
 }: LibraryGridProps) {
+  // Live Sonarr queue — polled while this grid is mounted. Each card
+  // gets its slice via the byTvdb / byAnidb lookups below.
+  const sonarrQueueMaps = useSonarrQueueLibrary();
   // Split items: no_match cards go to their own "Needs matching" section,
   // matched cards stay in their media-type section. Without this, the
   // 14-odd unmatched anime cards (e.g. all the One Pace seasons) mix in
@@ -547,7 +691,8 @@ export function LibraryGrid({
             {renderSectionBody(
               arr, sec.key,
               { selected, setSelected, focusedId, setFocusedId, anySelected,
-                onOpenCover, onApprove, onReject, onManualSearch },
+                onOpenCover, onApprove, onReject, onManualSearch,
+                sonarrQueueMaps },
             )}
           </section>
         );
@@ -573,7 +718,7 @@ export function LibraryGrid({
           {renderSectionBody(
             needsMatching, 'anime',
             { selected, setSelected, focusedId, setFocusedId, anySelected,
-              onOpenCover, onApprove, onReject, onManualSearch },
+              onOpenCover, onApprove, onReject, onManualSearch, sonarrQueueMaps },
           )}
         </section>
       ) : null}
@@ -595,6 +740,80 @@ interface SectionCtx {
   onApprove: (item: LibraryItem) => void;
   onReject: (item: LibraryItem) => void;
   onManualSearch: (item: LibraryItem) => void;
+  /** Live Sonarr queue maps — `useSonarrQueueLibrary()` output. Each
+   *  CoverCard render site uses `lookupQueue(item)` below to pull its
+   *  own slice. Keeping the maps on ctx avoids passing them through
+   *  every intermediate prop while still scoping lookup to the grid. */
+  sonarrQueueMaps: QueueMaps;
+}
+
+/** Resolve a card's Sonarr queue entries.
+ *
+ *  Looks up by `item.providers.tvdb` first (most accurate); falls back
+ *  to `item.providers.anidb` for AniDB-only cards (the backend reverse-
+ *  cross-refs via Fribb so anime cards still get a hit).
+ *
+ *  CRITICAL FILTER: entries for episodes the user already has a file
+ *  for are SKIPPED. These are stale Sonarr queue records — old failed
+ *  downloads, manual cleanups, or imports that succeeded outside
+ *  Sonarr. Counting them on the cover pill gave us misleading badges
+ *  like "30 warnings" on AoT Final Season when every episode was
+ *  actually present and matched at 100%. The popup already correctly
+ *  ignores these (FileRowCellImpl renders the matched-file row, not
+ *  the queue progress row, when both exist); the pill needs to
+ *  match that semantic.
+ *
+ *  Returns an empty array when neither provider id is present OR when
+ *  Sonarr isn't configured (maps are empty). The CoverCard renders no
+ *  pill in either case — UI silently degrades.
+ */
+function lookupQueue(item: LibraryItem, maps: QueueMaps): QueueEntry[] {
+  let entries: QueueEntry[] = [];
+
+  const tvdbId = item.providers?.tvdb;
+  if (tvdbId != null) {
+    const hits = maps.byTvdb.get(Number(tvdbId));
+    if (hits && hits.length) {
+      // Card represents ONE season for TVDB/TMDB providers; filter to
+      // matching season so a series-wide queue doesn't paint the same
+      // pill on every season card.
+      if (typeof item.season === 'number') {
+        const seasonHits = hits.filter(h => h.season === item.season);
+        if (seasonHits.length) entries = seasonHits;
+        else entries = hits;
+      } else {
+        entries = hits;
+      }
+    }
+  }
+  if (entries.length === 0) {
+    const anidbAid = item.providers?.anidb;
+    if (anidbAid != null) {
+      const hits = maps.byAnidb.get(Number(anidbAid));
+      if (hits && hits.length) entries = hits;
+    }
+  }
+
+  // Drop queue entries for episodes the user already has. Match on
+  // episode_number alone (not season+episode), same dedup rule the
+  // popup uses for the same reason: AniDB-native lists report
+  // season=1 for everything while the file's recorded season comes
+  // from the matcher's cross-ref. Episode numbers ARE consistent.
+  if (entries.length > 0 && item.files.length > 0) {
+    const haveEpisodeNums = new Set<number>();
+    for (const f of item.files) {
+      if (typeof f.matchedToEpisode !== 'number') continue;
+      const merged = item.episodes[f.matchedToEpisode];
+      if (merged && typeof merged.episode === 'number') {
+        haveEpisodeNums.add(merged.episode);
+      }
+    }
+    if (haveEpisodeNums.size > 0) {
+      entries = entries.filter(e => !haveEpisodeNums.has(e.episode_number));
+    }
+  }
+
+  return entries;
 }
 
 /**
@@ -680,6 +899,7 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
             onApprove={ctx.onApprove}
             onReject={ctx.onReject}
             onManualSearch={ctx.onManualSearch}
+            sonarrQueue={lookupQueue(item, ctx.sonarrQueueMaps)}
           />
         ))}
       </div>
@@ -709,6 +929,24 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
     });
     const earliest = sorted[0];
     const franchiseTitle = (earliest.title || '').replace(/\s*\(\d{4}\)\s*$/, '');
+
+    // Per-card title disambiguation. Normally we drop the trailing "(YYYY)"
+    // inside a franchise group (the heading already names the show). But when
+    // two cours of one TVDB season carry the SAME base name and AniDB only
+    // disambiguates them by year — Attack on Titan "Season 3" + "Season 3
+    // (2019)", or "The Final Season" + "(2022)" + "(2023)" — stripping the
+    // year makes the cards read identically. So: strip only when the result
+    // stays unique within the block; otherwise keep the year.
+    const stripYear = (t: string) => (t || '').replace(/\s*\(\d{4}\)\s*$/, '');
+    const strippedCounts = new Map<string, number>();
+    for (const it of sorted) {
+      const s = stripYear(it.title || '');
+      strippedCounts.set(s, (strippedCounts.get(s) || 0) + 1);
+    }
+    const displayTitleFor = (it: LibraryItem): string => {
+      const s = stripYear(it.title || '');
+      return (strippedCounts.get(s) || 0) > 1 ? (it.title || s) : s;
+    };
     const totalSeasons = b.items.length;
     const totalEpisodes = b.items.reduce((s, it) => s + (it.episodes?.length ?? 0), 0);
     const counter = totalEpisodes > 0
@@ -732,6 +970,9 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
               // CoverCard reads the canonical season from `item.season`
               // (provider ground truth, NOT a position-based heuristic).
               inFranchise
+              // Collision-aware title: keeps the "(YYYY)" only when two
+              // cours would otherwise read identically.
+              displayTitle={displayTitleFor(item)}
               selected={ctx.selected.has(item.id)}
               anySelected={ctx.anySelected}
               focused={ctx.focusedId === item.id}
@@ -744,6 +985,7 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
               onApprove={ctx.onApprove}
               onReject={ctx.onReject}
               onManualSearch={ctx.onManualSearch}
+              sonarrQueue={lookupQueue(item, ctx.sonarrQueueMaps)}
             />
           ))}
         </div>
@@ -754,6 +996,82 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
   flushBucket();
 
   return <>{out}</>;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// CardSonarrPill — bottom-left pill on the cover when Sonarr is
+// actively working on episodes for this series + season.
+// ─────────────────────────────────────────────────────────────────────
+
+// Per-status explanations surfaced on hover so the user doesn't have to
+// guess what "Importing" / "Queued" / "Searching" actually mean. The
+// status-word UI is intentionally short for the small pill footprint;
+// the tooltip carries the full explanation.
+const SONARR_STATUS_EXPLAIN: Record<string, string> = {
+  queued:
+    'Sonarr handed the download to your download client (sabnzbd / qBittorrent / etc.) and is waiting for it to start.',
+  searching:
+    'Sonarr is searching indexers for a usable release. Usually resolves in a few seconds.',
+  downloading:
+    'Bytes are flowing. Open the popup to see live percentage and ETA.',
+  importing:
+    "Download finished. Sonarr is moving the file from your download client's completed folder into your media library. Usually under 30 seconds.",
+  completed:
+    'Just imported. The queue entry will disappear shortly and Kira will rescan to pick up the new file.',
+  failed:
+    "Sonarr couldn't complete the download. Check Sonarr's UI for the specific error.",
+  warning:
+    'Sonarr flagged a concern with this download (quality / indexer / import policy). Check Sonarr for details.',
+};
+
+function CardSonarrPill({ entries }: { entries: QueueEntry[] }) {
+  const { count, status, maxProgress } = useMemo(() => summarizeQueue(entries), [entries]);
+  if (count === 0) return null;
+
+  // Label varies by status — "Downloading 3 · 47%" reads cleaner than
+  // "Downloading 3 of 9 · 47%" for the small pill footprint. The
+  // popup gives the precise breakdown when the user clicks through.
+  let label: string;
+  if (status === 'downloading' && maxProgress > 0) {
+    label = `Downloading ${count} · ${maxProgress.toFixed(0)}%`;
+  } else if (status === 'failed') {
+    label = count === 1 ? 'Failed' : `${count} failed`;
+  } else if (status === 'warning') {
+    label = count === 1 ? 'Warning' : `${count} warnings`;
+  } else if (status === 'importing') {
+    label = count === 1 ? 'Importing' : `Importing ${count}`;
+  } else if (status === 'searching') {
+    label = count === 1 ? 'Searching' : `Searching ${count}`;
+  } else if (status === 'completed') {
+    label = count === 1 ? 'Imported' : `${count} imported`;
+  } else {
+    // queued / fallback
+    label = count === 1 ? 'Queued' : `${count} queued`;
+  }
+
+  // Compose the tooltip: status meaning first (the "what is this?"
+  // answer), then the specifics of what Sonarr is grabbing. Title
+  // attribute is multi-line via \n so native tooltip rendering
+  // (which respects newlines on most platforms) shows both.
+  const explanation = SONARR_STATUS_EXPLAIN[status]
+    ?? 'Sonarr is processing this series.';
+  const specifics = entries.length === 1 && entries[0].release_title
+    ? `\n\nRelease: ${entries[0].release_title}`
+    : count > 1
+      ? `\n\n${count} downloads in flight for this series.`
+      : '';
+  const errorNote = entries.find(e => e.error_message)?.error_message;
+  const errorLine = errorNote ? `\n\n⚠ ${errorNote}` : '';
+
+  return (
+    <span
+      className={`cc-sonarr-pill cc-sonarr-${status}`}
+      title={`${explanation}${specifics}${errorLine}`}
+    >
+      <IcDownload />
+      <span className="cc-sonarr-pill-text">{label}</span>
+    </span>
+  );
 }
 
 // Re-export for consumers that don't need to import MediaTypeIcon themselves

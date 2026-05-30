@@ -1,4 +1,4 @@
-"""Bipartite file-to-episode pairing — FileBot's Matcher.deepMatch approach.
+"""Bipartite file-to-episode pairing — the reference renamer's Matcher.deepMatch approach.
 
 For an N-file cluster scored against a series with M episodes, build a
 metric matrix and greedily extract unambiguous pairs. Iterate: each pass
@@ -79,6 +79,12 @@ def assign_files_to_episodes(
             return ep.get("title")
         return None
 
+    def _ep_air_date(ep) -> str | None:
+        v = getattr(ep, "air_date", None)
+        if v is None and isinstance(ep, dict):
+            v = ep.get("air_date")
+        return (v[:10] if isinstance(v, str) and len(v) >= 10 else None)
+
     def _claim(fid: int, parsed, ep, via: str) -> None:
         s, e = _ep_key(ep)
         out[fid] = FileToEpisode(fid, s, e, _ep_title(ep), via)
@@ -97,7 +103,15 @@ def assign_files_to_episodes(
                 remaining_files = [(f, p) for f, p in remaining_files if f != fid]
                 break
 
-    # Pass 2 — absolute episode pairing (AniDB native: ep.season=1, ep.episode=absolute).
+    # Pass 2 — absolute episode pairing. Two provider conventions:
+    #   - AniDB: ep.season=1 for everything, ep.episode IS the absolute
+    #     number (E1158 → ep.episode=1158).
+    #   - TVDB: ep.season=23, ep.episode=5 (LOCAL), ep.absolute_number=1158.
+    # The straight `e == abs_ep` check only worked for AniDB. For TVDB-
+    # matched anime (the AniDB-ban fallback path on long-runners) the
+    # 1158-vs-5 comparison always failed, orphaning every absolute-
+    # numbered file. Resolution order: provider's absolute_number first
+    # when set, fall back to ep.episode (the AniDB-native case).
     for fid, parsed in list(remaining_files):
         abs_ep = parsed.absolute_episode
         if abs_ep is None:
@@ -106,7 +120,11 @@ def assign_files_to_episodes(
             s, e = _ep_key(ep)
             if (s, e) in used_ep_keys:
                 continue
-            if e == abs_ep:
+            provider_absolute = getattr(ep, "absolute_number", None)
+            if isinstance(ep, dict):
+                provider_absolute = ep.get("absolute_number")
+            target_ep = provider_absolute if provider_absolute is not None else e
+            if target_ep == abs_ep:
                 _claim(fid, parsed, ep, "absolute")
                 remaining_files = [(f, p) for f, p in remaining_files if f != fid]
                 break
@@ -128,6 +146,49 @@ def assign_files_to_episodes(
                     _claim(fid, parsed, ep, "episode_number")
                     remaining_files = [(f, p) for f, p in remaining_files if f != fid]
                     break
+
+    # Pass 4 — air-date match (Phase 9). Daily / talk / news files numbered
+    # by date pair against the provider's air_date field. Exact date match,
+    # so it runs ahead of the fuzzier title pass.
+    for fid, parsed in list(remaining_files):
+        ad = getattr(parsed, "air_date", None)
+        if not ad:
+            continue
+        target = ad[:10]
+        for ep in remaining_eps:
+            if _ep_key(ep) in used_ep_keys:
+                continue
+            if _ep_air_date(ep) == target:
+                _claim(fid, parsed, ep, "air_date")
+                remaining_files = [(f, p) for f, p in remaining_files if f != fid]
+                break
+
+    # Pass 5 — episode-title similarity (Phase 6). For files STILL unpaired
+    # after number-based passes, match the filename's episode-title guess
+    # (text after the SxE marker) against the remaining episodes' titles.
+    # Resolves SxE-less or wrong-numbered files by NAME — the reference renamer's
+    # episode-title matching. Additive: only touches files passes 1-3 left
+    # orphaned, and only claims an episode on a strong (≥0.6) title match.
+    from kira.matcher.similarity import trigram_similarity
+    for fid, parsed in list(remaining_files):
+        guess = getattr(parsed, "episode_title_guess", None)
+        if not guess:
+            continue
+        best_ep = None
+        best_sim = 0.0
+        for ep in remaining_eps:
+            if _ep_key(ep) in used_ep_keys:
+                continue
+            t = _ep_title(ep)
+            if not t:
+                continue
+            sim = trigram_similarity(guess, t)
+            if sim > best_sim:
+                best_sim = sim
+                best_ep = ep
+        if best_ep is not None and best_sim >= 0.6:
+            _claim(fid, parsed, best_ep, "title")
+            remaining_files = [(f, p) for f, p in remaining_files if f != fid]
 
     # Anything still unmatched is genuinely orphan.
     for fid, _parsed in remaining_files:

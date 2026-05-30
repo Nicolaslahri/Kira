@@ -30,7 +30,7 @@ _GENERIC_FOLDER_NAMES = frozenset({
     "new folder", "untitled folder", "rips", "rip", "audio",
 })
 
-_THRESHOLD = 0.7   # FileBot's SeriesNameMatcher threshold
+_THRESHOLD = 0.7   # the reference renamer's SeriesNameMatcher threshold
 
 
 class FolderIdentityMetric:

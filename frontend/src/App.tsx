@@ -3,7 +3,7 @@ import type { AppState, ModalState, Page, ToastData, MediaFile, SearchResult } f
 import { api } from './lib/api';
 import { apiToMediaFile } from './lib/adapters';
 import { cacheGet, cacheSet } from './lib/cache';
-import { IcSpin } from './lib/icons';
+import { ScanProgress } from './components/ScanProgress';
 import { Sidebar, Topbar, Toast } from './components/ui';
 import { ManualSearchModal, RenamePreviewModal, KeyboardShortcutsModal, FileDetailsModal } from './components/modals';
 import { Onboarding, isOnboarded } from './components/Onboarding';
@@ -12,27 +12,60 @@ import { ReviewPage } from './pages/ReviewPage';
 import { HistoryPage } from './pages/HistoryPage';
 import { SettingsPage } from './pages/SettingsPage';
 
-// Read the page name out of the URL hash on first render. Falls back to
-// review (the main work surface) if the hash is missing or unknown.
-function pageFromHash(): Page {
+// Settings sub-sections — now first-class routes (#/settings/<section>) so
+// the sidebar's nested Settings nav drives them and refresh/back/forward work.
+const SETTINGS_SECTIONS = ['connections', 'paths', 'integrations', 'naming', 'cleanup', 'confidence', 'advanced'] as const;
+export type SettingsSection = (typeof SETTINGS_SECTIONS)[number];
+
+// Parse `#/<page>` or `#/settings/<section>` out of the URL hash. Falls back to
+// review (the main work surface) / connections if missing or unknown.
+function parseHash(): { page: Page; section: SettingsSection } {
   const h = window.location.hash.replace(/^#\/?/, '').trim().toLowerCase();
-  if (h === 'dashboard' || h === 'review' || h === 'history' || h === 'settings') return h;
-  return 'review';
+  const [p, sub] = h.split('/');
+  const page: Page = (p === 'dashboard' || p === 'review' || p === 'history' || p === 'settings') ? p : 'review';
+  const section = (SETTINGS_SECTIONS as readonly string[]).includes(sub) ? (sub as SettingsSection) : 'connections';
+  return { page, section };
 }
 
 export default function App() {
-  const [active, setActiveState] = useState<Page>(() => pageFromHash());
+  const [active, setActiveState] = useState<Page>(() => parseHash().page);
+  const [settingsSection, setSettingsSectionState] = useState<SettingsSection>(() => parseHash().section);
   const [onboarded, setOnboardedState] = useState<boolean>(() => isOnboarded());
   const [searchQuery, setSearchQuery] = useState('');
+  // Mobile nav drawer (hamburger). Ignored on lg+ where the sidebar is static.
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
-  // Keep the hash in sync with the active page so refresh + back/forward work.
+  // Keep the hash in sync. Navigating to Settings preserves the last-open
+  // section; everything else is a bare `#/<page>`.
   const setActive = useCallback((p: Page) => {
     setActiveState(p);
-    if (window.location.hash !== `#/${p}`) window.location.hash = `#/${p}`;
+    const hash = p === 'settings' ? `#/settings/${settingsSection}` : `#/${p}`;
+    if (window.location.hash !== hash) window.location.hash = hash;
+  }, [settingsSection]);
+
+  // Select a Settings sub-section (from the nested sidebar nav). Also flips
+  // the active page to settings.
+  const setSettingsSection = useCallback((s: SettingsSection) => {
+    setSettingsSectionState(s);
+    setActiveState('settings');
+    const hash = `#/settings/${s}`;
+    if (window.location.hash !== hash) window.location.hash = hash;
   }, []);
 
+  // The topbar search drives the Review queue's filter. If the user starts
+  // typing from any other page, jump them to Review so the results are
+  // actually visible — otherwise the box looks dead.
+  const handleSearchChange = useCallback((q: string) => {
+    setSearchQuery(q);
+    if (q.trim() && active !== 'review') setActive('review');
+  }, [active, setActive]);
+
   useEffect(() => {
-    const onHashChange = () => setActiveState(pageFromHash());
+    const onHashChange = () => {
+      const { page, section } = parseHash();
+      setActiveState(page);
+      setSettingsSectionState(section);
+    };
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
@@ -47,7 +80,8 @@ export default function App() {
     scanRunning: false,
     scanProgress: 0,
     scanFound: 0,
-    scanMessage: 'Walking directory tree...',
+    scanMessage: 'Looking for media files…',
+    scanPhase: 'idle',
     // If we restored from cache, treat the page as hydrated for layout
     // purposes — the previous data is good enough to render. The
     // background fetch below will replace it with fresher data when it
@@ -189,10 +223,49 @@ export default function App() {
         return;
       }
     }
+    // Bug A: fetch the freshest paths from the server right before
+    // creating the scan. Reading from React state was a race trap —
+    // if the user clicked "Scan now" before `loadDefaults` had finished
+    // hydrating `scanRoot` from settings, we'd send the initial fallback
+    // value ('/media') and get a 400 "Library folder doesn't exist".
+    // That was the "first scan fails, second scan works" bug — by the
+    // time the user retried, hydration had completed.
+    //
+    // Fetching synchronously here means the call is ALWAYS authoritative
+    // regardless of what the React state thinks. The 10ms HTTP cost is
+    // negligible compared to the scan itself.
+    let effectiveRoot = SCAN_ROOT;
+    let extraRoots: string[] = [];
+    try {
+      const s = await api.getSettings();
+      // library_root may be saved as a bare string OR as {value: "..."}
+      // depending on which write path produced it — mirror the same
+      // parsing as the loadDefaults effect.
+      const lr = s['paths.library_root'];
+      if (typeof lr === 'string' && lr) {
+        effectiveRoot = lr;
+      } else if (lr && typeof lr === 'object' && 'value' in lr && typeof (lr as { value?: unknown }).value === 'string') {
+        effectiveRoot = (lr as { value: string }).value;
+      }
+      const wf = s['paths.watch_folders'];
+      if (Array.isArray(wf)) {
+        extraRoots = wf.filter((x): x is string => typeof x === 'string' && x.length > 0);
+      }
+    } catch {
+      // Fail-soft: if the settings GET fails, fall back to React state.
+      // Worse than authoritative server fetch but better than aborting
+      // the user's scan attempt entirely.
+    }
+    // Dedup + drop empties. Library root goes first so it's the
+    // "primary" display path for the Scan history row.
+    const allRoots = Array.from(new Set([effectiveRoot, ...extraRoots])).filter(p => !!p);
+
     setState(s => ({
       ...s,
-      scanRunning: true, scanProgress: 0, scanFound: 0,
-      scanMessage: `Walking ${SCAN_ROOT}...`,
+      scanRunning: true, scanProgress: 0, scanFound: 0, scanPhase: 'scanning',
+      scanMessage: allRoots.length > 1
+        ? `Looking through ${allRoots.length} folders…`
+        : `Looking through ${effectiveRoot}…`,
     }));
 
     try {
@@ -205,7 +278,11 @@ export default function App() {
       // runScan early-return staleness check (see above).
       lastProgressAtRef.current = Date.now();
       // Backend kicks off the work as a background task and returns the scan id.
-      const scan = await api.createScan(SCAN_ROOT);
+      // Bug A: pass `allRoots` so the worker walks the library root
+      // PLUS every configured watch folder in one scan. When only
+      // one root is configured the call collapses to a single-path
+      // scan (back-compat with pre-Bug-A clients).
+      const scan = await api.createScan(effectiveRoot, allRoots);
 
       // Poll scan progress AND refresh the file list every second so rows
       // animate into the Review queue as they're discovered + matched.
@@ -236,18 +313,25 @@ export default function App() {
         // is a totally different commitment than "watch the count climb
         // and hope it stops eventually").
         let pct = 0;
-        let msg = 'Walking directory tree...';
+        let msg = 'Looking for media files…';
+        let phase: AppState['scanPhase'] = 'scanning';
         const total = s.estimated_total;
         if (s.status === 'scanning') {
-          // No total yet — show file count climbing, cap visually at 50%.
-          pct = Math.min(50, Math.round(s.file_count * 0.25));
-          msg = s.current_path
-            ? `Scanning… ${s.file_count} files found`
-            : `Scanning ${SCAN_ROOT}...`;
+          // DISCOVERY: the file total isn't known until the walk finishes, so
+          // there's no honest percent — the banner renders an INDETERMINATE
+          // animated sweep (pct unused for the fill) and just surfaces the
+          // climbing count. (Previously this was faked as a bar capped at 50%,
+          // which looked "stuck".)
+          phase = 'scanning';
+          pct = 0;
+          msg = `Scanning… ${s.file_count} files found`;
         } else if (s.status === 'matching') {
+          // MATCHING: now that the total is known, show a REAL 0–100% bar over
+          // its own full range (not crammed into 50–95%).
+          phase = 'matching';
           const denom = total ?? s.file_count;
           const matchPct = denom > 0 ? (s.matched_count / denom) : 0;
-          pct = 50 + Math.round(matchPct * 45);
+          pct = Math.min(100, Math.round(matchPct * 100));
           // ETA — only meaningful if we have a denominator + non-zero progress.
           let etaSuffix = '';
           if (total && s.matched_count > 0 && scanStartedAtRef.current) {
@@ -261,12 +345,13 @@ export default function App() {
           }
           msg = `Matching ${s.matched_count} / ${denom}${etaSuffix}`;
         } else if (s.status === 'completed' || s.status === 'completed_partial') {
+          phase = 'done';
           pct = 100;
           const partial = s.status === 'completed_partial' ? ' (partial — see notifications)' : '';
-          msg = `Done · ${s.file_count} files, ${s.matched_count} matched${partial}`;
+          msg = `${s.file_count} files · ${s.matched_count} matched${partial}`;
           done = true;
         }
-        setState(st => ({ ...st, scanProgress: pct, scanFound: s.file_count, scanMessage: msg }));
+        setState(st => ({ ...st, scanProgress: pct, scanFound: s.file_count, scanMessage: msg, scanPhase: phase }));
         // Watchdog heartbeat — refreshed on every successful poll cycle.
         // If the loop dies (browser throttle, network error storm),
         // this ref goes stale and the next Scan click can detect it.
@@ -292,9 +377,147 @@ export default function App() {
       });
     } finally {
       // Brief delay so the user sees the 100% before the banner disappears.
-      setTimeout(() => setState(s => ({ ...s, scanRunning: false })), 600);
+      setTimeout(() => setState(s => ({ ...s, scanRunning: false })), 1600);
     }
   }, [state.scanRunning, pushToast, refreshFiles]);
+
+  // Re-parse the EXISTING library in place. A normal scan skips
+  // already-indexed files, so parser + folder-lock improvements only reach
+  // NEW files; this re-runs the parser on every stored file and re-matches
+  // non-manual ones (manual pins + history preserved). Reuses the scan
+  // banner — the backend returns a Scan row we poll exactly like a scan.
+  const runReparse = useCallback(async () => {
+    if (state.scanRunning) {
+      pushToast({
+        title: 'Busy',
+        sub: 'A scan or re-parse is already running — wait for it to finish.',
+        kind: 'error',
+      });
+      return;
+    }
+    setState(s => ({
+      ...s, scanRunning: true, scanProgress: 0, scanFound: 0, scanPhase: 'scanning',
+      scanMessage: 'Re-parsing library…',
+    }));
+    try {
+      scanStartedAtRef.current = Date.now();
+      lastProgressAtRef.current = Date.now();
+      const scan = await api.reparseLibrary();
+      let done = false;
+      while (!done) {
+        await new Promise(r => setTimeout(r, 800));
+        let s: typeof scan;
+        try { s = await api.getScan(scan.id); } catch { continue; }
+        try {
+          const rows = await api.listFiles({ limit: 500 });
+          setState(st => ({ ...st, files: rows.map(apiToMediaFile) }));
+        } catch { /* swallow */ }
+        if (s.status.startsWith('failed')) throw new Error(s.status);
+
+        let pct = 0;
+        let msg = 'Re-parsing…';
+        let phase: AppState['scanPhase'] = 'scanning';
+        const total = s.estimated_total;
+        if (s.status === 'scanning') {
+          // Re-parse walks the existing library; total is known almost
+          // immediately, but treat it as the indeterminate DISCOVERY phase
+          // for a consistent two-bar UX with a normal scan.
+          phase = 'scanning';
+          pct = 0;
+          msg = `Re-parsing… ${s.file_count}${total ? ` / ${total}` : ''} files`;
+        } else if (s.status === 'matching') {
+          phase = 'matching';
+          const denom = total ?? s.file_count;
+          const matchPct = denom > 0 ? (s.matched_count / denom) : 0;
+          pct = Math.min(100, Math.round(matchPct * 100));
+          msg = `Re-matching ${s.matched_count} / ${denom}`;
+        } else if (s.status === 'completed' || s.status === 'completed_partial') {
+          phase = 'done';
+          pct = 100;
+          msg = `Done · ${s.file_count} files, ${s.matched_count} matched`;
+          done = true;
+        }
+        setState(st => ({ ...st, scanProgress: pct, scanFound: s.file_count, scanMessage: msg, scanPhase: phase }));
+        lastProgressAtRef.current = Date.now();
+      }
+      await refreshFiles();
+      const final = await api.getScan(scan.id);
+      pushToast({
+        title: 'Re-parse complete',
+        sub: `${final.file_count} files · ${final.matched_count} matched`,
+        kind: 'success',
+      });
+    } catch (err) {
+      setBackendOk(false);
+      pushToast({
+        title: 'Re-parse failed',
+        sub: (err as Error).message.includes('Failed to fetch')
+          ? 'Backend not reachable — is uvicorn running on :8000?'
+          : (err as Error).message,
+        kind: 'error',
+      });
+    } finally {
+      setTimeout(() => setState(s => ({ ...s, scanRunning: false })), 1600);
+    }
+  }, [state.scanRunning, pushToast, refreshFiles]);
+
+  // Event-driven rescan trigger. CoverPopup dispatches this when it
+  // detects Sonarr completions (queue entries that were `downloading`/
+  // `importing` and have now vanished) AND when the user clicks
+  // "Force import" on a stuck-import row. Debounced 2.5s so a burst
+  // of completions (10 episodes finishing within seconds) fires
+  // exactly ONE scan, but quick enough that an isolated Force Import
+  // click feels responsive — the user sees the "Just imported" row
+  // morph into a real file row within seconds, not after a yawn.
+  //
+  // Flow after the debounce fires:
+  //   1. runScan() — finds the new files on disk, computes parser
+  //      output, attempts a matcher pass
+  //   2. sonarrHealUnmatched() — for any file the matcher couldn't
+  //      confidently match (AniDB banned, wrong year in filename,
+  //      atypical title), uses Sonarr's authoritative metadata to
+  //      pin a high-confidence Match. Sonarr already knew exactly
+  //      what each file was when it downloaded them.
+  //   3. refreshFiles() — pulls the now-matched files back into the
+  //      Review page. The popup's "Just imported · scanning…" rows
+  //      transition into real file rows with correct episode titles.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const onRequest = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(async () => {
+        timer = null;
+        // Suppress if a scan is already in flight; runScan's own
+        // re-entry guard would no-op but we'd rather not dispatch.
+        if (state.scanRunning) return;
+        try {
+          await runScan();
+        } catch (e) {
+          console.warn('Auto-rescan failed', e);
+          return; // skip heal if scan failed
+        }
+        // Heal-via-Sonarr step. Best-effort: failures here just leave
+        // the files in their pre-heal state, which is the same state
+        // they'd be in without this feature. No toast on success
+        // (silent magic is the desired UX); the popup's transitional
+        // row morphing into a real row IS the feedback.
+        try {
+          const r = await api.sonarrHealUnmatched();
+          if (r.healed > 0) {
+            await refreshFiles();
+          }
+        } catch (e) {
+          // Sonarr not configured / unreachable — silently no-op.
+          console.debug('Sonarr heal skipped', e);
+        }
+      }, 2500);
+    };
+    window.addEventListener('kira:request-rescan', onRequest);
+    return () => {
+      window.removeEventListener('kira:request-rescan', onRequest);
+      if (timer) clearTimeout(timer);
+    };
+  }, [runScan, state.scanRunning, refreshFiles]);
 
   // ── Action handlers (backed by the API; local state mirrors the response) ──
   // Defined here, BEFORE the keyboard useEffect, so the effect's dependency
@@ -410,11 +633,37 @@ export default function App() {
         const rows = await api.listFiles({ limit: 500 });
         setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
         if (res.failed === 0) {
+          // Tier 1.2: the backend tags videos whose sidecar files were
+          // moved along with the video via a "[SIDECARS] …" prefix on
+          // an otherwise-successful item's error field. Count them so
+          // the user knows subs / aux audio rode along — Plex/Jellyfin
+          // users will appreciate the explicit confirmation.
+          const withSubs = res.items.filter(
+            i => i.ok && typeof i.error === 'string' && i.error.startsWith('[SIDECARS]'),
+          ).length;
+          const subNote = withSubs > 0
+            ? ` · sidecars moved on ${withSubs} of ${res.succeeded}`
+            : '';
           pushToast({
             title: `${res.succeeded} file${res.succeeded === 1 ? '' : 's'} renamed`,
-            sub: `${savedOp} · ${savedProfile} — see Renamed filter or History.`,
+            sub: `${savedOp} · ${savedProfile}${subNote} — see Renamed filter or History.`,
             kind: 'success',
           });
+          // Pre-warm History's cache so navigating to that tab paints
+          // the fresh rows instantly instead of the "blank → 500ms gap
+          // → everything pops in" pattern. Best-effort; failure here
+          // just means History has to fetch on its own (which is fine).
+          try {
+            const [rows, counts] = await Promise.all([
+              api.listHistory(),
+              api.historyCounts(),
+            ]);
+            cacheSet('history.items', rows);
+            cacheSet('history.counts', counts);
+          } catch {
+            // History prefetch failed; the History tab will still
+            // refetch when the user navigates to it.
+          }
           window.dispatchEvent(new CustomEvent('kira:rename-success'));
           return;
         }
@@ -527,7 +776,7 @@ export default function App() {
       } else if (e.key === 'a' && !e.metaKey && !e.ctrlKey) {
         const f = state.files.find(x => x.id === focusedId);
         if (f && f.match?.provider && f.match?.providerId
-            && (f.status === 'pending' || f.status === 'matched' || f.status === 'matching')) {
+            && (f.status === 'pending' || f.status === 'matching')) {
           // Approve + rename in one shot — same contract as the card
           // green check + bulk-bar button. Without the rename call the
           // keyboard shortcut would only flip status, stranding the file
@@ -580,9 +829,18 @@ export default function App() {
       const rows = await api.listFiles({ limit: 500 });
       setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
       if (res.failed === 0) {
+        // Tier 1.2: surface sidecar count alongside the success — see
+        // the matching enhancement on the primary rename path earlier
+        // in this file for the same pattern.
+        const withSubs = res.items.filter(
+          i => i.ok && typeof i.error === 'string' && i.error.startsWith('[SIDECARS]'),
+        ).length;
+        const subNote = withSubs > 0
+          ? ` Sidecars moved on ${withSubs} of ${res.succeeded}.`
+          : '';
         pushToast({
           title: `${res.succeeded} file${res.succeeded === 1 ? '' : 's'} renamed`,
-          sub: `Switched to "Renamed" view — also visible on the History page.`,
+          sub: `Switched to "Renamed" view — also visible on the History page.${subNote}`,
           kind: 'success',
         });
         // Auto-switch the Review filter so the user immediately SEES the
@@ -694,7 +952,13 @@ export default function App() {
    *  "Match all to..." flow in the Needs matching section. */
   const handleBulkManualMatch = useCallback(async (
     fileIds: string[],
-    selection: SearchResult & { _provider?: string; _providerId?: string },
+    // Matches the `onBulkManualMatch` prop contract in ReviewPage: the picked
+    // result's optional fields can be null (not just undefined). The body
+    // normalizes with `?? null` before hitting the API, so null is fine.
+    selection: {
+      title?: string | null; year?: number | null; overview?: string | null;
+      mediaType?: string; _provider?: string; _providerId?: string;
+    },
     contextMediaType?: string,
   ) => {
     const backendIds = fileIds.map(id => Number(id)).filter(Number.isFinite);
@@ -734,40 +998,25 @@ export default function App() {
           setTimeout(() => runScan(), 350);
         }} />
       )}
-      <div className="app">
-        <Sidebar active={active} setActive={setActive} pendingCount={pendingCount} scanRunning={state.scanRunning} backendOk={backendOk} />
-        <main className="main">
+      <div className="relative z-[1] min-h-screen lg:grid lg:grid-cols-[var(--side-w)_1fr]">
+        <Sidebar active={active} setActive={setActive} settingsSection={settingsSection} setSettingsSection={setSettingsSection} pendingCount={pendingCount} scanRunning={state.scanRunning} backendOk={backendOk} mobileOpen={mobileNavOpen} onClose={() => setMobileNavOpen(false)} />
+        {/* Mobile drawer backdrop — tap to dismiss (hidden on lg+) */}
+        {mobileNavOpen ? (
+          <div className="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm lg:hidden" onClick={() => setMobileNavOpen(false)} />
+        ) : null}
+        <main className="main min-w-0">
           <Topbar
             active={active}
             onScan={runScan}
             scanRunning={state.scanRunning}
             onShortcuts={() => openModal('shortcuts')}
             searchQuery={searchQuery}
-            onSearchChange={setSearchQuery}
+            onSearchChange={handleSearchChange}
+            onMenuClick={() => setMobileNavOpen(true)}
           />
 
-          {/* Global scan-progress strip — visible on every page while a scan
-              runs so the user is never "out of touch" with what's happening. */}
-          {state.scanRunning ? (
-            <div className="global-scan-bar">
-              <div className="global-scan-bar-fill" style={{ width: `${state.scanProgress}%` }} />
-              <div className="global-scan-bar-content">
-                <div className="global-scan-spinner"><IcSpin /></div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div className="font-semibold text-sm" style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
-                    <span>Scanning library</span>
-                    <span className="text-xs text-muted">· {state.scanMessage}</span>
-                  </div>
-                </div>
-                <div className="text-sm font-semibold text-mono" style={{ color: 'var(--accent)' }}>
-                  {state.scanProgress}%
-                </div>
-              </div>
-            </div>
-          ) : null}
-
           {active === 'dashboard' && (
-            <DashboardPage state={state} openModal={openModal} runScan={runScan} setActive={setActive} scanRoot={SCAN_ROOT} />
+            <DashboardPage state={state} openModal={openModal} runScan={runScan} runReparse={runReparse} setActive={setActive} scanRoot={SCAN_ROOT} />
           )}
           {active === 'review' && (
             <ReviewPage
@@ -778,13 +1027,14 @@ export default function App() {
               searchQuery={searchQuery}
               onBulkManualMatch={handleBulkManualMatch}
               renameFilesDirectly={renameFilesDirectly}
+              pushToast={pushToast}
             />
           )}
           {active === 'history' && (
             <HistoryPage pushToast={pushToast} />
           )}
           {active === 'settings' && (
-            <SettingsPage state={state} pushToast={pushToast} />
+            <SettingsPage state={state} pushToast={pushToast} section={settingsSection} setSection={setSettingsSection} />
           )}
         </main>
       </div>
@@ -823,7 +1073,18 @@ export default function App() {
         />
       )}
 
-      <Toast toasts={toasts} onDismiss={dismissToast} />
+      <Toast
+        toasts={toasts}
+        onDismiss={dismissToast}
+        leading={state.scanRunning ? (
+          <ScanProgress
+            phase={state.scanPhase}
+            progress={state.scanProgress}
+            found={state.scanFound}
+            message={state.scanMessage}
+          />
+        ) : null}
+      />
     </>
   );
 }

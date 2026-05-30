@@ -1,11 +1,16 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import type { PosterData, ToastData, Page, MediaType } from '../lib/types';
+import type { SettingsSection } from '../App';
 import {
   IcDashboard, IcReview, IcHistory, IcSettings, IcSearch,
   IcCheck, IcX, IcAlertTri, IcKeyboard, IcScan, IcSpin,
-  IcLogoMark, IcFilm, IcTv, IcAnime, IcMusic,
+  IcLogoMark, IcFilm, IcTv, IcAnime, IcMusic, IcChevDown, IcMenu,
 } from '../lib/icons';
 import { NotificationsBell } from './NotificationsBell';
+import { cn } from '../lib/utils';
+import { Button } from './base/buttons/button';
+import { FeaturedIcon } from './base/featured-icons/featured-icon';
 
 export function Poster({ data, imgUrl, size = 'md', shape = 'poster', className = '' }: {
   data: PosterData | null | undefined;
@@ -100,12 +105,18 @@ export function MediaTypeIcon({ type }: { type: MediaType | string }) {
   return <IcFilm />;
 }
 
-export function Sidebar({ active, setActive, pendingCount, scanRunning, backendOk }: {
+export function Sidebar({ active, setActive, settingsSection, setSettingsSection, pendingCount, scanRunning, backendOk, mobileOpen = false, onClose }: {
   active: Page;
   setActive: (p: Page) => void;
+  settingsSection: string;
+  setSettingsSection: (s: SettingsSection) => void;
   pendingCount: number;
   scanRunning: boolean;
   backendOk: boolean | null;
+  /** Mobile drawer open state (ignored on lg+ where the sidebar is static). */
+  mobileOpen?: boolean;
+  /** Close the mobile drawer (called after navigating). */
+  onClose?: () => void;
 }) {
   const items: { key: Page; label: string; icon: ReactNode; count?: number }[] = [
     { key: 'dashboard', label: 'Dashboard', icon: <IcDashboard /> },
@@ -113,56 +124,132 @@ export function Sidebar({ active, setActive, pendingCount, scanRunning, backendO
     { key: 'history', label: 'History', icon: <IcHistory /> },
     { key: 'settings', label: 'Settings', icon: <IcSettings /> },
   ];
+  // Sub-settings revealed when Settings is the active page (nested nav).
+  const settingsSub: { key: SettingsSection; label: string }[] = [
+    { key: 'connections', label: 'Connections' },
+    { key: 'paths', label: 'Paths & folders' },
+    { key: 'integrations', label: 'Integrations' },
+    { key: 'naming', label: 'Naming & format' },
+    { key: 'cleanup', label: 'Folder cleanup' },
+    { key: 'confidence', label: 'Confidence' },
+    { key: 'advanced', label: 'Advanced' },
+  ];
+  const statusColor = backendOk === false ? 'var(--conf-low)'
+    : scanRunning ? 'var(--conf-mid)' : 'var(--conf-high)';
+  const statusLabel = backendOk === false ? 'Backend disconnected'
+    : scanRunning ? 'Scanning…' : backendOk === null ? 'Connecting…' : 'Idle';
+
   return (
-    <aside className="sidebar">
-      <div className="brand">
-        <div className="brand-mark"><IcLogoMark /></div>
-        <div>
-          <div className="brand-name">Kira</div>
-          <div className="brand-tag">v0.4.1</div>
+    <aside className={cn(
+      'fixed inset-y-0 left-0 z-50 flex h-screen w-[var(--side-w)] flex-col gap-8 border-r border-secondary bg-secondary px-4 py-6 transition-transform duration-300 ease-out lg:sticky lg:top-0 lg:z-20 lg:translate-x-0',
+      mobileOpen ? 'translate-x-0' : '-translate-x-full',
+    )}>
+      {/* Brand */}
+      <div className="flex items-center gap-3 px-2">
+        <div className="grid size-9 place-items-center rounded-xl bg-brand-solid text-white [&_svg]:size-5">
+          <IcLogoMark />
+        </div>
+        <div className="leading-tight">
+          <div className="text-[15px] font-bold tracking-tight text-primary">Kira</div>
+          <div className="text-[11px] text-quaternary">v0.5.0</div>
         </div>
       </div>
 
-      <nav className="nav">
-        <div className="nav-section-label">Workspace</div>
-        {items.map(it => (
-          <button key={it.key} className={`nav-item ${active === it.key ? 'active' : ''}`} onClick={() => setActive(it.key)}>
-            {it.icon}
-            <span>{it.label}</span>
-            {it.count != null && it.count > 0 ? <span className="count">{it.count}</span> : null}
-          </button>
-        ))}
+      {/* Nav */}
+      <nav className="flex flex-col gap-1">
+        <div className="px-3 pb-1.5 pt-3 text-[10px] font-semibold uppercase tracking-[0.08em] text-quaternary">
+          Workspace
+        </div>
+        {items.map(it => {
+          const isActive = active === it.key;
+          const isSettings = it.key === 'settings';
+          return (
+            <div key={it.key}>
+              <button
+                onClick={() => { setActive(it.key); if (it.key !== 'settings') onClose?.(); }}
+                className={cn(
+                  'group relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-semibold transition duration-100 ease-linear',
+                  isActive ? 'bg-active text-secondary' : 'text-tertiary hover:bg-primary_hover hover:text-secondary',
+                )}
+              >
+                <span className={cn('inline-flex size-5 shrink-0 [&_svg]:size-5', isActive ? 'text-fg-brand-primary' : 'text-fg-quaternary')}>
+                  {it.icon}
+                </span>
+                <span className="flex-1 text-left">{it.label}</span>
+                {it.count != null && it.count > 0 ? (
+                  <span className="rounded-full bg-primary px-1.5 py-0.5 text-[11px] font-semibold tabular-nums text-tertiary ring-1 ring-secondary ring-inset">
+                    {it.count}
+                  </span>
+                ) : null}
+                {/* Settings gets a chevron that rotates when expanded */}
+                {isSettings ? (
+                  <IcChevDown
+                    style={{ width: 14, height: 14 }}
+                    className={cn('shrink-0 transition-transform duration-200', isActive ? 'rotate-180 text-fg-tertiary' : 'text-fg-quaternary')}
+                  />
+                ) : null}
+              </button>
+
+              {/* Nested sub-settings — expand when Settings is active */}
+              {isSettings ? (
+                <AnimatePresence initial={false}>
+                  {isActive ? (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.22, ease: 'easeOut' }}
+                      className="overflow-hidden"
+                    >
+                      <div className="relative ml-[22px] mt-1 flex flex-col gap-0.5 border-l border-secondary pl-3">
+                        {settingsSub.map(s => {
+                          const subActive = settingsSection === s.key;
+                          return (
+                            <button
+                              key={s.key}
+                              onClick={() => { setSettingsSection(s.key); onClose?.(); }}
+                              className={cn(
+                                'relative rounded-lg px-2.5 py-1.5 text-left text-[13px] transition duration-100 ease-linear',
+                                subActive ? 'font-semibold text-secondary' : 'text-tertiary hover:text-secondary',
+                              )}
+                            >
+                              {subActive ? (
+                                <span className="absolute -left-[13px] top-1/2 h-4 w-[2px] -translate-y-1/2 rounded-full bg-brand-solid" />
+                              ) : null}
+                              {s.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </motion.div>
+                  ) : null}
+                </AnimatePresence>
+              ) : null}
+            </div>
+          );
+        })}
       </nav>
 
-      <div className="sidebar-footer">
-        <div className="row">
-          <span className="dot" style={{
-            background: backendOk === false ? 'var(--conf-low)'
-                       : scanRunning ? 'var(--conf-mid)'
-                       : 'var(--conf-high)',
-            boxShadow: backendOk === false ? '0 0 0 3px rgba(255,91,110,0.18)'
-                       : scanRunning ? '0 0 0 3px rgba(255,201,74,0.18)'
-                       : '0 0 0 3px rgba(40,217,160,0.18)',
-          }} />
-          <span style={{ color: 'var(--ink-2)' }}>
-            {backendOk === false ? 'Backend disconnected'
-             : scanRunning ? 'Scanning...'
-             : backendOk === null ? 'Connecting...'
-             : 'Idle'}
-          </span>
+      {/* Status footer */}
+      <div className="mt-auto rounded-xl border border-secondary bg-primary px-3 py-2.5">
+        <div className="flex items-center gap-2 text-xs text-tertiary">
+          <span className="size-[7px] shrink-0 rounded-full" style={{ background: statusColor, boxShadow: `0 0 0 3px ${statusColor}2e` }} />
+          <span>{statusLabel}</span>
         </div>
       </div>
     </aside>
   );
 }
 
-export function Topbar({ active, onScan, scanRunning, onShortcuts, searchQuery, onSearchChange }: {
+export function Topbar({ active, onScan, scanRunning, onShortcuts, searchQuery, onSearchChange, onMenuClick }: {
   active: Page;
   onScan: () => void;
   scanRunning: boolean;
   onShortcuts: () => void;
   searchQuery: string;
   onSearchChange: (q: string) => void;
+  /** Opens the mobile nav drawer (hamburger). Hidden on lg+. */
+  onMenuClick?: () => void;
 }) {
   const titles: Record<Page, string[]> = {
     dashboard: ['Workspace', 'Dashboard'],
@@ -172,90 +259,117 @@ export function Topbar({ active, onScan, scanRunning, onShortcuts, searchQuery, 
   };
   const trail = titles[active];
   return (
-    <header className="topbar">
-      <div className="crumb">
+    <header className="sticky top-0 z-30 flex h-[60px] items-center gap-3 border-b border-secondary bg-primary/80 px-4 backdrop-blur-xl lg:gap-4 lg:px-7">
+      <button
+        className="grid size-9 shrink-0 place-items-center rounded-lg text-fg-quaternary transition hover:bg-primary_hover hover:text-fg-tertiary lg:hidden [&_svg]:size-5"
+        title="Menu"
+        aria-label="Open navigation"
+        onClick={onMenuClick}
+      >
+        <IcMenu />
+      </button>
+      <div className="flex items-center text-[13px] text-tertiary">
         {trail.map((s, i) => (
-          <span key={i}>
-            {i > 0 ? <span style={{ margin: '0 8px', color: 'var(--ink-4)' }}>/</span> : null}
-            {i === trail.length - 1 ? <b>{s}</b> : s}
+          <span key={i} className="flex items-center">
+            {i > 0 ? <span className="mx-2 text-quaternary">/</span> : null}
+            {i === trail.length - 1 ? <b className="font-semibold text-secondary">{s}</b> : s}
           </span>
         ))}
       </div>
 
-      <div className="search" onClick={(e) => { (e.currentTarget.querySelector('input') as HTMLInputElement)?.focus(); }}>
-        <IcSearch style={{ width: 14, height: 14, color: 'var(--ink-3)' }} />
+      <div
+        className="ml-auto flex h-9 w-full max-w-sm items-center gap-2 rounded-lg border border-primary bg-primary px-3 shadow-xs transition focus-within:ring-2 focus-within:ring-brand"
+        onClick={(e) => { (e.currentTarget.querySelector('input') as HTMLInputElement)?.focus(); }}
+      >
+        <IcSearch style={{ width: 14, height: 14 }} className="text-fg-quaternary" />
         <input
-          placeholder="Search files, titles, paths..."
+          className="min-w-0 flex-1 border-0 bg-transparent text-[13px] text-primary outline-none placeholder:text-placeholder"
+          placeholder="Search files, titles, paths…"
           value={searchQuery}
           onChange={e => onSearchChange(e.target.value)}
         />
         {searchQuery ? (
           <button
-            className="icon-btn"
+            className="grid size-[22px] place-items-center rounded-md text-fg-quaternary transition hover:bg-primary_hover hover:text-fg-tertiary"
             title="Clear"
-            style={{ width: 22, height: 22, padding: 0 }}
             onClick={() => onSearchChange('')}
           >
             <IcX style={{ width: 11, height: 11 }} />
           </button>
         ) : (
-          <span className="kbd">/</span>
+          <span className="rounded border border-secondary px-1.5 py-0.5 font-mono text-[10px] text-quaternary">/</span>
         )}
       </div>
 
-      <button className="icon-btn" title="Keyboard shortcuts (?)" onClick={onShortcuts}><IcKeyboard /></button>
-      <NotificationsBell />
       <button
-        className={scanRunning ? 'btn' : 'btn btn-primary'}
-        // Symmetric with the DashboardPage Quick-actions button: HTML
-        // `disabled` swallows clicks entirely, so if scanRunning is stuck
-        // true (previous scan crashed without resetting state), the user
-        // can't even see the "Scan already in progress" toast that
-        // explains the situation. Use aria-disabled + style for the
-        // visual + a11y, let onScan handle the early-return through its
-        // own scanRunning check.
-        aria-disabled={scanRunning}
-        onClick={onScan}
-        style={{
-          opacity: scanRunning ? 0.6 : undefined,
-          cursor: scanRunning ? 'not-allowed' : undefined,
-        }}
+        className="grid size-9 shrink-0 place-items-center rounded-lg border border-primary bg-primary text-fg-quaternary shadow-xs transition hover:bg-primary_hover hover:text-fg-tertiary [&_svg]:size-[16px]"
+        title="Keyboard shortcuts (?)"
+        onClick={onShortcuts}
       >
-        {scanRunning ? <IcSpin /> : <IcScan />}
-        {scanRunning ? 'Scanning...' : 'Scan now'}
+        <IcKeyboard />
       </button>
+      <NotificationsBell />
+      <Button
+        size="md"
+        color="primary"
+        iconLeading={scanRunning ? IcSpin : IcScan}
+        isDisabled={scanRunning}
+        onClick={onScan}
+      >
+        {scanRunning ? 'Scanning…' : 'Scan now'}
+      </Button>
     </header>
   );
 }
 
-export function Toast({ toasts, onDismiss }: { toasts: ToastData[]; onDismiss?: (id: string) => void }) {
+export function Toast({ toasts, onDismiss, leading }: { toasts: ToastData[]; onDismiss?: (id: string) => void; leading?: ReactNode }) {
   return (
     <div className="toasts">
-      {toasts.map(t => (
-        <div key={t.id} className={`toast ${t.kind || ''}`}>
-          <div className="toast-icon">{t.kind === 'error' ? <IcAlertTri /> : <IcCheck />}</div>
-          <div className="toast-body">
-            <div className="toast-title">{t.title}</div>
-            {t.sub ? <div className="toast-sub">{t.sub}</div> : null}
-          </div>
-          {onDismiss ? (
-            <button
-              className="toast-dismiss"
-              onClick={() => onDismiss(t.id)}
-              aria-label="Dismiss"
-              title="Dismiss"
-              style={{
-                appearance: 'none', background: 'transparent', border: 0,
-                color: 'var(--ink-3)', cursor: 'pointer',
-                padding: 6, marginLeft: 4, alignSelf: 'flex-start',
-                lineHeight: 0,
-              }}
-            >
-              <IcX />
-            </button>
-          ) : null}
-        </div>
-      ))}
+      <AnimatePresence initial={false}>
+        {leading ? (
+          <motion.div
+            key="__leading"
+            layout
+            initial={{ opacity: 0, y: 12, scale: 0.97 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.96, transition: { duration: 0.15 } }}
+            transition={{ type: 'spring', stiffness: 400, damping: 32 }}
+          >
+            {leading}
+          </motion.div>
+        ) : null}
+        {toasts.map(t => (
+          <motion.div
+            key={t.id}
+            layout
+            initial={{ opacity: 0, y: 12, scale: 0.97 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.96, transition: { duration: 0.15 } }}
+            transition={{ type: 'spring', stiffness: 400, damping: 32 }}
+            className="flex w-[340px] max-w-[90vw] items-start gap-3 rounded-xl border border-white/[0.1] bg-[rgba(8,9,12,0.66)] px-3.5 py-3 shadow-[0_12px_32px_rgba(0,0,0,0.5)] backdrop-blur-2xl"
+          >
+            <FeaturedIcon
+              size="sm"
+              color={t.kind === 'error' ? 'error' : 'success'}
+              icon={t.kind === 'error' ? <IcAlertTri /> : <IcCheck />}
+            />
+            <div className="min-w-0 flex-1">
+              <div className="text-[13px] font-semibold text-ink">{t.title}</div>
+              {t.sub ? <div className="mt-0.5 text-[12px] leading-relaxed text-ink-muted">{t.sub}</div> : null}
+            </div>
+            {onDismiss ? (
+              <button
+                onClick={() => onDismiss(t.id)}
+                aria-label="Dismiss"
+                title="Dismiss"
+                className="grid size-6 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink [&_svg]:size-[14px]"
+              >
+                <IcX />
+              </button>
+            ) : null}
+          </motion.div>
+        ))}
+      </AnimatePresence>
     </div>
   );
 }
@@ -292,6 +406,164 @@ export function Segmented({ options, value, onChange }: {
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// <Select> — themed dropdown replacement for native <select>
+//
+// The native element's open list is OS-painted and ignores CSS, which
+// shipped a blinding white-on-blue Windows dropdown in the middle of
+// Kira's dark theme. This component renders a button styled exactly
+// like our `.input` class, and on click pops a custom panel below it
+// with the options rendered as buttons. Click-outside / Escape close
+// the panel; Arrow keys + Enter navigate.
+//
+// Generic over value type so it works for both numeric ids (Sonarr
+// quality profile id) and string paths (root folder). Stringifies
+// internally for comparison via the caller-supplied keyFor (defaults
+// to JSON.stringify which works for primitives).
+// ─────────────────────────────────────────────────────────────────────
+export function Select<T>({
+  options,
+  value,
+  onChange,
+  placeholder,
+  className = '',
+  style,
+  buttonClassName = '',
+  disabled = false,
+}: {
+  options: { value: T; label: string; secondary?: string }[];
+  value: T | null | undefined;
+  onChange: (v: T) => void;
+  placeholder?: string;
+  /** Class for the OUTER wrapper (used for width / flex sizing). */
+  className?: string;
+  /** Inline style for the OUTER wrapper. Pass `{ flex: 1, minWidth: 0 }`
+   *  to make the Select fill its row inside a flex layout — the
+   *  default `display: block` keeps the popup width tracking the
+   *  trigger width without needing this. */
+  style?: React.CSSProperties;
+  /** Class for the trigger BUTTON — accepts e.g. `mono` for monospaced
+   *  paths like root-folder pickers. The base `.select-trigger` class
+   *  is always applied. */
+  buttonClassName?: string;
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  // Hover/keyboard-focused index for arrow-key navigation. -1 = none.
+  const [activeIdx, setActiveIdx] = useState<number>(-1);
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+
+  // Match an option by deep-equal-ish comparison. We JSON-stringify
+  // both sides so primitive values, dicts, and lists all compare
+  // sanely without needing a custom keyFor prop.
+  const keyOf = (v: T | null | undefined): string => {
+    if (v === null || v === undefined) return '';
+    try { return JSON.stringify(v); } catch { return String(v); }
+  };
+  const selectedKey = keyOf(value);
+  const selected = options.find(o => keyOf(o.value) === selectedKey) ?? null;
+
+  // Click-outside + Escape close the popup. Bound on document so a
+  // click ANYWHERE off the dropdown collapses it — matches every
+  // other native-feeling dropdown the user has seen.
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { setOpen(false); return; }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setActiveIdx(i => Math.min((i < 0 ? -1 : i) + 1, options.length - 1));
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setActiveIdx(i => Math.max(i - 1, 0));
+      } else if (e.key === 'Enter' && activeIdx >= 0 && activeIdx < options.length) {
+        e.preventDefault();
+        onChange(options[activeIdx].value);
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDocClick);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open, options, activeIdx, onChange]);
+
+  // When opening, jump the highlight to the currently-selected entry
+  // so Up/Down feels natural — pre-fix Arrow Down ALWAYS started at
+  // the top regardless of the current selection.
+  const handleOpen = () => {
+    if (disabled) return;
+    setActiveIdx(selected ? options.findIndex(o => keyOf(o.value) === selectedKey) : -1);
+    setOpen(o => !o);
+  };
+
+  // Folder/path selects pass buttonClassName="mono" — render their value and
+  // options in the monospace face so they match the app's path fields.
+  const mono = buttonClassName.includes('mono');
+
+  return (
+    <div ref={wrapperRef} className={cn('relative', className)} style={style}>
+      <button
+        type="button"
+        className={cn(
+          'flex w-full items-center justify-between gap-2 rounded-xl border bg-glass px-3.5 py-2.5 text-[13px] text-ink outline-none transition-colors hover:bg-glass-2 disabled:cursor-not-allowed disabled:opacity-55',
+          open ? 'border-accent-line bg-glass-2' : 'border-line',
+        )}
+        onClick={handleOpen}
+        disabled={disabled}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <span className={cn('flex-1 truncate text-left', mono && 'font-mono text-[12px]', !selected && 'text-ink-soft')}>
+          {selected ? selected.label : (placeholder ?? '— select —')}
+        </span>
+        <IcChevDown className={cn('size-4 shrink-0 text-ink-soft transition-transform duration-200', open && 'rotate-180')} />
+      </button>
+      {open && (
+        <div
+          role="listbox"
+          className="absolute left-0 right-0 top-[calc(100%+6px)] z-[1000] max-h-[280px] overflow-y-auto rounded-xl border border-line bg-[#0e0f14] p-1 shadow-[0_12px_32px_rgba(0,0,0,0.5),0_2px_6px_rgba(0,0,0,0.4)] [scrollbar-width:thin]"
+        >
+          {options.length === 0 ? (
+            <div className="px-2.5 py-3 text-center text-[12px] text-ink-soft">No options available.</div>
+          ) : options.map((opt, idx) => {
+            const isSelected = keyOf(opt.value) === selectedKey;
+            const isActive = idx === activeIdx;
+            return (
+              <button
+                key={`${idx}-${keyOf(opt.value)}`}
+                type="button"
+                role="option"
+                aria-selected={isSelected}
+                className={cn(
+                  'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] transition-colors [&_svg]:size-4 [&_svg]:shrink-0',
+                  isActive && 'bg-glass-2',
+                  isSelected ? 'text-accent' : 'text-ink',
+                )}
+                onMouseEnter={() => setActiveIdx(idx)}
+                onClick={() => { onChange(opt.value); setOpen(false); }}
+              >
+                <span className={cn('flex-1 truncate', mono && 'font-mono text-[12px]', isSelected && 'font-medium')}>{opt.label}</span>
+                {opt.secondary ? (
+                  <span className="shrink-0 text-[11px] text-ink-soft">{opt.secondary}</span>
+                ) : null}
+                {isSelected ? <IcCheck /> : null}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function FilterPill({ on, onClick, label, num }: {
   on: boolean;
   onClick: () => void;
@@ -299,32 +571,31 @@ export function FilterPill({ on, onClick, label, num }: {
   num?: number;
 }) {
   return (
-    <button className={`filter-pill ${on ? 'on' : ''}`} onClick={onClick}>
+    <button
+      onClick={onClick}
+      className={cn(
+        'inline-flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-[12.5px] font-medium transition-colors',
+        on
+          ? 'bg-white/[0.1] text-ink shadow-[0_1px_2px_rgba(0,0,0,0.3)]'
+          : 'text-ink-muted hover:bg-white/[0.05] hover:text-ink',
+      )}
+    >
       {label}
-      {num != null ? <span className="num">{num}</span> : null}
+      {num != null ? (
+        <span className={cn(
+          'rounded-md px-1.5 py-0.5 text-[10px] font-semibold tabular-nums',
+          on ? 'bg-white/[0.16] text-ink' : 'bg-white/[0.06] text-ink-soft',
+        )}>{num}</span>
+      ) : null}
     </button>
   );
 }
 
-/**
- * Generic page-level loader. Pages render this in place of their main
- * content while their initial data fetch is in flight, so the user
- * never sees the empty-state UI flash on refresh.
- *
- * Just a CSS-driven ring spinner + label. No props except a custom label
- * (defaults to "Loading…"). Styled by .lib-loading / .lib-loading-spinner
- * in index.css.
- *
- * NOTE: prefer `Skeleton` for individual values inside an otherwise
- * laid-out page — this loader blocks the entire region. Use it only
- * when there's literally nothing meaningful to render until the fetch
- * lands.
- */
-export function PageLoader({ label = 'Loading…' }: { label?: string }) {
+// Wraps a set of FilterPills into a tidy segmented group (subtle inset bar).
+export function FilterGroup({ children }: { children: ReactNode }) {
   return (
-    <div className="lib-loading" aria-busy="true" role="status" aria-label={label}>
-      <div className="lib-loading-spinner" />
-      <div className="lib-loading-label">{label}</div>
+    <div className="inline-flex flex-wrap items-center gap-1 rounded-xl border border-line bg-white/[0.025] p-1">
+      {children}
     </div>
   );
 }
@@ -406,7 +677,10 @@ export function Modal({ title, sub, onClose, children, footer, size }: {
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className={`modal ${size ? 'size-' + size : ''}`} onClick={e => e.stopPropagation()}>
+      <div
+        className={`modal ${size ? 'size-' + size : ''}`}
+        onClick={e => e.stopPropagation()}
+      >
         <div className="modal-head">
           <div>
             <div className="modal-title">{title}</div>

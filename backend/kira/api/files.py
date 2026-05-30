@@ -152,12 +152,23 @@ async def reparse_all(
     """
     from pathlib import Path as _Path
     from kira.parser import parse_filename
-    from kira.api.scans import _compute_series_key
+    from kira.api.scans import (
+        _compute_series_key,
+        _maybe_enrich_mediainfo,
+        _read_mediainfo_setting,
+        _read_mediainfo_authoritative_setting,
+    )
 
     stmt = select(MediaFile)
     if media_type is not None:
         stmt = stmt.where(MediaFile.media_type == media_type)
     files = list(await session.scalars(stmt))
+
+    # Phase 16: apply the same MediaInfo enrichment the scan worker does, so a
+    # reparse picks up tech tags (and authoritative overrides) without needing
+    # a full rescan of the library.
+    read_mi = await _read_mediainfo_setting(session)
+    mi_authoritative = await _read_mediainfo_authoritative_setting(session)
 
     changed = 0
     for mf in files:
@@ -165,6 +176,7 @@ async def reparse_all(
             continue
         parent = str(_Path(mf.file_path).parent)
         fresh = parse_filename(_Path(mf.file_path).name, parent_path=parent)
+        await _maybe_enrich_mediainfo(fresh, mf.file_path, read_mi, mi_authoritative)
         new_data = fresh.to_dict()
         if new_data != mf.parsed_data:
             mf.parsed_data = new_data

@@ -1,6 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { api, type ApiNotification } from '../lib/api';
 import { IcBell, IcCheck, IcAlertTri } from '../lib/icons';
+import { cn } from '../lib/utils';
+import { FeaturedIcon } from './base/featured-icons/featured-icon';
+import { Button } from './base/buttons/button';
+import { Alert } from './base/alert/alert';
 
 function relativeTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
@@ -10,31 +14,38 @@ function relativeTime(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
+// Map a notification kind to a FeaturedIcon color + glyph. Success/error/warning
+// keep their semantic colors; anything else is neutral.
+function kindColor(kind: string): 'success' | 'error' | 'warning' | 'gray' {
+  if (kind === 'success') return 'success';
+  if (kind === 'error') return 'error';
+  if (kind === 'warning') return 'warning';
+  return 'gray';
+}
+function kindIcon(kind: string): ReactNode {
+  if (kind === 'success') return <IcCheck />;
+  if (kind === 'error' || kind === 'warning') return <IcAlertTri />;
+  return <IcBell />;
+}
+
 export function NotificationsBell() {
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<ApiNotification[]>([]);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   // M11: surface fetch errors once per session so a silent broken bell
-  // doesn't hide the fact that the backend is unreachable. We track
-  // whether we've already shown the warning so 15s polls don't spam
-  // the popover with duplicate "Connection lost" rows.
+  // doesn't hide the fact that the backend is unreachable.
   const errorSurfacedRef = useRef(false);
 
   const refresh = async () => {
     try {
       const next = await api.listNotifications();
       setItems(next);
-      // Recovery — clear the error banner if a poll succeeds.
       if (fetchError) {
         setFetchError(null);
         errorSurfacedRef.current = false;
       }
     } catch (e) {
-      // M11: was a bare swallow. Now we record the error so the popover
-      // can render a one-line "Notifications offline — backend
-      // unreachable" banner. Only surface ONCE per disconnection so a
-      // user clicking the bell during an outage isn't bombarded.
       const msg = (e as Error).message || 'fetch failed';
       if (!errorSurfacedRef.current) {
         setFetchError(msg);
@@ -70,21 +81,10 @@ export function NotificationsBell() {
     } catch { /* swallow */ }
   };
 
-  const dotColor = (kind: string): string => {
-    if (kind === 'success') return 'var(--conf-high)';
-    if (kind === 'error') return 'var(--conf-low)';
-    if (kind === 'warning') return 'var(--conf-mid)';
-    return 'var(--ink-3)';
-  };
-
   return (
-    <div ref={wrapRef} style={{ position: 'relative' }}>
-      {/* F-14: aria-label includes the live count so screen-reader
-          users know there are unread notifications without expanding
-          the popover. Also gives sighted users a tooltip that reflects
-          state instead of the static "Notifications" label. */}
+    <div ref={wrapRef} className="relative">
       <button
-        className="icon-btn"
+        className="relative grid size-9 shrink-0 place-items-center rounded-lg border border-primary bg-primary text-fg-quaternary shadow-xs transition hover:bg-primary_hover hover:text-fg-tertiary [&_svg]:size-[16px]"
         title={unread > 0 ? `Notifications (${unread} unread)` : 'Notifications'}
         aria-label={unread > 0 ? `Notifications, ${unread} unread` : 'Notifications'}
         onClick={() => setOpen(o => !o)}
@@ -92,87 +92,53 @@ export function NotificationsBell() {
         <IcBell />
         {unread > 0 ? (
           <span
-            // aria-hidden because the parent button already announces
-            // the count — letting the badge be announced would read
-            // "Notifications, 3 unread, 3" which is awkward.
             aria-hidden="true"
-            style={{
-              position: 'absolute', top: 4, right: 4,
-              minWidth: 14, height: 14, padding: '0 4px',
-              borderRadius: 7,
-              background: 'var(--conf-low)', color: 'white',
-              fontSize: 9, fontWeight: 700,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              lineHeight: 1,
-            }}>{unread > 99 ? '99+' : unread}</span>
+            className="absolute -right-1 -top-1 grid h-4 min-w-4 place-items-center rounded-full bg-conf-low px-1 text-[9px] font-bold leading-none text-white"
+          >
+            {unread > 99 ? '99+' : unread}
+          </span>
         ) : null}
       </button>
 
       {open ? (
-        <div style={{
-          position: 'absolute', top: 'calc(100% + 8px)', right: 0, zIndex: 50,
-          width: 360, maxHeight: 480, overflowY: 'auto',
-          background: 'rgba(20,16,32,0.95)',
-          border: '1px solid var(--line)', borderRadius: 12,
-          boxShadow: '0 18px 60px rgba(0,0,0,0.5)',
-          backdropFilter: 'blur(20px)',
-        }}>
-          <div className="flex items-center justify-between" style={{ padding: '12px 14px', borderBottom: '1px solid var(--line)' }}>
-            <div className="font-semibold text-sm">Notifications</div>
+        <div className="absolute right-0 top-[calc(100%+8px)] z-50 w-[360px] overflow-hidden rounded-2xl border border-white/[0.12] bg-[rgba(20,19,28,0.96)] shadow-[0_18px_60px_rgba(0,0,0,0.55)] backdrop-blur-xl">
+          <div className="flex items-center justify-between border-b border-white/[0.1] px-4 py-3">
+            <div className="text-[13px] font-semibold text-ink">Notifications</div>
             {items.some(i => !i.read) ? (
-              <button className="btn btn-sm btn-ghost" onClick={() => void markAllRead()}>Mark all read</button>
+              <Button color="link-gray" size="sm" className="text-xs" onClick={() => void markAllRead()}>Mark all read</Button>
             ) : null}
           </div>
-          {/* M11: surface fetch failure so a broken bell never lies. */}
+
           {fetchError ? (
-            <div style={{
-              padding: '10px 14px',
-              background: 'rgba(255,80,90,0.08)',
-              borderBottom: '1px solid rgba(255,80,90,0.18)',
-              color: 'var(--conf-low)',
-              fontSize: 12,
-              display: 'flex', alignItems: 'center', gap: 8,
-            }}>
-              <IcAlertTri style={{ width: 12, height: 12, flexShrink: 0 }} />
-              <span>Notifications offline — backend unreachable.</span>
-            </div>
+            <Alert color="error" icon={IcAlertTri} className="m-3">Notifications offline — backend unreachable.</Alert>
           ) : null}
+
           {items.length === 0 ? (
-            <div style={{ padding: 28, textAlign: 'center', color: 'var(--ink-3)', fontSize: 13 }}>
-              All caught up — no notifications.
+            <div className="flex flex-col items-center gap-2.5 px-6 py-10 text-center">
+              <FeaturedIcon size="md" color="gray" icon={<IcBell />} />
+              <div className="text-[13px] text-ink-muted">All caught up — no notifications.</div>
             </div>
           ) : (
-            <div>
+            <div className="max-h-[420px] overflow-y-auto [scrollbar-width:thin]">
               {items.map(n => (
-                <div
+                <button
                   key={n.id}
-                  className="flex items-start gap-3"
-                  style={{
-                    padding: '10px 14px',
-                    borderBottom: '1px solid rgba(255,255,255,0.04)',
-                    background: n.read ? 'transparent' : 'rgba(40,217,160,0.04)',
-                    cursor: n.read ? 'default' : 'pointer',
-                  }}
+                  className={cn(
+                    'flex w-full items-start gap-3 border-b border-white/[0.06] px-4 py-3 text-left transition-colors last:border-0 hover:bg-glass',
+                    !n.read && 'bg-[var(--accent-soft)]',
+                  )}
                   onClick={async () => {
                     if (!n.read) { try { await api.markNotificationRead(n.id); void refresh(); } catch { /* */ } }
                   }}
                 >
-                  <span className="dot" style={{
-                    background: dotColor(n.kind),
-                    width: 8, height: 8, marginTop: 6, flexShrink: 0,
-                  }} />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div className="text-sm font-medium">
-                      {n.kind === 'success' ? <IcCheck style={{ width: 11, height: 11, display: 'inline', marginRight: 4, color: 'var(--conf-high)' }} /> : null}
-                      {n.kind === 'error' ? <IcAlertTri style={{ width: 11, height: 11, display: 'inline', marginRight: 4, color: 'var(--conf-low)' }} /> : null}
-                      {n.title}
-                    </div>
-                    {n.body ? (
-                      <div className="text-xs text-muted" style={{ marginTop: 2, lineHeight: 1.4 }}>{n.body}</div>
-                    ) : null}
-                    <div className="text-xs" style={{ marginTop: 4, color: 'var(--ink-4)' }}>{relativeTime(n.created_at)}</div>
+                  <FeaturedIcon size="sm" color={kindColor(n.kind)} icon={kindIcon(n.kind)} />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[13px] font-medium text-ink">{n.title}</div>
+                    {n.body ? <div className="mt-0.5 text-[12px] leading-relaxed text-ink-muted">{n.body}</div> : null}
+                    <div className="mt-1 text-[11px] text-ink-faint">{relativeTime(n.created_at)}</div>
                   </div>
-                </div>
+                  {!n.read ? <span className="mt-1.5 size-2 shrink-0 rounded-full bg-accent" /> : null}
+                </button>
               ))}
             </div>
           )}

@@ -102,6 +102,14 @@ export function apiToMediaFile(api: ApiMediaFile): MediaFile {
     ? {
         title: displayTitle,
         year: displayYear,
+        // Backend Match row id — needed by cluster-level cross-system
+        // actions (Sonarr "send missing" being the first). Without it
+        // the downstream LibFile.matchId field stays null and any
+        // "act on this match" button can't find the server-side
+        // handle. Pulled from topMatch only; synthesised matches
+        // (from parsed.title when no provider hit) legitimately have
+        // no backend id.
+        matchId: topMatch?.id ?? undefined,
         provider: topMatch?.provider,
         providerId: topMatch?.provider_id,
         seriesGroupId: topMatch?.series_group_id ?? undefined,
@@ -288,7 +296,7 @@ function buildItem(group: MediaFile[]): LibraryItem {
   }
 
   // Map each MediaFile → LibFile with its index into the episodes array.
-  const files: LibFile[] = group.map((f, idx) => {
+  const files: LibFile[] = group.map((f) => {
     let matchedToEpisode: number | null = null;
     if (kind === 'movie') {
       matchedToEpisode = f.match ? 0 : null;
@@ -317,6 +325,14 @@ function buildItem(group: MediaFile[]): LibraryItem {
       matchedWrong: false, // future: detect filename-says-X but matched-to-Y
       status: f.status,
       confidence: f.confidence,
+      // Surface the backend Match.id so cluster-level cross-system
+      // actions (Sonarr "send missing", future NFO writers) have a
+      // server-side handle without re-querying. We previously stripped
+      // `f.match` here to keep LibFile lean, then realized the cluster
+      // popup actions needed it — exposing just the id keeps the win
+      // (no nested match blob duplicated 26× per cluster) while
+      // unblocking these actions.
+      matchId: f.match?.matchId ?? null,
     };
   });
 
@@ -352,8 +368,21 @@ function buildItem(group: MediaFile[]): LibraryItem {
   };
   const heroMeta = _readMatchMeta(repMatch);
 
+  // Library item id: must be unique across ALL items rendered in the grid.
+  // The naive `lib_<seriesKey>` collides when one series_key spans multiple
+  // provider matches — most commonly when cour-routing correctly splits a
+  // multi-cour anime (Bleach S17 across AIDs 15449/17849/18671) into
+  // distinct cards. Each split keeps the same series_key ("anime|bleach|17|
+  // bleach") but ends up on a different provider_id. Pre-fix: React warns
+  // "Encountered two children with the same key" and reconciliation may
+  // mis-attribute card state across renders. Fix: append the provider+id
+  // disambiguator when a match exists, fall back to head.id when no match.
+  const _matchSuffix = repMatch?.provider && repMatch?.providerId
+    ? `_${repMatch.provider}_${repMatch.providerId}`
+    : '';
+  const _idStem = head.seriesKey ? `lib_${head.seriesKey}` : `lib_${head.id}`;
   return {
-    id: head.seriesKey ? `lib_${head.seriesKey}` : `lib_${head.id}`,
+    id: `${_idStem}${_matchSuffix}`,
     kind, mediaType: head.mediaType,
     title,
     year,
@@ -378,6 +407,9 @@ function buildItem(group: MediaFile[]): LibraryItem {
       ?? group.map(g => g.match?.posterUrl).find(Boolean)
       ?? null,
     seriesGroupId: repMatch?.seriesGroupId ?? null,
+    // Per-cluster key (distinct from the franchise group id) — lets the
+    // Review page re-find this exact item after a re-match shifts its id.
+    seriesKey: head.seriesKey ?? null,
     // Canonical season number from the provider — Fribb cross-ref for AniDB
     // (each AID → exactly one TVDB season), filename parser for others.
     // Replaces the old `i + 1` year-sort heuristic on the franchise grid.

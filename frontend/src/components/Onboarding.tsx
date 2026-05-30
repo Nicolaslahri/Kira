@@ -491,7 +491,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
         <div className="onboarding-foot">
           {step === 0 ? (
             <>
-              <div className="text-xs text-muted">Self-hosted · v0.4.1 · Docker</div>
+              <div className="text-xs text-muted">Self-hosted · v0.5.0 · Docker</div>
               <button className="btn btn-brand" style={{ padding: '12px 24px', fontSize: 14 }} onClick={next}>
                 Get started <IcArrowRight />
               </button>

@@ -1,8 +1,10 @@
 /* Kira — glassmorphic dark, emerald accent, pink/orange backdrop. v2 */
 
 :root {
-  /* Surfaces */
-  --bg:           #07060c;
+  /* Surfaces — pure black canvas (Magic UI startup-template look:
+     black bg, white-forward UI, colour only where it carries meaning). Was
+     #07060c (purple-tinted) → #050506 (near-black) → now true black. */
+  --bg:           #000000;
   --ink:          #ffffff;
   --ink-2:        #bdc1d0;
   --ink-3:        #71778e;
@@ -37,6 +39,13 @@
   /* Misc */
   --info:          #49b8fe;
   --info-bg:       rgba(73,184,254,0.12);
+
+  /* Rainbow button (Magic UI) — gradient stops as HSL triplets */
+  --color-1: 0 100% 63%;
+  --color-2: 270 100% 63%;
+  --color-3: 210 100% 63%;
+  --color-4: 195 100% 63%;
+  --color-5: 90 100% 63%;
 
   /* Type */
   --font-ui:      'Inter', -apple-system, 'SF Pro Text', system-ui, sans-serif;
@@ -83,15 +92,13 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 10px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.14); }
 
-/* Backdrop */
+/* Backdrop — pure black canvas; no colour glows (colour lives in the UI,
+   not the background). Only a faint neutral dot grid for texture. */
 .backdrop {
   position: fixed; inset: 0;
   z-index: 0;
   pointer-events: none;
-  background:
-    radial-gradient(900px 600px at 15% -10%, rgba(229,75,186,0.18), transparent 60%),
-    radial-gradient(900px 700px at 100% 100%, rgba(255,151,75,0.14), transparent 55%),
-    radial-gradient(1200px 800px at 50% 120%, rgba(114,0,228,0.10), transparent 60%);
+  background: var(--bg);
 }
 .backdrop::after {
   content: '';
@@ -531,6 +538,23 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   background: linear-gradient(90deg, rgba(40,217,160,0.18), rgba(40,217,160,0.10));
   transition: width 0.35s ease-out;
 }
+/* DISCOVERY phase: the file total isn't known yet, so a fixed % would lie.
+   Animate a chunk of fill sweeping across the track to show it's actively
+   working (instead of a bar frozen at 50%). The MATCHING phase drops this
+   class and uses the real width-driven fill above. */
+.global-scan-bar.indeterminate .global-scan-bar-fill {
+  inset: 0 auto 0 0;
+  width: 35%;
+  background: linear-gradient(90deg,
+    rgba(40,217,160,0.04), rgba(40,217,160,0.24), rgba(40,217,160,0.04));
+  transition: none;
+  animation: scanSweep 1.15s ease-in-out infinite;
+  will-change: transform;
+}
+@keyframes scanSweep {
+  0%   { transform: translateX(-110%); }
+  100% { transform: translateX(320%); }
+}
 .global-scan-bar-content {
   position: relative;
   display: flex; align-items: center; gap: 14px;
@@ -783,7 +807,10 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 .modal {
-  background: rgba(20,16,32,0.92);
+  /* Neutral near-black surface to match the app canvas (--bg). Was a
+     purple-blue rgba(20,16,32) from the old theme, which read as off-brand
+     "dark blue" against the rest of the UI. */
+  background: rgba(13,13,16,0.95);
   backdrop-filter: blur(40px);
   border: 1px solid var(--line);
   border-radius: var(--r-xl);
@@ -1005,6 +1032,42 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   letter-spacing: 0.03em;
 }
 .history-row:last-child { border-bottom: 0; }
+
+/* Fresh-row highlight — pulses for ~2.5s after the row first appears
+   so the user can see what was just added. Without this, the rows
+   silently insert at the top with no visual cue. Combined with the
+   `kira:rename-success` listener in HistoryPage, the user gets
+   immediate "here's what just happened" feedback. */
+.history-row-fresh {
+  position: relative;
+  animation: history-row-pulse 2.5s ease-out;
+  background: rgba(40, 217, 160, 0.06);
+}
+.history-row-fresh::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: var(--conf-high);
+  animation: history-row-flash 2.5s ease-out forwards;
+}
+@keyframes history-row-pulse {
+  0%   { background: rgba(40, 217, 160, 0.20); }
+  50%  { background: rgba(40, 217, 160, 0.12); }
+  100% { background: transparent; }
+}
+@keyframes history-row-flash {
+  0%   { opacity: 1; }
+  85%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .history-row-fresh,
+  .history-row-fresh::before {
+    animation: none;
+    background: rgba(40, 217, 160, 0.10);
+  }
+}
 .history-paths {
   display: flex; flex-direction: column; gap: 4px;
   min-width: 0;
@@ -1024,7 +1087,9 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 
 /* ── Settings page ───────────────────────────────────────── */
 .settings-grid {
-  display: grid; grid-template-columns: 240px 1fr; gap: 28px;
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 28px;
 }
 .settings-nav {
   display: flex; flex-direction: column; gap: 2px;
@@ -1069,6 +1134,234 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 }
 .input:focus { border-color: var(--accent-line); background: var(--glass-2); }
 .input.mono { font-family: var(--font-mono); font-size: 12px; }
+
+/* ── Themed Select dropdown ───────────────────────────────────────
+   Drop-in replacement for the native <select> element, which
+   ignored every CSS rule we threw at it and rendered a glaring
+   white-on-blue Windows dropdown in the middle of our dark theme.
+   The trigger button reuses .input styles so it lines up visually
+   with neighbouring fields; the popup is a fully-styled custom
+   panel we paint ourselves. */
+.select { display: block; }
+.select-trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  cursor: pointer;
+  /* Inherit .input padding/border/bg but override one default —
+     buttons get an inset focus ring by default in some browsers
+     which fights our border-radius. Suppress it; the :focus state
+     comes from .input above. */
+  -webkit-appearance: none;
+  appearance: none;
+}
+.select-trigger:hover:not(:disabled) {
+  border-color: var(--accent-line);
+}
+.select-trigger.is-open {
+  border-color: var(--accent-line);
+  background: var(--glass-2);
+}
+.select-trigger:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.select-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.select-value.is-placeholder { color: var(--ink-3); }
+.select-caret {
+  font-size: 10px;
+  color: var(--ink-3);
+  flex-shrink: 0;
+}
+
+.select-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  background: var(--bg-2, #0e0f14);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 4px;
+  z-index: 1000;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.4);
+  max-height: 280px;
+  overflow-y: auto;
+  /* Slight in-from-top animation so the menu feels intentional
+     rather than snapping into place. */
+  animation: select-menu-in 90ms ease-out;
+}
+@keyframes select-menu-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.select-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  color: var(--ink);
+  font-size: 13px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  /* Disabled by default so the keyboard navigation's "active"
+     row gets a hover even when the mouse hasn't moved. */
+  transition: background 60ms ease-out;
+}
+.select-option.is-active,
+.select-option:hover {
+  background: var(--glass-2);
+}
+.select-option.is-selected {
+  color: var(--accent);
+  font-weight: 500;
+}
+.select-option-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.select-option-secondary {
+  font-size: 11px;
+  color: var(--ink-3);
+  flex-shrink: 0;
+}
+.select-option.mono .select-option-label {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.select-empty {
+  padding: 12px 10px;
+  color: var(--ink-3);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* ── Integrations panel layout ────────────────────────────────────
+   Each external tool (Sonarr, Radarr, Plex, …) gets one self-
+   contained "block" card. Inside: header with title + status,
+   description, vertically-stacked form rows for credentials, then
+   an optional defaults section laid out as side-by-side mini-cards
+   for per-flavor settings (e.g. Sonarr TV vs Anime profiles). The
+   field-row pattern used by other sections wastes width on a
+   redundant label column when the form has many vertical fields. */
+.integ-block {
+  border: 1px solid var(--line);
+  background: var(--glass);
+  border-radius: 12px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.integ-block.dim {
+  opacity: 0.55;
+}
+.integ-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.integ-title {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.integ-status {
+  font-size: 12px;
+  color: var(--ink-3);
+  margin-left: auto;
+}
+.integ-status.ok { color: var(--ok); }
+.integ-status.fail { color: var(--danger); }
+.integ-desc {
+  font-size: 12px;
+  color: var(--ink-2);
+  line-height: 1.5;
+  max-width: 720px;
+}
+.integ-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.integ-row-label {
+  width: 64px;
+  font-size: 12px;
+  color: var(--ink-2);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.integ-row-action {
+  flex-shrink: 0;
+}
+
+/* Defaults section header — separates credentials from per-flavor
+   selection so the eye groups the two flavor cards visually. */
+.integ-defaults {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+.integ-defaults-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink-2);
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+}
+.integ-defaults-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+@media (max-width: 900px) {
+  .integ-defaults-grid { grid-template-columns: 1fr; }
+}
+.integ-flavor {
+  border: 1px solid var(--line);
+  background: var(--glass-2);
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.integ-flavor-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+.integ-flavor-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.integ-flavor-sub {
+  font-size: 11px;
+  color: var(--ink-3);
+}
 
 /* Range / threshold sliders */
 .threshold {
@@ -1213,6 +1506,24 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 @keyframes kira-skeleton-shimmer {
   0%   { background-position: -200px 0; }
   100% { background-position: calc(200px + 100%) 0; }
+}
+
+/* Indeterminate progress sweep — scan-discovery phase (total unknown). */
+@keyframes kira-indeterminate {
+  0%   { left: -40%; }
+  100% { left: 100%; }
+}
+
+/* Pop-in for the scan progress popup. */
+@keyframes kira-pop {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Glass sheen — a diagonal highlight that sweeps across, then rests. */
+@keyframes kira-shine {
+  0%        { left: -45%; }
+  55%, 100% { left: 130%; }
 }
 .kira-skeleton {
   background-color: rgba(255, 255, 255, 0.06);
@@ -1906,6 +2217,71 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   border: 1px solid var(--line);
   border-radius: 7px;
   font-size: 11px;
+  font-family: inherit;
+  color: var(--ink);
+}
+/* Clickable token chips (Custom profile) insert at the caret. */
+.token-chip.clickable { cursor: pointer; transition: border-color .12s ease, background .12s ease, transform .08s ease; }
+.token-chip.clickable:hover { border-color: var(--accent-line); background: var(--glass-3); }
+.token-chip.clickable:active { transform: translateY(1px); }
+.token-chip:disabled { cursor: default; }
+
+/* ── Naming template editor: 2-pane editor | live preview ── */
+.naming-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+.naming-pane {
+  background: var(--glass);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 16px;
+  min-width: 0;
+}
+.naming-pane-preview {
+  background: rgba(40, 217, 160, 0.03);
+  border-color: var(--accent-line);
+}
+.naming-pane-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  font-size: 10.5px; color: var(--ink-3);
+  text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600;
+  margin-bottom: 8px;
+}
+.naming-pane-preview .naming-pane-head { color: var(--accent); }
+.naming-lock {
+  text-transform: none; letter-spacing: 0; font-weight: 500;
+  color: var(--ink-3); font-size: 11px; white-space: nowrap;
+}
+.naming-hint {
+  margin-top: 8px; font-size: 11.5px; color: var(--ink-3); line-height: 1.6;
+}
+.naming-hint code {
+  font-family: var(--font-mono); font-size: 10.5px;
+  background: var(--glass-3); padding: 1px 5px; border-radius: 4px; color: var(--ink-2);
+}
+.naming-tokens { display: flex; flex-wrap: wrap; gap: 6px; }
+.naming-preview-list { display: flex; flex-direction: column; gap: 8px; }
+.naming-preview-row {
+  background: rgba(40, 217, 160, 0.04);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-sm, 8px);
+  padding: 8px 10px;
+  min-width: 0;
+}
+.naming-preview-src {
+  font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-3);
+  margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.naming-preview-empty {
+  font-size: 12px; color: var(--ink-3); padding: 10px 12px;
+  border: 1px dashed var(--line); border-radius: var(--r-sm, 8px);
+}
+/* Stack the two panes on narrower viewports (nav already eats 240px). */
+@media (max-width: 1180px) {
+  .naming-editor { grid-template-columns: 1fr; }
 }
 
 /* ── Onboarding content-type cards (step 1) ─────────────── */
@@ -2084,16 +2460,16 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
    "big card" feel. */
 .lib-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, 220px);
-  gap: 22px 18px;
+  grid-template-columns: repeat(auto-fit, 250px);
+  gap: 24px 20px;
   justify-content: start;
 }
 .lib-grid.shape-square {
-  grid-template-columns: repeat(auto-fit, 220px);
+  grid-template-columns: repeat(auto-fit, 250px);
 }
-@media (max-width: 1400px) { .lib-grid { grid-template-columns: repeat(auto-fit, 200px); } }
-@media (max-width: 1100px) { .lib-grid { grid-template-columns: repeat(auto-fit, 180px); } }
-@media (max-width: 760px)  { .lib-grid { grid-template-columns: repeat(auto-fit, 150px); } }
+@media (max-width: 1400px) { .lib-grid { grid-template-columns: repeat(auto-fit, 224px); } }
+@media (max-width: 1100px) { .lib-grid { grid-template-columns: repeat(auto-fit, 200px); } }
+@media (max-width: 760px)  { .lib-grid { grid-template-columns: repeat(auto-fit, 168px); } }
 
 /* ════════════════════════════════════════════════════════════════════
    COVER CARD — the atomic unit
@@ -2574,6 +2950,177 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 }
 
 /* ════════════════════════════════════════════════════════════════════
+   CINEMATIC COVER — CodePen-inspired hover-reveal treatment.
+   Additive layer gated on `.cc.cinema`; the base `.cc` styles above are
+   untouched, so dropping the `cinema` class reverts instantly.
+
+   At rest: poster fills the card, title sits at the bottom over a blurred
+   dark gradient (titles stay scannable — it's a library). On hover: poster
+   pushes in (scale), and the sub-line (year · season · eps) + quick actions
+   slide + fade up out of the gradient — the CodePen reveal.
+   ════════════════════════════════════════════════════════════════════ */
+.cc.cinema { gap: 0; }
+
+/* Caption overlays the bottom of the cover. Flush to the edges (the card has
+   no padding in cinema mode), so the gradient band spans the full poster
+   width instead of leaving a misaligned strip. */
+.cc.cinema .cc-meta {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  z-index: 5;
+  padding: 30px 11px 11px;
+  border-radius: 0 0 10px 10px;
+  /* A solid dark gradient (no backdrop-filter): the blur version was lovely
+     on ONE card but 48 simultaneous backdrop-filters tanked the renderer.
+     The gradient alone keeps titles perfectly legible over any poster. */
+  background: linear-gradient(to top,
+    rgba(8,6,16,0.96) 0%, rgba(8,6,16,0.86) 34%, rgba(8,6,16,0.42) 66%, transparent 100%);
+  pointer-events: none;
+  transition: padding 0.28s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+.cc.cinema .cc-meta > * { pointer-events: auto; }
+.cc.cinema .cc-cover.shape-square + .cc-meta,
+.cc.cinema .cc-cover-nm + .cc-meta { border-radius: 0 0 8px 8px; }
+
+/* Title is now on-art → white + shadow for legibility (no transform, so it
+   never fights the title marquee). */
+.cc.cinema .cc-title {
+  color: #fff;
+  font-size: 14px;
+  text-shadow: 0 1px 6px rgba(0,0,0,0.75);
+}
+.cc.cinema .cc-title.approved { color: rgba(255,255,255,0.6); }
+
+/* Sub-line = the CodePen "description": collapsed at rest, slides up + fades
+   in on hover. */
+.cc.cinema .cc-bottom-row {
+  /* Sub-info on the left, quick actions on the right (CodePen layout) so they
+     can never overlap. */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  max-height: 0;
+  opacity: 0;
+  translate: 0 6px;
+  overflow: hidden;
+  transition: max-height 0.3s ease, opacity 0.3s ease,
+              translate 0.3s ease, margin-top 0.3s ease;
+}
+.cc.cinema .cc-sub {
+  color: rgba(255,255,255,0.82);
+  flex: 1;
+  min-width: 0;          /* allow the text to shrink rather than push actions */
+  overflow: hidden;
+  /* Force a single clipping row — a later rule was letting the spans wrap to
+     two lines, which then got clipped by the row's max-height. */
+  flex-direction: row !important;
+  flex-wrap: nowrap !important;
+  white-space: nowrap;
+}
+.cc.cinema .cc-sub { gap: 0 !important; }
+/* Sub-info = lightweight secondary TEXT, not chips. Later sections box every
+   cc-sub span (background + border + padding) which made the season/episode
+   read like buttons next to the real action buttons. Strip that here and join
+   the parts with a middot so info and actions look clearly different. */
+.cc.cinema .cc-sub > span:not(.dot-sep) {
+  white-space: nowrap;
+  flex-shrink: 0;
+  background: transparent !important;
+  border: 0 !important;
+  padding: 0 !important;
+  border-radius: 0 !important;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  color: rgba(255,255,255,0.74) !important;
+}
+.cc.cinema .cc-sub > span.cc-sub-strong { color: #fff !important; font-weight: 600 !important; }
+.cc.cinema .cc-sub > span:not(.dot-sep) + span:not(.dot-sep)::before {
+  content: '·';
+  margin: 0 6px;
+  opacity: 0.5;
+  font-weight: 400;
+}
+.cc.cinema .cc-sub > .dot-sep { margin: 0 6px; }
+/* Actions now flow INSIDE the caption row (not an absolute overlay): pin to
+   the right, never shrink, so the sub-info text yields space to them. */
+.cc.cinema .cc-actions {
+  position: static;
+  opacity: 1;
+  transform: none;
+  flex-shrink: 0;
+  bottom: auto; right: auto;
+}
+.cc.cinema:hover .cc-bottom-row,
+.cc.cinema:focus-within .cc-bottom-row {
+  max-height: 36px;
+  opacity: 1;
+  translate: 0 0;
+  margin-top: 4px;
+}
+
+/* Poster zoom on hover — the camera-push that sells the reveal. Replaces the
+   base card's 2px lift (which would desync from the absolute caption). */
+.cc.cinema .cc-cover > img { transition: transform 0.45s cubic-bezier(0.2, 0.9, 0.3, 1); }
+.cc.cinema:hover .cc-cover > img,
+.cc.cinema:focus-within .cc-cover > img { transform: scale(1.07); }
+.cc.cinema:hover .cc-cover { transform: none; }
+
+/* No-match cards have no real poster behind the gradient — soften it so the
+   centered media-type icon stays legible. */
+.cc.cinema .cc-cover-nm + .cc-meta {
+  background: linear-gradient(to top,
+    rgba(8,6,16,0.82) 0%, rgba(8,6,16,0.42) 50%, transparent 100%);
+}
+
+/* Flush poster — the artwork goes edge-to-edge with no frame.
+
+   NOTE: later sections of this stylesheet (a bordered "glass card container"
+   and a 3D-tilt/glare treatment) re-style .cc with `!important`. Those are the
+   actual frame/padding the user sees. We out-specify them with `.cc.cinema`
+   (0,2,0) + `!important` so the cinema cover owns the look: no border, no
+   padding, no card background, no glare, no 3D tilt — just the poster, a clean
+   drop shadow, and the hover-reveal. */
+.cc.cinema {
+  border: 0 !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  gap: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+.cc.cinema:hover {
+  border: 0 !important;
+  background: transparent !important;
+  transform: none !important;      /* kill the 3D-tilt scale/rotate */
+  box-shadow: none !important;     /* kill the 3D hover glow */
+}
+.cc.cinema.is-anime,
+.cc.cinema.is-anime:hover,
+.cc.cinema.selected,
+.cc.cinema.state-approved,
+.cc.cinema.state-no_match {
+  border: 0 !important;
+  background: transparent !important;
+}
+.cc.cinema.state-no_match { border-style: none !important; }
+.cc.cinema::before { display: none !important; }   /* specular glare overlay */
+
+/* Cover keeps a clean drop shadow only — no inset 1px ring, no confidence
+   ring, no 3D depth lift. */
+.cc.cinema .cc-cover,
+.cc.cinema.is-anime .cc-cover {
+  box-shadow: 0 12px 28px -10px rgba(0,0,0,0.6) !important;
+  transform: none !important;
+}
+.cc.cinema:hover .cc-cover,
+.cc.cinema.is-anime:hover .cc-cover {
+  box-shadow: 0 22px 44px -14px rgba(0,0,0,0.72) !important;
+  transform: none !important;
+}
+
+/* ════════════════════════════════════════════════════════════════════
    SCAN-IN-PROGRESS BANNER (floating above grid)
    ════════════════════════════════════════════════════════════════════ */
 .lib-scan-floater {
@@ -2688,10 +3235,10 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   position: relative;
   width: min(1320px, 92vw);
   height: min(880px, 86vh);
-  background: rgba(18, 14, 28, 0.92);
-  backdrop-filter: blur(40px) saturate(150%);
-  -webkit-backdrop-filter: blur(40px) saturate(150%);
-  border: 1px solid var(--line-strong);
+  background: rgba(9, 10, 14, 0.72);
+  backdrop-filter: blur(48px) saturate(135%);
+  -webkit-backdrop-filter: blur(48px) saturate(135%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 22px;
   overflow: hidden;
   box-shadow:
@@ -2790,7 +3337,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .cx-hero-meta-row {
   display: flex; align-items: center; gap: 10px;
   font-size: 12px;
-  color: var(--ink-3);
+  color: var(--ink-2);
   flex-wrap: wrap;
 }
 .cx-hero-meta-row .dot-sep {
@@ -2806,7 +3353,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 }
 .cx-hero-alt {
   font-size: 13px;
-  color: var(--ink-3);
+  color: var(--ink-2);
   font-style: italic;
   display: inline-flex; align-items: center; gap: 8px;
   flex-wrap: wrap;
@@ -2914,7 +3461,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   z-index: 3;
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 20px;
-  background: rgba(12, 8, 22, 0.92);
+  background: rgba(11, 12, 16, 0.92);
   backdrop-filter: blur(20px);
   border-bottom: 1px solid var(--line);
   font-size: 10.5px;
@@ -3289,7 +3836,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 }
 .cx-foot-summary {
   font-size: 12.5px;
-  color: var(--ink-3);
+  color: var(--ink-2);
   display: flex; align-items: center; gap: 10px;
 }
 .cx-foot-summary b { color: var(--ink); font-weight: 600; }
@@ -3297,7 +3844,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 
 .cx-foot-link {
   background: transparent; border: 0;
-  color: var(--ink-3);
+  color: var(--ink-2);
   font-size: 12px;
   cursor: pointer;
   padding: 6px 10px;
@@ -3519,7 +4066,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 /* The 56×56 thumb — both sides use the same shape, only content differs */
 .cx-pair-thumb {
   width: 56px; height: 56px;
-  border-radius: 9px;
+  border-radius: 10px;
   display: flex; flex-direction: column;
   align-items: center; justify-content: center;
   flex-shrink: 0;
@@ -3527,7 +4074,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   overflow: hidden;
   color: rgba(255,255,255,0.95);
   text-align: center;
-  border: 1px solid rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.1);
   margin-top: 2px;
 }
 .cx-pair-thumb::after {
@@ -3608,7 +4155,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 }
 .cx-row-sub {
   font-size: 11px;
-  color: var(--ink-3);
+  color: var(--ink-2);
   display: flex; align-items: center;
   gap: 7px;
   flex-wrap: wrap;
@@ -3617,7 +4164,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .cx-row-sub .dot-sep {
   width: 3px; height: 3px; border-radius: 50%; background: var(--ink-4);
 }
-.cx-row-sub.mono { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-4); }
+.cx-row-sub.mono { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-3); }
 .cx-row-sub.mono .seg { color: var(--ink-3); }
 
 .cx-row-tags {
@@ -3626,14 +4173,14 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   align-items: center;
 }
 .cx-row-tag {
-  font-size: 10px;
-  padding: 1px 7px;
-  border-radius: 5px;
-  background: rgba(255,255,255,0.04);
-  border: 1px solid var(--line);
+  font-size: 10.5px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.1);
   color: var(--ink-2);
   font-weight: 500;
-  letter-spacing: 0;
+  letter-spacing: 0.01em;
   font-family: var(--font-mono);
 }
 .cx-row-tag.rg {
@@ -3658,17 +4205,26 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   border-radius: 999px;
   letter-spacing: 0;
 }
-.cx-row-conf.high { background: var(--conf-high-bg); color: var(--conf-high); }
-.cx-row-conf.mid  { background: var(--conf-mid-bg);  color: var(--conf-mid); }
-.cx-row-conf.low  { background: var(--conf-low-bg);  color: var(--conf-low); }
-.cx-row-conf.muted { background: rgba(255,255,255,0.04); color: var(--ink-4); }
+.cx-row-conf.high { background: var(--conf-high-bg); color: var(--conf-high); border: 1px solid rgba(40,217,160,0.3); }
+.cx-row-conf.mid  { background: var(--conf-mid-bg);  color: var(--conf-mid);  border: 1px solid rgba(255,201,74,0.3); }
+.cx-row-conf.low  { background: var(--conf-low-bg);  color: var(--conf-low);  border: 1px solid rgba(255,91,110,0.3); }
+.cx-row-conf.muted { background: rgba(255,255,255,0.04); color: var(--ink-3); border: 1px solid rgba(255,255,255,0.08); }
 
 .cx-row-actions {
   display: flex; gap: 4px;
-  opacity: 0;
+  /* Used to be opacity: 0 (hover-revealed). Users with mostly-matched
+     rows couldn't tell there were per-row actions available without
+     hovering each row one-by-one. Faint-always with hover-bump strikes
+     the balance: discoverable at a glance, not crowding the row. */
+  opacity: 0.55;
   transition: opacity 0.14s ease;
 }
 .cx-row:hover .cx-row-actions { opacity: 1; }
+/* Keep disabled buttons (no file paired with the row) clearly muted
+   — without this they'd just look at the 0.55 base which is bright
+   enough to imply "you can click me". */
+.cx-row-actions:has(button:disabled:only-child),
+.cx-row-act:disabled { opacity: 0.25; }
 .cx-row-act {
   width: 26px; height: 26px;
   border-radius: 7px;
@@ -4401,25 +4957,62 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 
 .cx-shell {
   background:
-    radial-gradient(120% 80% at 0% 0%, color-mix(in srgb, var(--hue-a, #3a2a52) 22%, transparent), transparent 55%),
-    radial-gradient(120% 80% at 100% 100%, color-mix(in srgb, var(--hue-b, #2a1f3f) 16%, transparent), transparent 55%),
-    rgba(18, 14, 28, 0.94) !important;
-  border-color: color-mix(in srgb, var(--hue-a, #ffffff) 14%, var(--line-strong)) !important;
+    radial-gradient(110% 75% at 0% 0%, color-mix(in srgb, var(--hue-a, #3a2a52) 26%, transparent), transparent 58%),
+    radial-gradient(95% 75% at 100% 100%, color-mix(in srgb, var(--hue-b, #2a1f3f) 16%, transparent), transparent 58%),
+    rgba(9, 10, 14, 0.72) !important;
+  border-color: rgba(255, 255, 255, 0.12) !important;
 }
 
 .cx-hero {
-  background:
-    linear-gradient(180deg,
-      color-mix(in srgb, var(--hue-a, #3a2a52) 12%, transparent) 0%,
-      transparent 100%);
+  background: transparent;
 }
 
-.cx-foot {
-  background:
-    linear-gradient(0deg,
-      color-mix(in srgb, var(--hue-b, #2a1f3f) 10%, transparent) 0%,
-      rgba(0,0,0,0.28) 100%) !important;
+/* Ambient cover-color bleed — a blurred, enlarged copy of the poster behind
+   the popup content so the cover's real colors spread across the surface.
+   Scrim keeps the lower content readable. */
+.cx-bg-bleed {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background-size: cover;
+  background-position: center 16%;
+  transform: scale(1.35);
+  filter: blur(80px) saturate(1.3);
+  opacity: 0.28;
+  pointer-events: none;
 }
+.cx-bg-bleed::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(9,10,14,0.5) 0%, rgba(9,10,14,0.84) 55%, rgba(9,10,14,0.95) 100%);
+}
+/* Lift real content above the bleed layer. */
+.cx-shell > *:not(.cx-bg-bleed) { position: relative; z-index: 1; }
+
+.cx-foot {
+  background: rgba(0, 0, 0, 0.28) !important;
+}
+
+/* Popup controls — crisp Untitled UI button + chip feel (popup-scoped). */
+.cx-shell .btn {
+  border-radius: 9px;
+  font-weight: 600;
+  border-color: rgba(255, 255, 255, 0.12);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+.cx-shell .btn:hover { border-color: rgba(255, 255, 255, 0.2); }
+.cx-shell .btn-primary {
+  border-color: transparent;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    0 1px 2px rgba(0, 0, 0, 0.3),
+    0 10px 22px -10px rgba(40, 217, 160, 0.5);
+}
+.cx-shell .btn-danger { border-color: rgba(255, 91, 110, 0.3); }
+.cx-shell .cx-summary-chip,
+.cx-shell .cx-prov-link,
+.cx-shell .alt-chip { border-radius: 8px; }
 
 
 
@@ -4830,7 +5423,12 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .cx-row-sub {
   gap: 5px !important;
 }
-.cx-row-sub > span:not(.dot-sep) {
+/* Chip styling for content spans inside the sub-line. `:not(.marquee-inner)`
+   excludes the MarqueeText wrapper — that's structural plumbing, NOT a
+   content chip; if we let it match, the row gets a wrapper-shaped box
+   AND any actual content chip inside it gets nested inside, producing
+   visible double-boxes around long folder paths. */
+.cx-row-sub > span:not(.dot-sep):not(.marquee-inner) {
   background: rgba(255,255,255,0.06);
   border: 1px solid rgba(255,255,255,0.06);
   border-radius: 4px;
@@ -4842,17 +5440,25 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   white-space: nowrap;
   flex-shrink: 0;
 }
-.cx-row-sub.mono > span:not(.dot-sep) {
+.cx-row-sub.mono > span:not(.dot-sep):not(.marquee-inner) {
   font-family: var(--font-mono);
   font-size: 10px;
   text-transform: none;
 }
 .cx-row-sub .dot-sep { display: none; }
 
-/* The file folder path stays as a quieter chip */
-.cx-row-sub.mono > span.seg {
+/* The file folder path stays as a quieter chip. Descendant combinator
+   (` ` not `>`) so the override still matches when `.seg` lives inside
+   a MarqueeText wrapper — same selector pattern used to target nested
+   content while preserving the styling intent.
+   Reset everything `.seg` inherits from the global button-group rule
+   (.seg at line ~955: glass background, 9px radius, padding 3px) so
+   the path renders as muted plain text, not as a styled chip. */
+.cx-row-sub.mono .seg {
+  display: inline;
   background: transparent;
   border: 0;
+  border-radius: 0;
   padding: 0;
   color: var(--ink-4);
   font-size: 10.5px;
@@ -5282,3 +5888,396 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   text-decoration: none;
 }
 .lib-empty-steps .step-link:hover { text-decoration: underline; }
+
+/* ─────────────────────────────────────────────────────────────────
+   MarqueeText — ping-pong auto-scroll for overflowing filenames
+   + titles. Slides the text leftward to reveal its end, pauses,
+   slides back to show the start, pauses, repeats. The keyframe
+   percentages divide one cycle into four phases:
+
+     0–10%  : hold at start (showing beginning of text)
+     10–48% : slide left until the end aligns with the right edge
+     48–58% : hold at end (showing tail of text)
+     58–98% : slide back to the start
+     98–100%: hold momentarily at start before next cycle
+
+   The shift distance is computed in JS (`--marquee-shift`) since
+   it depends on the actual overflow amount per row. Duration is
+   also derived from the overflow (longer text = longer slide).
+
+   When NOT scrolling, the inner falls back to plain truncated
+   text with ellipsis — the visual default for non-overflow rows
+   + the prefers-reduced-motion override.
+*/
+
+.marquee-outer {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  /* min-width: 0 guards against the row's flex layout from
+     stretching this column wider than its allotted slot, which
+     would suppress overflow detection. */
+  min-width: 0;
+}
+
+.marquee-inner {
+  display: inline-block;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+
+.marquee-inner.scrolling {
+  display: inline-block;
+  /* While the scrolling class is on, allow horizontal overflow
+     so the ping-pong animation can translate the text past the
+     container's right edge. Without `overflow: visible` the
+     outer's `overflow: hidden` would just clip mid-animation. */
+  max-width: none;
+  overflow: visible;
+  /* NO `animation` declared here. The marquee stays static
+     until the user hovers the parent row — see the rule
+     below. Always-on motion across many rows was too noisy;
+     hover-only matches the Spotify / YouTube / Finder pattern. */
+}
+
+/* Hover the row → animate every marquee inside it. Each cycle
+   starts from the beginning on each fresh hover, so the user
+   always sees the start of the text first then watches it
+   slide to reveal the end. */
+.cx-row:hover .marquee-inner.scrolling {
+  animation: marquee-pingpong var(--marquee-duration, 8s) ease-in-out infinite;
+}
+
+@keyframes marquee-pingpong {
+  0%, 10%   { transform: translateX(0); }
+  48%, 58%  { transform: translateX(var(--marquee-shift, 0px)); }
+  98%, 100% { transform: translateX(0); }
+}
+
+/* Accessibility: kill animation for prefers-reduced-motion users.
+   They get plain truncated text + the `title` tooltip on hover. */
+@media (prefers-reduced-motion: reduce) {
+  .marquee-inner.scrolling {
+    animation: none;
+    /* Hard-reset transform so any stuck-mid-cycle state from
+       toggling the OS setting doesn't leave the text off-screen. */
+    transform: translateX(0);
+    /* Re-engage the ellipsis truncation so the static state
+       matches the non-overflow rendering. */
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   Sonarr live download progress (Phase 2)
+   ─────────────────────────────────────────────────────────────────
+   Replaces the "No file for this episode" blank-row in the popup
+   when Sonarr is actively downloading the missing episode. The
+   whole row gets a low-opacity green band whose width tracks
+   progress %; queued / importing rows get an indeterminate
+   shimmer instead. Failed / warning rows surface red / amber
+   accents on the status pill.
+
+   Layout fits the existing .cx-row geometry exactly so it slots
+   into the synced-scroll columns without breaking row alignment
+   between left and right.
+*/
+
+.cx-row.dl {
+  position: relative;
+  /* Subtle base tint — even for queued rows you can see "Sonarr
+     is engaged here." Live downloading rows get a brighter green
+     band via .cx-row-dl-fill on top. */
+  background: rgba(40, 217, 160, 0.03);
+  overflow: hidden;
+}
+.cx-row.dl.dl-failed { background: rgba(255, 91, 110, 0.05); }
+.cx-row.dl.dl-warning { background: rgba(255, 201, 74, 0.04); }
+.cx-row.dl.dl-completed { background: rgba(40, 217, 160, 0.06); }
+
+/* The progress-fill bar. Lives behind the row content (z-index
+   below the .cx-file-row's `position: relative; z-index: 1`).
+   `width` is set inline from React (progress_pct). The opacity is
+   also set inline to differentiate live / shimmer / queued tints. */
+.cx-row-dl-fill {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 0;
+  background: linear-gradient(
+    90deg,
+    rgba(40, 217, 160, 0.55) 0%,
+    rgba(40, 217, 160, 0.32) 100%
+  );
+  pointer-events: none;
+  /* Short transition for static / non-live states (queued, importing,
+     baseline snap on new poll). Live downloading bars override with
+     `.live` below — those updates come from rAF at 60fps and a CSS
+     transition would smear them into a sluggish lag. */
+  transition: width 0.3s linear;
+  z-index: 0;
+}
+/* While the download is live, rAF writes width every animation frame.
+   Any CSS transition would interpolate between those writes and make
+   the bar lag visibly behind the rAF-computed position. Disable here. */
+.cx-row-dl-fill.live {
+  transition: none;
+}
+
+/* Failed/warning states use red/amber instead of green so the
+   user can see at a glance which rows need attention. */
+.cx-row.dl-failed .cx-row-dl-fill {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 91, 110, 0.50) 0%,
+    rgba(255, 91, 110, 0.28) 100%
+  );
+}
+.cx-row.dl-warning .cx-row-dl-fill {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 201, 74, 0.50) 0%,
+    rgba(255, 201, 74, 0.28) 100%
+  );
+}
+
+/* Indeterminate-shimmer fill for queued / searching / importing
+   states. Sliding gradient ping-pongs across the row to show
+   "Sonarr is doing something" without committing to a fake
+   percentage. Ping-pong (vs continuous loop) matches the marquee
+   text aesthetic and reads as "still working" rather than the
+   slightly-stressful constant-direction conveyor belt. */
+.cx-row.dl-queued .cx-row-dl-fill,
+.cx-row.dl-searching .cx-row-dl-fill,
+.cx-row.dl-importing .cx-row-dl-fill {
+  width: 100% !important;
+  background: linear-gradient(
+    90deg,
+    rgba(40, 217, 160, 0.0) 0%,
+    rgba(40, 217, 160, 0.22) 50%,
+    rgba(40, 217, 160, 0.0) 100%
+  );
+  background-size: 60% 100%;
+  background-repeat: no-repeat;
+  animation: dl-shimmer-pingpong 3.2s ease-in-out infinite;
+}
+@keyframes dl-shimmer-pingpong {
+  /* Slide right to a hold, then back left, briefly hold at the
+     start, loop. ease-in-out softens the direction reversal so
+     it doesn't feel jerky. */
+  0%   { background-position: -60% 0; }
+  45%, 55%  { background-position: 160% 0; }
+  100% { background-position: -60% 0; }
+}
+
+/* Thumb on the left side of a download row — pulses when active
+   to give a "this is alive" cue independent of the fill bar. */
+.dl-thumb {
+  position: relative;
+}
+.dl-thumb-downloading,
+.dl-thumb-importing,
+.dl-thumb-queued,
+.dl-thumb-searching {
+  border-color: rgba(40, 217, 160, 0.5) !important;
+  background: rgba(40, 217, 160, 0.10) !important;
+  color: var(--conf-high) !important;
+  animation: dl-thumb-pulse 2.2s ease-in-out infinite;
+}
+.dl-thumb-downloading .ep-num,
+.dl-thumb-importing .ep-num,
+.dl-thumb-queued .ep-num,
+.dl-thumb-searching .ep-num {
+  color: var(--conf-high) !important;
+}
+.dl-thumb-failed {
+  border-color: rgba(255, 91, 110, 0.5) !important;
+  background: rgba(255, 91, 110, 0.10) !important;
+  color: var(--conf-low) !important;
+}
+.dl-thumb-warning {
+  border-color: rgba(255, 201, 74, 0.5) !important;
+  background: rgba(255, 201, 74, 0.10) !important;
+  color: var(--conf-mid) !important;
+}
+@keyframes dl-thumb-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(40, 217, 160, 0); }
+  50%      { box-shadow: 0 0 0 4px rgba(40, 217, 160, 0.15); }
+}
+
+/* Status pill in the aside (right-hand corner of each row).
+   Reuses the .cx-row-conf positioning + the colour palette per
+   status. Visible on BOTH the left FileRow (always present) and
+   the right EpisodeRow (when there's no file paired). */
+.dl-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.dl-pill-downloading {
+  background: rgba(40, 217, 160, 0.18);
+  color: var(--conf-high);
+  border: 1px solid rgba(40, 217, 160, 0.40);
+}
+.dl-pill-importing,
+.dl-pill-completed {
+  background: rgba(40, 217, 160, 0.14);
+  color: var(--conf-high);
+  border: 1px solid rgba(40, 217, 160, 0.32);
+}
+.dl-pill-queued,
+.dl-pill-searching {
+  background: rgba(110, 168, 254, 0.14);
+  color: #9ec5ff;
+  border: 1px solid rgba(110, 168, 254, 0.30);
+}
+.dl-pill-failed {
+  background: rgba(255, 91, 110, 0.16);
+  color: var(--conf-low);
+  border: 1px solid rgba(255, 91, 110, 0.36);
+}
+.dl-pill-warning {
+  background: rgba(255, 201, 74, 0.16);
+  color: var(--conf-mid);
+  border: 1px solid rgba(255, 201, 74, 0.36);
+}
+
+/* Reduced-motion: kill the shimmer + pulse so users with
+   vestibular sensitivity don't get a wobbly UI. They still see
+   the static fill bar at the right percentage. */
+@media (prefers-reduced-motion: reduce) {
+  .cx-row.dl-queued .cx-row-dl-fill,
+  .cx-row.dl-searching .cx-row-dl-fill,
+  .cx-row.dl-importing .cx-row-dl-fill {
+    animation: none;
+    background: rgba(40, 217, 160, 0.16);
+    background-size: 100% 100%;
+  }
+  .dl-thumb-downloading,
+  .dl-thumb-importing,
+  .dl-thumb-queued,
+  .dl-thumb-searching {
+    animation: none;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   Cover-card live Sonarr pill (Phase B)
+   ─────────────────────────────────────────────────────────────────
+   Bottom-left chip rendered over each cover when Sonarr has any
+   in-flight downloads for the card's series + season. Polled every
+   12s by `useSonarrQueueLibrary` in LibraryGrid.
+
+   Sits above the cover art (z-index 2) and below the hover-actions
+   row so the user can still see / read the pill while reaching for
+   the quick-action icons.
+*/
+
+.cc-sonarr-pill {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 4px 9px 4px 7px;
+  border-radius: 999px;
+  z-index: 2;
+  pointer-events: auto;   /* so the title tooltip is reachable */
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  max-width: calc(100% - 16px);
+  overflow: hidden;
+}
+.cc-sonarr-pill svg {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+}
+.cc-sonarr-pill-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Per-status colours mirror the popup's row palette so the same
+   status reads as the same colour in both places. */
+.cc-sonarr-downloading {
+  background: rgba(40, 217, 160, 0.92);
+  color: #022b1c;
+  animation: cc-sonarr-pulse 2.2s ease-in-out infinite;
+}
+.cc-sonarr-queued,
+.cc-sonarr-searching {
+  background: rgba(110, 168, 254, 0.92);
+  color: #03132d;
+  animation: cc-sonarr-pulse 2.6s ease-in-out infinite;
+}
+.cc-sonarr-importing {
+  background: rgba(40, 217, 160, 0.78);
+  color: #022b1c;
+  animation: cc-sonarr-pulse 2.0s ease-in-out infinite;
+}
+.cc-sonarr-completed {
+  background: rgba(40, 217, 160, 0.55);
+  color: #022b1c;
+}
+.cc-sonarr-failed {
+  background: rgba(255, 91, 110, 0.92);
+  color: #2b020a;
+}
+.cc-sonarr-warning {
+  background: rgba(255, 201, 74, 0.92);
+  color: #2c1e02;
+}
+
+/* Pulse animation — slow scale + opacity breath to communicate
+   "this card has live activity" without being distracting in a grid
+   of dozens of cards. */
+@keyframes cc-sonarr-pulse {
+  0%, 100% {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35),
+                0 0 0 0 rgba(40, 217, 160, 0.0);
+  }
+  50% {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35),
+                0 0 0 5px rgba(40, 217, 160, 0.20);
+  }
+}
+/* Re-tint the pulse ring per-status so the colour stays consistent
+   when the user glances at the pill mid-pulse. */
+.cc-sonarr-queued,
+.cc-sonarr-searching {
+  /* Override the green halo with blue */
+  animation-name: cc-sonarr-pulse-blue;
+}
+@keyframes cc-sonarr-pulse-blue {
+  0%, 100% {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35),
+                0 0 0 0 rgba(110, 168, 254, 0.0);
+  }
+  50% {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35),
+                0 0 0 5px rgba(110, 168, 254, 0.20);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cc-sonarr-pill {
+    animation: none !important;
+  }
+}

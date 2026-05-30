@@ -7,11 +7,114 @@ Profiles live in the `settings` table under `naming.profiles.<profile>.<type>`.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from jinja2.sandbox import SandboxedEnvironment
+
 from kira.parser import ParsedFile
+
+# Jinja2 naming-template engine (Tier 1.5). SandboxedEnvironment so a
+# user-authored template can't reach Python internals (`{{ ''.__class__ }}`
+# and friends are blocked). autoescape OFF — we render filesystem paths, not
+# HTML, so `&` / quotes must pass through untouched (the per-segment _safe()
+# pass is what sanitizes for the filesystem). `finalize` coerces None → ""
+# so a missing optional value renders blank instead of the literal "None".
+# A token the template references but that we don't populate renders blank
+# (Jinja's default Undefined → ""), matching the old str.replace behavior
+# where an absent token simply wasn't substituted.
+_JINJA_ENV = SandboxedEnvironment(
+    autoescape=False,
+    finalize=lambda v: "" if v is None else v,
+    keep_trailing_newline=False,
+)
+
+
+# ── Custom Jinja filters (Tier 1.5 step 4) ───────────────────────────────
+# the reference renamer-style helpers that Jinja doesn't ship. Built-ins (upper, lower,
+# title, replace, default, trim, truncate, join, int) cover the rest, so we
+# only add the gaps. Registered on the env's filter table — purely additive,
+# they only do anything when a template actually pipes through them, so
+# existing profiles are unaffected (locked by the equivalence test).
+
+def _filter_pad(value: Any, width: int = 2, char: str = "0") -> str:
+    """Left-pad to `width` with `char` (default zero). `{{ episode | pad(3) }}`."""
+    return str(value).rjust(int(width), (str(char)[:1] or "0"))
+
+
+def _filter_ascii(value: Any) -> str:
+    """Fold accents to plain ASCII: `Frieren: Sōsō` → `Frieren: Soso`.
+    NFKD-decompose, drop combining marks, then drop any remaining non-ASCII."""
+    decomposed = unicodedata.normalize("NFKD", str(value))
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return stripped.encode("ascii", "ignore").decode("ascii")
+
+
+_ROMAN_TABLE = [
+    (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+    (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+]
+
+
+def _filter_roman(value: Any) -> str:
+    """Integer → Roman numeral (`{{ season | roman }}` → `II`). Out-of-range
+    or non-numeric values pass through unchanged."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if n <= 0 or n >= 4000:
+        return str(value)
+    out: list[str] = []
+    for v, sym in _ROMAN_TABLE:
+        while n >= v:
+            out.append(sym)
+            n -= v
+    return "".join(out)
+
+
+def _filter_clean(value: Any) -> str:
+    """Collapse runs of whitespace to a single space and trim the ends."""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+_LEADING_ARTICLE_RE = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
+
+
+def _filter_sort_name(value: Any) -> str:
+    """Move a leading article to the end, library-sort style:
+    `The Matrix` → `Matrix, The`. No-op when there's no leading article."""
+    s = str(value).strip()
+    m = _LEADING_ARTICLE_RE.match(s)
+    if not m:
+        return s
+    article, rest = s[:m.end()].strip(), s[m.end():].strip()
+    return f"{rest}, {article}" if rest else s
+
+
+def _filter_upper_initial(value: Any) -> str:
+    """Capitalize the first letter of each word, leaving the rest untouched
+    (unlike `title`, which lowercases the remainder and mangles `iPhone`)."""
+    return re.sub(r"(^|\s)([a-z])", lambda m: m.group(1) + m.group(2).upper(), str(value))
+
+
+def _filter_acronym(value: Any) -> str:
+    """First letter of each alphanumeric word, uppercased:
+    `The Lord of the Rings` → `TLOTR`. `{{ n | acronym }}`."""
+    return "".join(w[0] for w in re.findall(r"[A-Za-z0-9]+", str(value))).upper()
+
+
+_JINJA_ENV.filters.update({
+    "pad": _filter_pad,
+    "ascii": _filter_ascii,
+    "roman": _filter_roman,
+    "clean": _filter_clean,
+    "sortName": _filter_sort_name,
+    "upperInitial": _filter_upper_initial,
+    "acronym": _filter_acronym,
+})
 
 
 @dataclass
@@ -35,22 +138,22 @@ DEFAULT_PROFILES: dict[str, NamingProfile] = {
     # `Frieren - S01E01.JAP.mkv` + `Frieren - S01E01.ENG.mkv` — both
     # files survive on disk with distinguishable names.
     "Plex": NamingProfile(
-        movie="{n} ({y})/{n} ({y}){variant} [{q}].{x}",
-        tv="{n} ({y})/Season {s2}/{n} - S{s2}E{e2}{variant} - {t} [{q}].{x}",
-        anime="{n}/Season {s2}/{n} - S{s2}E{e2}{variant} - {t} [{rg}].{x}",
-        music="{artist}/{album} ({y})/{tn}{variant} - {title}.{x}",
+        movie="{{n}} ({{y}})/{{n}} ({{y}}){{variant}} [{{q}}].{{x}}",
+        tv="{{n}} ({{y}})/Season {{s2}}/{{n}} - S{{s2}}E{{e2}}{{variant}} - {{t}} [{{q}}].{{x}}",
+        anime="{{n}}/Season {{s2}}/{{n}} - S{{s2}}E{{e2}}{{variant}} - {{t}} [{{rg}}].{{x}}",
+        music="{{artist}}/{{album}} ({{y}})/{{tn}}{{variant}} - {{title}}.{{x}}",
     ),
     "Jellyfin": NamingProfile(
-        movie="{n} ({y})/{n} ({y}){variant}.{x}",
-        tv="{n} ({y})/Season {s2}/{n} ({y}) - S{s2}E{e2}{variant} - {t}.{x}",
-        anime="{n} ({y})/Season {s2}/{n} - S{s2}E{e2}{variant} - {t}.{x}",
-        music="{artist}/{album}/{tn}{variant} {title}.{x}",
+        movie="{{n}} ({{y}})/{{n}} ({{y}}){{variant}}.{{x}}",
+        tv="{{n}} ({{y}})/Season {{s2}}/{{n}} ({{y}}) - S{{s2}}E{{e2}}{{variant}} - {{t}}.{{x}}",
+        anime="{{n}} ({{y}})/Season {{s2}}/{{n}} - S{{s2}}E{{e2}}{{variant}} - {{t}}.{{x}}",
+        music="{{artist}}/{{album}}/{{tn}}{{variant}} {{title}}.{{x}}",
     ),
     "Kodi": NamingProfile(
-        movie="{n} ({y})/{n} ({y}){variant} - {q}.{x}",
-        tv="{n}/Season {s2}/{n}.S{s2}E{e2}{variant}.{t}.{x}",
-        anime="{n}/S{s2}/{n} - {abs}{variant} - {t}.{x}",
-        music="{artist} - {album}/{tn}{variant}. {title}.{x}",
+        movie="{{n}} ({{y}})/{{n}} ({{y}}){{variant}} - {{q}}.{{x}}",
+        tv="{{n}}/Season {{s2}}/{{n}}.S{{s2}}E{{e2}}{{variant}}.{{t}}.{{x}}",
+        anime="{{n}}/S{{s2}}/{{n}} - {{abs}}{{variant}} - {{t}}.{{x}}",
+        music="{{artist}} - {{album}}/{{tn}}{{variant}}. {{title}}.{{x}}",
     ),
 }
 
@@ -155,12 +258,38 @@ def _safe(part: str) -> str:
     return out
 
 
+def _safe_opt(value: str) -> str:
+    """`_safe()` for OPTIONAL tokens: an empty/blank input stays empty rather
+    than becoming the `_` placeholder `_safe()` emits for empty path segments.
+
+    The legacy tokens (rg, title, artist, album) keep `_safe()`'s `_`-on-empty
+    behavior so their rename output is byte-identical to before (locked by the
+    equivalence test). New tech / metadata tokens use this instead, so an
+    absent value (no HDR, no director, …) renders blank in the path, not `_`.
+    """
+    return _safe(value) if value else ""
+
+
 def apply_template(template: str, ctx: dict[str, Any]) -> str:
-    """Replace {token} placeholders in template using ctx values."""
-    out = template
-    for k, v in ctx.items():
-        out = out.replace("{" + k + "}", "" if v is None else str(v))
-    return out
+    """Render a Jinja2 naming template against `ctx`.
+
+    Replaces the old `str.replace` loop. Tokens are now `{{ token }}` and can
+    be piped through filters (`{{ n | upper }}`), guarded by conditionals
+    (`{% if hdr %}…{% endif %}`), and defaulted (`{{ t | default('Episode ' ~ e2) }}`).
+    Sandboxed: a user template can't reach Python internals. Tokens not in
+    `ctx` render blank, matching the old "absent token = no substitution"
+    behavior. The per-segment `_safe()` pass + path-traversal guard in
+    `format_target_path` still run afterward, unchanged — they remain the
+    filesystem safety net regardless of what the template produces.
+
+    A malformed template (syntax error, undefined filter) raises ValueError
+    so the rename endpoint reports it clearly instead of writing a path
+    containing literal `{{ … }}`.
+    """
+    try:
+        return _JINJA_ENV.from_string(template).render(ctx)
+    except Exception as e:
+        raise ValueError(f"Naming template failed to render: {e}") from e
 
 
 def _build_ctx(
@@ -169,6 +298,8 @@ def _build_ctx(
     library_year: int | None,
     episode_title: str | None = None,
     season_override: int | None = None,
+    metadata: dict[str, Any] | None = None,
+    file_size: int | None = None,
 ) -> dict[str, Any]:
     # Fix #2: strip a trailing `(YYYY)` from library_title before it lands
     # in {n}. AniDB embeds the year directly in its sequel-season titles
@@ -233,7 +364,43 @@ def _build_ctx(
         variant_parts.append(f"Cour{_cour}")
     variant_suffix = "." + ".".join(variant_parts) if variant_parts else ""
 
-    return {
+    # ── Tier 1.5 step 2: additional tokens ───────────────────────────────
+    # PURELY ADDITIVE. Every token below is new; none changes an existing
+    # token's value, so any template that doesn't reference these renders
+    # byte-for-byte identically (locked by test_templates_jinja). All derive
+    # from `parsed` or locals already computed above — no new caller plumbing.
+    _name = _safe(library_title or parsed.title or "")
+    _year = str(library_year if library_year is not None else parsed.year or "")
+    _ny = f"{_name} ({_year})" if _year else _name
+    _s00e00 = f"S{s2}E{e2}" if (s2 and e2) else ""
+    _sxe = f"{season}x{e2}" if (season is not None and e2) else ""
+    _e2end = f"{parsed.episode_end:02d}" if parsed.episode_end is not None else ""
+    _audio = " ".join(a for a in (parsed.audio or []) if isinstance(a, str))
+    _original = Path(parsed.original_filename).stem
+
+    # Derived: decade from the resolved year, and human file-size tokens.
+    _yr_for_decade = library_year if library_year is not None else parsed.year
+    _decade = f"{(_yr_for_decade // 10) * 10}s" if _yr_for_decade else ""
+    _bytes = str(file_size) if file_size else ""
+    _megabytes = f"{file_size / 1048576:.0f}" if file_size else ""
+    _gigabytes = f"{file_size / 1073741824:.1f}" if file_size else ""
+
+    # ── Provider-metadata tokens (Tier 1.5 step 2b) ──────────────────────
+    # Sourced from the Match row's metadata_blob (director/genres/cast/etc.)
+    # + provider ids, assembled by the caller. `metadata=None` (the default,
+    # and the path the equivalence test exercises) means every token below is
+    # "" — present but empty, so templates that don't use them are unchanged.
+    md = metadata or {}
+
+    def _mget(key: str) -> str:
+        v = md.get(key)
+        if isinstance(v, list):
+            return ", ".join(str(x) for x in v if x)
+        return "" if v is None else str(v)
+
+    _genres_list = md.get("genres") if isinstance(md.get("genres"), list) else []
+
+    ctx: dict[str, Any] = {
         "n":      _safe(library_title or parsed.title or ""),
         "y":      str(library_year if library_year is not None else parsed.year or ""),
         "q":      quality,
@@ -263,7 +430,68 @@ def _build_ctx(
         "album":  _safe(parsed.album or ""),
         "tn":     tn,
         "title":  _safe(parsed.track_title or ""),
+
+        # ── Tier 1.5 step 2 additions (all optional in templates) ────────
+        # Convenience composites (the reference renamer-canonical names):
+        "ny":     _ny,          # "Frieren (2023)" — name + year
+        "s00e00": _s00e00,      # "S01E05"
+        "sxe":    _sxe,         # "1x05"
+        "e2end":  _e2end,       # zero-padded end episode for ranges (S01E01-E03)
+        "ext":    Path(parsed.original_filename).suffix.lstrip(".").lower() or "mkv",  # alias of {x}
+        "group":  _safe_opt(parsed.release_group or ""),  # alias of {rg} (blank, not "_", when absent)
+        "original": _safe_opt(_original),              # original filename stem
+        "mtype":  parsed.media_type or "",             # movie | tv | anime | music
+        # Tech tags straight off the parser (filename-derived; pymediainfo
+        # backfill in a later step will make these authoritative):
+        "resolution": _safe_opt(parsed.quality or ""),  # "1080p"
+        "vf":     _safe_opt(parsed.quality or ""),     # the reference renamer {vf} alias
+        "source": _safe_opt(parsed.source or ""),      # "BluRay" / "WEB-DL"
+        "vc":     _safe_opt(parsed.codec or ""),       # "x265" / "HEVC"
+        "ac":     _safe_opt(_audio),                   # audio codec(s)
+        "channels": _safe_opt(parsed.channels or ""),  # "5.1" / "7.1" (MediaInfo)
+        "hdr":    _safe_opt(parsed.hdr or ""),         # "HDR10" / "DV" / ""
+        "bitdepth": _safe_opt(parsed.bit_depth or ""), # "10bit" / "8bit"
+        "edition": _safe_opt(parsed.edition or ""),    # "Director's Cut" (normalized)
+        "cour":   str(parsed.cour) if parsed.cour is not None else "",
+        "airdate": _safe_opt(parsed.air_date or ""),   # ISO "YYYY-MM-DD"
+        "decade": _decade,                             # "2010s" (from year)
+        "bytes":  _bytes,                              # raw byte count
+        "megabytes": _megabytes,                       # "1413"
+        "gigabytes": _gigabytes,                       # "3.4"
+
+        # ── Provider-metadata tokens (empty unless the caller passed metadata) ──
+        "director": _safe_opt(_mget("director")),
+        "genres":  _safe_opt(_mget("genres")),         # "Drama, Sci-Fi"
+        "genre":   _safe_opt(str(_genres_list[0]) if _genres_list else ""),  # first genre
+        "cast":    _safe_opt(_mget("cast")),           # "Cillian Murphy, Emily Blunt"
+        "actors":  _safe_opt(_mget("cast")),           # the reference renamer {actors} alias
+        "network": _safe_opt(_mget("network")),
+        "studio":  _safe_opt(_mget("studio")),
+        "language": _safe_opt(_mget("language")),
+        "country": _safe_opt(_mget("country")),
+        "runtime": _mget("runtime"),                   # minutes, e.g. "180"
+        "label":   _safe_opt(_mget("label")),          # music label
+        "yearrange": _safe_opt(_mget("yearRange")),    # "2022 – 2024"
+        "tmdbid":  _mget("tmdbid"),
+        "tvdbid":  _mget("tvdbid"),
+        "anidbid": _mget("anidbid"),
+        "imdbid":  _mget("imdbid"),
     }
+
+    # ── Preset macros (Tier 1.5 step 5) ──────────────────────────────────
+    # `{{ plex }}` / `{{ jellyfin }}` / `{{ kodi }}` / `{{ emby }}` expand to
+    # the FULL canonical path for this file's media type, so a user template
+    # can be just `{{ plex }}` (or build on it). Rendered against the ctx we
+    # just built; the built-in presets never reference these macro tokens, so
+    # there's no recursion. Additive — doesn't touch any existing token.
+    for _preset in ("Plex", "Jellyfin", "Kodi"):
+        _tmpl = getattr(DEFAULT_PROFILES[_preset], parsed.media_type, DEFAULT_PROFILES[_preset].movie)
+        try:
+            ctx[_preset.lower()] = apply_template(_tmpl, ctx)
+        except Exception:
+            ctx[_preset.lower()] = ""
+    ctx["emby"] = ctx.get("jellyfin", "")   # Emby shares Jellyfin's layout
+    return ctx
 
 
 def format_target_path(
@@ -275,6 +503,8 @@ def format_target_path(
     episode_title: str | None = None,
     season_override: int | None = None,
     type_target_root: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    file_size: int | None = None,
 ) -> Path:
     """Build the destination Path for a renamed file.
 
@@ -299,10 +529,25 @@ def format_target_path(
         library_year,
         episode_title=episode_title,
         season_override=season_override,
+        metadata=metadata,
+        file_size=file_size,
     )
     filled = apply_template(template, ctx)
     # Each "/" in the template becomes a real path separator. Sanitize each segment.
     parts = [_safe(p) for p in filled.split("/")]
+
+    # Phase 2: route season-0 files to a "Specials" folder (the reference renamer / Plex /
+    # Jellyfin convention) instead of "Season 00" / "S00". We swap the FOLDER
+    # segment only (exact match, case-insensitive) — the filename keeps its
+    # SxxExx token (e.g. "Show.S00E05...") because only a whole-segment match
+    # triggers, never a substring. The episode number still renders as S00E05,
+    # which both Plex and Jellyfin read as a special.
+    effective_season = season_override if season_override is not None else parsed.season
+    if effective_season == 0 and len(parts) > 1:
+        parts = [
+            "Specials" if p.strip().lower() in ("season 00", "season 0", "s00", "s0") else p
+            for p in parts[:-1]
+        ] + parts[-1:]
 
     # Resolve the effective root: caller-supplied per-type override wins,
     # else fall back to `library_root / SUBFOLDER[type]` (legacy default).

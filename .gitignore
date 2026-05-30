@@ -55,8 +55,9 @@ Thumbs.db
 *.swo
 *~
 
-# ── Claude / agent state (per-machine; not for the public repo) ──────
+# ── Local agent / editor state (per-machine; not for the public repo) ──
 .claude/
+.kira-cleanup-backup-*/
 *.bak
 
 # ── User-local test fixtures the project doesn't ship ────────────────

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import httpx
+from cachetools import TTLCache
 
 # PB-1: defusedxml is a drop-in replacement for xml.etree.ElementTree that
 # rejects XXE / entity-expansion / external-entity attacks. We parse XML
@@ -38,8 +39,10 @@ import httpx
 import defusedxml.ElementTree as ET
 from xml.etree.ElementTree import Element  # noqa: E402  # type alias only — no parsing
 
+from kira.matcher.acronyms import KNOWN_ACRONYMS, acronym_forms, is_acronym_shaped
 from kira.matcher.similarity import normalize, trigram_similarity
 from kira.providers.base import (
+    KIRA_USER_AGENT,
     EpisodeResult,
     MetadataProvider,
     MovieResult,
@@ -47,6 +50,13 @@ from kira.providers.base import (
     ProviderKey,
     TVResult,
 )
+
+# Local alias preserves existing `_USER_AGENT` call sites unchanged.
+# See KI-13 in the plan's Known Issues for the hoist rationale: AniDB
+# rejected the default `python-httpx` UA with a 403, and so does the
+# GitHub raw CDN that serves anime_mappings.py's Fribb dump. Same
+# defensive header now used in both places via the shared constant.
+_USER_AGENT = KIRA_USER_AGENT
 
 # PB-1: dedicated logger for AniDB telemetry. Default handler routes to
 # stderr at INFO level via uvicorn; ops can route this to a sink (file,
@@ -59,10 +69,6 @@ _CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache"
 _TITLES_PATH = _CACHE_DIR / "anidb-titles.xml.gz"
 _TITLES_URL = "https://anidb.net/api/anime-titles.xml.gz"
 _TITLE_MAX_AGE_SEC = 24 * 3600  # AniDB regenerates daily; refresh same cadence.
-
-# AniDB rejects requests with a Python default User-Agent (403). They require
-# a real client identifier — see https://wiki.anidb.net/HTTP_API_Definition.
-_USER_AGENT = "kira/0.4.1 (+https://github.com/anthropics/kira)"
 
 # AniDB docs say 1 req / 2s, but real-world experience says network jitter
 # makes a 2-second client-side gap insufficient: two requests sent 2s apart
@@ -94,6 +100,12 @@ class AniDBProvider(MetadataProvider):
     # (get_titles_for_aid, search_tv) unpack the 3-tuple.
     _titles: ClassVar[dict[int, list[tuple[str, str, str]]] | None] = None
     _title_index: ClassVar[list[tuple[int, str, str]] | None] = None    # [(aid, normalized, original), ...]
+    # M2 offline prefilter indices, built alongside `_title_index` in
+    # `_parse_titles`. Both map a key → set of AIDs for instant lookup with no
+    # network and no full-scan; they make acronym-only / exact-name filenames
+    # resolvable even while the AniDB HTTP API is banned.
+    _name_index: ClassVar[dict[str, set[int]] | None] = None       # normalized title → {aid}
+    _acronym_index: ClassVar[dict[str, set[int]] | None] = None    # initialism (3-6 chars) → {aid}
     _index_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _api_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     # Wall-clock timestamp of the last HTTP-API call BY ANY WORKER.
@@ -208,8 +220,15 @@ class AniDBProvider(MetadataProvider):
             tree = ET.parse(f)
 
         XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
+        # Cap AIDs per acronym so a common 3-letter initialism doesn't accrue a
+        # giant list. The injection in search_tv only matters when the right AID
+        # is in here; a curated acronym resolves precisely via the expansion
+        # trigram instead, so this generated index is the long-tail fallback.
+        _ACRO_CAP = 60
         titles: dict[int, list[tuple[str, str, str]]] = {}
         index: list[tuple[int, str, str]] = []
+        name_index: dict[str, set[int]] = {}
+        acro_index: dict[str, set[int]] = {}
         for anime in tree.getroot().findall("anime"):
             aid_attr = anime.get("aid")
             if not aid_attr:
@@ -231,11 +250,22 @@ class AniDBProvider(MetadataProvider):
                 normalized = normalize(text)
                 if normalized:
                     index.append((aid, normalized, text))
+                    name_index.setdefault(normalized, set()).add(aid)
+                    # Generated initialisms (3-6 chars) → AID, for acronym-only
+                    # filenames the trigram scan can't catch ("JJK" vs the
+                    # romaji "Jujutsu Kaisen" shares no trigrams).
+                    for form in acronym_forms(normalized):
+                        if 3 <= len(form) <= 6:
+                            bucket = acro_index.setdefault(form, set())
+                            if len(bucket) < _ACRO_CAP:
+                                bucket.add(aid)
             if entries:
                 titles[aid] = entries
 
         AniDBProvider._titles = titles
         AniDBProvider._title_index = index
+        AniDBProvider._name_index = name_index
+        AniDBProvider._acronym_index = acro_index
 
     # ── Public search API ─────────────────────────────────────────────────
     async def search_movie(self, title: str, year: int | None = None) -> list[MovieResult]:
@@ -245,7 +275,18 @@ class AniDBProvider(MetadataProvider):
         return []
 
     async def search_tv(self, title: str, year: int | None = None) -> list[TVResult]:
-        """Fuzzy title search against the local AniDB title index."""
+        """Fuzzy title search against the local AniDB title index.
+
+        M2 offline prefilter: when the query looks like an acronym ("JJK",
+        "AoT") the plain trigram scan finds nothing — an initialism shares no
+        trigrams with the romaji title. So we also consult the offline indices:
+          - exact normalized-name → AID (guarantees inclusion),
+          - a curated acronym → its full expansion, trigram-scanned + exact-name,
+          - a non-curated acronym → the generated-initialism index.
+        All in-memory, no HTTP — works even while the AniDB API is banned. The
+        cascade (AcronymMetric / Substring / Fribb) decides the real
+        confidence, so an injected candidate can never auto-commit on its own.
+        """
         await self._ensure_index()
         if not AniDBProvider._title_index or not title.strip():
             return []
@@ -254,16 +295,45 @@ class AniDBProvider(MetadataProvider):
         if not q_norm:
             return []
 
+        # Acronym handling. A CURATED acronym expands to its full title so we can
+        # trigram against it directly (precise); a non-curated acronym falls back
+        # to the generated-initialism index (best-effort).
+        acro = is_acronym_shaped(q_norm)
+        is_known = acro and q_norm in KNOWN_ACRONYMS
+        exp_norm = normalize(KNOWN_ACRONYMS[q_norm]) if is_known else None
+
         # Score every indexed title against the query. Group by aid so the
         # same anime doesn't appear multiple times.
         per_aid: dict[int, tuple[float, str]] = {}
         for aid, t_norm, t_orig in AniDBProvider._title_index:
             score = trigram_similarity(q_norm, t_norm)
+            if exp_norm:
+                score = max(score, trigram_similarity(exp_norm, t_norm))
             if score <= 0.15:  # cheap floor — skip obvious non-matches
                 continue
             prev = per_aid.get(aid)
             if prev is None or score > prev[0]:
                 per_aid[aid] = (score, t_orig)
+
+        # ── Offline index injections ────────────────────────────────────────
+        def _inject(aid: int, floor: float) -> None:
+            prev = per_aid.get(aid)
+            if prev is None or floor > prev[0]:
+                per_aid[aid] = (floor, self._pick_display_title(aid) or "")
+
+        name_idx = AniDBProvider._name_index or {}
+        # Exact normalized-name hit → perfect; guarantee it's in the candidate
+        # set even past the top-10 trigram cut.
+        for aid in name_idx.get(q_norm, ()):
+            _inject(aid, 1.0)
+        if exp_norm:
+            # Curated acronym whose expansion maps to an exact title → strong.
+            for aid in name_idx.get(exp_norm, ()):
+                _inject(aid, 0.95)
+        elif acro:
+            # Non-curated acronym → generated-initialism index, modest floor.
+            for aid in (AniDBProvider._acronym_index or {}).get(q_norm, ()):
+                _inject(aid, 0.5)
 
         # Sort and take top 10 — matcher.score_match adds its own confidence.
         ranked = sorted(per_aid.items(), key=lambda x: x[1][0], reverse=True)[:10]
@@ -381,33 +451,71 @@ class AniDBProvider(MetadataProvider):
 # Legacy class-level entries shape was (type, title); some external callers
 # may still expect that. New consumers use the (type, lang, title) shape.
 
-    async def get_episodes(self, series_id: str, season: int) -> list[EpisodeResult]:
+    # Cache parsed episode lists per (AID, include_specials). AniDB's HTTP API
+    # is rate-limited (5s gate) and One Piece-scale series return 1100+ episodes
+    # — re-fetching on every popup open / cluster match was the "popup takes
+    # forever" cause. 6h TTL lets newly-aired episodes appear without a restart.
+    # Only successful (non-empty) parses are cached.
+    _episodes_cache: ClassVar[TTLCache] = TTLCache(maxsize=512, ttl=6 * 3600)
+
+    async def get_episodes(
+        self, series_id: str, season: int, include_specials: bool = False,
+        order: str = "default",
+    ) -> list[EpisodeResult]:
         """Fetch full anime details from AniDB HTTP API. Rate-limited.
 
-        AniDB has no season concept; this returns regular episodes only.
-        `<epno type="1">` = regular episode. type=2 (special), type=3 (credit/OP/ED),
-        type=4 (trailer), type=5 (parody), type=6 (other) are skipped — they'd
-        only confuse the cluster's episode-title assignment.
+        `order` is a no-op (AniDB has a single episode ordering) — present
+        only to satisfy the shared provider signature.
+
+        AniDB has no season concept; regular `<epno type="1">` episodes come
+        back tagged season=1. type=3 (credit/OP/ED), type=4 (trailer),
+        type=5 (parody), type=6 (other) are always skipped — they'd only
+        confuse episode-title assignment.
+
+        Phase 2: when `include_specials=True`, type=2 (specials) are ALSO
+        returned, tagged season=0 (Plex/Jellyfin "Specials" convention).
+        AniDB numbers specials as `S1`, `S2`, … in `<epno>` — we strip the
+        leading letter and keep the integer. Defaults False so the scan /
+        cluster path is unchanged; the `/series` endpoint opts in for
+        season-0 cards.
         """
+        cache_key = (str(series_id), bool(include_specials))
+        hit = AniDBProvider._episodes_cache.get(cache_key)
+        if hit is not None:
+            return hit
         data = await self._http_api(series_id)
         if not data:
             return []
         # ElementTree's xml:lang requires Clark notation, not 'xml:lang'.
         XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
         out: list[EpisodeResult] = []
+        regular_count = 0
         for ep in data.findall(".//episode"):
             num_el = ep.find("epno")
             if num_el is None:
                 continue
-            # Skip non-regular episodes (specials, OP/ED, etc.).
-            if (num_el.get("type") or "1") != "1":
-                continue
+            eptype = num_el.get("type") or "1"
             raw = (num_el.text or "").strip()
             if not raw:
                 continue
-            try:
-                num = int(raw)
-            except ValueError:
+            # Regular episode (type 1) → season 1. Special (type 2) → season 0
+            # only when the caller opted in. Everything else (OP/ED, trailers,
+            # parodies) is dropped.
+            if eptype == "1":
+                try:
+                    num = int(raw)
+                except ValueError:
+                    continue
+                regular_count += 1
+                ep_season = 1
+            elif include_specials and eptype == "2":
+                # Specials carry "S1"/"S2" epno — keep the trailing digits.
+                digits = re.sub(r"\D", "", raw)
+                if not digits:
+                    continue
+                num = int(digits)
+                ep_season = 0
+            else:
                 continue
 
             # Prefer English title, then x-jat (romaji), then anything.
@@ -439,24 +547,29 @@ class AniDBProvider(MetadataProvider):
             out.append(EpisodeResult(
                 provider="anidb",
                 series_id=series_id,
-                season=1,
+                season=ep_season,
                 episode=num,
                 title=title,
                 air_date=(air_el.text.strip() if air_el is not None and air_el.text else None),
                 runtime=runtime,
             ))
-        out.sort(key=lambda e: e.episode)
+        # Sort regulars (season 1) before specials (season 0)? No — keep
+        # numeric (season, episode) so specials (season 0) sort first; the
+        # frontend groups by season anyway. Within a season, ascending.
+        out.sort(key=lambda e: (e.season, e.episode))
 
         # Write-through to the per-AID episode-count cache. This is the
         # data Phase 3's franchise-offset builder needs; piggybacking
         # on the existing get_episodes call means most franchise members
         # already have counts cached by the time `get_franchise_offsets`
-        # runs — no extra AniDB HTTP for them.
+        # runs — no extra AniDB HTTP for them. Count REGULAR episodes only —
+        # specials must never inflate the absolute-range arithmetic.
         try:
-            await AniDBProvider._record_episode_count(int(series_id), len(out))
+            await AniDBProvider._record_episode_count(int(series_id), regular_count)
         except (ValueError, TypeError):
             pass
 
+        AniDBProvider._episodes_cache[cache_key] = out
         return out
 
     # ── Episode-count cache — populated by get_episodes write-through
@@ -589,11 +702,26 @@ class AniDBProvider(MetadataProvider):
 
         visited: set[int] = set()
         queue: list[str] = [aid]
-        # If ANY HTTP call in the chain fails (timeout, ban, network drop),
-        # we abort and do NOT persist a partial closure to disk. A truncated
-        # group would split a franchise into separate cards forever — next
-        # call would hit the cache and never retry the missing siblings.
-        failed = False
+        # ── KI-8: skip-and-continue on a missing related AID ───────────
+        # Pre-fix: a single dead/banned/timed-out related AID broke out
+        # of the traversal entirely, leaving the franchise resolved to
+        # just the seed AID. Old/sprawling franchises with 50-80 AIDs
+        # (Gundam, Pretty Cure, the early-2000s long-runners) routinely
+        # have one bad relation that nuked the whole group.
+        # Post-fix: log + continue, so a single bad relation no longer
+        # poisons the whole chain. We DO still hard-fail if the SEED
+        # AID itself can't be fetched — without the seed we can't trust
+        # anything we're inferring.
+        # Pattern D — Cache-Completeness Invariant: when ANY related
+        # AID was skipped, return the partial walk to the caller but
+        # DON'T persist to the relations cache. Subsequent calls retry
+        # the missing siblings instead of hitting a stale-partial entry.
+        try:
+            seed_i = int(aid)
+        except (TypeError, ValueError):
+            seed_i = None
+        seed_failed = False
+        had_failures = False
         while queue:
             current = queue.pop()
             try:
@@ -605,8 +733,17 @@ class AniDBProvider(MetadataProvider):
             visited.add(current_i)
             data = await self._http_api(current)
             if data is None:
-                failed = True
-                break
+                _anidb_log.warning(json.dumps({
+                    "evt": "anidb_related_skip",
+                    "seed": aid,
+                    "missing_aid": current,
+                }))
+                if seed_i is not None and current_i == seed_i:
+                    # Seed itself failed — entire result is unreliable.
+                    seed_failed = True
+                    break
+                had_failures = True
+                continue
             related_block = data.find("relatedanime")
             if related_block is None:
                 continue
@@ -618,20 +755,30 @@ class AniDBProvider(MetadataProvider):
                 if rel_aid and int(rel_aid) not in visited:
                     queue.append(rel_aid)
 
-        if failed:
-            # Return whatever we know for this call (at minimum the seed AID
-            # so the matcher can still emit a usable series_group_id), but
-            # DON'T cache — let a future call retry the full walk.
+        if seed_failed:
+            # Seed lookup couldn't even resolve. Don't return a partial
+            # walk built from un-seeded relations; caller falls back to
+            # whatever the singleton match path can produce.
             return [int(aid)] if aid.isdigit() else []
 
         group = sorted(visited)
         if not group:
             group = [int(aid)] if aid.isdigit() else []
 
-        # Persist the whole closure under EVERY member so any starting AID
-        # returns the same answer instantly next time. Disk write offloaded
-        # to a worker thread so the event loop isn't blocked on json.dumps +
-        # filesystem fsync for large caches.
+        if had_failures:
+            # KI-8 Pattern D: skip-and-continue gave us a USEFUL partial
+            # group (more than just the seed) but at least one related
+            # AID is missing. Return the partial so the matcher gets
+            # SOMETHING immediately, but DON'T cache — the cache
+            # invariant is "ground truth or nothing." A future call
+            # will retry from scratch and may catch the missing AID.
+            return group
+
+        # Full success — every walked AID resolved. Persist the closure
+        # under EVERY member so any starting AID returns the same answer
+        # instantly next time. Disk write offloaded to a worker thread
+        # so the event loop isn't blocked on json.dumps + filesystem
+        # fsync for large caches.
         async with AniDBProvider._relations_cache_lock:
             for member in group:
                 cache[str(member)] = group
@@ -714,12 +861,70 @@ class AniDBProvider(MetadataProvider):
                 return []
             counts[member] = n
 
-        # Build the cumulative range table, sorted by AID (proxy for
-        # chronological order in most franchises — AniDB assigns AIDs
-        # roughly in registration order, and sequels are registered later).
+        # ── KI-9 Pattern A: Observer Mode for franchise sort order ─────
+        # The bare-AID sort below is a heuristic — AniDB assigns AIDs
+        # in registration order, which is "usually" chronological but
+        # breaks down for reboots (the reboot is registered AFTER the
+        # parent series so gets a higher AID, but episode 1 of the
+        # reboot belongs at the START of the franchise timeline) and
+        # for side-stories that get registered out-of-band.
+        #
+        # The Fribb cross-reference carries a `season` integer per AID
+        # (TVDB season number); when present, that's a far more
+        # reliable chronological signal than AID order.
+        #
+        # We compute BOTH orders, KEEP USING the bare-AID sort (current
+        # behaviour, no regression), and emit a structured log every
+        # time the two diverge. After 24-72 hours of normal scans the
+        # log will surface every franchise where the heuristic disagrees
+        # with the canonical Fribb order; we can then triage and flip
+        # the live sort.
+        old_order = sorted(counts.keys())
+        # Pull Fribb seasons for each member. Module imported lazily to
+        # avoid circular-import noise (AnimeMappings imports utilities
+        # that might re-import this file).
+        from kira.providers.anime_mappings import AnimeMappings
+        fribb_seasons: dict[int, int | None] = {}
+        for m in counts.keys():
+            try:
+                fribb_seasons[m] = await AnimeMappings.tvdb_season(m)
+            except Exception:
+                fribb_seasons[m] = None
+
+        def _new_sort_key(aid: int) -> tuple[int, int]:
+            # Fribb season as primary; bare AID as tiebreaker. Unknown
+            # Fribb season goes to the end of the list (sentinel 9999)
+            # so AIDs with proper season metadata sort first.
+            s = fribb_seasons.get(aid)
+            return (s if isinstance(s, int) else 9999, aid)
+        new_order = sorted(counts.keys(), key=_new_sort_key)
+
+        # Phase 8 (KI-9 flip): adopt the Fribb-season order — but ONLY when
+        # EVERY member has a known season. Fribb's TVDB-season integer is a
+        # far more reliable chronological signal than AID registration order
+        # (reboots / side-stories get high AIDs but belong earlier in the
+        # timeline). When the franchise is fully season-mapped we trust it;
+        # if ANY member lacks a season we fall back to bare-AID order rather
+        # than shoving the unmapped members to the end via the 9999 sentinel
+        # (which could be worse than the registration-order heuristic). So
+        # this strictly improves fully-mapped franchises and never regresses
+        # partially-mapped ones.
+        all_have_season = all(isinstance(fribb_seasons.get(m), int) for m in counts.keys())
+        order = new_order if all_have_season else old_order
+        if old_order != new_order:
+            _anidb_log.info(json.dumps({
+                "evt": "franchise_sort",
+                "canonical_aid": canonical,
+                "applied": "fribb_season" if all_have_season else "bare_aid",
+                "old_order": old_order,
+                "new_order": new_order,
+                "fribb_seasons": {str(k): v for k, v in fribb_seasons.items()},
+            }))
+
+        # Build the cumulative range table from the chosen order.
         offsets: list[tuple[int, int, int]] = []
         cursor = 1
-        for member in sorted(counts.keys()):
+        for member in order:
             n = counts[member]
             if n <= 0:
                 continue
@@ -772,8 +977,11 @@ class AniDBProvider(MetadataProvider):
     # Bumped whenever the picture-resolution algorithm changes in a way
     # that should invalidate previously-cached URLs. v2 = season-aware
     # TVDB/TMDB fetch landed; previous v1 cached series-level posters
-    # that need re-fetching for non-S1 franchise members.
-    _PICTURE_CACHE_VERSION: ClassVar[int] = 2
+    # that need re-fetching for non-S1 franchise members. v3 = cour-aware
+    # (prefer AniDB's own per-AID art over the shared season poster for
+    # multi-cour seasons) — the existing season≥2 eviction below re-resolves
+    # every cour, since all cours are season ≥ 2.
+    _PICTURE_CACHE_VERSION: ClassVar[int] = 3
 
     @classmethod
     async def migrate_picture_cache(cls) -> None:
@@ -809,6 +1017,22 @@ class AniDBProvider(MetadataProvider):
         if evicted:
             print(f"anidb pictures: evicted {evicted} stale franchise-member URLs (now season-aware).")
 
+    async def _anidb_cdn_picture(self, aid: str) -> tuple[str | None, bool]:
+        """Fetch the AID's OWN picture from the AniDB HTTP API.
+
+        Returns ``(url_or_None, responded)``. ``responded=False`` means the
+        API errored / we're banned — the caller must NOT cache a null
+        (so the next call retries). ``responded=True`` with ``None`` means
+        AniDB confirmed this AID has no picture.
+        """
+        data = await self._http_api(aid)
+        if data is None:
+            return None, False
+        pic = data.find("picture")
+        if pic is not None and pic.text and pic.text.strip():
+            return f"https://cdn.anidb.net/images/main/{pic.text.strip()}", True
+        return None, True
+
     async def get_picture_url(self, aid: str) -> str | None:
         """Return a poster URL for an anime, or None if no source has one.
 
@@ -837,12 +1061,33 @@ class AniDBProvider(MetadataProvider):
         except ValueError:
             return None
 
-        # Path 1: TVDB via cross-reference. When the Fribb mapping carries
-        # a `season.tvdb` number, fetch the SEASON-specific poster instead
-        # of the series-level one — otherwise all N seasons of a franchise
-        # (e.g. all 5 Rent-a-Girlfriend AIDs map to TVDB series 380654)
-        # share one image and the franchise grid looks like clones.
+        # ── Cour detection (distinct cour covers) ─────────────────────────
+        # Fetch the Fribb cross-ref up front. When ≥2 AIDs map to the SAME
+        # (tvdb_id, season) — Bleach TYBW cours, Attack on Titan S3 / Final-
+        # Season parts — the TVDB/TMDB SEASON poster is IDENTICAL across them,
+        # so the franchise grid looks like clones. For those, prefer AniDB's
+        # OWN per-AID art (distinct per cour). Single-AID seasons keep the
+        # nicer English TVDB/TMDB season poster (the path below).
         tvdb_id = await AnimeMappings.tvdb_id(aid_i)
+        season_num = await AnimeMappings.tvdb_season(aid_i)
+        is_cour = False
+        if tvdb_id and season_num:
+            try:
+                sibs = await AnimeMappings.aids_by_tvdb_season(tvdb_id, season_num)
+                is_cour = len([s for s in (sibs or []) if s]) >= 2
+            except Exception:
+                is_cour = False
+        if is_cour:
+            cour_url, _responded = await self._anidb_cdn_picture(aid)
+            if cour_url:
+                async with AniDBProvider._picture_cache_lock:
+                    cache[aid] = cour_url
+                    await asyncio.to_thread(self._save_picture_cache)
+                return cour_url
+            # No AniDB art for this cour (or banned) → fall through to the
+            # shared season poster: a collide-y cover beats no cover.
+
+        # Path 1: TVDB via cross-reference (season-specific poster).
         if tvdb_id:
             tvdb = await self._get_xref("tvdb")
             if tvdb is not None:
@@ -911,14 +1156,14 @@ class AniDBProvider(MetadataProvider):
         # truth check), so an empty-string response (vs a valid URL)
         # falls through to the next provider rather than poisoning
         # the cache.
-        data = await self._http_api(aid)
-        if data is None:
+        # Cours already tried their own AniDB picture above — don't fire a
+        # second rate-limited call.
+        if is_cour:
+            return None
+        url, responded = await self._anidb_cdn_picture(aid)
+        if not responded:
             # API error / banned — do NOT cache. Future calls retry.
             return None
-        pic = data.find("picture")
-        url: str | None = None
-        if pic is not None and pic.text and pic.text.strip():
-            url = f"https://cdn.anidb.net/images/main/{pic.text.strip()}"
         async with AniDBProvider._picture_cache_lock:
             cache[aid] = url  # may be None — only when AniDB confirmed no picture
             await asyncio.to_thread(self._save_picture_cache)
@@ -1218,14 +1463,64 @@ class AniDBProvider(MetadataProvider):
                 # waiter (here or in another worker) sees the fresh value.
                 await asyncio.to_thread(AniDBProvider._write_last_call_wallclock)
 
-                # 500-class responses + any payload mentioning "banned" mean
-                # AniDB temporarily blocked our IP. Stop hammering NOW.
                 body = r.text or ""
-                if r.status_code >= 500 or "banned" in body.lower():
+                body_lower = body.lower()
+
+                # ── KI-7 Pattern C: capture ground-truth response shapes ─
+                # For every 4xx/5xx we log a structured event with status,
+                # a body snippet, and a few discriminating headers. This is
+                # free intelligence — costs nothing in normal operation,
+                # gives us ammunition for tightening the ban detector when
+                # AniDB or a CDN-side error page evolves its shape. The
+                # detector below makes informed decisions today; the log
+                # is for the next change.
+                if r.status_code >= 400:
+                    _anidb_log.warning(json.dumps({
+                        "evt": "anidb_http_error",
+                        "status": r.status_code,
+                        "body_snippet": body[:240],
+                        "content_type": r.headers.get("content-type", "")[:80],
+                        "server": r.headers.get("server", "")[:80],
+                    }))
+
+                # ── KI-7: narrow the ban trigger ─────────────────────────
+                # PRE-FIX: any 5xx — even a transient AniDB-overloaded 503
+                # or a CDN-side 502 — tripped the 12-hour cooldown. A single
+                # blip during a routine scan locked out every anime call for
+                # half a day; the user saw "AniDB banned" in the UI with no
+                # recourse beyond a hidden manual reset.
+                #
+                # POST-FIX: only treat these as real bans —
+                #   * `banned` token anywhere in the body (AniDB's primary
+                #     signal; works for both <html> error pages and the
+                #     plain-text ban responses we've seen historically)
+                #   * status 429 (Too Many Requests — explicit rate-limit
+                #     ban signal per HTTP semantics)
+                # Anything else 5xx falls through to the elif branch:
+                # record into the circuit-breaker window (5 errors in 60s
+                # → 5-min pause) but DON'T trigger the 12-hour cooldown.
+                # The circuit breaker handles the "AniDB is genuinely
+                # broken right now" case at a reasonable cost; the ban
+                # only fires when AniDB explicitly tells us we're banned.
+                is_ban = (
+                    r.status_code == 429
+                    or "banned" in body_lower
+                )
+                if is_ban:
                     AniDBProvider._set_banned(f"HTTP {r.status_code}: {body[:80]}")
                     AniDBProvider._record_error()
                     outcome = "banned"
                     err_msg = f"HTTP {r.status_code}"
+                    return None
+                if r.status_code >= 500:
+                    # Transient server-side problem (overload, CDN 502,
+                    # gateway timeout, etc.). Record into the circuit
+                    # breaker so repeated failures still escalate to a
+                    # short pause, but never trip the 12h cooldown.
+                    AniDBProvider._last_error = f"HTTP {r.status_code}"
+                    AniDBProvider._record_error()
+                    outcome = "server_error"
+                    err_msg = f"HTTP {r.status_code} (transient)"
                     return None
 
                 if r.status_code != 200 or not body.strip().startswith("<"):

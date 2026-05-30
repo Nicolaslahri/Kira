@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from kira.api import files as files_api
 from kira.api import health as health_api
 from kira.api import history as history_api
+from kira.api import integrations as integrations_api
 from kira.api import matches as matches_api
 from kira.api import providers as providers_api
 from kira.api import rename as rename_api
@@ -21,6 +22,17 @@ from kira.database import init_db
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    # Clear any stale scan lock left by a crash or hard kill. A scan runs as
+    # an in-process background task, so a process restart definitionally means
+    # NO scan is in flight — yet `system.scan_running` may still hold the
+    # timestamp of the dead scan, which 409-locks the Scan button for up to 6h
+    # ("I restarted and it still says a scan is already running"). Resetting on
+    # boot makes "just restart" actually fix it.
+    try:
+        from kira.api.scans import _release_db_scan_lock
+        await _release_db_scan_lock()
+    except Exception as e:
+        print(f"startup: scan-lock reset failed: {e!r}")
     # Background warm-up: refresh the AniDB↔TVDB↔TMDB cross-reference table
     # (weekly), then start the auto-heal sweep for files matched before
     # later fixes landed.
@@ -85,3 +97,4 @@ app.include_router(history_api.router, prefix="/api/v1")
 app.include_router(system_api.router, prefix="/api/v1")
 app.include_router(system_api.notif_router, prefix="/api/v1")
 app.include_router(providers_api.router, prefix="/api/v1")
+app.include_router(integrations_api.router, prefix="/api/v1")

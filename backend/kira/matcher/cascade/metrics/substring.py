@@ -1,7 +1,7 @@
 """SubstringMetric — tier-1 identity hit when parsed title is a clean
 word-boundary substring of a candidate alias.
 
-Mirrors FileBot's SubstringMetric.java semantics: word boundaries on
+Mirrors the reference renamer's SubstringMetric.java semantics: word boundaries on
 both sides of the substring. Catches the trivial case ("Rent-a-Girlfriend"
 appears verbatim in alias list) before trigram normalization can drift.
 

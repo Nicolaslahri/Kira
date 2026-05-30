@@ -38,14 +38,40 @@ class ParsedFile:
     edition: str | None = None
     hdr: str | None = None
     bit_depth: str | None = None  # "10bit" | "8bit" | None — drives the dedupe ranker
+    channels: str | None = None   # "5.1" | "7.1" | "2.0" — usually from MediaInfo (filenames rarely carry it)
     release_group: str | None = None
     # R2-H12: cour/part/arc sub-season hint detected from parent path
-    # (e.g. `/Bleach/Season 17/Cour 1/`). Anime split-cour shows assign
-    # different AIDs per cour but TVDB lumps them under one season — we
-    # store the cour to disambiguate which sub-AID a file belongs to
-    # and to surface in the variant_key when no other variant signal
-    # exists. None for non-cour-split shows.
+    # (e.g. `/Bleach/Season 17/Cour 1/`) OR from a filename "Part N" token
+    # (Phase 1, PB pattern). Anime split-cour shows assign different AIDs per
+    # cour but TVDB lumps them under one season — we store the cour to
+    # disambiguate which sub-AID a file belongs to and to surface in the
+    # variant_key when no other variant signal exists. None for non-cour
+    # shows.
     cour: int | None = None
+    # Phase 1: named-season keyword detected in the filename ("Final Season"
+    # → "final"). We keep the keyword in the title (it's the provider's real
+    # title qualifier and trigram-matches the right AID), but also record it
+    # here so the episode-list validation gate (Phase 4) and season-ordinal
+    # routing can use it. None when no named season is present.
+    named_season: str | None = None
+    # Phase 6: the episode-title text guessed from the filename (the run
+    # AFTER the SxE marker, e.g. "The Rains of Castamere" from
+    # "Game of Thrones - 3x09 - The Rains of Castamere"). Used by the
+    # bipartite pairing to resolve a file against the provider's episode
+    # list by NAME when the number is missing/ambiguous. None when the
+    # filename carries no episode-title text.
+    episode_title_guess: str | None = None
+    # Phase 14: explicit provider IDs embedded in the filename / folder by a
+    # prior renamer (the reference renamer, Sonarr, manual tags): {tmdb-27205}, [tvdb-81797],
+    # {anidb-9541}, tt1375666. When present the matcher resolves by ID and
+    # skips title search entirely — zero ambiguity. Maps provider key → id
+    # string ("imdb" → "tt1375666"). None when no IDs are embedded.
+    provider_ids: dict[str, str] | None = None
+    # Phase 9: air date (ISO "YYYY-MM-DD") parsed from a date-named file
+    # ("The Daily Show 2020.01.15.mkv") when there's no clean SxE. Daily /
+    # talk / news shows are numbered by air date, not season+episode; the
+    # bipartite pairing resolves these against the provider's air_date field.
+    air_date: str | None = None
     # Parser's own confidence in the extraction (0-1)
     confidence: float = 0.0
 
@@ -59,9 +85,62 @@ def parse(path: str | Path) -> ParsedFile:
     return parse_filename(p.name, parent_path=str(p.parent))
 
 
+# Phase 14: explicit provider-ID tags a prior renamer may have embedded.
+# Matched against the RAW filename + parent path (format-stripping would
+# eat the braces). Brace/bracket forms: {tmdb-27205}, [tvdb-81797],
+# {anidb-9541}, {tmdbid-27205}. Plus a bare IMDB id: tt1375666.
+_PROVIDER_ID_PATTERNS = {
+    "tmdb": re.compile(r"[\[{]\s*tmdb(?:id)?\s*[-=:]\s*(\d+)\s*[\]}]", re.IGNORECASE),
+    "tvdb": re.compile(r"[\[{]\s*tvdb(?:id)?\s*[-=:]\s*(\d+)\s*[\]}]", re.IGNORECASE),
+    "anidb": re.compile(r"[\[{]\s*anidb(?:id)?\s*[-=:]\s*(\d+)\s*[\]}]", re.IGNORECASE),
+}
+_IMDB_ID_RE = re.compile(r"\b(tt\d{6,9})\b", re.IGNORECASE)
+
+
+# Phase 9: full air-date in a filename — YYYY[sep]MM[sep]DD, zero-padded
+# month/day so a bare "2020 1 5" doesn't false-positive. Matched on the RAW
+# filename (separators intact) before format-stripping flattens them.
+_AIR_DATE_RE = re.compile(
+    r"\b(19\d{2}|20\d{2})[.\-_ ](0[1-9]|1[0-2])[.\-_ ](0[1-9]|[12]\d|3[01])\b"
+)
+# The same date AFTER stripping (dots/underscores → spaces) — used to cut it
+# out of the extracted title.
+_AIR_DATE_SPACE_RE = re.compile(
+    r"\b(?:19\d{2}|20\d{2})\s+(?:0[1-9]|1[0-2])\s+(?:0[1-9]|[12]\d|3[01])\b"
+)
+
+
+def _extract_air_date(raw_filename: str) -> str | None:
+    """Return ISO 'YYYY-MM-DD' when the filename carries a full date, else None."""
+    m = _AIR_DATE_RE.search(raw_filename)
+    if not m:
+        return None
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+
+def _extract_provider_ids(text: str) -> dict[str, str] | None:
+    """Pull embedded provider IDs from raw filename/folder text. None if none."""
+    out: dict[str, str] = {}
+    for prov, rx in _PROVIDER_ID_PATTERNS.items():
+        m = rx.search(text)
+        if m:
+            out[prov] = m.group(1)
+    m = _IMDB_ID_RE.search(text)
+    if m:
+        out["imdb"] = m.group(1).lower()
+    return out or None
+
+
 def parse_filename(filename: str, parent_path: str = "") -> ParsedFile:
     """Parse a bare filename. parent_path is optional; used as a fallback hint
     (e.g. an `/anime/` ancestor folder pushes the type toward anime)."""
+
+    # Phase 14: scan the RAW filename + parent for embedded provider IDs
+    # before any stripping eats the braces.
+    provider_ids = _extract_provider_ids(f"{filename} {parent_path}")
+    # Phase 9: full air-date (daily/talk/news shows). Detected on the RAW
+    # filename so the date separators are intact.
+    air_date = _extract_air_date(filename)
 
     # ── Music routing — by extension ──────────────────────────────────────
     ext = Path(filename).suffix.lower()
@@ -105,9 +184,29 @@ def parse_filename(filename: str, parent_path: str = "") -> ParsedFile:
             abs_hint = extract_absolute_after(cleaned, after_pos)
             if abs_hint is not None:
                 sxe.absolute = abs_hint
+            else:
+                # Fallback: bracket-absolute placed BEFORE the SxE
+                # (`[SubsPlease] My Hero Academia - [128] S06E15.mkv`).
+                # extract_absolute_after only scans the tail, so a
+                # leading `[128]` is invisible to it — and the bare
+                # SxE match leaves `sxe.absolute = None`, dropping the
+                # cour-routing signal. Scan the WHOLE cleaned name for
+                # `[NNNN]` with the same year-range guard P5B uses.
+                from kira.parser.patterns import _P5B_BRACKET_ABS
+                bm = _P5B_BRACKET_ABS.search(cleaned)
+                if bm:
+                    bv = int(bm.group(1))
+                    if 1 <= bv <= 9999 and not (1900 <= bv <= 2049):
+                        sxe.absolute = bv
 
     media_type = _classify(tokens, sxe, parent_path, year)
     title = _extract_title(cleaned, sxe, year_span, media_type)
+    # Phase 6: episode-title guess (text after the SxE marker). Only for
+    # episodic media; movies don't have episode titles.
+    episode_title_guess = (
+        _extract_episode_title(cleaned, sxe)
+        if media_type in ("tv", "anime") else None
+    )
 
     # Season fallback — anime files often look like `Foo S3 - 03` (filename
     # carries a bare S3, not a full SxE) and Plex-style libraries put each
@@ -131,13 +230,48 @@ def parse_filename(filename: str, parent_path: str = "") -> ParsedFile:
     else:
         final_season = None
 
-    # R2-H12: cour detection from parent path. The helper exists since
-    # an earlier iteration but was never actually called. Files in a
-    # `Cour 1` / `Cour 2` subfolder need this hint to disambiguate split-
-    # cour anime (Bleach TYBW, Attack on Titan S4, Demon Slayer S2). The
-    # cour number flows into _compute_variant_key so two files in
-    # different cours of the same TVDB season don't collide on rename.
-    cour = _cour_from_parent(parent_path) if media_type in ("tv", "anime") else None
+    # R2-H12 + Phase 1: cour detection. Priority order:
+    #   1. Filename "Part N" / "Cour N" captured by PB (most specific).
+    #   2. Parent-path `Cour N` / `Part N` folder.
+    #   3. A trailing "Part N" left glued to the title (no episode form,
+    #      e.g. a batch file "Show The Final Season Part 3").
+    # The cour number flows into _compute_variant_key so two files in
+    # different cours of the same TVDB season don't collide on rename, and
+    # into cour_routing to pick the right sibling AID for split-cour anime
+    # (Bleach TYBW, Attack on Titan Final Season parts, Demon Slayer S2).
+    cour: int | None = None
+    named_season: str | None = None
+    if media_type in ("tv", "anime"):
+        if sxe is not None and sxe.cour is not None:
+            cour = sxe.cour
+        else:
+            cour = _cour_from_parent(parent_path)
+        # Strip a trailing "Part N" / "Cour N" still glued to the title and
+        # adopt its number if we don't have a cour yet.
+        title, cour_from_title = _strip_part_suffix(title)
+        if cour is None:
+            cour = cour_from_title
+        # Detect (but keep) a named season like "The Final Season".
+        named_season = _detect_named_season(title)
+
+    # Phase 9: a date-named file with no SxE is a daily/talk/news episode.
+    # Cut the date out of the title, lean the type toward TV, and seed the
+    # year from the date so the provider search is anchored. The bipartite
+    # pairing resolves the episode against the provider's air_date field.
+    if air_date and sxe is None:
+        title = _AIR_DATE_SPACE_RE.sub(" ", title)
+        title = re.sub(r"\s{2,}", " ", title).strip(" -._")
+        if media_type == "unknown":
+            media_type = "tv"
+        if year is None:
+            try:
+                year = int(air_date[:4])
+            except ValueError:
+                pass
+    else:
+        # Only surface the air date when it's the file's PRIMARY numbering
+        # (no SxE). When SxE is present, the date is just a release tag.
+        air_date = None
 
     # ── Confidence ───────────────────────────────────────────────────────
     confidence = _score(title, sxe, year, media_type)
@@ -161,6 +295,10 @@ def parse_filename(filename: str, parent_path: str = "") -> ParsedFile:
         bit_depth=tokens.bit_depth,
         release_group=tokens.release_group,
         cour=cour,
+        named_season=named_season,
+        episode_title_guess=episode_title_guess,
+        provider_ids=provider_ids,
+        air_date=air_date,
         confidence=confidence,
     )
 
@@ -327,11 +465,34 @@ def _classify(tokens: FormatTokens, sxe: SxEMatch | None,
     return "unknown"
 
 
-# Common fansub release groups — extend as we see more. Used only as one signal.
+# Known anime fansub / release groups — a `[Group]` or `-Group` tag matching
+# one of these is a strong "this is anime" signal (Phase 10). Curated to
+# anime-specific groups so a non-anime release with a coincidental tag isn't
+# misclassified. Stored lowercase; the check lowercases the extracted group.
+# Extend freely as new groups appear — this is intentionally just a data set.
 _FANSUB_GROUPS = {
+    # Current-era subbers / muxers
     "subsplease", "erai-raws", "horriblesubs", "asw", "judas", "smc",
     "commie", "fff", "underwater", "doki", "lazier", "toonshub", "anime time",
+    "ember", "ohys-raws", "animerg", "dkb", "cerberus", "nan-desu",
+    "kawaiika-raws", "beatrice-raws", "moozzi2", "sallysubs", "vivid",
+    "mtbb", "lazylily", "coalgirls", "thora", "niisama", "golumpa",
+    "kaleido-subs", "kaleido", "cyc", "yameii", "exiled-destiny", "chihiro",
+    "deadfish", "pog", "anidl", "breeze", "gjm", "kametsu", "nyanpasu",
+    "asakura", "anipakku", "animension", "judas", "tenrai-sensei",
+    "varyg", "hatsuyuki", "ddy", "dragssubs", "neo", "arid", "smc-raws",
+    "anime kaizoku", "animekaizoku", "anime chap", "yui-7", "rapidbot",
+    "saizen", "frostii", "ahodomo", "orphan", "live-evil", "a-l",
+    "subsplease-raws", "erai", "judasdvd",
 }
+# Phase 17: merge any user-supplied groups from the optional scene-rules JSON
+# so power users can teach Kira about groups it doesn't ship, without editing
+# source. Empty when no user file exists → in-code set used unchanged.
+try:
+    from kira.parser.scene_rules import extra_fansub_groups as _extra_groups
+    _FANSUB_GROUPS = _FANSUB_GROUPS | _extra_groups()
+except Exception:
+    pass
 
 
 def _looks_like_fansub(group: str) -> bool:
@@ -381,6 +542,42 @@ def _strip_season_suffix(title: str) -> str:
     return _INLINE_SEASON_SUFFIX.sub("", title or "").strip()
 
 
+# Phase 1: a trailing `Part N` / `Cour N` glued to the extracted title. This
+# fires for batch / mis-named files where there's no episode form for PB to
+# consume (e.g. "Attack on Titan The Final Season Part 3" with no episode
+# number). The numeric part/cour token is anime sub-season noise — strip it
+# and adopt the number as the cour. We deliberately keep any preceding named
+# season ("The Final Season") because that's the provider's real title.
+_TITLE_PART_SUFFIX = re.compile(r"\s+(?:Part|Cour)\s+(\d{1,2})\s*$", re.IGNORECASE)
+
+# Phase 1: named-season keyword. Recognized so downstream phases can route
+# "Final Season" files; the keyword stays IN the title (it's the provider's
+# actual title qualifier — AniDB names AID 14977 "...The Final Season").
+_NAMED_SEASON_RE = re.compile(r"\b(?:the\s+)?final\s+season\b", re.IGNORECASE)
+
+
+def _strip_part_suffix(title: str) -> tuple[str, int | None]:
+    """Drop a trailing `Part N` / `Cour N` from the title.
+
+    Returns ``(cleaned_title, cour_or_None)``. No-op (returns the title
+    unchanged) when there's no trailing part/cour token.
+    """
+    t = title or ""
+    m = _TITLE_PART_SUFFIX.search(t)
+    if not m:
+        return t.strip(), None
+    n = int(m.group(1))
+    cleaned = _TITLE_PART_SUFFIX.sub("", t).strip()
+    return cleaned, (n if 1 <= n <= 10 else None)
+
+
+def _detect_named_season(title: str) -> str | None:
+    """Return a named-season key ("final") when the title carries one."""
+    if title and _NAMED_SEASON_RE.search(title):
+        return "final"
+    return None
+
+
 def _season_from_parent(parent_path: str) -> int | None:
     """Detect `…/Season 3/…` from the parent path."""
     if not parent_path:
@@ -410,6 +607,92 @@ def _cour_from_parent(parent_path: str) -> int | None:
     return n if 1 <= n <= 10 else None
 
 
+# Phase 3: bracket residue the format-stripper's carve-outs intentionally
+# keep (it preserves space-containing / long brackets so legit subtitles like
+# "[Unlimited Blade Works]" survive). That same carve-out also keeps release-
+# flavor noise — these normalized tokens are dropped from the title.
+_TITLE_NOISE_BRACKET = frozenset({
+    "dual audio", "dual-audio", "multi subs", "multi-subs", "multi sub",
+    "multi audio", "eng sub", "eng subs", "eng dub", "english sub",
+    "english dub", "subbed", "dubbed", "uncensored", "censored",
+    "bd", "bdrip", "bd rip", "web", "webrip", "web dl", "web-dl", "batch",
+    "complete", "remux", "hi10", "hi10p", "10 bit", "10bit", "8 bit",
+    "8bit", "hevc", "x264", "x265", "h264", "h265", "flac", "aac", "ac3",
+})
+
+
+def _clean_title_brackets(title: str) -> str:
+    """Phase 3: drop residue bracket groups left in the title.
+
+    Removes:
+      - empty / whitespace-only brackets and parens (`[ ]`, `( )`),
+      - brackets whose normalized content is a known release-flavor token
+        ("[Dual Audio]", "[Multi-Subs]", "[BD]"),
+      - brackets whose content trigram-matches the rest of the title (a
+        redundant same-language alt-spelling / all-caps echo, "Bleach [BLEACH]").
+
+    A cross-language alt-name ("[Shingeki no Kyojin]") is deliberately left
+    in place — we can't reliably tell an alt-name from a real subtitle here,
+    and the folder-level series lock (Phase 11) keeps such files clustered.
+    """
+    if not title or ("[" not in title and "(" not in title):
+        return title
+    from kira.matcher.similarity import normalize, trigram_similarity  # lazy: avoids matcher↔parser import cycle
+
+    # The title with EVERY bracket group removed — basis for the echo test.
+    bare_norm = normalize(re.sub(r"[\[(][^\])]*[\])]", " ", title))
+
+    def _decide(m: "re.Match[str]") -> str:
+        inside = m.group(1).strip()
+        if not inside:
+            return " "
+        inside_norm = normalize(inside)
+        if not inside_norm:
+            return " "
+        if inside_norm in _TITLE_NOISE_BRACKET:
+            return " "
+        if bare_norm and trigram_similarity(inside_norm, bare_norm) >= 0.65:
+            return " "
+        return m.group(0)  # keep — likely a real subtitle / alt-name
+
+    cleaned = re.sub(r"[\[(]([^\])]*)[\])]", _decide, title)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+# Phase 6: trailing tokens that follow an SxE marker but aren't an episode
+# title — reject these as the whole guess.
+_EP_TITLE_JUNK = frozenset({
+    "end", "fin", "ova", "oad", "op", "ed", "ncop", "nced", "preview", "pv",
+    "uncensored", "bd", "tv",
+})
+
+
+def _extract_episode_title(cleaned: str, sxe: SxEMatch | None) -> str | None:
+    """Phase 6: pull the episode-title text that follows the SxE marker.
+
+    "Game of Thrones - 3x09 - The Rains of Castamere" → "The Rains of
+    Castamere". Returns None for the common "Show S01E05" case (nothing
+    after the marker) and when the trailing text is a number / release tag
+    / known junk word rather than a real title.
+    """
+    if sxe is None or not sxe.match_span:
+        return None
+    after = cleaned[sxe.match_span[1]:]
+    if not after:
+        return None
+    # Drop residual bracket/paren groups (quality tokens already stripped).
+    after = re.sub(r"[\[(][^\])]*[\])]", " ", after)
+    after = re.sub(r"^[\s\-_.:~]+", "", after)
+    after = re.sub(r"[\s\-_.:~]+$", "", after)
+    after = re.sub(r"\s{2,}", " ", after).strip()
+    if len(after) < 3 or not any(c.isalpha() for c in after):
+        return None
+    if after.lower() in _EP_TITLE_JUNK:
+        return None
+    return after
+
+
 def _extract_title(cleaned: str, sxe: SxEMatch | None,
                    year_span: tuple[int, int] | None,
                    media_type: MediaType) -> str:
@@ -422,6 +705,21 @@ def _extract_title(cleaned: str, sxe: SxEMatch | None,
         cut = year_span[0]
 
     title = cleaned[:cut] if cut is not None else cleaned
+
+    # Pure-digit `[NNNN]` brackets are preserved through format-stripping
+    # so `extract_sxe` (P5B) and parser.py's bracket-absolute fallback can
+    # consume them. They've now done their job — drop them from the
+    # title so we don't ship "My Hero Academia - [128]" as the display
+    # title. Anything that survived to here is either an absolute
+    # episode marker (already captured) or a release-year decorator
+    # (already in ParsedFile.year). Either way, it doesn't belong in
+    # the title text.
+    title = re.sub(r"\[\d{2,4}\]", " ", title)
+
+    # Phase 3: drop release-flavor / echo bracket residue the format-stripper
+    # carve-outs preserve. Runs here (after the SxE/year cut) so it can never
+    # shift a match span.
+    title = _clean_title_brackets(title)
 
     # Title-case-friendly cleanup: drop trailing/leading separators, collapse spaces.
     title = re.sub(r"^[-._\s]+|[-._\s]+$", "", title)

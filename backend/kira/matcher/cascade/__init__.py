@@ -17,7 +17,7 @@ functions with a composable pipeline that:
   3. Stores the full trace on Match.metadata_blob['cascade_trace'] so
      the frontend can render "why this confidence?" on hover.
 
-See FileBot's MetricCascade.java + EpisodeMetrics.java for prior art
+See the reference renamer's MetricCascade.java + EpisodeMetrics.java for prior art
 (GPL-2 — we read the algorithms, wrote Python from scratch).
 """
 from kira.matcher.cascade.types import (

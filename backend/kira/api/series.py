@@ -112,10 +112,19 @@ async def list_series_episodes(
         # empty / errored / banned. Costs us English titles for shows
         # AniDB only has in romaji — acceptable trade since unpaired
         # files are a much worse UX than romaji-titled paired files.
+        # Phase 2: when the popup asks for season 0 it wants the Specials
+        # card. AniDB filters specials out by default; opt in here so its
+        # native call returns type=2 episodes tagged season 0. (TVDB/TMDB
+        # ignore the flag — their season=0 request already returns specials.)
+        want_specials = season == 0
         results = []
         if provider == "anidb":
             try:
-                results = await p.get_episodes(provider_id, season if season is not None else 1)
+                results = await p.get_episodes(
+                    provider_id,
+                    season if season is not None else 1,
+                    include_specials=want_specials,
+                )
             except Exception as e:
                 print(f"series anidb/{provider_id} native ep lookup failed: {e!r}")
                 results = []

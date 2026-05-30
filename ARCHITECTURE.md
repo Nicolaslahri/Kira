@@ -1,9 +1,9 @@
 # Kira — Architecture
 
 > "Rename, organize, done."
-> Self-hosted, Docker-native media metadata fixer. Modern alternative to FileBot.
+> Self-hosted, Docker-native media metadata fixer.
 
-This doc reflects what's **actually built** right now. For the original design intent (FileBot lessons, GPL stance, future v2/v3 scope), see the planning doc in `~/.claude/plans/`.
+This doc reflects what's **actually built** right now.
 
 ---
 
@@ -50,7 +50,7 @@ Migrations: none yet. Schema is created via `Base.metadata.create_all()` on star
 | Build | Vite |
 | Types | TypeScript (strict) |
 | State | Plain `useState` / props drilling — no Redux/Zustand yet |
-| Styling | Hand-written CSS (no Tailwind, no shadcn) — matches the Claude Design prototype |
+| Styling | Tailwind v4 + Untitled UI components (migrating from legacy hand-written CSS) |
 | HTTP | native `fetch` via a small `api` client |
 
 ---

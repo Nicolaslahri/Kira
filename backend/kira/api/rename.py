@@ -22,11 +22,126 @@ from kira.renamer import (
     DEFAULT_PROFILES,
     FileOp,
     NamingProfile,
+    compute_sidecar_target,
+    discover_sidecars,
     execute_op,
     format_target_path,
 )
 
 router = APIRouter(prefix="/rename", tags=["rename"])
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Live template preview (Tier 1.5 step 6 backend)
+# ─────────────────────────────────────────────────────────────────────
+# Renders user-supplied naming templates against the user's OWN recent
+# matched files using the REAL engine (format_target_path → same render +
+# _safe + specials-routing pipeline a real rename runs). This makes the
+# backend the single source of truth for the Settings → Naming live preview,
+# so the displayed path can't drift from what a rename would actually write.
+# Read-only: computes paths under a throwaway root and never touches disk.
+
+
+class TemplatePreviewRequest(BaseModel):
+    """The 4 per-type templates being edited. Any omitted type falls back to
+    the Plex default so a partial edit still previews."""
+    movie: str | None = None
+    tv: str | None = None
+    anime: str | None = None
+    music: str | None = None
+    samples_per_type: int = 3
+
+
+class PreviewSample(BaseModel):
+    media_type: str
+    filename: str
+    rendered: str            # relative path the template produces (posix)
+    error: str | None = None
+
+
+class TemplatePreviewResponse(BaseModel):
+    samples: list[PreviewSample]
+
+
+def _relativize_preview(target: Path, preview_root: str) -> str:
+    """Strip the abstract preview root so the UI shows a clean relative path
+    (e.g. `TV/Breaking Bad (2008)/Season 01/…`)."""
+    try:
+        return target.relative_to(Path(preview_root).resolve()).as_posix()
+    except ValueError:
+        return target.as_posix()
+
+
+@router.post("/preview-template", response_model=TemplatePreviewResponse)
+async def preview_template(
+    payload: TemplatePreviewRequest,
+    session: AsyncSession = Depends(get_session),
+) -> TemplatePreviewResponse:
+    """Render the supplied templates against recent matched files (per type)."""
+    base = DEFAULT_PROFILES["Plex"]
+    profile = NamingProfile(
+        movie=payload.movie or base.movie,
+        tv=payload.tv or base.tv,
+        anime=payload.anime or base.anime,
+        music=payload.music or base.music,
+    )
+    per_type = max(1, min(payload.samples_per_type or 3, 10))
+    preview_root = "__kira_preview__"
+    samples: list[PreviewSample] = []
+
+    for mtype in ("movie", "tv", "anime", "music"):
+        rows = (await session.execute(
+            select(MediaFile)
+            .options(selectinload(MediaFile.matches))
+            .where(MediaFile.media_type == mtype)
+            .order_by(MediaFile.id.desc())
+            .limit(40)
+        )).scalars().all()
+        picked = 0
+        for f in rows:
+            if picked >= per_type:
+                break
+            if not f.parsed_data:
+                continue
+            selected = next((m for m in f.matches if m.is_selected), None) \
+                or (f.matches[0] if f.matches else None)
+            if not selected or not selected.provider or not selected.provider_id:
+                continue
+            picked += 1
+            fname = Path(f.file_path).name  # ORM stores file_path, not filename
+            try:
+                fields = {
+                    k: v for k, v in f.parsed_data.items()
+                    if k in ParsedFile.__dataclass_fields__
+                }
+                parsed = ParsedFile(**fields)
+                meta = dict(getattr(selected, "metadata_blob", None) or {})
+                prov = (selected.provider or "").lower()
+                if selected.provider_id:
+                    if prov == "tmdb":
+                        meta.setdefault("tmdbid", selected.provider_id)
+                    elif prov == "tvdb":
+                        meta.setdefault("tvdbid", selected.provider_id)
+                    elif prov == "anidb":
+                        meta.setdefault("anidbid", selected.provider_id)
+                target = format_target_path(
+                    parsed, preview_root, profile,
+                    library_title=selected.title or parsed.title,
+                    library_year=(selected.year if selected.year is not None else parsed.year),
+                    episode_title=selected.episode_title,
+                    season_override=selected.season_number,
+                    metadata=meta,
+                    file_size=f.file_size,
+                )
+                samples.append(PreviewSample(
+                    media_type=mtype, filename=fname,
+                    rendered=_relativize_preview(target, preview_root),
+                ))
+            except Exception as e:
+                samples.append(PreviewSample(
+                    media_type=mtype, filename=fname, rendered="", error=str(e),
+                ))
+    return TemplatePreviewResponse(samples=samples)
 
 
 def _filesystem_reachable(src: Path) -> bool:
@@ -246,7 +361,7 @@ async def _resolve_cleanup_empty_dirs(session: AsyncSession) -> bool:
     user pain — the walker rmdir'd up to 6 levels of empty ancestors,
     which on a heavily-renamed library could wipe Show/Season/Type
     folders the user expected to keep. Users must explicitly opt in
-    via Settings → Naming & format → "Clean up empty source folders".
+    via Settings → Folder cleanup → "Remove empty folders after Move".
     """
     from kira.models import Setting
     row = await session.get(Setting, "rename.cleanup_empty_source_dirs")
@@ -260,6 +375,35 @@ async def _resolve_cleanup_empty_dirs(session: AsyncSession) -> bool:
         if isinstance(v, bool):
             return v
     return False
+
+
+async def _resolve_cleanup_artifacts(session: AsyncSession) -> bool:
+    """Setting sub-toggle: when cleaning up empty source folders, also
+    sweep Plex/Jellyfin/Kodi metadata artifacts (poster.jpg, *-thumb.jpg,
+    tvshow.nfo, .actors/, etc.) so the folders ACTUALLY become empty
+    and can be rmdir'd. Default TRUE — the whole point of folder
+    cleanup is to leave the source tidy; an artifact-only folder is
+    still "garbage" from the user's perspective.
+
+    Setting key: `rename.cleanup_media_server_artifacts`. Ignored when
+    the master `cleanup_empty_source_dirs` toggle is off (no cleanup
+    walk happens at all in that case).
+
+    Returns True (default) when the setting is missing, so a fresh
+    install gets the friendlier behaviour out of the box.
+    """
+    from kira.models import Setting
+    row = await session.get(Setting, "rename.cleanup_media_server_artifacts")
+    if not row:
+        return True  # friendly default — user can opt OUT if they want
+    val = row.value
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, dict):
+        v = val.get("value")
+        if isinstance(v, bool):
+            return v
+    return True
 
 
 async def _resolve_type_target_root(
@@ -340,6 +484,12 @@ async def rename(
     profile = await _resolve_profile(session, payload.profile)
     library_root = await _resolve_library_root(session, payload.library_root_name)
     cleanup_empty_source = await _resolve_cleanup_empty_dirs(session)
+    # Sub-toggle: when cleanup_empty_source is on, ALSO sweep Plex/
+    # Jellyfin/Kodi metadata artifacts (poster.jpg, *-thumb.jpg, etc.)
+    # so the rmdir actually succeeds. Default-on; user can disable in
+    # Settings → Folder cleanup if they want strict "only touch what's
+    # already empty" semantics.
+    cleanup_artifacts = await _resolve_cleanup_artifacts(session)
     rename_mode = await _resolve_rename_mode(session)
 
     files = list(await session.scalars(
@@ -392,7 +542,21 @@ async def rename(
         # time, `anidb:<lowest_aid>` for the franchise) to look up the
         # franchise root's title — the S1 title that all sequels collapse
         # under. Pure in-memory; zero HTTP; safe during AniDB bans.
-        if selected.provider == "anidb" and selected.series_group_id:
+        #
+        # CRITICAL: SKIP THIS WHEN selected.is_manual IS TRUE. The user
+        # explicitly chose this show via Re-identify; their pick MUST
+        # win. Pre-fix bug: user picked "Bleach: Thousand Year Blood War"
+        # (AID 15449), but the canonical AID for the Bleach franchise is
+        # the original 2004 show (AID 269 — way lower number). The collapse
+        # lookup returned "Bleach", overwriting the user's pick. Resulting
+        # folder: "Z:/anime/Bleach/" instead of "Z:/anime/Bleach: Thousand
+        # Year Blood War/" as the popup promised. Now: manual pins bypass
+        # the collapse and the chosen title flows through verbatim.
+        if (
+            selected.provider == "anidb"
+            and selected.series_group_id
+            and not selected.is_manual
+        ):
             try:
                 # series_group_id format: "anidb:<canonical_aid>"
                 root_aid_str = selected.series_group_id.split(":", 1)[-1]
@@ -426,6 +590,20 @@ async def rename(
             )
         if type_target_root is None:
             type_target_root = await _resolve_type_target_root(session, parsed.media_type)
+        # Tier 1.5 step 2b: assemble provider-metadata for the rich naming
+        # tokens ({director}/{genres}/{tmdbid}/{runtime}/…). metadata_blob
+        # carries the bulk; provider ids come off the Match row. Defensive
+        # getattr + None-coalesce: a missing blob just leaves those template
+        # tokens empty — templates that don't reference them are unaffected.
+        _meta = dict(getattr(selected, "metadata_blob", None) or {})
+        _prov = (selected.provider or "").lower()
+        if selected.provider_id:
+            if _prov == "tmdb":
+                _meta.setdefault("tmdbid", selected.provider_id)
+            elif _prov == "tvdb":
+                _meta.setdefault("tvdbid", selected.provider_id)
+            elif _prov == "anidb":
+                _meta.setdefault("anidbid", selected.provider_id)
         try:
             target = format_target_path(
                 parsed, library_root, profile,
@@ -434,6 +612,8 @@ async def rename(
                 episode_title=selected.episode_title,
                 season_override=selected.season_number,
                 type_target_root=type_target_root,
+                metadata=_meta,
+                file_size=f.file_size,
             )
         except Exception as e:
             results.append(RenameItemResult(file_id=fid, ok=False, error=f"Template error: {e}"))
@@ -528,14 +708,15 @@ async def rename(
             # `asyncio.to_thread` runs the blocking call on a worker
             # thread; the event loop stays responsive for poll/health
             # requests during the copy.
-            await asyncio.to_thread(
+            video_artifacts_cleaned = await asyncio.to_thread(
                 execute_op,
                 op, src, target,
                 overwrite=payload.overwrite,
                 cleanup_empty_source=cleanup_empty_source,
                 cleanup_stop_at=Path(library_root) if library_root else None,
                 cleanup_max_levels=cleanup_max_levels,
-            )
+                cleanup_artifacts=cleanup_artifacts,
+            ) or 0
         except Exception as e:
             results.append(RenameItemResult(
                 file_id=fid, ok=False, old_path=str(src), new_path=str(target),
@@ -547,7 +728,7 @@ async def rename(
         if op == FileOp.MOVE:
             f.file_path = str(target)
         f.status = "renamed"
-        session.add(RenameHistory(
+        video_history = RenameHistory(
             media_file_id=fid,
             match_id=selected.id if selected else None,
             old_path=str(src),
@@ -557,7 +738,119 @@ async def rename(
             media_type=parsed.media_type,
             title=library_title,
             poster_url=selected.poster_url if selected else None,
-        ))
+        )
+        session.add(video_history)
+
+        # ── Tier 1.2: Subtitle / sidecar co-renaming ─────────────────
+        # Now that the video has moved, hunt for sidecars (.srt, .ass,
+        # .sub, etc.) at the OLD location whose stem matched the video
+        # and bring them along to the NEW location under the renamed
+        # stem. Each sidecar gets its own RenameHistory row linked back
+        # to the video's row via `parent_id` so cascading undo restores
+        # everything together. Sidecar failures NEVER fail the video —
+        # the user's primary intent (rename the video) already succeeded
+        # before this block runs; sidecar warnings are surfaced via the
+        # result's error field with a "[SIDECARS]" prefix the frontend
+        # can recognise.
+        sidecar_msg: str | None = None
+        # MOVE removed the video from `src` but the sidecars still sit
+        # in `src.parent`. COPY/SYMLINK/HARDLINK leave the video itself
+        # in place too. Either way `discover_sidecars(src)` walks
+        # `src.parent` looking for stem matches — works for all ops.
+        try:
+            sidecars = discover_sidecars(src)
+        except Exception as e:
+            print(f"rename: sidecar discovery failed for {fid}: {e!r}")
+            sidecars = []
+
+        if sidecars:
+            # Need the video history row's id to link children — flush
+            # without committing so SQLite assigns the autoincrement id
+            # while keeping the transaction open. If the flush fails the
+            # commit a few lines below will fail too and the per-file
+            # error path handles it.
+            try:
+                await session.flush()
+                parent_history_id = video_history.id
+            except Exception as e:
+                print(f"rename: flush before sidecars failed for {fid}: {e!r}")
+                parent_history_id = None
+
+            moved_subs = 0
+            failed_subs: list[str] = []
+            for sidecar in sidecars:
+                sub_target = compute_sidecar_target(sidecar, src, target)
+                if sub_target is None:
+                    continue
+                try:
+                    # Same cleanup_empty_source policy as the video. Last
+                    # operation in the parent folder triggers the cleanup
+                    # naturally — the rmdir refuses non-empty dirs so
+                    # mid-batch sidecar moves never accidentally trip it.
+                    sub_artifacts_cleaned = await asyncio.to_thread(
+                        execute_op,
+                        op, sidecar, sub_target,
+                        overwrite=payload.overwrite,
+                        cleanup_empty_source=cleanup_empty_source,
+                        cleanup_stop_at=Path(library_root) if library_root else None,
+                        cleanup_max_levels=cleanup_max_levels,
+                        cleanup_artifacts=cleanup_artifacts,
+                    ) or 0
+                    # Aggregate artifact count across all sidecar moves
+                    # for this video. The LAST sidecar move triggers the
+                    # actual rmdir-walk (the directory becomes empty
+                    # then), so most of the cleanup count usually shows
+                    # up there — but counting per-call is robust to any
+                    # ordering.
+                    video_artifacts_cleaned += sub_artifacts_cleaned
+                except Exception as e:
+                    failed_subs.append(f"{sidecar.name}: {e}")
+                    continue
+                if parent_history_id is not None:
+                    session.add(RenameHistory(
+                        media_file_id=fid,
+                        match_id=selected.id if selected else None,
+                        parent_id=parent_history_id,
+                        old_path=str(sidecar),
+                        new_path=str(sub_target),
+                        operation=op.value,
+                        template_used=getattr(profile, parsed.media_type, profile.movie),
+                        media_type=parsed.media_type,
+                        title=library_title,
+                        poster_url=selected.poster_url if selected else None,
+                    ))
+                moved_subs += 1
+
+            if failed_subs:
+                joined = "; ".join(failed_subs)
+                sidecar_msg = (
+                    f"[SIDECARS] Moved {moved_subs}/{len(sidecars)} sidecar"
+                    f"{'s' if len(sidecars) != 1 else ''}; "
+                    f"{len(failed_subs)} failed: {joined[:200]}"
+                )
+            elif moved_subs > 0:
+                sidecar_msg = (
+                    f"[SIDECARS] Moved {moved_subs} sidecar"
+                    f"{'s' if moved_subs != 1 else ''} alongside the video."
+                )
+
+        # ── Folder cleanup artifact count ─────────────────────────────
+        # Append the count of Plex/Jellyfin/Kodi cache files Kira swept
+        # from the source folder hierarchy (poster.jpg, tvshow.nfo,
+        # .actors/, etc.) so the user knows their library is genuinely
+        # tidier than before, not that we silently deleted user data.
+        # The [ARTIFACTS] prefix lets the frontend toast surface this
+        # as a positive, informational note (not an error).
+        if video_artifacts_cleaned > 0:
+            artifact_note = (
+                f"[ARTIFACTS] Cleaned {video_artifacts_cleaned} stale Plex/Jellyfin "
+                f"metadata file{'s' if video_artifacts_cleaned != 1 else ''} "
+                f"from the source folder."
+            )
+            sidecar_msg = (
+                f"{sidecar_msg} · {artifact_note}" if sidecar_msg else artifact_note
+            )
+
         # ── Autopsy 8: durable per-file commit. The physical move just
         # succeeded — the disk now reflects the rename. We MUST persist
         # the matching MediaFile.file_path + RenameHistory NOW, before
@@ -594,6 +887,7 @@ async def rename(
                 continue
         results.append(RenameItemResult(
             file_id=fid, ok=True, old_path=str(src), new_path=str(target),
+            error=sidecar_msg,
         ))
 
     if not payload.dry_run:

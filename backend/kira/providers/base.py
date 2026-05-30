@@ -18,6 +18,16 @@ from pydantic import BaseModel
 ProviderKey = Literal["tmdb", "tvdb", "anidb", "musicbrainz", "acoustid"]
 
 
+# KI-13: shared User-Agent string. Originally lived in anidb.py because
+# AniDB rejects the default `python-httpx/0.x` UA with a 403. We hit the
+# same risk on GitHub's raw CDN (which serves the Fribb anime-list dump
+# in anime_mappings.py) — raw.githubusercontent.com is known to
+# rate-limit / 403 the default Python UA when aggregate traffic spikes.
+# Hoisted here so every external HTTP client in providers/ can adopt the
+# same defensive identifier without duplicating the string.
+KIRA_USER_AGENT = "kira/0.5.0 (+https://github.com/Nicolaslahri/Kira)"
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Exception hierarchy — providers raise these so the matcher can decide
 # whether to retry or give up.
@@ -129,6 +139,17 @@ class EpisodeResult(BaseModel):
     # row next to the air date (e.g. "Jun 27, 2024 · 36 min"). All three
     # video providers expose this; we plumb it through verbatim.
     runtime: int | None = None
+    # The provider's absolute episode number when distinct from the
+    # season-local `episode` field. TVDB exposes this as `absoluteNumber`
+    # for shows that maintain absolute numbering (One Piece, Naruto,
+    # Detective Conan, Pokémon). AniDB doesn't need it because its native
+    # season=1 schema makes `episode` already the absolute number. The
+    # bipartite Pass 2 reads this to pair `parsed.absolute_episode=1158`
+    # against TVDB's S23E5 row whose `absolute_number=1158` — without
+    # this field, the only working absolute-numbered anime path was via
+    # AniDB; during an AniDB ban the user would see mass orphans for
+    # long-runners. None on providers that don't expose it.
+    absolute_number: int | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -167,7 +188,10 @@ class MetadataProvider(ABC):
     async def search_tv(self, title: str, year: int | None = None) -> list[TVResult]: ...
 
     @abstractmethod
-    async def get_episodes(self, series_id: str, season: int) -> list[EpisodeResult]: ...
+    async def get_episodes(
+        self, series_id: str, season: int, include_specials: bool = False,
+        order: str = "default",
+    ) -> list[EpisodeResult]: ...
 
 
 # Default base URLs per provider. The factory uses these for DIRECT mode

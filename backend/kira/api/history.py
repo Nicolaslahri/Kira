@@ -28,7 +28,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kira.database import get_session
-from kira.models import MediaFile, Notification, RenameHistory
+from kira.models import Match, MediaFile, Notification, RenameHistory
 from kira.renamer.operations import FileOp, undo_op
 
 router = APIRouter(prefix="/history", tags=["history"])
@@ -44,6 +44,12 @@ class HistoryOut(BaseModel):
     operation: str
     media_type: str | None
     title: str | None
+    # Episode name pulled from the linked Match (TV only). Surfaced so the
+    # History page search can match on episode titles, not just the show
+    # name + paths. Defaults to None so the undo endpoint — which serializes
+    # a bare RenameHistory ORM row via from_attributes — doesn't choke on a
+    # missing attribute.
+    episode_title: str | None = None
     poster_url: str | None
     created_at: datetime
     undone_at: datetime | None
@@ -55,7 +61,22 @@ async def list_history(
     operation: str | None = None,
     limit: int = 500,
     session: AsyncSession = Depends(get_session),
-) -> list[RenameHistory]:
+) -> list[HistoryOut]:
+    """List rename history with fresh poster URLs.
+
+    `RenameHistory.poster_url` is frozen at rename time — whatever the
+    Match's poster_url was when the rename happened. But auto-heal /
+    cross-ref enrichment runs AFTER renames too, so the linked Match
+    row often has a richer/correct poster URL by the time the user
+    browses History. We fall back to `Match.poster_url` when the
+    history-row's own field is null so the cover grid stays complete
+    instead of degrading to gradient-only placeholders for entries
+    that landed before the poster fetch resolved.
+
+    Order: prefer the frozen poster (it WAS the right one at rename
+    time and might have been manually-picked), fall through to the
+    Match's current one when frozen is null.
+    """
     stmt = select(RenameHistory).order_by(RenameHistory.created_at.desc()).limit(limit)
     if period == "today":
         cutoff = _utcnow_naive().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -65,7 +86,41 @@ async def list_history(
         stmt = stmt.where(RenameHistory.created_at >= cutoff)
     if operation:
         stmt = stmt.where(RenameHistory.operation == operation)
-    return list(await session.scalars(stmt))
+    rows = list(await session.scalars(stmt))
+
+    # Batch-fetch the linked Match rows in one query so we don't N+1
+    # for libraries with hundreds of history entries.
+    match_ids = [r.match_id for r in rows if r.match_id is not None]
+    matches_by_id: dict[int, Match] = {}
+    if match_ids:
+        matches = await session.scalars(
+            select(Match).where(Match.id.in_(match_ids))
+        )
+        matches_by_id = {m.id: m for m in matches}
+
+    out: list[HistoryOut] = []
+    for r in rows:
+        # Prefer the frozen poster (manual picks, scene-of-the-time
+        # captures), fall back to the live Match poster (enrichment
+        # may have populated it after the rename).
+        effective_poster = r.poster_url
+        match = matches_by_id.get(r.match_id) if r.match_id is not None else None
+        if effective_poster is None and match is not None and match.poster_url:
+            effective_poster = match.poster_url
+        out.append(HistoryOut(
+            id=r.id,
+            media_file_id=r.media_file_id,
+            old_path=r.old_path,
+            new_path=r.new_path,
+            operation=r.operation,
+            media_type=r.media_type,
+            title=r.title,
+            episode_title=match.episode_title if match is not None else None,
+            poster_url=effective_poster,
+            created_at=r.created_at,
+            undone_at=r.undone_at,
+        ))
+    return out
 
 
 @router.get("/counts")
@@ -100,8 +155,20 @@ async def _sync_media_file_after_undo(
     Status "matched" puts the file back into the Review queue so the
     user can decide what to do with it next. "renamed" wouldn't make
     sense — by definition the rename has just been undone.
+
+    Sidecar rows skip the MediaFile sync — only the parent video row
+    represents the MediaFile's location on disk. The sidecar rows
+    move alongside it but they aren't tracked in `media_files` as
+    their own entities, so syncing MediaFile from them would
+    incorrectly rewrite `file_path` to the sidecar's path.
     """
     if not entry.media_file_id:
+        return
+    if entry.parent_id is not None:
+        # This is a sidecar — its MediaFile is the parent video, which
+        # got synced when the parent was undone. Skip to avoid
+        # clobbering the parent's freshly-restored file_path with a
+        # sidecar path.
         return
     mf = await session.get(MediaFile, entry.media_file_id)
     if mf is None:
@@ -112,6 +179,46 @@ async def _sync_media_file_after_undo(
     # manually marked it `discarded`).
     if mf.status == "renamed":
         mf.status = "matched"
+
+
+async def _undo_sidecar_children(
+    session: AsyncSession, parent_entry: RenameHistory,
+) -> tuple[int, int]:
+    """Undo every non-undone RenameHistory row whose parent_id is the
+    given parent's id. Used by both single-entry and bulk undo to keep
+    sidecar files locked to the parent video's location.
+
+    Returns `(succeeded, failed)` — best-effort; a missing-target
+    sidecar (someone manually moved it) counts as failed but doesn't
+    abort the rest. The parent's own undo is the caller's job; this
+    function only touches children.
+    """
+    children = list(await session.scalars(
+        select(RenameHistory).where(
+            RenameHistory.parent_id == parent_entry.id,
+            RenameHistory.undone_at.is_(None),
+        )
+    ))
+    if not children:
+        return 0, 0
+    succeeded = 0
+    failed = 0
+    for child in children:
+        try:
+            await asyncio.to_thread(
+                undo_op,
+                FileOp(child.operation),
+                Path(child.old_path),
+                Path(child.new_path),
+            )
+            child.undone_at = _utcnow_naive()
+            succeeded += 1
+        except Exception as e:
+            # A sidecar undo failure should NOT block the parent's undo
+            # from being recorded. Log + count + continue.
+            print(f"history: sidecar undo failed for entry {child.id}: {e!r}")
+            failed += 1
+    return succeeded, failed
 
 
 @router.post("/{entry_id}/undo", response_model=HistoryOut)
@@ -143,10 +250,20 @@ async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)
     # a path that doesn't exist.
     await _sync_media_file_after_undo(session, entry)
     entry.undone_at = _utcnow_naive()
+    # Tier 1.2: cascade to sidecar children. Subtitle / sub files that
+    # rode along with the video at rename time also ride back at undo
+    # time — otherwise the user ends up with subs at the new location
+    # and the video back at the old, breaking Plex/Jellyfin pairing.
+    sub_ok, sub_failed = await _undo_sidecar_children(session, entry)
+    body = f"Restored to {entry.old_path}"
+    if sub_ok:
+        body += f" (+ {sub_ok} sidecar{'s' if sub_ok != 1 else ''})"
+    if sub_failed:
+        body += f"; {sub_failed} sidecar{'s' if sub_failed != 1 else ''} failed to restore"
     session.add(Notification(
         kind="info",
         title=f"Undone: {entry.title or Path(entry.old_path).name}",
-        body=f"Restored to {entry.old_path}",
+        body=body,
     ))
     await session.commit()
     return entry
@@ -160,6 +277,8 @@ async def undo_bulk(
     ids = payload.get("ids", [])
     succeeded = 0
     failed = 0
+    sidecar_succeeded = 0
+    sidecar_failed = 0
     for entry_id in ids:
         entry = await session.get(RenameHistory, entry_id)
         if entry is None or entry.undone_at is not None:
@@ -187,10 +306,21 @@ async def undo_bulk(
             await _sync_media_file_after_undo(session, entry)
             entry.undone_at = _utcnow_naive()
             succeeded += 1
+            # Tier 1.2: sidecar cascade. Sidecar children attached to
+            # this video row also undo together. Sidecar failures are
+            # logged but never bubble up as a parent failure — the
+            # parent video itself has already been successfully undone.
+            ok_subs, failed_subs = await _undo_sidecar_children(session, entry)
+            sidecar_succeeded += ok_subs
+            sidecar_failed += failed_subs
         except Exception:
             failed += 1
     await session.commit()
-    return {"succeeded": succeeded, "failed": failed}
+    out = {"succeeded": succeeded, "failed": failed}
+    if sidecar_succeeded or sidecar_failed:
+        out["sidecars_undone"] = sidecar_succeeded
+        out["sidecars_failed"] = sidecar_failed
+    return out
 
 
 @router.get("/export.csv")
