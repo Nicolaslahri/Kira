@@ -118,3 +118,95 @@ def test_enrich_parsed_authoritative_keeps_value_when_mediainfo_blank() -> None:
     mediainfo.enrich_parsed(pf, {"quality": "1080p"}, authoritative=True)
     assert pf.quality == "1080p"   # MediaInfo had it → overridden
     assert pf.codec == "x264"      # MediaInfo lacked it → kept
+
+
+# ── per-track languages (roadmap item c) ─────────────────────────────────────
+def test_normalize_language() -> None:
+    assert mediainfo.normalize_language("en") == "eng"
+    assert mediainfo.normalize_language("eng") == "eng"
+    assert mediainfo.normalize_language("English") == "eng"
+    assert mediainfo.normalize_language("ja") == "jpn"
+    assert mediainfo.normalize_language("Japanese") == "jpn"
+    assert mediainfo.normalize_language("en-US") == "eng"   # locale → primary subtag
+    assert mediainfo.normalize_language("pt-BR") == "por"
+    assert mediainfo.normalize_language("und") is None      # undetermined
+    assert mediainfo.normalize_language("") is None
+    assert mediainfo.normalize_language(None) is None
+    assert mediainfo.normalize_language("xyz") == "xyz"     # unknown short code passes
+    assert mediainfo.normalize_language("klingon") is None  # unknown long name dropped
+
+
+def test_enrich_parsed_fills_languages() -> None:
+    pf = ParsedFile(original_filename="x.mkv", media_type="tv", title="X")
+    changed = mediainfo.enrich_parsed(pf, {"audio_langs": ["jpn", "eng"], "sub_langs": ["eng"]})
+    assert changed
+    assert pf.audio_langs == ["jpn", "eng"]
+    assert pf.sub_langs == ["eng"]
+
+
+def test_enrich_parsed_authoritative_overrides_languages() -> None:
+    pf = ParsedFile(original_filename="y.mkv", media_type="tv", title="Y",
+                    audio_langs=["eng"], sub_langs=[])
+    changed = mediainfo.enrich_parsed(
+        pf, {"audio_langs": ["jpn", "eng"], "sub_langs": ["eng", "spa"]}, authoritative=True,
+    )
+    assert changed
+    assert pf.audio_langs == ["jpn", "eng"]
+    assert pf.sub_langs == ["eng", "spa"]
+
+
+def test_read_media_info_collects_track_languages(monkeypatch) -> None:
+    class _T:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    class _Info:
+        tracks = [
+            _T(track_type="General", duration="1320000"),
+            _T(track_type="Video", height=1080, format="HEVC"),
+            _T(track_type="Audio", language="ja", channel_s=6, format="DTS"),
+            _T(track_type="Audio", language="en", channel_s=2, format="AAC"),
+            _T(track_type="Text", language="eng"),
+            _T(track_type="Text", language="spa"),
+            _T(track_type="Text", language="en"),   # dup of eng → deduped
+        ]
+
+    class _MI:
+        @staticmethod
+        def parse(_path):
+            return _Info()
+
+    monkeypatch.setattr(mediainfo, "_AVAILABLE", True)
+    monkeypatch.setattr(mediainfo, "_MediaInfo", _MI)
+    out = mediainfo.read_media_info("/fake.mkv")
+    assert out is not None
+    # languages collected across ALL tracks, in order, deduped + normalized
+    assert out["audio_langs"] == ["jpn", "eng"]
+    assert out["sub_langs"] == ["eng", "spa"]
+    # primary (first) video + audio fields still come from the first of each
+    assert out["quality"] == "1080p" and out["codec"] == "x265"
+    assert out["channels"] == "5.1" and out["audio"] == "DTS"
+    assert out["duration"] == 1320
+
+
+def test_read_media_info_no_languages_omits_keys(monkeypatch) -> None:
+    class _T:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    class _Info:
+        tracks = [
+            _T(track_type="Video", height=720, format="AVC"),
+            _T(track_type="Audio", channel_s=2, format="AAC"),  # no language attr
+        ]
+
+    class _MI:
+        @staticmethod
+        def parse(_path):
+            return _Info()
+
+    monkeypatch.setattr(mediainfo, "_AVAILABLE", True)
+    monkeypatch.setattr(mediainfo, "_MediaInfo", _MI)
+    out = mediainfo.read_media_info("/fake.mkv")
+    assert out is not None
+    assert "audio_langs" not in out and "sub_langs" not in out  # omitted, not []

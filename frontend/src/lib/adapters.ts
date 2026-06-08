@@ -113,6 +113,7 @@ export function apiToMediaFile(api: ApiMediaFile): MediaFile {
         provider: topMatch?.provider,
         providerId: topMatch?.provider_id,
         seriesGroupId: topMatch?.series_group_id ?? undefined,
+        collectionName: strOrU('collection_name') ?? null,  // #14
         tmdbId: topMatch && topMatch.provider === 'tmdb' ? Number(topMatch.provider_id) || null : null,
         poster: poster(displayTitle, displayYear),
         posterUrl: topMatch?.poster_url ?? null,
@@ -207,6 +208,11 @@ export function apiToMediaFile(api: ApiMediaFile): MediaFile {
     source: parsed.source ?? undefined,
     codec: parsed.codec ?? undefined,
     bitDepth: parsed.bit_depth ?? undefined,
+    hdr: parsed.hdr ?? undefined,
+    channels: parsed.channels ?? undefined,
+    audio: Array.isArray(parsed.audio) ? parsed.audio : undefined,
+    audio_langs: Array.isArray(parsed.audio_langs) ? parsed.audio_langs : undefined,
+    sub_langs: Array.isArray(parsed.sub_langs) ? parsed.sub_langs : undefined,
     size: humanSize(api.file_size),
     sizeBytes: api.file_size ?? undefined,
     parsedTitle: parsed.title ?? undefined,
@@ -320,6 +326,11 @@ function buildItem(group: MediaFile[]): LibraryItem {
       source: f.source,
       codec: f.codec,
       bitDepth: f.bitDepth,
+      hdr: f.hdr,
+      channels: f.channels,
+      audio: f.audio,
+      audio_langs: f.audio_langs,
+      sub_langs: f.sub_langs,
       releaseGroup: f.releaseGroup ?? null,
       matchedToEpisode,
       matchedWrong: false, // future: detect filename-says-X but matched-to-Y
@@ -407,6 +418,7 @@ function buildItem(group: MediaFile[]): LibraryItem {
       ?? group.map(g => g.match?.posterUrl).find(Boolean)
       ?? null,
     seriesGroupId: repMatch?.seriesGroupId ?? null,
+    collectionName: repMatch?.collectionName ?? null,  // #14 movie collections
     // Per-cluster key (distinct from the franchise group id) — lets the
     // Review page re-find this exact item after a re-match shifts its id.
     seriesKey: head.seriesKey ?? null,

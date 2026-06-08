@@ -35,6 +35,14 @@ class ParsedFile:
     codec: str | None = None
     audio: list[str] = field(default_factory=list)
     subtitles: list[str] = field(default_factory=list)
+    # Per-track LANGUAGES read from the container by MediaInfo (NOT the filename)
+    # — canonical ISO-639-2/B codes (eng, jpn, …), in track order, deduped. Power
+    # the dual-audio ([JPN+ENG]) and multi-sub chips. Empty until the background
+    # MediaInfo pass runs (or when the native lib is unavailable). Distinct from
+    # `subtitles` above, which holds filename-derived sub/lang TOKENS — not real
+    # track languages.
+    audio_langs: list[str] = field(default_factory=list)
+    sub_langs: list[str] = field(default_factory=list)
     edition: str | None = None
     hdr: str | None = None
     bit_depth: str | None = None  # "10bit" | "8bit" | None — drives the dedupe ranker
@@ -72,6 +80,19 @@ class ParsedFile:
     # talk / news shows are numbered by air date, not season+episode; the
     # bipartite pairing resolves these against the provider's air_date field.
     air_date: str | None = None
+    # #15: multi-disc movie part number — a single film physically split across
+    # disc files ("Movie (2009) CD1.avi", "Film Disc 2.mkv"). Movie-only; None
+    # for everything else. Drives the `{{disc}}` template token + a "- Part N"
+    # suffix so the two files don't collide at the same target path. Only the
+    # unambiguous CD/Disc/Disk tokens set it — "Part N" is deliberately NOT
+    # treated as a disc because it's so often a real title component ("Deathly
+    # Hallows: Part 1", "Kill Bill", "Nymphomaniac Vol 1").
+    disc: int | None = None
+    # M4: true media duration in whole SECONDS, read from the file container
+    # via MediaInfo (never from the filename). Feeds the tier-3 runtime
+    # corroboration metric — a 22-min file plausibly an episode, a 2h file a
+    # movie. None when MediaInfo is unavailable or wasn't read for this file.
+    duration: int | None = None
     # Parser's own confidence in the extraction (0-1)
     confidence: float = 0.0
 
@@ -129,6 +150,30 @@ def _extract_provider_ids(text: str) -> dict[str, str] | None:
     if m:
         out["imdb"] = m.group(1).lower()
     return out or None
+
+
+# #15: multi-disc movie token. ONLY the unambiguous physical-disc markers —
+# CD1 / Disc 1 / Disk 2 (optional separator + 1-2 digits). "Part N" / "Pt N" /
+# bare "D1" are excluded on purpose: "Part 1" is frequently a real movie-title
+# component (Deathly Hallows, Nymphomaniac), and stripping it would mangle the
+# title and break the provider match.
+_DISC_RE = re.compile(r"\b(?:CD|Disc|Disk)\s*\.?\s*(\d{1,2})\b", re.IGNORECASE)
+
+
+def _extract_disc(title: str) -> tuple[str, int | None]:
+    """For a movie title, pull a trailing CD/Disc number and clean the title.
+
+    "Inception (2010) CD1" → ("Inception (2010)", 1). Returns the title
+    unchanged + None when there's no disc marker or the number is implausible."""
+    m = _DISC_RE.search(title)
+    if not m:
+        return title, None
+    n = int(m.group(1))
+    if not (1 <= n <= 20):
+        return title, None
+    cleaned = (title[:m.start()] + " " + title[m.end():])
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -._")
+    return (cleaned or title), n
 
 
 def parse_filename(filename: str, parent_path: str = "") -> ParsedFile:
@@ -201,6 +246,16 @@ def parse_filename(filename: str, parent_path: str = "") -> ParsedFile:
 
     media_type = _classify(tokens, sxe, parent_path, year)
     title = _extract_title(cleaned, sxe, year_span, media_type)
+    # #15: multi-disc movies — pull a CD/Disc/Disk number so "Movie CD1" and
+    # "Movie CD2" don't render to the same path. Movie-only. The marker often
+    # sits AFTER the year (which `_extract_title` already trims off the title),
+    # so read the number from the full cleaned name, then also scrub it from
+    # the title in case it survived there ("Movie CD1 (2010)").
+    disc: int | None = None
+    if media_type == "movie":
+        _, disc = _extract_disc(cleaned)
+        if disc is not None:
+            title, _ = _extract_disc(title)
     # Phase 6: episode-title guess (text after the SxE marker). Only for
     # episodic media; movies don't have episode titles.
     episode_title_guess = (
@@ -299,6 +354,7 @@ def parse_filename(filename: str, parent_path: str = "") -> ParsedFile:
         episode_title_guess=episode_title_guess,
         provider_ids=provider_ids,
         air_date=air_date,
+        disc=disc,
         confidence=confidence,
     )
 

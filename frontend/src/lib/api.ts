@@ -46,6 +46,19 @@ export interface ApiParsedData {
   codec?: string | null;
   /** Normalized "10bit" / "8bit" — drives the dedupe ranker's bit-depth tier. */
   bit_depth?: string | null;
+  /** MediaInfo-derived (when `parsing.read_mediainfo` is on): HDR flavor
+   *  ("HDR10" / "HDR10+" / "DV" / "HLG"), speaker layout ("5.1" / "7.1"), and
+   *  the primary audio codec(s) ("TrueHD" / "DTS-HD" / …). Surfaced as chips +
+   *  fed into the duplicate "keep best" ranker. */
+  hdr?: string | null;
+  channels?: string | null;
+  audio?: string[] | null;
+  /** Per-track LANGUAGES read from the container (ISO-639-2/B codes, e.g.
+   *  ["jpn","eng"]), in track order. Power the dual-audio / multi-sub chips.
+   *  Empty/absent until the background MediaInfo pass runs. */
+  audio_langs?: string[] | null;
+  sub_langs?: string[] | null;
+  duration?: number | null;
   confidence?: number;
 }
 
@@ -84,12 +97,93 @@ export interface ApiScan {
   completed_at: string | null;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...init,
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
-  });
+// HTTP Basic auth (opt-in on the backend via KIRA_AUTH_USER/PASS). Since this
+// SPA is a separate origin from the API, a fetch() 401 does NOT trigger the
+// browser's native credential prompt — so we capture the credentials ourselves,
+// keep them in sessionStorage (cleared when the tab closes), and attach them as
+// an Authorization header. When auth is OFF (the default) none of this fires.
+const AUTH_KEY = 'kira.basicauth';
+const getStoredAuth = (): string | null => {
+  try { return sessionStorage.getItem(AUTH_KEY); } catch { return null; }
+};
+const setStoredAuth = (v: string | null): void => {
+  try { v ? sessionStorage.setItem(AUTH_KEY, v) : sessionStorage.removeItem(AUTH_KEY); } catch { /* ignore */ }
+};
+// Minimal credential capture. window.prompt is intentionally simple (single-user
+// self-host); it can be upgraded to a styled login modal later. Returns the
+// base64 user:pass or null if the user cancels.
+const promptForAuth = (): string | null => {
+  const user = window.prompt('Kira requires sign-in.\nUsername:');
+  if (user === null) return null;
+  const pass = window.prompt('Password:') ?? '';
+  return btoa(`${user}:${pass}`);
+};
+
+// ── Backend connectivity signal ────────────────────────────────────────────
+// Derived from the ACTUAL HTTP layer rather than a single probe: any response
+// we receive — even a 4xx/5xx — proves the backend is reachable; only a
+// network-level fetch failure (server down / unreachable / DNS) marks it
+// offline. Because EVERY api call funnels through `request()` (including the
+// continuous /activity poll), this self-heals: the moment the backend answers
+// again, the next request flips the status back to online — no page reload, no
+// stuck "Backend disconnected" after a transient blip or a slow cold start.
+type ConnListener = (online: boolean) => void;
+let _backendOnline: boolean | null = null;
+const _connListeners = new Set<ConnListener>();
+
+/** Current connectivity: true = reachable, false = unreachable, null = unknown
+ *  (no request has completed yet). */
+export function getBackendOnline(): boolean | null {
+  return _backendOnline;
+}
+
+/** Subscribe to connectivity changes. Returns an unsubscribe fn. Fires
+ *  immediately with the current value when it's already known. */
+export function onBackendConnectivity(fn: ConnListener): () => void {
+  _connListeners.add(fn);
+  if (_backendOnline !== null) fn(_backendOnline);
+  return () => { _connListeners.delete(fn); };
+}
+
+function markBackend(online: boolean): void {
+  if (_backendOnline === online) return;
+  _backendOnline = online;
+  for (const fn of _connListeners) fn(online);
+}
+
+async function request<T>(path: string, init?: RequestInit, _retried = false): Promise<T> {
+  const auth = getStoredAuth();
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(auth ? { Authorization: `Basic ${auth}` } : {}),
+        ...init?.headers,
+      },
+    });
+  } catch (err) {
+    // fetch() only rejects on a NETWORK-level failure (server down, refused,
+    // DNS, CORS preflight fail) — i.e. the backend is genuinely unreachable.
+    markBackend(false);
+    throw err;
+  }
+  // We got a response. The backend is reachable even if it answered non-2xx
+  // (a 500 on one endpoint is "connected but erroring", NOT "disconnected").
+  markBackend(true);
+  // 401 → credentials missing/rejected. Prompt once and retry; on a second 401
+  // (wrong creds) clear them and surface the error.
+  if (res.status === 401 && !_retried) {
+    const creds = promptForAuth();
+    if (creds !== null) {
+      setStoredAuth(creds);
+      return request<T>(path, init, true);
+    }
+    setStoredAuth(null);
+  }
   if (!res.ok) {
+    if (res.status === 401) setStoredAuth(null);   // bad creds — don't keep them
     const text = await res.text().catch(() => '');
     // FastAPI wraps errors as {"detail": "..."} — pull the inner message for clean toasts.
     let message = `${res.status} ${res.statusText}`;
@@ -120,6 +214,20 @@ export interface ApiSearchResponse {
   results: ApiSearchResult[];
 }
 
+export interface ApiActivityJob {
+  name: string;
+  label: string;
+  active: boolean;
+  done: number;
+  total: number | null;
+}
+export interface ApiActivity {
+  jobs: ApiActivityJob[];
+  active: boolean;
+  /** One-shot summary of what a restart cleaned up, or null if none. */
+  boot: { scans_reset: number; files_reset: number; at: number } | null;
+}
+
 export class ApiError extends Error {
   // Explicit field + assignment rather than a parameter property, so the
   // class is fully type-erasable (parameter properties emit runtime code,
@@ -143,6 +251,9 @@ export const api = {
   },
   listScans: () => request<ApiScan[]>('/scans'),
   getScan: (id: number) => request<ApiScan>(`/scans/${id}`),
+  /** Background-activity snapshot — boot recovery summary + any running
+   *  heal / warm-up job. Polled by the header activity indicator. */
+  getActivity: () => request<ApiActivity>('/activity'),
   // Bug A: optional `root_paths` lets callers walk multiple library
   // roots in one scan (library_root + every watch folder). When
   // omitted, the backend falls back to walking only `root_path`.
@@ -157,6 +268,18 @@ export const api = {
     }),
   rematchFile: (fileId: number) =>
     request<ApiMediaFile>(`/files/${fileId}/rematch`, { method: 'POST' }),
+  /** M5 — content-hash identify: hash the file's bytes (OSDb 64-bit), ask
+   *  OpenSubtitles which release it is, and pin the resulting TMDB match.
+   *  Works even when the filename is garbage. Requires an OpenSubtitles API
+   *  key. Returns the updated file with its freshly-pinned match. */
+  identifyByHash: (fileId: number) =>
+    request<ApiMediaFile>(`/files/${fileId}/identify-by-hash`, { method: 'POST' }),
+  /** #11 — download OpenSubtitles subtitles for one file as `<stem>.<lang>.srt`
+   *  sidecars (hash-first, falls back to the selected match's TMDB id + S/E).
+   *  Needs an API key; downloads also need account login. */
+  fetchSubtitles: (fileId: number) =>
+    request<{ saved: string[]; count: number; languages: string[] }>(
+      `/files/${fileId}/fetch-subtitles`, { method: 'POST' }),
   /** Re-parse the EXISTING library in place and re-match it. A normal scan
    *  skips already-indexed files, so parser + folder-lock improvements only
    *  reach NEW files; this re-runs the parser on every stored file so they
@@ -175,6 +298,15 @@ export const api = {
       { method: 'DELETE' },
     );
   },
+  /** Delete many files in ONE request (the duplicate "keep best, delete the
+   *  rest" flow). Each file is processed independently server-side, so the
+   *  result reports which ids were deleted and which failed (with a reason)
+   *  — a locked/out-of-root file never aborts the rest of the batch. */
+  deleteFiles: (fileIds: number[], opts?: { keepOnDisk?: boolean }) =>
+    request<{ deleted: number[]; failed: { id: number; error: string }[]; count: number }>(
+      '/files/bulk-delete',
+      { method: 'POST', body: JSON.stringify({ file_ids: fileIds, keep_on_disk: !!opts?.keepOnDisk }) },
+    ),
   rematchAll: (params?: { media_type?: string; limit?: number }) => {
     const q = new URLSearchParams();
     if (params?.media_type) q.set('media_type', params.media_type);
@@ -220,6 +352,10 @@ export const api = {
       episodes: {
         season: number;
         episode: number;
+        /** Series-wide absolute number (TVDB/TMDB cross-ref anime); null
+         *  when the provider doesn't expose it. The popup pairs absolute-
+         *  named files ("- 60") against this, not the local episode. */
+        absolute_number: number | null;
         title: string | null;
         air_date: string | null;
         overview: string | null;
@@ -281,6 +417,13 @@ export const api = {
     request<{ updated: number }>('/settings', {
       method: 'PUT',
       body: JSON.stringify({ values }),
+    }).then((res) => {
+      // A save may have just started background work (e.g. the tech-tag backfill
+      // when MediaInfo is enabled). Nudge the activity poller to check NOW
+      // instead of waiting out its idle interval, so the progress pill appears
+      // without a manual refresh. Guarded for non-DOM/test contexts.
+      try { window.dispatchEvent(new Event('kira:activity-refresh')); } catch { /* no window */ }
+      return res;
     }),
 
   testProvider: (provider: string) =>

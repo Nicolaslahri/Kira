@@ -232,22 +232,21 @@ def walk(root: str | Path) -> Iterator[Path]:
                 print(f"[SCAN] Skipping file with control chars in name: {fn!r} (in {dp})")
                 continue
             p = dp / fn
-            try:
-                if not p.is_file():
-                    continue
-            except OSError as e:
-                # Visible log — silent skip on OSError used to hide files
-                # whose paths the OS itself refused (NUL bytes, exceeding
-                # PATH_MAX). The user wonders where they went.
-                print(f"[SCAN] OSError on {p}: {e!r}")
+            # PERF: filter by EXTENSION first — a pure string check, no
+            # filesystem hit. The previous `p.is_file()` was a redundant stat
+            # PER FILE (os.walk already classified these as non-directory
+            # entries via scandir); on a NAS that's a wasted round-trip for
+            # every file. Non-regular entries (broken symlinks, FIFOs) that
+            # slip through are harmless — the scan worker's single `stat()`
+            # for file size handles them (size stays None, file still tracked).
+            if p.suffix.lower() not in MEDIA_EXTENSIONS:
                 continue
-            if p.suffix.lower() in MEDIA_EXTENSIONS:
-                # Phase 19: drop scene samples / trailers / extras so a 30 MB
-                # sample never gets renamed as the real episode/movie.
-                if _is_sample_or_extra(p):
-                    print(f"[SCAN] Skipping sample/extra: {p}")
-                    continue
-                yield p
+            # Phase 19: drop scene samples / trailers / extras so a 30 MB
+            # sample never gets renamed as the real episode/movie.
+            if _is_sample_or_extra(p):
+                print(f"[SCAN] Skipping sample/extra: {p}")
+                continue
+            yield p
 
 
 def media_type_hint(path: Path) -> str:

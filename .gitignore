@@ -5,6 +5,9 @@
 !.env.example
 backend/.env
 backend/.env.*
+# NOT a secret: the production build's same-origin API base (VITE_API_BASE=
+# /api/v1). The Docker image's `vite build` needs it, so it must be tracked.
+!frontend/.env.production
 
 # ── Python ────────────────────────────────────────────────────────────
 __pycache__/
@@ -59,6 +62,7 @@ Thumbs.db
 .claude/
 .kira-cleanup-backup-*/
 *.bak
+.ui-design/
 
 # ── Recovered planning journal (local working notes; not for the repo) ──
 PLAN.md

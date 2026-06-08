@@ -67,6 +67,40 @@ class AnimeMappings:
 
     _by_aid: ClassVar[dict[int, dict[str, Any]] | None] = None
     _load_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+    # Reverse indexes, rebuilt whenever `_by_aid` is (re)assigned via _set_map.
+    # Without these, every reverse lookup (aid_by_tvdb / aids_by_tvdb /
+    # aid_by_tmdb_tv / aid_by_tvdb_season / aids_by_tvdb_season) linearly
+    # scanned the whole ~40k-entry table — and those run per-candidate in the
+    # match hot loop and across the whole library on the boot heal sweep, i.e.
+    # millions of probes. Lists preserve insertion (Fribb-JSON) order so the
+    # "first match wins" single-AID lookups return the same AID as before.
+    _by_tvdb: ClassVar[dict[int, list[int]]] = {}
+    _by_tmdb_tv: ClassVar[dict[int, list[int]]] = {}
+    _by_tvdb_season: ClassVar[dict[tuple[int, int], list[int]]] = {}
+
+    @classmethod
+    def _set_map(cls, parsed: dict[int, dict[str, Any]]) -> None:
+        """Assign `_by_aid` and (re)build the reverse indexes in one place."""
+        cls._by_aid = parsed
+        by_tvdb: dict[int, list[int]] = {}
+        by_tmdb_tv: dict[int, list[int]] = {}
+        by_tvdb_season: dict[tuple[int, int], list[int]] = {}
+        for aid, entry in parsed.items():
+            tvdb = entry.get("tvdb_id")
+            if isinstance(tvdb, int):
+                by_tvdb.setdefault(tvdb, []).append(aid)
+                s = entry.get("season")
+                if isinstance(s, dict):
+                    sv = s.get("tvdb")
+                    if isinstance(sv, int):
+                        by_tvdb_season.setdefault((tvdb, sv), []).append(aid)
+            tm = entry.get("themoviedb_id")
+            tmdb_tv = tm.get("tv") if isinstance(tm, dict) else tm
+            if isinstance(tmdb_tv, int):
+                by_tmdb_tv.setdefault(tmdb_tv, []).append(aid)
+        cls._by_tvdb = by_tvdb
+        cls._by_tmdb_tv = by_tmdb_tv
+        cls._by_tvdb_season = by_tvdb_season
 
     @classmethod
     def _fresh(cls) -> bool:
@@ -91,7 +125,7 @@ class AnimeMappings:
                 except Exception as e:
                     print(f"anime_mappings: download failed ({e!r}); falling back to cache.")
                     if not _MAPPING_FILE.exists():
-                        cls._by_aid = {}
+                        cls._set_map({})
                         return
 
             # Parse + prune in a worker thread. The Fribb dump is ~20 MB JSON;
@@ -119,7 +153,7 @@ class AnimeMappings:
                     # Cold start: we have nothing in memory and nothing valid
                     # on disk. Mark as empty so we don't keep retrying inside
                     # the same request; the next call will retry the download.
-                    cls._by_aid = {}
+                    cls._set_map({})
                 return
 
             # H6: Sanity-check the parsed map. A "successful" parse that
@@ -129,10 +163,10 @@ class AnimeMappings:
             if len(parsed) < 100:
                 print(f"anime_mappings: parsed only {len(parsed)} entries (suspect); keeping previous cache.")
                 if cls._by_aid is None:
-                    cls._by_aid = parsed  # take what we got; better than nothing
+                    cls._set_map(parsed)  # take what we got; better than nothing
                 return
 
-            cls._by_aid = parsed
+            cls._set_map(parsed)
 
     @classmethod
     async def _download(cls, client: httpx.AsyncClient | None) -> None:
@@ -249,27 +283,29 @@ class AnimeMappings:
         anime cross-ref and is legitimate.
         """
         await cls._ensure_loaded()
-        if not cls._by_aid:
-            return None
-        for aid, entry in cls._by_aid.items():
-            if entry.get("tvdb_id") == tvdb_id:
-                return aid
-        return None
+        lst = cls._by_tvdb.get(tvdb_id)
+        return lst[0] if lst else None
+
+    @classmethod
+    async def aids_by_tvdb(cls, tvdb_id: int) -> list[int]:
+        """Every AID Fribb maps to this TVDB series id, across ALL seasons.
+
+        Unlike `aids_by_tvdb_season` (just one season's cours), this spans the
+        whole franchise — S1 + S2 + … + the Final Season's parts. Used by
+        EpisodeCountSanityMetric to recognize that an ABSOLUTE-numbered cluster
+        (whose max episode is a series-wide absolute index, e.g. AoT's 89) is
+        covered by the franchise's full absolute span, so a tail cour isn't
+        wrongly vetoed for being "too small to hold episode 89."
+        """
+        await cls._ensure_loaded()
+        return list(cls._by_tvdb.get(tvdb_id, ()))
 
     @classmethod
     async def aid_by_tmdb_tv(cls, tmdb_tv_id: int) -> int | None:
         """Same idea as aid_by_tvdb but for TMDB TV IDs."""
         await cls._ensure_loaded()
-        if not cls._by_aid:
-            return None
-        for aid, entry in cls._by_aid.items():
-            tm = entry.get("themoviedb_id")
-            if isinstance(tm, dict):
-                if tm.get("tv") == tmdb_tv_id:
-                    return aid
-            elif tm == tmdb_tv_id:
-                return aid
-        return None
+        lst = cls._by_tmdb_tv.get(tmdb_tv_id)
+        return lst[0] if lst else None
 
     @classmethod
     async def aid_by_tvdb_season(cls, tvdb_id: int, season: int) -> int | None:
@@ -284,15 +320,8 @@ class AnimeMappings:
         assignments even while AniDB is IP-banned.
         """
         await cls._ensure_loaded()
-        if not cls._by_aid:
-            return None
-        for aid, entry in cls._by_aid.items():
-            if entry.get("tvdb_id") != tvdb_id:
-                continue
-            s = entry.get("season")
-            if isinstance(s, dict) and s.get("tvdb") == season:
-                return aid
-        return None
+        lst = cls._by_tvdb_season.get((tvdb_id, season))
+        return lst[0] if lst else None
 
     @classmethod
     async def aids_by_tvdb_season(cls, tvdb_id: int, season: int) -> list[int]:
@@ -310,14 +339,4 @@ class AnimeMappings:
         Empty list if nothing matches.
         """
         await cls._ensure_loaded()
-        if not cls._by_aid:
-            return []
-        out: list[int] = []
-        for aid, entry in cls._by_aid.items():
-            if entry.get("tvdb_id") != tvdb_id:
-                continue
-            s = entry.get("season")
-            if isinstance(s, dict) and s.get("tvdb") == season:
-                out.append(aid)
-        out.sort()
-        return out
+        return sorted(cls._by_tvdb_season.get((tvdb_id, season), ()))

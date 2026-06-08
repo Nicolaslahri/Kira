@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { animate } from 'motion/react';
 import type { AppState, ModalState } from '../lib/types';
 import { api, type ApiHistoryEntry, type ApiNotification, type ApiScan } from '../lib/api';
 import {
@@ -42,8 +43,8 @@ function relativeTime(iso: string): string {
 const TYPE_META = [
   { k: 'movie' as const, label: 'Movies', icon: IcFilm,  color: '#bdc1d0' },
   { k: 'tv' as const,    label: 'TV',     icon: IcTv,    color: '#49b8fe' },
-  { k: 'anime' as const, label: 'Anime',  icon: IcAnime, color: '#c89bff' },
-  { k: 'music' as const, label: 'Music',  icon: IcMusic, color: '#ffb14a' },
+  { k: 'anime' as const, label: 'Anime',  icon: IcAnime, color: 'var(--media-anime)' },
+  { k: 'music' as const, label: 'Music',  icon: IcMusic, color: 'var(--media-music)' },
 ];
 
 const BUCKET_META = [
@@ -107,6 +108,36 @@ function CardLink({ label, onClick }: { label: string; onClick: () => void }) {
   );
 }
 
+// Count-up tween for KPI numbers. Animates from 0 → target on mount (and
+// between values on update) with an ease-out curve, so the dashboard's
+// headline figures "land" instead of snapping in. Honors
+// prefers-reduced-motion by jumping straight to the value. Writes the DOM
+// node's text directly via motion's `animate` (no React state) so the
+// per-frame updates don't re-render the card — and so toLocaleString
+// thousands separators match the static render.
+function CountUp({ value, duration = 0.55 }: { value: number; duration?: number }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const fromRef = useRef(0);
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+    const from = fromRef.current;
+    fromRef.current = value;
+    const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    if (reduce || from === value) {
+      node.textContent = value.toLocaleString();
+      return;
+    }
+    const controls = animate(from, value, {
+      duration,
+      ease: [0.2, 0.9, 0.3, 1],
+      onUpdate: (v) => { node.textContent = Math.round(v).toLocaleString(); },
+    });
+    return () => controls.stop();
+  }, [value, duration]);
+  return <span ref={ref}>{(0).toLocaleString()}</span>;
+}
+
 // ── KPI metric card ─────────────────────────────────────────────────
 function Metric({ icon, color, label, value, sub, onClick }: {
   icon: ReactNode;
@@ -116,14 +147,8 @@ function Metric({ icon, color, label, value, sub, onClick }: {
   sub?: ReactNode;
   onClick?: () => void;
 }) {
-  return (
-    <div
-      onClick={onClick}
-      className={cn(
-        'group relative flex flex-col overflow-hidden rounded-2xl border border-line bg-[rgba(255,255,255,0.025)] p-5 transition-colors duration-300 hover:border-line-strong',
-        onClick && 'cursor-pointer hover:bg-[rgba(255,255,255,0.045)]',
-      )}
-    >
+  const inner = (
+    <>
       <div className="pointer-events-none absolute -right-12 -top-12 size-36 rounded-full bg-[radial-gradient(closest-side,var(--accent-soft),transparent)] opacity-0 blur-2xl transition-opacity duration-500 group-hover:opacity-100" />
       <div className="relative flex items-center justify-between">
         <FeaturedIcon size="md" color={color} icon={icon} />
@@ -134,8 +159,19 @@ function Metric({ icon, color, label, value, sub, onClick }: {
       <div className="relative mt-4 text-[11px] font-medium uppercase tracking-[0.09em] text-ink-soft">{label}</div>
       <div className="relative mt-1 text-[30px] font-bold leading-none tracking-tight tabular-nums text-ink">{value}</div>
       {sub ? <div className="relative mt-2 text-xs text-ink-soft">{sub}</div> : null}
-    </div>
+    </>
   );
+  const base = 'group relative flex flex-col overflow-hidden rounded-2xl border border-line bg-[rgba(255,255,255,0.025)] p-5 text-left transition-colors duration-300 hover:border-line-strong';
+  // A clickable metric navigates — render a real <button> so it's keyboard-
+  // and screen-reader-operable; a static metric stays a plain <div>.
+  if (onClick) {
+    return (
+      <button type="button" onClick={onClick} className={cn(base, 'cursor-pointer hover:bg-[rgba(255,255,255,0.045)]')}>
+        {inner}
+      </button>
+    );
+  }
+  return <div className={base}>{inner}</div>;
 }
 
 export function DashboardPage({ state, openModal, runScan, runReparse, setActive, scanRoot: SCAN_ROOT }: Props) {
@@ -149,40 +185,36 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
   });
   const [activityHydrated, setActivityHydrated] = useState(false);
 
-  useEffect(() => {
-    const load = async () => {
-      try { const h = await api.listHistory({ period: 'all' }); setHistory(h); } catch { /* */ }
-      try { const n = await api.listNotifications(); setNotifications(n); } catch { /* */ }
-      try {
-        const allScans = await api.listScans();
-        setScans(allScans);
-        setLastScan(allScans[0] ?? null);
-      } catch { /* */ }
-      setActivityHydrated(true);
-    };
-    void load();
-    const t = setInterval(load, 10_000);
-    return () => clearInterval(t);
-  }, []);
-
+  // Single 10s poll for the whole dashboard — history, notifications, scans
+  // and provider status used to run on two independent intervals, doubling the
+  // timers and the request bursts. The `cancelled` guard also stops any
+  // setState after unmount.
   useEffect(() => {
     let cancelled = false;
-    const fetchProviders = async () => {
+    const load = async () => {
+      try { const h = await api.listHistory({ period: 'all' }); if (!cancelled) setHistory(h); } catch { /* */ }
+      try { const n = await api.listNotifications(); if (!cancelled) setNotifications(n); } catch { /* */ }
+      try {
+        const allScans = await api.listScans();
+        if (!cancelled) { setScans(allScans); setLastScan(allScans[0] ?? null); }
+      } catch { /* */ }
       try {
         const list = await api.getProviders();
-        if (cancelled) return;
-        const next: Record<string, 'ok' | 'fail' | 'unknown'> = {};
-        for (const p of list) {
-          if (!p.implemented) next[p.key] = 'unknown';
-          else next[p.key] = p.configured ? 'ok' : 'fail';
+        if (!cancelled) {
+          const next: Record<string, 'ok' | 'fail' | 'unknown'> = {};
+          for (const p of list) {
+            if (!p.implemented) next[p.key] = 'unknown';
+            else next[p.key] = p.configured ? 'ok' : 'fail';
+          }
+          setProviderStatus(s => ({ ...s, ...next }));
         }
-        setProviderStatus(s => ({ ...s, ...next }));
       } catch {
         if (!cancelled) setProviderStatus(s => ({ ...s, tmdb: 'fail', tvdb: 'fail' }));
       }
+      if (!cancelled) setActivityHydrated(true);
     };
-    void fetchProviders();
-    const t = setInterval(fetchProviders, 10_000);
+    void load();
+    const t = setInterval(load, 10_000);
     return () => { cancelled = true; clearInterval(t); };
   }, []);
 
@@ -306,14 +338,14 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
           icon={<IcFolder />}
           color="brand"
           label="Library"
-          value={stats.total.toLocaleString()}
+          value={<CountUp value={stats.total} />}
           sub={typesPresent > 0 ? `${typesPresent} media type${typesPresent === 1 ? '' : 's'}` : 'No files yet'}
         />
         <Metric
           icon={<IcCheck />}
           color="success"
           label="Matched"
-          value={stats.matched.toLocaleString()}
+          value={<CountUp value={stats.matched} />}
           sub={`${matchedPct}% of library`}
           onClick={() => setActive('review')}
         />
@@ -321,7 +353,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
           icon={<IcReview />}
           color="warning"
           label="Pending review"
-          value={stats.pending.toLocaleString()}
+          value={<CountUp value={stats.pending} />}
           sub={stats.lowConf > 0
             ? <span className="inline-flex items-center gap-1 text-conf-low"><IcAlertTri className="size-3" />{stats.lowConf} low-confidence</span>
             : 'All reviewed'}
@@ -331,7 +363,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
           icon={<IcShieldCheck />}
           color="brand"
           label="Approved"
-          value={stats.approved.toLocaleString()}
+          value={<CountUp value={stats.approved} />}
           sub="Confirmed & ready"
         />
       </div>
@@ -492,7 +524,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
                     color={a.kind === 'success' ? 'success' : a.kind === 'error' ? 'error' : 'gray'}
                     icon={a.kind === 'success' ? <IcCheck /> : a.kind === 'error' ? <IcX /> : <IcHistory />}
                   />
-                  <div className="min-w-0 flex-1 truncate text-[13px] text-ink-muted">{a.text}</div>
+                  <div className="min-w-0 flex-1 truncate text-[13px] text-ink-muted" title={typeof a.text === 'string' ? a.text : undefined}>{a.text}</div>
                   <div className="shrink-0 text-[11px] text-ink-faint">{relativeTime(a.when)}</div>
                 </div>
               ))}

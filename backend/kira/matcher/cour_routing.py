@@ -152,28 +152,50 @@ async def build_cour_routing_table(
 def route_file_to_cour(
     table: list[tuple[int, int, int, int]] | None,
     file_episode: int | None,
+    abs_to_local: dict[int, int] | None = None,
 ) -> tuple[int, int] | None:
     """Look up which cour `(aid, local_episode)` owns `file_episode`.
 
-    `table` should be the result of `build_cour_routing_table`.
-    `file_episode` is typically `parsed.episode` (season-local
-    numbering); fall back to `parsed.absolute_episode` only when
-    season-local is unavailable.
+    `table` should be the result of `build_cour_routing_table` — its ranges
+    are in SEASON-LOCAL episode space (1..N across the TVDB season).
+    `file_episode` is typically `parsed.episode` (season-local numbering).
 
-    Returns `(routed_aid, routed_local_episode)` when the file falls
-    in some cour's range, or `None` when:
+    `abs_to_local` (optional): a `{absolute_number: season_local_episode}` map
+    built from the matched provider's episode list. It bridges the one case the
+    plain table can't: a file numbered in SERIES-ABSOLUTE space. AoT's Final
+    Season files are `- 60`..`- 89` (absolute), but the cours are keyed 1..30
+    (season-local), so a direct lookup of 60 falls outside every range. When the
+    direct lookup misses AND `file_episode` is a known absolute number, we
+    convert it to season-local and retry — which lets pure-absolute-numbered
+    long-runners (AoT Final Season, One-Piece-style "- 1071") reach the router.
+    Only consulted ON A DIRECT MISS, so cour-local-numbered shows (Bleach TYBW,
+    whose files are 1..40 and hit the table directly) are completely unaffected.
+
+    Returns `(routed_aid, routed_local_episode)` when the file falls in some
+    cour's range, or `None` when:
       - `table` is None (no routing applicable for this match)
       - `file_episode` is None
-      - the episode falls outside every cour's range (anomalous file,
-        e.g. an episode 41 in a 40-episode 3-cour season)
+      - the episode is outside every range AND not bridgeable via `abs_to_local`
 
     Pure-Python lookup; no I/O.
     """
     if table is None or file_episode is None:
         return None
-    for c_start, c_end, c_aid, c_offset in table:
-        if c_start <= file_episode <= c_end:
-            return c_aid, file_episode - c_offset
+
+    def _lookup(ep: int) -> tuple[int, int] | None:
+        for c_start, c_end, c_aid, c_offset in table:
+            if c_start <= ep <= c_end:
+                return c_aid, ep - c_offset
+        return None
+
+    direct = _lookup(file_episode)
+    if direct is not None:
+        return direct
+    # Absolute-number bridge: series-absolute → season-local, then retry.
+    if abs_to_local:
+        local = abs_to_local.get(file_episode)
+        if local is not None:
+            return _lookup(local)
     return None
 
 
@@ -184,6 +206,7 @@ async def route_file_to_cour_precise(
     provider: str = "",
     top_provider_id: str = "",
     parsed_season: int | None = None,
+    abs_to_local: dict[int, int] | None = None,
 ) -> tuple[int, int] | None:
     """Cour routing: summed-count table FIRST, ScudLee only to fill gaps.
 
@@ -210,8 +233,9 @@ async def route_file_to_cour_precise(
     GitHub, not AniDB → safe during an AniDB ban. `resolve_tvdb_to_anidb` never
     raises.
     """
-    # 1. Authoritative summed-count routing for contiguous cours.
-    base = route_file_to_cour(table, file_episode)
+    # 1. Authoritative summed-count routing for contiguous cours (with the
+    #    absolute→local bridge for pure-absolute-numbered files).
+    base = route_file_to_cour(table, file_episode, abs_to_local)
     if base is not None:
         return base
 
@@ -244,4 +268,89 @@ async def route_file_to_cour_precise(
                     table_aids = {c_aid for _, _, c_aid, _ in table}
                     if s_aid in table_aids and s_ep >= 1:
                         return s_aid, s_ep
+    return None
+
+
+def remap_umbrella_local_to_absolute(
+    ep_num: int | None,
+    *,
+    is_flat_umbrella: bool,
+    routed_aid: int | None,
+    local_to_abs: dict[int, int],
+) -> int | None:
+    """Flat-umbrella local→absolute remap (the One Piece "S23E04" → 1159 fix).
+
+    The INVERSE of `route_file_to_cour`'s abs→local bridge. A FLAT umbrella is a
+    single AniDB AID that numbers the WHOLE long-runner absolutely (One Piece 69,
+    Naruto, Detective Conan — Fribb carries no `season.tvdb`, so the caller's
+    `tvdb_season(top_aid) is None`). A file that arrived in TVDB-season-LOCAL form
+    ("One Piece 1999 S23E04" → bipartite pairs it to the Elbaf cour's LOCAL
+    episode 4) must store the ABSOLUTE (1159) so it lines up with its
+    absolute-numbered siblings ("S23E1159" → already 1159) and is recognised as
+    the duplicate it is.
+
+    `local_to_abs` is the cluster's reverse of `abs_to_local`
+    (`{season_local_episode: provider_absolute_number}`). Returns `ep_num`
+    unchanged unless ALL hold:
+      • `is_flat_umbrella` — caller proved tvdb_season(top_aid) is None;
+      • `routed_aid is None` — cour routing didn't already place the file. By
+        construction a flat umbrella has NO Fribb cours (aids_by_tvdb_season is
+        empty → no routing table), so this is always true for a real umbrella;
+        the guard just makes the two systems provably non-overlapping;
+      • `ep_num` is a known LOCAL index present in `local_to_abs`.
+
+    Therefore left UNTOUCHED:
+      • absolute-named files (1159 ∉ local_to_abs → siblings keep their number);
+      • per-season AIDs — Frieren S2 (tvdb_season=2), AoT cours (=4) — whose
+        episode lists ARE local: caller passes is_flat_umbrella=False;
+      • normal TV, whose provider episodes carry no absolute_number, so
+        `local_to_abs` is empty;
+      • an early-cour file where absolute == local (One Piece ep 4 in the 1999
+        season): local_to_abs[4] == 4 → a self-mapping no-op.
+
+    Pure; no I/O. The rename FILENAME is independent of this (it renders from
+    parsed.episode / {{absx}}); this only corrects the stored episode_number so
+    the popup pairs the file against the umbrella's absolute episode list.
+    """
+    if ep_num is None or not is_flat_umbrella or routed_aid is not None:
+        return ep_num
+    return local_to_abs.get(ep_num, ep_num)
+
+
+def franchise_absolute(
+    offsets: list[tuple[int, int, int]] | None,
+    aid: int | None,
+    local_ep: int | None,
+) -> int | None:
+    """Map an AID-LOCAL episode to its FRANCHISE-ABSOLUTE number — the
+    rename-output inverse of `AniDBProvider.get_franchise_offsets`.
+
+    This closes the locally-named→absolute gap: a file named per-cour-local
+    (`AoT S4E01`) and matched to a per-cour AniDB AID has no absolute number in
+    its name, so `{{absx}}` had nothing to render. The franchise offset table
+    supplies it.
+
+    `offsets` is `get_franchise_offsets()`'s result — `[(aid, abs_start, abs_end)]`
+    sorted by start, where each season/cour AID owns the absolute range
+    `[abs_start, abs_end]`. A file matched to `aid` at AID-local episode
+    `local_ep` (1-based within that AID — i.e. `Match.episode_number` after cour
+    routing) is the `abs_start + local_ep - 1`-th episode of the whole franchise.
+
+    Example: AoT Final Season cour at `(…, 60, 87)`, local ep 1 → **60**.
+
+    Returns None — leaving the filename to fall back to its SxE form, exactly as
+    today — when it can't be computed SAFELY:
+      • no offsets / aid / local_ep (or local_ep < 1),
+      • `aid` isn't in the franchise table (unknown / not an offset member),
+      • the result falls OUTSIDE that AID's `[abs_start, abs_end]` span (local_ep
+        too large — a numbering mismatch we refuse to guess through, since a
+        wrong absolute on a rename path is worse than none).
+
+    Pure; no I/O — the offsets come from the (cache-first) provider call."""
+    if not offsets or aid is None or local_ep is None or local_ep < 1:
+        return None
+    for a, abs_start, abs_end in offsets:
+        if a == aid:
+            absolute = abs_start + local_ep - 1
+            return absolute if abs_start <= absolute <= abs_end else None
     return None

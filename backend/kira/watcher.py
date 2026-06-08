@@ -10,9 +10,12 @@ Design (deliberately conservative):
   + parses + matches only NEW files and surfaces them in Review. The user
   still approves every rename.
 - Per-folder automation mode: each watched folder is "scan" (default) or
-  "auto_rename" (auto-organize high-confidence matches). For now auto_rename
-  is a LOG-ONLY stub (`_maybe_auto_rename`) — the actual file-moving will be
-  wired in a dedicated follow-up so it can be reviewed on its own.
+  "auto_rename". In "auto_rename", `maybe_auto_rename()` (called from the scan-
+  completion hook) renames the NEW files whose selected match clears that
+  folder's STRICT confidence threshold, reusing the real `rename()` executor
+  (so RenameHistory, the media-server refresh, and notifications all fire). The
+  default op is hardlink — non-destructive, the original stays put. Sub-threshold
+  / unmatched files are left in Review for the user.
 - Two triggers, belt-and-braces:
     1. Filesystem events via `watchfiles.awatch` (near-real-time, debounced
        so a batched download settles before we scan).
@@ -40,6 +43,7 @@ from sqlalchemy import select
 
 from kira.database import SessionLocal
 from kira.models import Setting
+from kira.settings_store import unwrap_str as _coerce_str  # canonical settings-value unwrap
 
 _log = logging.getLogger("kira.watcher")
 
@@ -151,17 +155,6 @@ def folder_mode(cfg: dict[str, Any], path: str) -> tuple[str, float]:
 async def _read_setting(db, key: str) -> Any:
     row = await db.get(Setting, key)
     return row.value if row is not None else None
-
-
-def _coerce_str(v: Any) -> str | None:
-    """library_root may be a bare string OR {"value": "..."} (legacy shape)."""
-    if isinstance(v, str):
-        return v.strip() or None
-    if isinstance(v, dict):
-        inner = v.get("value")
-        if isinstance(inner, str):
-            return inner.strip() or None
-    return None
 
 
 async def get_watch_config(db) -> dict[str, Any]:
@@ -358,8 +351,9 @@ class WatcherService:
             self._last_reason = reason
             _log.info("watcher: auto-scan triggered (%s), scan_id=%s", reason, scan_id)
             # Per-folder auto_rename is handled post-scan by the completion
-            # hook (currently a log-only stub). The scan itself is fire-and-
-            # forget; we don't await it here.
+            # hook (scans.py → maybe_auto_rename, which actually renames the
+            # files that clear threshold). The scan itself is fire-and-forget;
+            # we don't await it here.
         except Exception as e:  # noqa: BLE001 — a trigger failure must not kill the loop
             _log.warning("watcher: failed to fire auto-scan (%s): %r", reason, e)
 
@@ -381,27 +375,122 @@ class WatcherService:
 watcher = WatcherService()
 
 
-async def maybe_auto_rename(scan_id: int, new_file_ids: list[int]) -> None:
-    """LOG-ONLY stub for per-folder auto_rename mode.
+def compute_auto_rename_eligibility(
+    cfg: dict[str, Any],
+    files: list[tuple[int, str, float | None, bool]],
+) -> tuple[list[int], int]:
+    """Pure gate (Pass 6 #6 + #7) — no I/O, unit-testable.
 
-    A follow-up will wire this to the real rename engine: for each newly
-    matched file whose watched-folder mode is "auto_rename" and whose match
-    confidence ≥ that folder's threshold, auto-execute the configured rename
-    op. For now it only logs what it WOULD do, so the destructive path lands
-    as its own reviewable change.
+    `files` is [(file_id, file_path, confidence, has_valid_match)]. A file is
+    ELIGIBLE for auto-rename when its watched-folder mode (by path) is
+    "auto_rename" AND it has a valid match that clears
+    `meets_threshold(confidence, STRICT, folder_threshold)`. Returns
+    (eligible_file_ids, held_count) where `held` counts auto_rename-folder
+    files that had a match but fell below threshold (or lacked one) — i.e.
+    files we deliberately left for manual review. Files in scan-only folders
+    are neither eligible nor held (they were never auto-rename candidates).
+    """
+    from kira.matcher.strict_mode import MatchMode, meets_threshold
+
+    eligible: list[int] = []
+    held = 0
+    for fid, path, confidence, has_match in files:
+        if not path:
+            continue
+        mode, threshold = folder_mode(cfg, path)
+        if mode != "auto_rename":
+            continue
+        if not has_match:
+            held += 1
+            continue
+        if meets_threshold(confidence, MatchMode.STRICT, threshold):
+            eligible.append(fid)
+        else:
+            held += 1
+    return eligible, held
+
+
+async def _resolve_rename_defaults(db) -> tuple[str, str]:
+    """The op + naming profile an auto-rename should use — the SAME defaults
+    the user set for manual renames (`rename.default_op`, `naming.profile`).
+    Falls back to ('hardlink', 'Plex'): hardlink is non-destructive (the
+    original stays put), the safe choice for an unattended move."""
+    op = _coerce_str(await _read_setting(db, "rename.default_op")) or "hardlink"
+    profile = _coerce_str(await _read_setting(db, "naming.profile")) or "Plex"
+    return op, profile
+
+
+async def maybe_auto_rename(scan_id: int, new_file_ids: list[int]) -> None:
+    """Auto-organize newly-matched files that sit in an `auto_rename` watched
+    folder AND clear that folder's confidence threshold (Pass 6 #6 + #7).
+
+    Gate, per file:
+      1. its watched-folder mode (by path) is "auto_rename" — else it stays
+         pending for manual review (the conservative default);
+      2. its selected match clears `meets_threshold(confidence, STRICT,
+         folder_threshold)` — STRICT mode, so a shaky match is never auto-acted.
+
+    Eligible files are renamed by reusing the normal `rename()` executor with
+    the user's default op + profile — which also fires the media-server refresh
+    + notification fan-out. Files below threshold are left for the user. The
+    whole pass is exception-isolated: an auto-rename failure must never crash
+    the scan worker that called it.
     """
     if not new_file_ids:
         return
     try:
+        from kira.models import MediaFile
+        from sqlalchemy.orm import selectinload
+
         async with SessionLocal() as db:
             cfg = await get_watch_config(db)
-        if not any(fc.get("mode") == "auto_rename" for fc in cfg.get("folders", {}).values()):
-            return
-        _log.info(
-            "watcher: auto_rename is configured for some folder(s); "
-            "scan %s produced %d new file(s). (auto-rename execution is a "
-            "planned follow-up — no files moved.)",
-            scan_id, len(new_file_ids),
-        )
-    except Exception as e:  # noqa: BLE001
-        _log.warning("watcher: maybe_auto_rename stub failed: %r", e)
+            folders = cfg.get("folders", {}) if isinstance(cfg, dict) else {}
+            if not any(
+                isinstance(fc, dict) and fc.get("mode") == "auto_rename"
+                for fc in folders.values()
+            ):
+                return  # no folder opts into auto-rename — nothing to do
+
+            rows = list(await db.scalars(
+                select(MediaFile)
+                .options(selectinload(MediaFile.matches))
+                .where(MediaFile.id.in_(new_file_ids))
+            ))
+
+            # Build (id, path, confidence, has_valid_match) tuples for the pure gate.
+            file_infos: list[tuple[int, str, float | None, bool]] = []
+            for f in rows:
+                selected = next((m for m in f.matches if m.is_selected), None)
+                has_match = bool(selected and selected.provider and selected.provider_id)
+                conf = selected.confidence if selected else None
+                file_infos.append((f.id, f.file_path or "", conf, has_match))
+
+            eligible, held = compute_auto_rename_eligibility(cfg, file_infos)
+
+            if not eligible:
+                _log.info(
+                    "watcher: auto_rename — scan %s: 0 of %d new file(s) cleared "
+                    "threshold (%d held for review)", scan_id, len(rows), held,
+                )
+                return
+
+            op, profile = await _resolve_rename_defaults(db)
+
+            # CR-08: reuse the real rename executor via the plain SERVICE
+            # function `perform_rename` (NOT the FastAPI endpoint handler), so
+            # the daemon isn't coupled to the API layer / `Depends(get_session)`.
+            # It still persists RenameHistory, creates the summary Notification,
+            # refreshes Plex/Jellyfin, and fans out to external sinks — we just
+            # drive it with our own session.
+            from kira.api.rename import RenameRequest, perform_rename
+            payload = RenameRequest(
+                file_ids=eligible, profile=profile, op=op,
+                library_root_name=None, dry_run=False,
+            )
+            result = await perform_rename(payload, db)
+            _log.info(
+                "watcher: auto_rename — scan %s: renamed %d, failed %d, held %d (op=%s, profile=%s)",
+                scan_id, result.succeeded, result.failed, held, op, profile,
+            )
+    except Exception as e:  # noqa: BLE001 — never crash the scan worker
+        _log.warning("watcher: maybe_auto_rename failed: %r", e)

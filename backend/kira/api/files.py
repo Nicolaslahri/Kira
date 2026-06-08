@@ -6,20 +6,44 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from kira.api.webhooks import path_under_roots
 from kira.database import get_session
-from kira.models import MediaFile, RenameHistory
+from kira.models import MediaFile, RenameHistory, Setting
 from kira.schemas import FileStatusUpdate, MediaFileOut
+from kira.settings_store import unwrap_str as _unwrap_path  # canonical settings-value unwrap
 
 VALID_STATUSES = {"pending", "matching", "matched", "approved", "rejected", "no_match", "discovered"}
 
 router = APIRouter(prefix="/files", tags=["files"])
 
 
+async def _managed_roots(session: AsyncSession) -> list[str]:
+    """Every directory Kira legitimately manages — scan SOURCES (library_root,
+    watch_folders) and rename DESTINATIONS (the named library_roots dict + the
+    per-type targets). Used to refuse a disk delete whose DB path sits outside
+    all of them (defence-in-depth against a corrupt/injected file_path)."""
+    roots: list[str] = []
+    single = await session.get(Setting, "paths.library_root")
+    if single is not None and (p := _unwrap_path(single.value)):
+        roots.append(p)
+    watch = await session.get(Setting, "paths.watch_folders")
+    if watch is not None and isinstance(watch.value, list):
+        roots.extend(p.strip() for p in watch.value if isinstance(p, str) and p.strip())
+    named = await session.get(Setting, "paths.library_roots")
+    if named is not None and isinstance(named.value, dict):
+        roots.extend(p.strip() for p in named.value.values() if isinstance(p, str) and p.strip())
+    for mt in ("movie", "tv", "anime", "music"):
+        tgt = await session.get(Setting, f"paths.targets.{mt}")
+        if tgt is not None and (p := _unwrap_path(tgt.value)):
+            roots.append(p)
+    return roots
+
+
 @router.get("", response_model=list[MediaFileOut])
 async def list_files(
     media_type: str | None = None,
     status: str | None = None,
-    limit: int = 500,
+    limit: int = Query(500, ge=1, le=100_000),
     session: AsyncSession = Depends(get_session),
 ) -> list[MediaFile]:
     stmt = (
@@ -98,32 +122,12 @@ async def delete_file(
         raise HTTPException(404, "File not found")
 
     disk_path = media_file.file_path
-    disk_status: str = "skipped" if keep_on_disk else "missing"
-
-    # 1. Physical deletion FIRST — if it fails (permission denied, locked
-    #    file), we abort and leave the DB row alone so the UI doesn't show
-    #    a phantom-deleted entry that still exists on disk.
-    if not keep_on_disk and disk_path:
-        try:
-            p = Path(disk_path)
-            # Offload to a worker thread so large-network-share deletes
-            # don't freeze the event loop.
-            existed = await asyncio.to_thread(_safe_unlink, p)
-            disk_status = "deleted" if existed else "missing"
-        except PermissionError as e:
-            raise HTTPException(403, f"Couldn't delete on disk: {e}") from e
-        except OSError as e:
-            raise HTTPException(500, f"Disk delete failed: {e}") from e
-
-    # 2. Preserve RenameHistory by nulling the FK before the cascade nukes it.
-    await session.execute(
-        update(RenameHistory)
-        .where(RenameHistory.media_file_id == file_id)
-        .values(media_file_id=None)
-    )
-
-    # 3. Now safe to delete the row (Match rows cascade away).
-    await session.delete(media_file)
+    # Physical deletion happens FIRST inside _delete_one — if it fails
+    # (permission denied, locked file, outside the managed roots), it raises and
+    # we leave the DB row alone so the UI doesn't show a phantom-deleted entry
+    # that still exists on disk. Shared with the bulk-delete path.
+    roots = await _managed_roots(session)
+    disk_status = await _delete_one(session, media_file, keep_on_disk=keep_on_disk, roots=roots)
     await session.commit()
 
     return {"deleted": file_id, "disk": disk_status, "path": disk_path}
@@ -138,6 +142,91 @@ def _safe_unlink(p: Path) -> bool:
         return False
 
 
+async def _delete_one(
+    session: AsyncSession, media_file: MediaFile, *, keep_on_disk: bool, roots: list[str],
+) -> str:
+    """Delete one file from disk (unless keep_on_disk) + drop its row, preserving
+    RenameHistory. Returns the disk status ("deleted"/"missing"/"skipped").
+    Raises HTTPException on a guard/permission/OS failure (so the caller can
+    record a per-file error). Does NOT commit — the caller controls the txn.
+
+    Shared by the single `DELETE /{file_id}` and the `POST /bulk-delete` paths so
+    the confinement + RenameHistory-preserve behavior can't drift between them."""
+    disk_path = media_file.file_path
+    disk_status = "skipped" if keep_on_disk else "missing"
+    if not keep_on_disk and disk_path:
+        # Defence-in-depth: only ever delete inside a configured library root.
+        if roots and not path_under_roots(disk_path, roots):
+            raise HTTPException(
+                400,
+                "Refusing to delete a file outside the configured library roots. "
+                "Pass keep_on_disk=true to drop only the database row.",
+            )
+        try:
+            existed = await asyncio.to_thread(_safe_unlink, Path(disk_path))
+            disk_status = "deleted" if existed else "missing"
+        except PermissionError as e:
+            raise HTTPException(403, f"Couldn't delete on disk: {e}") from e
+        except OSError as e:
+            raise HTTPException(500, f"Disk delete failed: {e}") from e
+    # Preserve RenameHistory by nulling the FK before the cascade nukes it.
+    await session.execute(
+        update(RenameHistory)
+        .where(RenameHistory.media_file_id == media_file.id)
+        .values(media_file_id=None)
+    )
+    await session.delete(media_file)
+    return disk_status
+
+
+@router.post("/bulk-delete", response_model=dict[str, object])
+async def bulk_delete(
+    payload: dict[str, object],
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, object]:
+    """Delete MANY files at once (the duplicate-resolution "keep best, delete the
+    rest" flow). Body: {file_ids: int[], keep_on_disk?: bool}.
+
+    Each file is processed and committed independently so one locked/permission-
+    denied file can't abort the rest of the batch — the response reports exactly
+    which ids were deleted and which failed (with a reason), letting the UI
+    update optimistically for the successes and surface only the real failures.
+    No `confirm` flag: a non-empty `file_ids` list IS the intent, and the UI
+    shows a single batch confirmation before calling this.
+    """
+    raw_ids = payload.get("file_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(400, "Body must be {file_ids: int[], keep_on_disk?: bool}")
+    try:
+        file_ids = [int(x) for x in raw_ids]
+    except (TypeError, ValueError):
+        raise HTTPException(400, "file_ids must be integers")
+    keep_on_disk = bool(payload.get("keep_on_disk", False))
+
+    roots = await _managed_roots(session)
+    deleted: list[int] = []
+    failed: list[dict[str, object]] = []
+    for fid in file_ids:
+        media_file = await session.get(MediaFile, fid)
+        if media_file is None:
+            # Already gone (e.g. deleted in a prior partial run / concurrent
+            # tab) — treat as success so the UI converges, not a hard error.
+            deleted.append(fid)
+            continue
+        try:
+            await _delete_one(session, media_file, keep_on_disk=keep_on_disk, roots=roots)
+            await session.commit()
+            deleted.append(fid)
+        except HTTPException as e:
+            await session.rollback()
+            failed.append({"id": fid, "error": e.detail})
+        except Exception as e:  # noqa: BLE001 — never let one file kill the batch
+            await session.rollback()
+            failed.append({"id": fid, "error": str(e)})
+
+    return {"deleted": deleted, "failed": failed, "count": len(deleted)}
+
+
 @router.post("/reparse-all", response_model=dict[str, int])
 async def reparse_all(
     media_type: str | None = None,
@@ -149,34 +238,33 @@ async def reparse_all(
     Run this after a parser-pattern improvement ships (e.g. the WxH
     resolution fix) so existing rows pick up the new tokens without
     waiting for the next match cycle. Cheap — pure regex over names.
+
+    Tech tags from real container metadata (resolution/codec/HDR/channels) are
+    then refilled in the BACKGROUND when `parsing.read_mediainfo` is on — this
+    handler never does the slow per-file container reads itself, so it returns
+    immediately even over a NAS and even in authoritative mode.
     """
     from pathlib import Path as _Path
     from kira.parser import parse_filename
-    from kira.api.scans import (
-        _compute_series_key,
-        _maybe_enrich_mediainfo,
-        _read_mediainfo_setting,
-        _read_mediainfo_authoritative_setting,
-    )
+    from kira.api.scans import _compute_series_key, _spawn_mediainfo_enrich
 
     stmt = select(MediaFile)
     if media_type is not None:
         stmt = stmt.where(MediaFile.media_type == media_type)
     files = list(await session.scalars(stmt))
 
-    # Phase 16: apply the same MediaInfo enrichment the scan worker does, so a
-    # reparse picks up tech tags (and authoritative overrides) without needing
-    # a full rescan of the library.
-    read_mi = await _read_mediainfo_setting(session)
-    mi_authoritative = await _read_mediainfo_authoritative_setting(session)
-
     changed = 0
+    enrich_ids: list[int] = []
     for mf in files:
         if not mf.file_path:
             continue
+        if mf.id is not None:
+            enrich_ids.append(mf.id)
         parent = str(_Path(mf.file_path).parent)
         fresh = parse_filename(_Path(mf.file_path).name, parent_path=parent)
-        await _maybe_enrich_mediainfo(fresh, mf.file_path, read_mi, mi_authoritative)
+        # Pure regex reparse drops any prior MediaInfo enrichment (fresh is
+        # filename-only); the background pass below re-applies it. With
+        # read_mediainfo off, filename-only IS the intended result.
         new_data = fresh.to_dict()
         if new_data != mf.parsed_data:
             mf.parsed_data = new_data
@@ -185,6 +273,9 @@ async def reparse_all(
             changed += 1
 
     await session.commit()
+    # Hand the container reads to the detached background pass (own session, off
+    # the request path). No-op unless `parsing.read_mediainfo` is enabled.
+    _spawn_mediainfo_enrich(enrich_ids)
     return {"scanned": len(files), "updated": changed}
 
 

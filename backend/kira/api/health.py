@@ -63,12 +63,28 @@ async def health(session: AsyncSession = Depends(get_session)) -> dict:
     elif anidb_banned or anidb_circuit_open:
         status = "degraded"   # non-critical — app still serves the UI
 
+    # Network diagnostics — ground truth from INSIDE this process. `force_ipv4`
+    # is the runtime flag; `tmdb_families` is what address resolution actually
+    # returns RIGHT NOW for TMDB. If force_ipv4 is true but tmdb_families still
+    # contains AF_INET6, the IPv4 patch isn't taking effect in this process.
+    force_ipv4 = None
+    tmdb_families: list[str] = []
+    try:
+        import socket as _socket
+        from kira import net as _net
+        force_ipv4 = _net.force_ipv4_enabled()
+        tmdb_families = sorted({ai[0].name for ai in _socket.getaddrinfo("api.themoviedb.org", 443)})
+    except Exception as e:  # noqa: BLE001
+        tmdb_families = [f"resolve-error:{type(e).__name__}"]
+
     return {
         "status": status,
         "db": "ok" if db_ok else "error",
         "db_error": db_err,
         "anidb_banned": anidb_banned,
         "anidb_circuit_open": anidb_circuit_open,
+        "force_ipv4": force_ipv4,
+        "tmdb_families": tmdb_families,
         "uptime_sec": int(time.monotonic() - _START_TIME),
         "version": getattr(settings, "version", "0.0.0"),
         "latency_ms": int((time.monotonic() - started) * 1000),

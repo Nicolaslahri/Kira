@@ -22,6 +22,8 @@ export interface MatchData {
   /** Franchise identity for visual grouping on the Review page.
    *  Cards sharing this value sit together under a sub-heading. */
   seriesGroupId?: string;
+  /** #14: TMDB movie-collection display name, when the film belongs to one. */
+  collectionName?: string | null;
   tmdbId?: number | null;
   runtime?: number;
   poster?: PosterData;
@@ -117,6 +119,15 @@ export interface MediaFile {
   sizeBytes?: number;
   /** Normalized "10bit" / "8bit" from the format-stripper. */
   bitDepth?: string;
+  /** MediaInfo-derived (opt-in `parsing.read_mediainfo`): HDR flavor, speaker
+   *  layout, primary audio codec(s). Surfaced as chips + used by the ranker. */
+  hdr?: string;
+  channels?: string;
+  audio?: string[];
+  /** Per-track languages (ISO-639-2/B) read from the container → dual-audio /
+   *  multi-sub chips. */
+  audio_langs?: string[];
+  sub_langs?: string[];
   /** The clean title the parser extracted from the filename — e.g.
    *  "Kanojo, Okarishimasu" from "[Moozzi2] Kanojo, Okarishimasu-01.mkv".
    *  Used as the Manual Search seed because the *current* match.title is
@@ -152,7 +163,7 @@ export interface SearchResult {
   tracks?: number;
 }
 
-export type ProviderKey = 'TMDB' | 'TVDB' | 'AniDB' | 'MusicBrainz' | 'AcoustID';
+export type ProviderKey = 'TMDB' | 'TVDB' | 'AniDB' | 'MusicBrainz' | 'AcoustID' | 'fanart.tv';
 
 export interface ProviderMeta {
   name: string;
@@ -232,6 +243,17 @@ export interface LibFile {
    *  dedupe ranker. 10-bit is the anime gold standard for killing
    *  color banding in gradients. */
   bitDepth?: string;
+  /** MediaInfo-derived (when `parsing.read_mediainfo` is on): HDR flavor
+   *  ("HDR10" / "HDR10+" / "DV" / "HLG"), speaker layout ("5.1" / "7.1"), and
+   *  primary audio codec(s) ("TrueHD" / "DTS-HD" / …). Shown as chips + used by
+   *  the dedupe ranker (HDR > SDR, more channels win). */
+  hdr?: string;
+  channels?: string;
+  audio?: string[];
+  /** Per-track languages (ISO-639-2/B) read from the container → dual-audio /
+   *  multi-sub chips. */
+  audio_langs?: string[];
+  sub_langs?: string[];
   releaseGroup?: string | null;
   /** Index into the parent item's `episodes` array; null when unmatched. */
   matchedToEpisode: number | null;
@@ -293,6 +315,10 @@ export interface LibraryItem {
   /** Franchise identity — cards sharing this value cluster under one
    *  sub-heading inside their media-type section on the Review page. */
   seriesGroupId?: string | null;
+  /** #14: TMDB movie-collection display name ("The Matrix Collection"). When
+   *  set, the franchise band heading uses it instead of the earliest film's
+   *  title. Only populated for movies that belong to a collection. */
+  collectionName?: string | null;
   /** Per-cluster key from the backend (`tv|breaking bad|1`). Distinct from
    *  the franchise `seriesGroupId`; used to re-find the same item after a
    *  re-match shifts its synthesized `id`. */

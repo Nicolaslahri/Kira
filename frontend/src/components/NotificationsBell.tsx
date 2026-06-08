@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { api, type ApiNotification } from '../lib/api';
+import { api, ApiError, type ApiNotification } from '../lib/api';
 import { IcBell, IcCheck, IcAlertTri } from '../lib/icons';
 import { cn } from '../lib/utils';
 import { FeaturedIcon } from './base/featured-icons/featured-icon';
@@ -33,6 +33,8 @@ export function NotificationsBell() {
   const [items, setItems] = useState<ApiNotification[]>([]);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   // M11: surface fetch errors once per session so a silent broken bell
   // doesn't hide the fact that the backend is unreachable.
   const errorSurfacedRef = useRef(false);
@@ -46,6 +48,10 @@ export function NotificationsBell() {
         errorSurfacedRef.current = false;
       }
     } catch (e) {
+      // An ApiError means the backend ANSWERED (with a non-2xx) — it's
+      // reachable, just erroring on this endpoint. Only a raw network failure
+      // means "backend unreachable", so don't cry offline on a 500.
+      if (e instanceof ApiError) return;
       const msg = (e as Error).message || 'fetch failed';
       if (!errorSurfacedRef.current) {
         setFetchError(msg);
@@ -62,14 +68,28 @@ export function NotificationsBell() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Close on outside click.
+  // Close on outside click or Escape; move focus into the panel on open and
+  // restore it to the bell on close so keyboard users aren't stranded.
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => {
       if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
     };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setOpen(false);
+        triggerRef.current?.focus();
+      }
+    };
     document.addEventListener('mousedown', onDoc);
-    return () => document.removeEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    // Defer so the panel is mounted before we move focus into it.
+    const t = setTimeout(() => panelRef.current?.focus(), 0);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+      clearTimeout(t);
+    };
   }, [open]);
 
   const unread = items.filter(i => !i.read).length;
@@ -84,9 +104,13 @@ export function NotificationsBell() {
   return (
     <div ref={wrapRef} className="relative">
       <button
+        ref={triggerRef}
         className="relative grid size-9 shrink-0 place-items-center rounded-lg border border-primary bg-primary text-fg-quaternary shadow-xs transition hover:bg-primary_hover hover:text-fg-tertiary [&_svg]:size-[16px]"
         title={unread > 0 ? `Notifications (${unread} unread)` : 'Notifications'}
         aria-label={unread > 0 ? `Notifications, ${unread} unread` : 'Notifications'}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-controls="notifications-panel"
         onClick={() => setOpen(o => !o)}
       >
         <IcBell />
@@ -101,7 +125,14 @@ export function NotificationsBell() {
       </button>
 
       {open ? (
-        <div className="absolute right-0 top-[calc(100%+8px)] z-50 w-[360px] overflow-hidden rounded-2xl border border-white/[0.12] bg-[rgba(20,19,28,0.96)] shadow-[0_18px_60px_rgba(0,0,0,0.55)] backdrop-blur-xl">
+        <div
+          ref={panelRef}
+          id="notifications-panel"
+          role="dialog"
+          aria-label="Notifications"
+          tabIndex={-1}
+          className="absolute right-0 top-[calc(100%+8px)] z-50 w-[360px] overflow-hidden rounded-2xl border border-white/[0.12] bg-[rgba(20,19,28,0.96)] shadow-[0_18px_60px_rgba(0,0,0,0.55)] backdrop-blur-xl outline-none"
+        >
           <div className="flex items-center justify-between border-b border-white/[0.1] px-4 py-3">
             <div className="text-[13px] font-semibold text-ink">Notifications</div>
             {items.some(i => !i.read) ? (

@@ -144,6 +144,15 @@ async def list_series_episodes(
         {
             "season":   ep.season,
             "episode":  ep.episode,
+            # LOAD-BEARING for absolute-numbered anime on cross-ref providers.
+            # TVDB/TMDB model a long-runner's "Season 4" as local E1..E30 but
+            # carry the series-wide absolute number (AoT S4E1 = abs 60, ...
+            # S4E30 = abs 89). The user's files are named by absolute number
+            # ("Shingeki no Kyojin - 60"). Without this field the popup pairs
+            # local-1..30 episodes against absolute-60..89 files and shows
+            # every file as "orphaned" even though the match is correct.
+            # Same class as the scan-path _to_dicts absolute_number fix.
+            "absolute_number": getattr(ep, "absolute_number", None),
             "title":    ep.title,
             "air_date": ep.air_date,
             "overview": ep.overview,

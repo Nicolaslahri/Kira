@@ -147,3 +147,38 @@ def test_reload_with_no_rules_is_curated_only(monkeypatch, tmp_path) -> None:
     finally:
         monkeypatch.delenv("KIRA_SCENE_RULES", raising=False)
         fs.reload_rules()
+
+
+# ── Streaming platform tags vs. source TYPE (dupe-ranker correctness) ────────
+def test_platform_does_not_shadow_real_source() -> None:
+    # AMZN is the platform, WEB-DL the delivery type. Even though AMZN appears
+    # first, the stored source must be the real type — else the dedupe ranker
+    # mis-ranks the WEB-DL (treated as unknown "AMZN") below a WEBRip.
+    _, tok = fs.strip("Euphoria.US.S03E01.REPACK.1080p.AMZN.WEB-DL.DDP5.1.Atmos.H.264-FLUX.mkv")
+    assert tok.source == "WEB-DL"
+
+
+def test_platform_alone_implies_webdl() -> None:
+    _, tok = fs.strip("Show.S01E02.1080p.AMZN.x264-GRP.mkv")
+    assert tok.source == "WEB-DL"
+
+
+def test_platform_stripped_from_title() -> None:
+    cleaned, _ = fs.strip("Show.S01E02.1080p.NFLX.WEB-DL.x265-GRP.mkv")
+    assert "NFLX" not in cleaned
+
+
+def test_real_disc_source_unaffected() -> None:
+    _, tok = fs.strip("Movie.2021.1080p.BluRay.x264-GRP.mkv")
+    assert tok.source == "BluRay"
+
+
+def test_streaming_ambiguous_implies_webdl() -> None:
+    _, tok = fs.strip("The.Boys.S01E01.1080p.HMAX.x264-GRP.mkv")
+    assert tok.source == "WEB-DL"
+
+
+def test_max_title_not_eaten_as_platform() -> None:
+    cleaned, tok = fs.strip("Max.2015.1080p.WEB-DL.mkv")
+    assert tok.source == "WEB-DL"
+    assert "Max" in cleaned

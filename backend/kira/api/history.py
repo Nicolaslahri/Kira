@@ -30,8 +30,36 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from kira.database import get_session
 from kira.models import Match, MediaFile, Notification, RenameHistory
 from kira.renamer.operations import FileOp, undo_op
+from kira.schemas import UtcDateTime
 
 router = APIRouter(prefix="/history", tags=["history"])
+
+
+async def prune_old_history(session: AsyncSession) -> int:
+    """Delete rename-history rows older than the configured retention window
+    (Settings → Advanced → History retention). Stored as a day count string;
+    ``0`` / ``"forever"`` (or absent) means keep everything. Returns the number
+    of rows removed. Best-effort — callers run it on startup and after scans so
+    the log self-prunes without a separate scheduler."""
+    from kira.models import Setting
+    from kira.settings_store import unwrap
+
+    row = await session.get(Setting, "history.retention_days")
+    raw = unwrap(row.value) if row is not None else None
+    if raw is None or (isinstance(raw, str) and raw.strip().lower() in ("", "forever")):
+        return 0
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    if days <= 0:
+        return 0
+    cutoff = _utcnow_naive() - timedelta(days=days)
+    result = await session.execute(
+        delete(RenameHistory).where(RenameHistory.created_at < cutoff)
+    )
+    await session.commit()
+    return result.rowcount or 0
 
 
 class HistoryOut(BaseModel):
@@ -51,15 +79,15 @@ class HistoryOut(BaseModel):
     # missing attribute.
     episode_title: str | None = None
     poster_url: str | None
-    created_at: datetime
-    undone_at: datetime | None
+    created_at: UtcDateTime
+    undone_at: UtcDateTime | None
 
 
 @router.get("", response_model=list[HistoryOut])
 async def list_history(
     period: str = Query("all", description="today | week | all"),
     operation: str | None = None,
-    limit: int = 500,
+    limit: int = Query(500, ge=1, le=100_000),
     session: AsyncSession = Depends(get_session),
 ) -> list[HistoryOut]:
     """List rename history with fresh poster URLs.

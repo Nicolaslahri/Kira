@@ -19,6 +19,14 @@ engine = create_async_engine(settings.database_url, echo=False, future=True)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
+# Fire-and-forget background tasks are tracked by the canonical helper in
+# `kira.tasks` (a single strong-ref registry shared across the app, avoiding the
+# asyncio weakref-GC trap). These names are kept as back-compat aliases so any
+# existing importer of `database._spawn_tracked` / `database._BACKGROUND_TASKS`
+# keeps working against the shared registry.
+from kira.tasks import _BACKGROUND_TASKS, spawn_tracked as _spawn_tracked  # noqa: F401
+
+
 # v0.4→v0.5 naming-engine migration. The renamer switched from a
 # `str.replace("{token}", …)` loop to a Jinja2 SandboxedEnvironment (see
 # renamer/templates.py). Built-in profiles were rewritten to `{{token}}` in
@@ -34,19 +42,41 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSe
 _LEGACY_TOKEN_RE = re.compile(r"(?<!\{)\{(\w+)\}(?!\})")
 
 
-# H9: SQLite ships with foreign-key enforcement OFF by default — including
-# ON DELETE SET NULL. Without this listener, `RenameHistory.media_file_id`
-# stays pointing at a deleted MediaFile.id (the constraint is a no-op).
-# Enable the pragma on every new connection so the orphan-prevention rule
-# we added to the model actually fires.
+def _apply_connection_pragmas(dbapi_connection) -> None:
+    """PRAGMAs every SQLite connection needs, run once per physical connection.
+
+    Module-level (not a closure) so it's unit-testable against a raw sqlite3
+    connection. These are the difference between a single-user app that quietly
+    serializes and one that throws ``database is locked`` the moment two
+    boot-time writers overlap — self-heal, the AniDB group backfill, and a
+    manual scan can all hit the DB within the first second of startup.
+
+    - foreign_keys: OFF by default in SQLite, so the ``ON DELETE SET NULL`` on
+      ``RenameHistory.media_file_id`` is a no-op without it (H9).
+    - journal_mode=WAL: readers never block the single writer (and vice-versa),
+      so the Review page keeps rendering while a scan writes. Persistent (lives
+      in the DB header) — a cheap no-op on every connection after the first.
+    - busy_timeout: wait up to 5s for a held lock instead of erroring instantly.
+    - synchronous=NORMAL: the recommended durability level under WAL — crash-safe
+      for app crashes, only risks the last transaction on OS/power loss, and is
+      markedly faster than FULL for our write-bursty backfills.
+    """
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys = ON")
+        cursor.execute("PRAGMA journal_mode = WAL")
+        cursor.execute("PRAGMA busy_timeout = 5000")
+        cursor.execute("PRAGMA synchronous = NORMAL")
+    finally:
+        cursor.close()
+
+
 if "sqlite" in settings.database_url:
     from sqlalchemy import event
 
     @event.listens_for(engine.sync_engine, "connect")
-    def _enable_sqlite_fk_pragma(dbapi_connection, _conn_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys = ON")
-        cursor.close()
+    def _sqlite_connect(dbapi_connection, _conn_record):
+        _apply_connection_pragmas(dbapi_connection)
 
 
 # PB-5: slow-query logger. SQLAlchemy event hooks let us instrument every
@@ -95,59 +125,67 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         yield session
 
 
+# Columns added after first ship, in the order they were introduced. Applied
+# idempotently on every boot via `_ensure_column` (ADD COLUMN IF the PRAGMA
+# says it's missing). SQLite ADD COLUMN with no/constant default is fast + safe.
+_MIGRATION_COLUMNS: list[tuple[str, str, str]] = [
+    ("media_files",   "series_key",      "VARCHAR"),
+    ("matches",       "series_group_id", "VARCHAR"),
+    ("scans",         "estimated_total", "INTEGER"),           # PB-4 scan ETA
+    ("matches",       "is_manual",       "BOOLEAN DEFAULT 0"), # user-pinned matches
+    ("media_files",   "variant_key",     "VARCHAR"),           # dual-audio/edition variants
+    ("rename_history", "parent_id",      "INTEGER"),           # Tier 1.2 sidecar links
+    ("scans",         "source",          "VARCHAR DEFAULT 'manual'"),  # watched-folders
+    ("matches",       "collection_id",   "VARCHAR"),           # Pass 7 #14 movie collections
+    ("matches",       "collection_name", "VARCHAR"),
+]
+
+
 async def init_db() -> None:
-    # Dev convenience: create tables on startup. Production uses Alembic.
+    """Create tables + apply idempotent in-place migrations on startup.
+
+    CRITICAL ORDERING (do not collapse back into one transaction): SCHEMA
+    changes commit FIRST and in ISOLATION from data backfills. The old code ran
+    `create_all` + every `ADD COLUMN` + every backfill inside ONE transaction —
+    so if a backfill threw on a user's data, the whole transaction (including
+    the column adds) rolled back, the ORM then selected a column the table
+    lacked, and EVERY query 500'd until a manual DB reset. Now each column add
+    and each data op is isolated + best-effort: a data-op failure logs and is
+    skipped, and can never undo a schema change.
+    """
     from kira import models  # noqa: F401 — register mappers
 
+    # ── 1) Tables ────────────────────────────────────────────────────────
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Lightweight in-place migrations for columns added after first ship.
-        # SQLite is forgiving: ADD COLUMN with no default is fast and safe.
-        await _ensure_column(conn, "media_files", "series_key", "VARCHAR")
-        await _ensure_column(conn, "matches", "series_group_id", "VARCHAR")
-        # PB-4: scan ETA — populated by scan worker at Phase 1 → Phase 2
-        # transition so the frontend can render a real % + ETA banner
-        # instead of "watch the file count climb forever".
-        await _ensure_column(conn, "scans", "estimated_total", "INTEGER")
-        # `is_manual` — user-pinned matches survive auto-heal/rematch.
-        # SQLite stores Bool as INTEGER (0/1). Default 0 = matcher-picked.
-        await _ensure_column(conn, "matches", "is_manual", "BOOLEAN DEFAULT 0")
-        # `variant_key` — disambiguates same-episode files in different
-        # flavors (audio language, edition, bit depth). See model docstring.
-        # Default null means "no variant"; backfill happens lazily as files
-        # are re-scanned or auto-healed.
-        await _ensure_column(conn, "media_files", "variant_key", "VARCHAR")
-        # Tier 1.2: `parent_id` on rename_history — links sidecar rows
-        # (subtitles, etc.) back to their parent video's history row so
-        # cascading undo restores the whole bundle together. Pre-1.2
-        # rows stay NULL (interpreted as "standalone"), perfectly
-        # backward-compatible.
-        await _ensure_column(conn, "rename_history", "parent_id", "INTEGER")
-        # Watched-folders: who triggered a scan — "manual" (user clicked Scan)
-        # or "auto" (the watch daemon). Default keeps pre-column rows as manual.
-        await _ensure_column(conn, "scans", "source", "VARCHAR DEFAULT 'manual'")
-        # Idempotent backfills: cheap when there's nothing to fix, so we run
-        # them every boot rather than gating on "just-added the column".
-        await _backfill_series_keys(conn)
-        await _backfill_variant_keys(conn)
-        await _backfill_series_group_ids(conn)
-        # v0.4→v0.5: rewrite custom naming profiles from `{token}` to Jinja
-        # `{{token}}`. Idempotent — a no-op once every stored profile is
-        # already double-brace, so it's cheap to run on every boot.
-        await _migrate_legacy_naming_templates(conn)
-        # Autopsy 6: ensure the multi-worker scan lock row exists. Value
-        # is an integer Unix-timestamp; 0 = idle, nonzero = scan started
-        # at that timestamp. INSERT OR IGNORE — first writer wins, never
-        # clobber a live lock held by another worker process.
-        await _ensure_scan_lock_row(conn)
-        # PB-5: hot-path indexes for Review-page filter queries. At 100k
-        # files, unindexed `WHERE status=?` is a full table scan; the
-        # composite (status, media_type) covers the filter-pill flow.
-        # All idempotent — CREATE INDEX IF NOT EXISTS is a no-op when
-        # the index already exists. Followed by ANALYZE so the query
-        # planner actually picks the new indexes (without ANALYZE, fresh
-        # indexes stay invisible to SQLite's planner until DB reopen).
-        await _create_perf_indexes(conn)
+
+    # ── 2) Columns — each in its OWN transaction so one bad ALTER can't
+    #        block the rest, and they're durably committed before any backfill.
+    for table, column, ddl in _MIGRATION_COLUMNS:
+        try:
+            async with engine.begin() as conn:
+                await _ensure_column(conn, table, column, ddl)
+        except Exception as e:  # noqa: BLE001 — never let a migration crash boot
+            print(f"init_db: ensure_column {table}.{column} failed (non-fatal): {e!r}")
+
+    # ── 3) Data backfills + one-shot data migrations — EACH isolated and
+    #        NON-FATAL. A failure here logs and is skipped; the schema above
+    #        is already committed, so the app still starts cleanly.
+    _data_ops = [
+        ("backfill_series_keys", _backfill_series_keys),
+        ("backfill_variant_keys", _backfill_variant_keys),
+        ("backfill_series_group_ids", _backfill_series_group_ids),
+        ("refold_tvdb_anime_groups", _refold_tvdb_anime_groups),
+        ("migrate_legacy_naming_templates", _migrate_legacy_naming_templates),
+        ("ensure_scan_lock_row", _ensure_scan_lock_row),
+        ("create_perf_indexes", _create_perf_indexes),
+    ]
+    for name, fn in _data_ops:
+        try:
+            async with engine.begin() as conn:
+                await fn(conn)
+        except Exception as e:  # noqa: BLE001
+            print(f"init_db: {name} failed (non-fatal): {e!r}")
 
 
 async def _ensure_scan_lock_row(conn) -> None:
@@ -275,8 +313,10 @@ async def _backfill_series_group_ids(conn) -> None:
         "WHERE provider='anidb' AND series_group_id IS NULL"
     )))
     if pending:
-        import asyncio
-        asyncio.create_task(_backfill_anidb_groups_async([r[0] for r in pending]))
+        _spawn_tracked(
+            _backfill_anidb_groups_async([r[0] for r in pending]),
+            label="anidb_group_backfill",
+        )
 
 
 async def _backfill_anidb_groups_async(aids: list[str]) -> None:
@@ -316,6 +356,72 @@ async def _backfill_anidb_groups_async(aids: list[str]) -> None:
                         f"AND series_group_id IS NULL"
                     ),
                     {"gid": group_id},
+                )
+
+
+async def _refold_tvdb_anime_groups(conn) -> None:
+    """One-shot: re-fold TVDB-matched anime into their AniDB franchise card.
+
+    A long-runner whose files are pure-absolute-numbered (Attack on Titan's
+    Final Season — "Shingeki no Kyojin - 60") can't sit in any single AniDB
+    cour, so the matcher routes it to TVDB and the cheap Pass-1 backfill above
+    stamps it `tvdb:<id>` — a SEPARATE card from the AniDB-matched siblings
+    (`anidb:9541`). compute_series_group_id now folds TVDB anime through Fribb,
+    but that only governs FRESH matches; existing rows keep their old
+    `tvdb:<id>` group until a rescan. This recomputes the group for any
+    still-`tvdb:`-grouped episode rows so the card merges on the next boot
+    without a rescan.
+
+    Deferred to a background task: resolving the franchise root can need a
+    rate-limited AniDB relations walk for a TVDB id never matched via AniDB
+    (instant when the chain is already disk-cached — as it is for any franchise
+    the user already has AniDB seasons of). Idempotent: only ever rewrites
+    `tvdb:%` episode groups, and only when the fold resolves to an `anidb:` id
+    (live-action TVDB shows resolve back to `tvdb:<id>` and are left as-is).
+    """
+    from sqlalchemy import text
+
+    pending = list(await conn.execute(text(
+        "SELECT DISTINCT provider_id FROM matches "
+        "WHERE provider='tvdb' AND match_type='tv_episode' "
+        "AND series_group_id LIKE 'tvdb:%'"
+    )))
+    if pending:
+        _spawn_tracked(
+            _refold_tvdb_anime_groups_async([r[0] for r in pending]),
+            label="tvdb_anime_refold",
+        )
+
+
+async def _refold_tvdb_anime_groups_async(tvdb_ids: list[str]) -> None:
+    """Resolve each TVDB id's franchise fold + rewrite the group for its
+    episode rows. Runs in the background after startup. See the sync sibling.
+
+    compute_series_group_id does the Fribb gate: a known-anime TVDB id folds
+    to `anidb:<root>`; a live-action id returns `tvdb:<id>` and is skipped, so
+    no movie or non-anime card is ever disturbed.
+    """
+    import httpx
+    from sqlalchemy import text
+    from kira.matcher.engine import compute_series_group_id, registry_from_settings
+
+    async with httpx.AsyncClient() as client:
+        registry = await registry_from_settings(client)
+        for tid in tvdb_ids:
+            try:
+                gid = await compute_series_group_id("tvdb", str(tid), registry)
+            except Exception:
+                continue
+            if not gid.startswith("anidb:"):
+                continue  # live-action / unmapped → leave the tvdb:<id> card
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE matches SET series_group_id = :gid "
+                        "WHERE provider='tvdb' AND provider_id = :tid "
+                        "AND match_type='tv_episode' AND series_group_id LIKE 'tvdb:%'"
+                    ),
+                    {"gid": gid, "tid": str(tid)},
                 )
 
 

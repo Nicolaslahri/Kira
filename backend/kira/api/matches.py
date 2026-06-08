@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from pydantic import Field
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kira.api.match_cleanup import detach_and_delete_matches
 from kira.database import SessionLocal, get_session
 from kira.matcher import MatchEngine
+from kira.matcher.cour_routing import remap_umbrella_local_to_absolute
 from kira.matcher.engine import compute_series_group_id, fetch_match_metadata, registry_from_settings, resolve_canonical_season
 from kira.models import Match, MediaFile, Setting
 from kira.parser import ParsedFile
 from kira.providers.opensubtitles import identify_file_by_hash
 from kira.schemas import ManualMatch, MediaFileOut
+from kira.settings_store import unwrap_str as _unwrap_setting  # canonical settings-value unwrap
 
 router = APIRouter(tags=["matches"])
 
@@ -116,6 +119,13 @@ async def _rematch_one(
                 ep_dict: dict[tuple[int, int], str | None] = {
                     (ep.season, ep.episode): ep.title for ep in ep_results
                 }
+                # absolute_number→episode map so an absolute-named file ("- 88")
+                # can reach the season-local cour table in the routing below.
+                enrich_abs_to_local: dict[int, int] = {
+                    ep.absolute_number: ep.episode
+                    for ep in ep_results
+                    if getattr(ep, "absolute_number", None) is not None and ep.episode is not None
+                }
                 # ── Local-episode memory for multi-cour anime ────────
                 # When this pin's provider_id is a sibling cour AID
                 # (e.g. Bleach S17E31 routed to AID 18671), the
@@ -144,7 +154,7 @@ async def _rematch_one(
                             registry=engine.registry,
                         )
                         if cour_table_enrich is not None and ep_num_for_enrich is not None:
-                            routed = route_file_to_cour(cour_table_enrich, ep_num_for_enrich)
+                            routed = route_file_to_cour(cour_table_enrich, ep_num_for_enrich, enrich_abs_to_local)
                             # Only trust the local-episode translation when
                             # the cour-routed AID MATCHES the row's
                             # provider_id. If they disagree, the row is
@@ -294,11 +304,58 @@ async def _rematch_one(
         print(f"_rematch_one: matcher raised for file {media_file.id}: {e!r}")
         return 0  # leave existing rows untouched
 
+    # Fetch the episode list for the top match (TV/anime only) FIRST — cour
+    # routing below needs it to bridge absolute-numbered files into the cour
+    # table. Keyed by (season, episode) for the episode_title write (the season
+    # in the key stops cross-season collisions); `abs_to_local` is the
+    # absolute_number→episode map that lets a file named by series-absolute
+    # ("- 88") reach the season-local cour table — the SAME bridge the scan
+    # path uses, so Re-identify now matches a full rescan.
+    #
+    # Routes through `_fetch_episodes_for_match` (in scans.py) which prefers
+    # TVDB cross-ref for AniDB matches — AniDB-ban hardening; one cached call,
+    # not a per-file AniDB hit.
+    episodes_by_key: dict[tuple[int, int], str | None] = {}
+    abs_to_local: dict[int, int] = {}
+    if scored and scored[0].match_type == "tv_episode":
+        try:
+            from kira.api.scans import _fetch_episodes_for_match
+            ep_results = await _fetch_episodes_for_match(
+                scored[0].provider, scored[0].provider_id, parsed.season, engine.registry,
+            )
+            for ep in ep_results:
+                episodes_by_key[(ep.season, ep.episode)] = ep.title
+                _abs = getattr(ep, "absolute_number", None)
+                if _abs is not None and ep.episode is not None:
+                    abs_to_local[_abs] = ep.episode
+        except Exception as e:
+            print(f"_rematch_one: get_episodes failed: {e!r}")
+
+    # Flat-umbrella detection (mirrors _match_cluster): a single AniDB AID that
+    # numbers the whole long-runner absolutely (One Piece 69 → tvdb_season None).
+    # `local_to_abs` (reverse of abs_to_local) drives the local→absolute remap so
+    # a TVDB-season-LOCAL file ("S23E04") RE-IDENTIFIES to its absolute (1159) —
+    # so Re-identify produces the same number a full rescan does. Per-season AIDs
+    # (Frieren S2, AoT cours) carry a tvdb_season → not umbrellas → left local.
+    is_flat_umbrella = False
+    if scored and scored[0].match_type == "tv_episode" and scored[0].provider == "anidb":
+        try:
+            from kira.providers.anime_mappings import AnimeMappings
+            is_flat_umbrella = (await AnimeMappings.tvdb_season(int(scored[0].provider_id))) is None
+        except (ValueError, TypeError):
+            is_flat_umbrella = False
+        except Exception as e:
+            print(f"_rematch_one: flat-umbrella check failed: {e!r}")
+            is_flat_umbrella = False
+    local_to_abs: dict[int, int] = {loc: ab for ab, loc in abs_to_local.items()}
+
     # ── Per-file cour routing (shared helper) ──────────────────────────
     # Single source of truth: the same builder _match_cluster uses. Auto-
     # heal + manual single-file rematch + bulk rematch all route through
     # this; without it, the engine's tie-break would re-pick Cour 1's
-    # AID for every Bleach S17 file and orphan E14-E40 silently.
+    # AID for every Bleach S17 file and orphan E14-E40 silently. Passing
+    # `abs_to_local` lets absolute-numbered files (AoT "- 88") route to their
+    # cour here too — previously only the scan path could (Re-identify missed).
     routed_aid: int | None = None
     routed_local_ep: int | None = None
     routed_eps: list = []  # cour AID's own episode list for title fallback
@@ -321,6 +378,7 @@ async def _rematch_one(
                     cour_table, file_ep_for_routing,
                     provider=scored[0].provider, top_provider_id=scored[0].provider_id,
                     parsed_season=parsed.season,
+                    abs_to_local=abs_to_local,
                 )
                 if routed is not None:
                     routed_aid, routed_local_ep = routed
@@ -338,26 +396,6 @@ async def _rematch_one(
                         routed_eps = []
         except Exception as e:
             print(f"_rematch_one: cour routing build failed: {e!r}")
-
-    # Fetch the episode list for the top match (TV/anime only) so we can
-    # write a real episode_title alongside the Match row. Keyed by
-    # (season, episode) so cross-season collisions can't overwrite titles.
-    #
-    # Routes through `_fetch_episodes_for_match` (in scans.py) which
-    # prefers TVDB cross-ref for AniDB matches — AniDB-ban hardening.
-    # Without this, every manual rematch on an AniDB-matched series
-    # burns one rate-limited HTTP API call against AniDB's quota.
-    episodes_by_key: dict[tuple[int, int], str | None] = {}
-    if scored and scored[0].match_type == "tv_episode":
-        try:
-            from kira.api.scans import _fetch_episodes_for_match
-            ep_results = await _fetch_episodes_for_match(
-                scored[0].provider, scored[0].provider_id, parsed.season, engine.registry,
-            )
-            for ep in ep_results:
-                episodes_by_key[(ep.season, ep.episode)] = ep.title
-        except Exception as e:
-            print(f"_rematch_one: get_episodes failed: {e!r}")
 
     # Snapshot manual rows BEFORE the delete so we can preserve them
     # across the rematch. Without this, /rematch-all + auto-heal silently
@@ -404,6 +442,19 @@ async def _rematch_one(
         ep_title = _lookup_episode_title(
             routed_eb_key, "anidb", parsed, routed_local_ep,
         )
+
+    # Keep episode_number consistent with the routed cour AID's own numbering
+    # (mirrors the scan path) so the popup can pair the file against that AID's
+    # episode list. Rename output is unaffected (renders from parsed / {{absx}}).
+    if routed_aid is not None and routed_local_ep is not None:
+        ep_num = routed_local_ep
+
+    # Flat-umbrella local→absolute remap (mirrors _match_cluster; the One Piece
+    # "S23E04" → 1159 fix on the Re-identify path). No-ops for absolute-named
+    # files, per-season AIDs, normal TV, and early-cour self-maps.
+    ep_num = remap_umbrella_local_to_absolute(
+        ep_num, is_flat_umbrella=is_flat_umbrella, routed_aid=routed_aid, local_to_abs=local_to_abs,
+    )
 
     # When the file routes to a specific cour AID, pull its display title
     # from AniDB's in-memory cache so the Match row carries the COUR's
@@ -604,6 +655,35 @@ async def select_match(
     return media_file
 
 
+def _apply_media_type_for_manual_pick(
+    media_file: MediaFile, provider: str, payload_media_type: str | None
+) -> None:
+    """Reconcile a file's media_type with a MANUAL match pick, then recompute
+    its series/variant keys so it re-clusters into the right group.
+
+    Why: manual select used to leave media_type untouched, so pinning a
+    `tv`-typed file (e.g. one scanned from a `/tv/` usenet folder) to an AniDB
+    anime kept it in the "TV Series" group. AniDB is anime-only, so an AniDB
+    pick is authoritative → anime; otherwise we honor the type of the result
+    the user explicitly chose (tv / movie / music). No-op when unchanged."""
+    if provider == "anidb":
+        new_mt = "anime"
+    elif payload_media_type in ("movie", "tv", "anime", "music"):
+        new_mt = payload_media_type
+    else:
+        return
+    if new_mt == media_file.media_type:
+        return
+    try:
+        from kira.matcher.media_type import apply_media_type_and_recompute_keys
+        apply_media_type_and_recompute_keys(media_file, new_mt)
+    except Exception:
+        # Key recompute is best-effort; the helper sets media_type first
+        # internally, so even if the recompute raises the grouping fix
+        # (media_type flip) has already landed.
+        media_file.media_type = new_mt
+
+
 @router.post("/files/{file_id}/select-manual", response_model=MediaFileOut)
 async def select_manual_match(
     file_id: int,
@@ -683,6 +763,9 @@ async def select_manual_match(
     # Manual match resolves no_match state.
     if media_file.status == "no_match":
         media_file.status = "matched"
+    # Move the file into the right group (e.g. TV → Anime when pinned to an
+    # AniDB show) so a manual fix doesn't leave it stranded under TV Series.
+    _apply_media_type_for_manual_pick(media_file, payload.provider, payload.media_type)
     await session.commit()
     # Refresh with the new match in the relationship.
     refreshed = await session.scalar(
@@ -744,9 +827,73 @@ async def identify_by_content_hash(
     return await select_manual_match(file_id, payload, session)
 
 
+async def load_opensubtitles_settings(session: AsyncSession):
+    """(api_key, username, password, languages) from settings. api_key is None
+    when unset or stored as a masked placeholder. languages defaults to ['en']."""
+    async def _val(key: str):
+        row = await session.get(Setting, key)
+        return row.value if row is not None else None
+
+    api_key_raw = await _val("providers.opensubtitles.api_key")
+    api_key = None if isinstance(api_key_raw, dict) else _unwrap_setting(api_key_raw)
+    user = _unwrap_setting(await _val("providers.opensubtitles.username"))
+    pw = _unwrap_setting(await _val("providers.opensubtitles.password"))
+
+    languages = ["en"]
+    lang_v = await _val("subtitles.languages")
+    if isinstance(lang_v, str) and lang_v.strip():
+        languages = [s.strip().lower() for s in lang_v.split(",") if s.strip()]
+    elif isinstance(lang_v, list) and lang_v:
+        languages = [str(s).strip().lower() for s in lang_v if str(s).strip()]
+    return api_key, user, pw, (languages or ["en"])
+
+
+@router.post("/files/{file_id}/fetch-subtitles")
+async def fetch_subtitles(
+    file_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """#11 — download subtitles for one file from OpenSubtitles and save them as
+    `<stem>.<lang>.srt` sidecars (which the rename co-move then carries). Hash-
+    first, falling back to the selected match's TMDB/IMDb id + season/episode.
+    Requires an OpenSubtitles API key; downloads also need username/password
+    (the API charges downloads against the user's quota)."""
+    from sqlalchemy.orm import selectinload
+    from kira.providers.opensubtitles import fetch_and_save_subtitles
+
+    media_file = await session.scalar(
+        select(MediaFile).options(selectinload(MediaFile.matches)).where(MediaFile.id == file_id)
+    )
+    if media_file is None:
+        raise HTTPException(404, "File not found")
+    if not media_file.file_path:
+        raise HTTPException(422, "File has no on-disk path")
+
+    api_key, user, pw, languages = await load_opensubtitles_settings(session)
+    if not api_key:
+        raise HTTPException(400, "OpenSubtitles API key not configured (Settings → Connections)")
+
+    selected = next((m for m in media_file.matches if m.is_selected), None)
+    tmdb_id = None
+    if selected and selected.provider == "tmdb" and selected.provider_id:
+        try:
+            tmdb_id = int(selected.provider_id)
+        except (TypeError, ValueError):
+            tmdb_id = None
+    season = selected.season_number if selected else None
+    episode = selected.episode_number if selected else None
+
+    async with httpx.AsyncClient() as client:
+        saved = await fetch_and_save_subtitles(
+            media_file.file_path, api_key=api_key, client=client, languages=languages,
+            username=user, password=pw, tmdb_id=tmdb_id, season=season, episode=episode,
+        )
+    return {"saved": saved, "count": len(saved), "languages": languages}
+
+
 class BulkSelectManualPayload(ManualMatch):
     """Same ManualMatch fields PLUS the list of file IDs to apply to."""
-    file_ids: list[int]
+    file_ids: list[int] = Field(..., max_length=10_000)
 
 
 @router.post("/files/bulk-select-manual", response_model=dict[str, int])
@@ -795,6 +942,8 @@ async def bulk_select_manual_match(
             rep_season = f.parsed_data.get("season")
             break
     cour_table = None
+    abs_to_local: dict[int, int] = {}
+    is_flat_umbrella = False
     # The helper's lazy-fetch needs a proper ProviderRegistry to construct
     # an AniDBProvider — this endpoint doesn't have one natively (no
     # matcher engine in scope), so we build a short-lived registry via
@@ -810,9 +959,34 @@ async def bulk_select_manual_match(
                 payload.provider, payload.provider_id, rep_season,
                 registry=_routing_registry,
             )
+            # Flat-umbrella detection for the local→absolute remap: a single
+            # AniDB AID that numbers the whole long-runner absolutely (One Piece
+            # 69 → tvdb_season None) has NO cour table, so the abs→local fetch
+            # below must ALSO fire for it — not only for multi-cour shows.
+            if match_type == "tv_episode" and payload.provider == "anidb":
+                try:
+                    from kira.providers.anime_mappings import AnimeMappings
+                    is_flat_umbrella = (
+                        await AnimeMappings.tvdb_season(int(payload.provider_id))
+                    ) is None
+                except (ValueError, TypeError):
+                    is_flat_umbrella = False
+            # Build the absolute_number→local-episode map when EITHER a cour table
+            # exists (AoT "- 88" bridge) OR the pick is a flat umbrella (One Piece
+            # local→absolute remap). One cached episode-list fetch for the pick —
+            # parity with the scan + Re-identify paths.
+            if cour_table or is_flat_umbrella:
+                from kira.api.scans import _fetch_episodes_for_match
+                for _ep in await _fetch_episodes_for_match(
+                    payload.provider, payload.provider_id, rep_season, _routing_registry,
+                ):
+                    _abs = getattr(_ep, "absolute_number", None)
+                    if _abs is not None and _ep.episode is not None:
+                        abs_to_local[_abs] = _ep.episode
     except Exception as e:
         print(f"bulk_select_manual_match: cour routing build failed: {e!r}")
         cour_table = None
+    local_to_abs: dict[int, int] = {loc: ab for ab, loc in abs_to_local.items()}
     if cour_table:
         print(
             f"bulk_select_manual_match: routing across {len(cour_table)} cours "
@@ -835,6 +1009,7 @@ async def bulk_select_manual_match(
                 cour_table, file_ep,
                 provider=payload.provider, top_provider_id=payload.provider_id,
                 parsed_season=rep_season,
+                abs_to_local=abs_to_local,
             )
             if routed is not None:
                 final_provider_id = str(routed[0])
@@ -881,6 +1056,40 @@ async def bulk_select_manual_match(
         # index for the routed AID). Skip for non-routed files.
         if final_episode_override is not None:
             existing_ep = final_episode_override
+
+        # Re-identify drift repair (One Piece S23E1156→ep1): when cour routing
+        # did NOT place this file (single-cour series like One Piece) and the
+        # pick is an absolute-numbered AniDB show, re-derive the episode from
+        # the file's OWN parsed number. The user picks the SERIES in the modal,
+        # never an episode index, so a stored episode_number matching NEITHER
+        # parsed.episode NOR parsed.absolute_episode is stale auto-derived drift
+        # — safe to overwrite (only episode_number; identity/title/poster kept).
+        # Mirrors the absolute-preferred expression used elsewhere (L97-102).
+        redrive_episode = False
+        if final_episode_override is None and payload.provider == "anidb" and f.parsed_data:
+            _p_ep = f.parsed_data.get("episode")
+            _p_abs = f.parsed_data.get("absolute_episode")
+            _canonical = _p_abs if _p_abs is not None else _p_ep
+            _parsed_candidates = {v for v in (_p_ep, _p_abs) if v is not None}
+            if _canonical is not None and (existing_ep is None or existing_ep not in _parsed_candidates):
+                existing_ep = _canonical
+                redrive_episode = True
+
+        # Flat-umbrella local→absolute remap (One Piece "S23E04" → 1159): on a
+        # manual bulk-pick of the umbrella, a TVDB-season-LOCAL file's number is
+        # rewritten to its absolute so duplicates line up — parity with scan +
+        # Re-identify. Only non-routed files (a real umbrella has no cour table;
+        # routed files already carry final_episode_override). `redrive_episode`
+        # is set so the commandeer branch is authorised to overwrite a stale
+        # local index sitting on an existing row.
+        if final_episode_override is None:
+            _remapped = remap_umbrella_local_to_absolute(
+                existing_ep, is_flat_umbrella=is_flat_umbrella,
+                routed_aid=None, local_to_abs=local_to_abs,
+            )
+            if _remapped != existing_ep:
+                existing_ep = _remapped
+                redrive_episode = True
 
         # The user's payload.poster_url + payload.title are for the AID
         # THEY PICKED in the modal. For non-routed files (final_provider_id
@@ -936,6 +1145,12 @@ async def bulk_select_manual_match(
                 target_match.season_number = existing_season
             if final_episode_override is not None:
                 target_match.episode_number = final_episode_override
+            elif redrive_episode and existing_ep is not None:
+                # Authoritative drift repair — overwrite a stale auto-derived
+                # episode index (the One Piece 1156→1 collapse) with the file's
+                # real number. Narrower than #66's anti-clobber: identity,
+                # title, poster, selection are all left untouched.
+                target_match.episode_number = existing_ep
             elif target_match.episode_number is None and existing_ep is not None:
                 target_match.episode_number = existing_ep
             # Null out enrichment fields that depend on the AID — the
@@ -981,6 +1196,9 @@ async def bulk_select_manual_match(
             ))
         if f.status == "no_match":
             f.status = "matched"
+        # Move each file into the right group (TV → Anime when pinned to an
+        # AniDB show) so a bulk manual fix doesn't strand files under TV Series.
+        _apply_media_type_for_manual_pick(f, payload.provider, payload.media_type)
         updated += 1
     await session.commit()
     return {"updated": updated, "skipped": len(payload.file_ids) - updated}
@@ -990,7 +1208,7 @@ async def bulk_select_manual_match(
 async def rematch_all(
     background: BackgroundTasks,
     media_type: str | None = None,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=100_000),
     force: bool = False,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, int]:
@@ -1021,7 +1239,7 @@ async def rematch_all(
 # (e.g. because the matcher logic changed in a way that retroactively
 # invalidates old decisions). Stored in the `settings` table so we know
 # whether THIS boot needs to do extra work.
-_HEAL_VERSION = 23  # v23 = ruthless cascade vetoes (Autopsy 10+11): FribbAuthority explicit-season contradiction now vetoes (-1.0) instead of abstaining, and EpisodeCountSanity drops the ≤3-ep floor and vetoes any candidate that fails both the own-count margin AND the Fribb-sibling aggregate. Forces every existing AniDB anime match to be re-evaluated so wrong-season picks (My Hero S06 stuck on S01 AID, 12-ep spin-offs stealing 60-file clusters) get killed on the next heal pass.
+_HEAL_VERSION = 25  # v25 = media_type-from-provider heal: _heal_media_type_from_provider sets media_type=anime for files whose selected match is AniDB (anime-only) but were typed tv/movie by the parser (the "Rent-a-Girlfriend in TV Series" bug — a copy scanned from a release-named folder outside /anime/), recomputing series/variant keys so they re-cluster under anime. v24 = episode-drift self-heal: _heal_episode_number_drift re-matches selected non-manual tv_episode rows whose stored episode_number matches neither the parsed season-local nor absolute episode (the One Piece stale-match class — files parsed as 1156-1160 but Match rows stuck on 1-5). Detection is comparison-only and over-approximate; the real fix is delegated to the ban-aware BATCH loop so cour-routed/absolute remaps re-confirm idempotently while genuine drift heals. v23 = ruthless cascade vetoes (Autopsy 10+11): FribbAuthority explicit-season contradiction now vetoes (-1.0) instead of abstaining, and EpisodeCountSanity drops the ≤3-ep floor and vetoes any candidate that fails both the own-count margin AND the Fribb-sibling aggregate. Forces every existing AniDB anime match to be re-evaluated so wrong-season picks (My Hero S06 stuck on S01 AID, 12-ep spin-offs stealing 60-file clusters) get killed on the next heal pass.
 
 
 async def _heal_anime_fribb_misroutes(session: AsyncSession) -> int:
@@ -1470,6 +1688,197 @@ async def _heal_title_mismatch_matches(session: AsyncSession) -> int:
     return nuked
 
 
+async def _heal_episode_number_drift(session: AsyncSession) -> int:
+    """v24: Re-match TV/anime files whose stored ``Match.episode_number`` no
+    longer agrees with the file's parsed episode — the "stale match" class
+    the user hit on One Piece (the files parse as episodes 1156–1160, but
+    the selected Match rows still said episodes 1–5 from an earlier scan,
+    so the popup showed the wrong episodes).
+
+    Why the existing heals miss it:
+      - The regular BATCH loop triggers on a MISSING ``episode_title`` /
+        ``metadata_blob``. These rows had both — they just pointed at the
+        wrong episode.
+      - ``_reparse_missing_episodes`` only fires when the parser now
+        extracts a DIFFERENT number than before. Here the parser was
+        already right; it's the stored Match that drifted.
+      - ``_trigger_anime_rematch`` only re-touches rows once per version
+        bump, and only for ``media_type == 'anime'``.
+
+    Detection — pure in-memory, no HTTP — a row is suspect when its stored
+    ``episode_number`` matches NEITHER the parsed season-local episode NOR
+    the parsed absolute episode::
+
+        episode_number not in {parsed.episode, parsed.absolute_episode}
+
+    Comparing against BOTH is what keeps correctly-numbered rows out of the
+    suspect set: AniDB-pipeline anime is usually absolute-numbered on disk
+    AND in the Match (``1156 == 1156`` → not flagged), and standard TV is
+    season-local in both (``S01E05`` → ``5 == 5`` → not flagged).
+
+    Crucially we do NOT decide the correct episode here. Number comparison
+    alone cannot distinguish genuine drift (``1156`` wrongly stored as ``1``)
+    from a legitimate remap (a cour-routed file whose season-local episode
+    differs from its absolute on-disk number) — both look like "mismatch".
+    So we only flag "worth re-checking" and NULL the enrichment, letting the
+    regular, ban-aware heal loop re-run each row through the REAL matcher
+    (cour routing + absolute→local mapping and all). That makes a false
+    positive harmless: a correctly cour-routed file is simply re-matched to
+    the same answer (idempotent, no data change), while a genuinely drifted
+    row heals to the right episode.
+
+    Two deliberate safety choices:
+      - ``episode_number`` is LEFT INTACT (only ``episode_title`` +
+        ``metadata_blob`` are nulled to arm the BATCH-loop trigger). If the
+        re-match is deferred during an AniDB ban, a correctly cour-routed
+        row keeps displaying its right episode instead of going blank.
+      - This runs INSIDE the version-gated CAS block, so it's a one-shot.
+        The small set of legitimately-remapped rows that get re-matched
+        once won't be re-flagged (and re-matched) on every subsequent boot.
+
+    Manual pins are never touched.
+    """
+    from sqlalchemy import update as sql_update
+
+    stmt = (
+        select(MediaFile.id, MediaFile.parsed_data, Match.episode_number)
+        .join(Match, Match.media_file_id == MediaFile.id)
+        .where(
+            MediaFile.media_type.in_(("tv", "anime")),
+            MediaFile.parsed_data.is_not(None),
+            Match.is_selected.is_(True),
+            Match.is_manual.is_(False),  # never touch user-pinned rows
+            Match.match_type == "tv_episode",
+        )
+    )
+    drifted_ids: list[int] = []
+    for fid, parsed, ep_no in (await session.execute(stmt)).all():
+        parsed = parsed or {}
+        p_ep = parsed.get("episode")
+        p_abs = parsed.get("absolute_episode")
+        # Need a parsed episode to compare against. The no-episode case is
+        # _reparse_missing_episodes' job, not ours.
+        candidates = {v for v in (p_ep, p_abs) if v is not None}
+        if not candidates:
+            continue
+        # A tv_episode Match with no episode number at all is itself broken;
+        # so is one whose number matches neither parsed value.
+        if ep_no is not None and ep_no in candidates:
+            continue  # stored episode agrees with the file — leave it alone
+        drifted_ids.append(fid)
+
+    if not drifted_ids:
+        return 0
+    # Arm the BATCH-loop trigger (episode_title IS NULL) so each row is
+    # re-matched through the real engine on this same boot — ban-aware,
+    # throttled. Chunk the IN(...) to stay under SQLite's variable cap.
+    for i in range(0, len(drifted_ids), 400):
+        chunk = drifted_ids[i:i + 400]
+        await session.execute(
+            sql_update(Match)
+            .where(Match.media_file_id.in_(chunk), Match.is_selected.is_(True))
+            .values(episode_title=None, metadata_blob=None)
+        )
+    return len(drifted_ids)
+
+
+async def _heal_media_type_from_provider(session: AsyncSession) -> int:
+    """v25: fix MediaFile.media_type for files whose SELECTED match is from
+    AniDB (an anime-only source) but were typed 'tv'/'movie' by the parser.
+
+    Background — the "Rent-a-Girlfriend in TV Series" bug: media_type is decided
+    once at scan time from the path/filename (only `/anime/` paths or fansub
+    groups → "anime"), and a successful AniDB match never corrected it. A copy
+    scanned from a release-named download folder (outside `/anime/`) came out
+    "tv", so it grouped under "TV Series" and split from its anime siblings.
+
+    Since AniDB only catalogues anime, an AniDB match is authoritative: set
+    media_type to "anime" and recompute the series/variant keys off the
+    corrected type so the row re-clusters under its anime identity. Pure
+    in-memory — no provider HTTP."""
+    from kira.matcher.media_type import apply_media_type_and_recompute_keys
+
+    stmt = (
+        select(MediaFile)
+        .join(Match, Match.media_file_id == MediaFile.id)
+        .where(
+            Match.is_selected.is_(True),
+            Match.provider == "anidb",
+            MediaFile.media_type != "anime",
+            MediaFile.parsed_data.is_not(None),
+        )
+    )
+    # CR-05: stream the matched set instead of materializing every row (each
+    # carries the parsed_data JSON blob) at once. `stream_scalars` + `yield_per`
+    # bounds how many ORM instances live in memory per fetch while keeping them
+    # ATTACHED to the session — dirty-tracking still flushes the in-place
+    # mutations on the caller's commit, exactly as the prior `.all()` loop did.
+    fixed = 0
+    result = await session.stream_scalars(stmt.execution_options(yield_per=200))
+    async for mf in result:
+        try:
+            # Helper sets media_type='anime' first, then rebuilds the
+            # ParsedFile (field-filtered) and recomputes series/variant keys.
+            apply_media_type_and_recompute_keys(mf, "anime")
+        except Exception:
+            # Key recompute is best-effort; ensure the grouping fix (the
+            # media_type flip) still lands even if the recompute raised.
+            mf.media_type = "anime"
+        fixed += 1
+    return fixed
+
+
+async def _heal_movie_year_mismatch(session: AsyncSession) -> int:
+    """v25: re-match selected movie rows whose stored year disagrees with the
+    file's PARSED year — the "Nobody 2 (2025) stuck on Nobody (2021)" class.
+
+    Such rows are usually STALE: matched before the parser extracted the year
+    (so the matcher had no temporal anchor and fell back to the more prominent
+    original). NULLing ``metadata_blob`` arms the BATCH-loop movie rematch,
+    which re-runs the real matcher WITH the parsed year so the year metric can
+    pick the right film.
+
+    Safe by the same logic as the episode-drift heal: we don't choose the film
+    here, the matcher does. For a row the matcher confidently picked at a
+    different year (it overrode a wrong filename year), re-matching is
+    idempotent — same parsed year + same provider data → same pick. Only genuinely
+    stale rows actually change. Manual pins are never touched."""
+    from sqlalchemy import update as sql_update
+
+    stmt = (
+        select(MediaFile.id, MediaFile.parsed_data, Match.year)
+        .join(Match, Match.media_file_id == MediaFile.id)
+        .where(
+            MediaFile.media_type == "movie",
+            MediaFile.parsed_data.is_not(None),
+            Match.is_selected.is_(True),
+            Match.is_manual.is_(False),
+            Match.match_type == "movie",
+        )
+    )
+    drifted: list[int] = []
+    for fid, parsed, m_year in (await session.execute(stmt)).all():
+        parsed = parsed or {}
+        p_year = parsed.get("year")
+        if p_year is None or m_year is None:
+            continue  # no year on one side → nothing to compare
+        try:
+            if int(p_year) != int(m_year):
+                drifted.append(fid)
+        except (TypeError, ValueError):
+            continue
+    if not drifted:
+        return 0
+    for i in range(0, len(drifted), 400):
+        chunk = drifted[i:i + 400]
+        await session.execute(
+            sql_update(Match)
+            .where(Match.media_file_id.in_(chunk), Match.is_selected.is_(True))
+            .values(metadata_blob=None)
+        )
+    return len(drifted)
+
+
 async def _trigger_anime_rematch(session: AsyncSession) -> int:
     """v7 cleanup: nullify episode_title + metadata_blob for every anime
     file's selected match so the heal loop picks them up and re-runs
@@ -1615,7 +2024,9 @@ async def _auto_heal_stale_matches() -> None:
     # the DB + providers; lets the user reach a usable Review page first.
     import asyncio
     from kira.providers.anidb import AniDBProvider
+    from kira import activity
     await asyncio.sleep(5)
+    activity.begin("heal", "Healing library matches")
 
     # Cursor pagination — see the loop body below for full rationale.
     # `last_processed_id` advances monotonically through MediaFile.id so
@@ -1730,6 +2141,23 @@ async def _auto_heal_stale_matches() -> None:
                 series_key_n = await _recompute_series_keys(session)
                 if series_key_n:
                     print(f"auto_heal: recomputed series_key for {series_key_n} files with year/parent disambiguator.")
+                # v24: re-match files whose stored episode_number drifted away
+                # from the file's parsed episode (the One Piece stale-match
+                # class). Pure in-memory detection; arms the BATCH loop to do
+                # the real, ban-aware rematch below.
+                drift_n = await _heal_episode_number_drift(session)
+                if drift_n:
+                    print(f"auto_heal: flagged {drift_n} episode-drifted matches for rematch.")
+                # v25: AniDB-matched files that the parser typed non-anime get
+                # corrected to media_type=anime so they leave the TV Series group.
+                mt_n = await _heal_media_type_from_provider(session)
+                if mt_n:
+                    print(f"auto_heal: corrected media_type=anime for {mt_n} AniDB-matched file(s).")
+                # v25: re-match movies whose stored year != parsed year (stale
+                # fallback to the wrong-year film, e.g. Nobody 2 → Nobody 2021).
+                myr_n = await _heal_movie_year_mismatch(session)
+                if myr_n:
+                    print(f"auto_heal: flagged {myr_n} year-mismatched movie(s) for rematch.")
                 await session.commit()
             except Exception as e:
                 # R2-H2 caveat: the CAS already bumped the version row, so
@@ -1746,6 +2174,7 @@ async def _auto_heal_stale_matches() -> None:
                     await session.commit()
                 except Exception:
                     pass
+        total_healed = 0
         while True:
             # Find files where the selected match exists, is TV/anime, and
             # has no episode_title OR no metadata_blob. Pull the file's
@@ -1864,12 +2293,27 @@ async def _auto_heal_stale_matches() -> None:
                         continue
                     await _rematch_one(fresh, engine, session)
                     await session.commit()
+                    total_healed += 1
+                    activity.progress("heal", total_healed)
                 except Exception as e:
                     print(f"auto_heal: file {fid} failed: {e!r}")
                     await session.rollback()
             # Yield between batches so request handlers stay responsive.
             await asyncio.sleep(1.0)
         print("auto_heal: done.")
+        activity.end("heal")
+        if total_healed > 0:
+            try:
+                from kira.models import Notification
+                async with SessionLocal() as n_sess:
+                    n_sess.add(Notification(
+                        kind="info",
+                        title=f"Auto-heal: {total_healed} file{'s' if total_healed != 1 else ''} refreshed",
+                        body="Stale matches were automatically re-matched with the latest engine.",
+                    ))
+                    await n_sess.commit()
+            except Exception:
+                pass
 
 
 async def _bulk_rematch_worker(fids: list[int], force: bool = False) -> None:
@@ -1891,6 +2335,8 @@ async def _bulk_rematch_worker(fids: list[int], force: bool = False) -> None:
     from kira.providers.anidb import AniDBProvider
     CALL_YIELD = 10  # yield to foreground after this many AniDB calls
     SETTLE_SLEEP = 0.5  # how long to step aside
+    done = 0
+    failed = 0
     async with SessionLocal() as session, httpx.AsyncClient() as client:
         engine = MatchEngine(await registry_from_settings(client))
         last_call_mark = AniDBProvider._http_call_count
@@ -1900,12 +2346,25 @@ async def _bulk_rematch_worker(fids: list[int], force: bool = False) -> None:
                 if mf:
                     await _rematch_one(mf, engine, session, force=force)
                     await session.commit()
+                    done += 1
             except Exception as e:
                 print(f"bulk_rematch: file {fid} failed: {e!r}")
                 await session.rollback()
-            # Yield once we've crossed the CALL_YIELD threshold since our
-            # last yield. Tracks the global counter so multiple bulk
-            # workers (rare but possible) cooperate naturally.
+                failed += 1
             if AniDBProvider._http_call_count - last_call_mark >= CALL_YIELD:
                 await asyncio.sleep(SETTLE_SLEEP)
                 last_call_mark = AniDBProvider._http_call_count
+    try:
+        from kira.models import Notification
+        async with SessionLocal() as n_sess:
+            parts = [f"{done} file{'s' if done != 1 else ''} re-matched"]
+            if failed:
+                parts.append(f"{failed} failed")
+            n_sess.add(Notification(
+                kind="success" if not failed else "warning",
+                title=f"Rematch complete: {', '.join(parts)}",
+                body="Open Review to see the updated matches.",
+            ))
+            await n_sess.commit()
+    except Exception:
+        pass

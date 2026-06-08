@@ -326,23 +326,45 @@ def test_parent_walk_unwinds_through_artifacts(tmp_path: Path) -> None:
     assert library.exists()
 
 
-def test_parent_walk_stops_at_user_content(tmp_path: Path) -> None:
-    """A folder with a poster + a user file → sweep removes the poster
-    but rmdir fails because the user file remains. Walk stops there,
-    counts what it cleaned."""
+def test_parent_walk_preserves_artifacts_in_surviving_folder(tmp_path: Path) -> None:
+    """DATA-LOSS FIX: a folder with a poster + a user file is NOT
+    artifacts-only, so cleanup deletes NOTHING and leaves the poster intact.
+
+    Pre-fix the sweep ran before the rmdir check, so it stripped poster.jpg
+    even though the folder survived (rmdir failed on the user file) — silent
+    loss of a file the user might care about. Now: no removal at all when any
+    real content remains."""
     library = tmp_path / "media"
     show = library / "Show"
-    _touch(show / "poster.jpg")
+    poster = _touch(show / "poster.jpg")
     user_file = _touch(show / "user-notes.txt")
 
     count = _cleanup_empty_source_parents(
         show, stop_at=library, max_levels=2,
     )
 
-    assert count == 1  # poster.jpg got swept
-    assert show.exists()        # rmdir refused (still has user-notes.txt)
+    assert count == 0            # nothing deleted — folder isn't artifacts-only
+    assert show.exists()         # folder kept (has user content)
     assert user_file.exists()    # never touched
-    assert not (show / "poster.jpg").exists()  # artifact gone
+    assert poster.exists()       # FIX: artifact preserved because the folder survives
+
+
+def test_freeform_user_image_preserved_when_folder_has_content(tmp_path: Path) -> None:
+    """A user's free-form 'tour-poster.jpg' (which DOES match the broad
+    per-file artifact regex) must not be deleted while its folder still holds
+    real content — the data-loss class the audit flagged."""
+    library = tmp_path / "media"
+    show = library / "Concert Films"
+    art = _touch(show / "tour-poster.jpg")      # matches _PER_FILE_ARTIFACT_RE
+    keep = _touch(show / "Concert.2024.1080p.mkv")
+
+    count = _cleanup_empty_source_parents(
+        show, stop_at=library, max_levels=2,
+    )
+
+    assert count == 0
+    assert art.exists()          # preserved — folder is not artifacts-only
+    assert keep.exists()
 
 
 def test_parent_walk_stops_at_library_root(tmp_path: Path) -> None:
@@ -520,3 +542,50 @@ def test_execute_op_hardlink_with_same_inode_unlinks_and_cleans(tmp_path: Path) 
     assert dst.exists()
     assert cleaned == 1
     assert not show.exists()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Recycle / trash instead of hard delete — swept artifacts are MOVED to a
+# managed trash folder so a mistaken sweep stays recoverable.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_cleanup_artifacts_trash_moves_not_deletes(tmp_path: Path) -> None:
+    """With a trash_root, swept artifacts (files + artifact dirs) leave the
+    source folder but land in the trash, recoverable — not destroyed."""
+    src = tmp_path / "Show" / "Season 01"
+    _touch(src / "poster.jpg", "img")
+    _touch(src / "tvshow.nfo", "<nfo/>")
+    (src / ".actors").mkdir(parents=True, exist_ok=True)
+    _touch(src / ".actors" / "a.jpg", "x")
+    trash = tmp_path / ".kira-trash"
+
+    removed = _cleanup_media_server_artifacts(src, trash_root=trash)
+
+    assert removed == 3  # poster + nfo + .actors dir
+    assert not (src / "poster.jpg").exists()
+    assert not (src / "tvshow.nfo").exists()
+    assert not (src / ".actors").exists()
+    # Recoverable: each item is in the trash, name prefixed by its source folder.
+    trashed = {p.name for p in trash.iterdir()}
+    assert any("poster.jpg" in n for n in trashed)
+    assert any("tvshow.nfo" in n for n in trashed)
+    assert any("actors" in n for n in trashed)
+
+
+def test_cleanup_trash_collision_gets_suffix(tmp_path: Path) -> None:
+    """Two same-named artifacts whose source folders share a name don't clobber
+    each other in the trash — the second gets a numeric suffix, both survive."""
+    trash = tmp_path / ".kira-trash"
+    a = tmp_path / "x" / "Show"   # parent.name == "Show"
+    b = tmp_path / "y" / "Show"   # parent.name == "Show" → same trash base
+    _touch(a / "poster.jpg", "one")
+    _touch(b / "poster.jpg", "two")
+
+    _cleanup_media_server_artifacts(a, trash_root=trash)
+    _cleanup_media_server_artifacts(b, trash_root=trash)
+
+    files = sorted(p.name for p in trash.iterdir())
+    assert len(files) == 2  # both preserved
+    contents = sorted((trash / f).read_text() for f in files)
+    assert contents == ["one", "two"]

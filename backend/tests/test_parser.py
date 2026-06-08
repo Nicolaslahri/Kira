@@ -98,6 +98,33 @@ CASES: list[tuple[str, dict]] = [
     # still extracted, type stays "unknown" (no year/SxE/path to justify movie).
     ("Movie.Name.mkv",
      {"media_type": "unknown", "title": "Movie Name", "year": None}),
+
+    # ── Audit fixes ───────────────────────────────────────────────────────
+    # GLUED multi-episode (no separator between the two E-codes). Was dropping
+    # the second episode entirely (imported a 2-parter as a single episode).
+    ("Severance.S01E01E02.1080p.mkv",
+     {"media_type": "tv", "season": 1, "episode": 1, "episode_end": 2}),
+    ("Show.S03E10E11.mkv",
+     {"media_type": "tv", "season": 3, "episode": 10, "episode_end": 11}),
+
+    # P4 must NOT overload the dash-number as both episode AND absolute when a
+    # SEPARATE bracket-absolute is present: the dash-number is the season-local
+    # episode (12), the bracket is the real absolute (36). Previously abs=12 and
+    # the real [36] was discarded.
+    ("[Moozzi2] Kanojo Okarishimasu S3 - 12 [36].mkv",
+     {"media_type": "anime", "episode": 12, "absolute_episode": 36}),
+
+    # No bracket → the dash-number IS the absolute for a pure long-runner
+    # (regression guard so the fix above didn't break the common anime shape).
+    ("[SubsPlease] One Piece - 1156 (1080p).mkv",
+     {"media_type": "anime", "episode": 1156, "absolute_episode": 1156}),
+
+    # Movie sequels must stay movies — the trailing number is part of the title,
+    # never an episode/absolute (regression guards for the padding/no-dash rules).
+    ("John.Wick.Chapter.4.2023.1080p.mkv",
+     {"media_type": "movie", "episode": None, "absolute_episode": None, "year": 2023}),
+    ("Spider-Man.2.2004.mkv",
+     {"media_type": "movie", "episode": None, "title": "Spider-Man 2", "year": 2004}),
 ]
 
 
@@ -110,6 +137,15 @@ def test_parse(filename: str, expected: dict) -> None:
             f"{filename}: field {key!r} expected {want!r}, got {got!r} "
             f"(full parse: {actual.to_dict()})"
         )
+
+
+def test_degenerate_filenames_do_not_crash() -> None:
+    """Empty / extension-only / dot names must parse to a harmless 'unknown'
+    ParsedFile, never raise (audit: empty-stem)."""
+    for fn in ("", ".mkv", "...", "   .mkv"):
+        r = parse_filename(fn)
+        assert r.media_type == "unknown"
+        assert r.season is None and r.episode is None
 
 
 def test_year_is_never_in_title() -> None:

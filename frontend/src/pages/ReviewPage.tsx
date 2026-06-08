@@ -47,6 +47,11 @@ export function ReviewPage({
   // those so the user can sweep through them.
   const [statusF, setStatusF] = useState<'pending' | 'no_match' | 'approved' | 'rejected' | 'renamed' | 'all'>('pending');
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  // In-flight flag for the approve-&-rename actions. Drives the buttons'
+  // loading spinner so a multi-hundred-ms rename doesn't look like a dead
+  // click. A single boolean is enough — the UI only needs "is a rename
+  // happening", not which one.
+  const [renaming, setRenaming] = useState(false);
 
   // ── Apply filters to flat files first, then group into LibraryItems ────
   const visibleFiles = useMemo(() => {
@@ -117,28 +122,41 @@ export function ReviewPage({
   // and the popup's stored id no longer points anywhere. Without the
   // fallback, the popup stays frozen showing "Just imported" forever
   // even though the real file row is sitting in the new cluster.
+  // Index file-id → its current LibraryItem so the popup re-sync fallback is
+  // O(popup's files) instead of re-scanning every cluster's files each tick.
+  const fileIdToItem = useMemo(() => {
+    const m = new Map<string, LibraryItem>();
+    for (const it of allItemsById.values())
+      for (const f of it.files) m.set(f.id, it);
+    return m;
+  }, [allItemsById]);
+
   useEffect(() => {
     if (!popup) return;
     let fresh = allItemsById.get(popup.item.id);
     if (!fresh) {
-      // Look for any item whose seriesKey matches AND has at least
-      // one file in common with the popup's current item. The file-
-      // overlap check guards against false positives in case multiple
-      // clusters happen to share a seriesKey (rare but possible).
-      const oldFileIds = new Set(popup.item.files.map(f => f.id));
-      for (const it of allItemsById.values()) {
-        if (popup.item.seriesKey
-            && it.seriesKey === popup.item.seriesKey
-            && it.files.some(f => oldFileIds.has(f.id))) {
-          fresh = it;
-          break;
-        }
+      // The item id is `lib_<seriesKey>_<provider>_<providerId>`, so a manual
+      // re-match (which flips provider/providerId) CHANGES the id — and movies
+      // have no seriesKey (Nobody 2). Match instead by FILE-ID OVERLAP: the
+      // popup's files are stable across re-matches (only their match changes),
+      // so whichever cluster now holds the most of them IS the fresh item.
+      // This re-syncs movies, id-changed clusters, and even media_type shifts
+      // (e.g. a file moving TV → Anime after pinning an AniDB show).
+      const overlapByItem = new Map<LibraryItem, number>();
+      for (const f of popup.item.files) {
+        const it = fileIdToItem.get(f.id);
+        if (it) overlapByItem.set(it, (overlapByItem.get(it) ?? 0) + 1);
       }
+      let bestOverlap = 0;
+      for (const [it, n] of overlapByItem) {
+        if (n > bestOverlap) { bestOverlap = n; fresh = it; }
+      }
+      if (bestOverlap === 0) fresh = undefined;
     }
     if (fresh && fresh !== popup.item) {
       setPopup(p => p ? { ...p, item: fresh as LibraryItem } : p);
     }
-  }, [allItemsById, popup]);
+  }, [allItemsById, popup, fileIdToItem]);
 
   // User feedback: do NOT auto-switch tabs after a rename. The previous
   // behavior jumped to the "Renamed" filter automatically, which was
@@ -231,7 +249,15 @@ export function ReviewPage({
     if (renameFilesDirectly) await renameFilesDirectly(ids);
   };
   const rejectItem = (item: LibraryItem) => {
-    void setFileStatusBulk(item.files.map(f => f.id), 'rejected');
+    const ids = item.files.map(f => f.id);
+    void setFileStatusBulk(ids, 'rejected');
+    // Reject was the one mutation with no success feedback — approve renames
+    // (which toasts), manual match toasts, but a reject just silently greyed
+    // the card. Confirm it landed.
+    pushToast?.({
+      title: `Rejected ${ids.length === 1 ? item.title || 'item' : `${ids.length} files`}`,
+      kind: 'error',
+    });
   };
   const manualSearchItem = (item: LibraryItem, _epIdx?: number | null, fileIdx?: number | null) => {
     // Choose the file to seed the Manual Search modal with. When the user
@@ -250,8 +276,12 @@ export function ReviewPage({
     setPopup(p => p && p.item.id === next.id ? { ...p, item: next } : p);
     const prev = popup?.item;
     if (!prev) return;
-    next.files.forEach((nf, i) => {
-      const pf = prev.files[i];
+    // Diff by file id, not array position — a re-match/reorder between
+    // snapshots could otherwise compare a file against an unrelated sibling
+    // and fire a status change against the wrong file.
+    const prevById = new Map(prev.files.map(f => [f.id, f]));
+    next.files.forEach((nf) => {
+      const pf = prevById.get(nf.id);
       if (pf && pf.status !== nf.status) {
         if (nf.status === 'approved' || nf.status === 'rejected' || nf.status === 'pending') {
           void setFileStatus(nf.id, nf.status);
@@ -307,9 +337,13 @@ export function ReviewPage({
               color="primary"
               size="md"
               iconLeading={IcPlay}
+              isLoading={renaming}
+              showTextWhileLoading
               onClick={async () => {
                 const ids = state.files.filter(f => f.status === 'approved').map(f => f.id);
-                if (ids.length && renameFilesDirectly) await renameFilesDirectly(ids);
+                if (!ids.length || !renameFilesDirectly) return;
+                setRenaming(true);
+                try { await renameFilesDirectly(ids); } finally { setRenaming(false); }
               }}
             >
               Rename {statusCounts.approved} approved
@@ -352,8 +386,8 @@ export function ReviewPage({
             <FilterPill on={type === 'all'}   onClick={() => setType('all')}   label="All media" />
             <FilterPill on={type === 'movie'} onClick={() => setType('movie')} label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3"><IcFilm />Movies</span>}  num={counts.movie} />
             <FilterPill on={type === 'tv'}    onClick={() => setType('tv')}    label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3"><IcTv />TV</span>}      num={counts.tv} />
-            <FilterPill on={type === 'anime'} onClick={() => setType('anime')} label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3" style={{ color: type === 'anime' ? '#c89bff' : undefined }}><IcAnime />Anime</span>} num={counts.anime} />
-            <FilterPill on={type === 'music'} onClick={() => setType('music')} label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3" style={{ color: type === 'music' ? '#ffb14a' : undefined }}><IcMusic />Music</span>} num={counts.music} />
+            <FilterPill on={type === 'anime'} onClick={() => setType('anime')} label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3" style={{ color: type === 'anime' ? 'var(--media-anime)' : undefined }}><IcAnime />Anime</span>} num={counts.anime} />
+            <FilterPill on={type === 'music'} onClick={() => setType('music')} label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3" style={{ color: type === 'music' ? 'var(--media-music)' : undefined }}><IcMusic />Music</span>} num={counts.music} />
           </FilterGroup>
         </div>
       </div>
@@ -378,8 +412,10 @@ export function ReviewPage({
               size="sm"
               iconLeading={IcX}
               onClick={() => {
+                const n = selectedFileIds.length;
                 void setFileStatusBulk(selectedFileIds, 'rejected');
                 setSelected(new Set());
+                pushToast?.({ title: `Rejected ${n} file${n === 1 ? '' : 's'}`, kind: 'error' });
               }}
             >Reject</Button>
 
@@ -404,13 +440,20 @@ export function ReviewPage({
               color="primary"
               size="sm"
               iconLeading={IcCheck}
+              isLoading={renaming}
+              showTextWhileLoading
               onClick={async () => {
                 // Approve + rename in one shot using saved profile + op.
                 const ids = selectedFileIds;
                 if (!ids.length) return;
-                await setFileStatusBulk(ids, 'approved');
-                if (renameFilesDirectly) await renameFilesDirectly(ids);
-                setSelected(new Set());
+                setRenaming(true);
+                try {
+                  await setFileStatusBulk(ids, 'approved');
+                  if (renameFilesDirectly) await renameFilesDirectly(ids);
+                  setSelected(new Set());
+                } finally {
+                  setRenaming(false);
+                }
               }}
             >Approve &amp; rename ({selectedFileIds.length})</Button>
           </div>

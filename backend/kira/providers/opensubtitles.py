@@ -14,14 +14,23 @@ without any network.
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
 import httpx
 
+from kira.download_guard import fetch_capped, looks_like_error_page
+
 from kira.providers.base import KIRA_USER_AGENT
 
+_log = logging.getLogger("kira.opensubtitles")
+
 _BASE_URL = "https://api.opensubtitles.com/api/v1"
+
+# A subtitle file is small text; cap the download so a hostile/oversized CDN
+# payload can't exhaust memory or fill the disk (unbounded-download guard).
+_MAX_SUB_BYTES = 8 * 1024 * 1024
 
 
 def parse_identity(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -83,6 +92,86 @@ def parse_identity(payload: dict[str, Any]) -> dict[str, Any] | None:
     return ident
 
 
+def parse_subtitle_candidates(payload: dict[str, Any], languages: list[str] | None = None
+                              ) -> list[dict[str, Any]]:
+    """Flatten a `/subtitles` response into ranked download candidates.
+
+    Each candidate: {file_id, language, moviehash_match, downloads, release}.
+    Ranked best-first: an exact `moviehash_match` (sync-guaranteed) wins, then
+    higher download count (community-vetted). When `languages` is given, only
+    those (lowercased) survive. Pure — no I/O."""
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return []
+    langs = {l.lower() for l in languages} if languages else None
+    out: list[dict[str, Any]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        attrs = entry.get("attributes") or {}
+        if not isinstance(attrs, dict):
+            continue
+        lang = (attrs.get("language") or "").lower() or None
+        if langs and lang not in langs:
+            continue
+        files = attrs.get("files")
+        if not isinstance(files, list) or not files:
+            continue
+        fid = files[0].get("file_id") if isinstance(files[0], dict) else None
+        if fid is None:
+            continue
+        out.append({
+            "file_id": fid,
+            "language": lang or "en",
+            "moviehash_match": attrs.get("moviehash_match") is True,
+            "downloads": _safe_int(attrs.get("download_count")) or 0,
+            "release": attrs.get("release") or "",
+        })
+    out.sort(key=lambda c: (c["moviehash_match"], c["downloads"]), reverse=True)
+    return out
+
+
+def pick_best_per_language(candidates: list[dict[str, Any]],
+                           languages: list[str]) -> dict[str, dict[str, Any]]:
+    """First (best-ranked) candidate per requested language. Pure."""
+    best: dict[str, dict[str, Any]] = {}
+    for lang in (l.lower() for l in languages):
+        for c in candidates:
+            if c["language"] == lang:
+                best[lang] = c
+                break
+    return best
+
+
+def parse_download_link(payload: dict[str, Any]) -> str | None:
+    """Pull the temporary download URL from a `/download` response. Pure."""
+    if not isinstance(payload, dict):
+        return None
+    link = payload.get("link")
+    return link if isinstance(link, str) and link else None
+
+
+def parse_login_token(payload: dict[str, Any]) -> str | None:
+    """Pull the JWT from a `/login` response. Pure."""
+    if not isinstance(payload, dict):
+        return None
+    tok = payload.get("token")
+    return tok if isinstance(tok, str) and tok else None
+
+
+# Canonical sidecar naming now lives in the neutral subtitles.naming module so
+# the subtitle SOURCES don't depend on this provider for a generic path helper.
+# Re-exported here for backward compatibility with existing importers.
+from kira.subtitles.naming import subtitle_sidecar_name  # noqa: E402
+
+
+def _safe_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 class OpenSubtitlesClient:
     """Thin async client. No-op (returns None) when no api_key is configured."""
 
@@ -119,8 +208,204 @@ class OpenSubtitlesClient:
             r.raise_for_status()
             return parse_identity(r.json())
         except Exception as e:  # network / decode / HTTP — degrade gracefully
-            print(f"opensubtitles: identify_by_hash failed: {e!r}")
+            _log.warning("identify_by_hash failed: %r", e)
             return None
+
+    def _headers(self, token: str | None = None) -> dict[str, str]:
+        h = {
+            "Api-Key": self.api_key,
+            "User-Agent": self.app_name,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        if token:
+            h["Authorization"] = f"Bearer {token}"
+        return h
+
+    async def login(self, username: str, password: str) -> str | None:
+        """Exchange username/password for a JWT (needed for downloads — they
+        count against the user's daily quota). None on failure. Never raises."""
+        if not self.api_key or not username or not password:
+            return None
+        try:
+            r = await self.client.post(
+                f"{_BASE_URL}/login",
+                json={"username": username, "password": password},
+                headers=self._headers(), timeout=20.0,
+            )
+            r.raise_for_status()
+            return parse_login_token(r.json())
+        except Exception as e:
+            _log.warning("login failed: %r", e)
+            return None
+
+    async def search(self, *, moviehash: str | None = None, moviebytesize: int | None = None,
+                     tmdb_id: int | None = None, imdb_id: int | None = None,
+                     query: str | None = None, season: int | None = None,
+                     episode: int | None = None, languages: list[str] | None = None
+                     ) -> list[dict[str, Any]]:
+        """Search `/subtitles`. Hash-first when a moviehash is given, with
+        id/name params layered on so the API can fall back. Returns ranked
+        candidates (parse_subtitle_candidates). [] on any failure."""
+        if not self.api_key:
+            return []
+        params: dict[str, str] = {}
+        if moviehash:
+            params["moviehash"] = moviehash
+        if moviebytesize:
+            params["moviebytesize"] = str(moviebytesize)
+        if tmdb_id:
+            params["tmdb_id"] = str(tmdb_id)
+        if imdb_id:
+            params["imdb_id"] = str(imdb_id)
+        if query:
+            params["query"] = query
+        if season is not None:
+            params["season_number"] = str(season)
+        if episode is not None:
+            params["episode_number"] = str(episode)
+        if languages:
+            params["languages"] = ",".join(sorted(l.lower() for l in languages))
+        if not params:
+            return []
+        try:
+            r = await self.client.get(
+                f"{_BASE_URL}/subtitles", params=params,
+                headers={"Api-Key": self.api_key, "User-Agent": self.app_name,
+                         "Accept": "application/json"},
+                timeout=20.0,
+            )
+            r.raise_for_status()
+            return parse_subtitle_candidates(r.json(), languages)
+        except Exception as e:
+            _log.warning("search failed: %r", e)
+            return []
+
+    async def download_link(self, file_id: int, token: str | None = None) -> str | None:
+        """POST `/download` to get the temporary URL for a subtitle file. None
+        on failure. Never raises."""
+        if not self.api_key:
+            return None
+        try:
+            r = await self.client.post(
+                f"{_BASE_URL}/download", json={"file_id": file_id},
+                headers=self._headers(token), timeout=20.0,
+            )
+            r.raise_for_status()
+            return parse_download_link(r.json())
+        except Exception as e:
+            _log.warning("download_link failed: %r", e)
+            return None
+
+
+async def fetch_and_save_subtitles(
+    path: str | os.PathLike,
+    *,
+    api_key: str | None,
+    client: httpx.AsyncClient,
+    languages: list[str],
+    username: str | None = None,
+    password: str | None = None,
+    tmdb_id: int | None = None,
+    imdb_id: int | None = None,
+    season: int | None = None,
+    episode: int | None = None,
+) -> list[str]:
+    """End-to-end subtitle fetch for one video. Hash-first search (falls back to
+    tmdb/imdb id + season/episode), best candidate per language, download, write
+    `<stem>.<lang>.srt` beside the video. Returns the saved sidecar paths.
+
+    Best-effort and key/credential-gated: no key → []. Download needs login
+    creds (OpenSubtitles quota); without them search still runs but nothing is
+    saved. Never raises — a subtitle failure must not affect the rename."""
+    import os as _os
+    from pathlib import Path
+
+    if not api_key or not languages:
+        return []
+
+    # Exists-before-search: drop languages whose sidecar is already on disk, and
+    # if NONE remain, return BEFORE spending an OpenSubtitles search/quota (the
+    # per-language dest check previously ran only AFTER search + download_link,
+    # so a fully-subtitled file still burned a search request every scan).
+    languages = [
+        lang for lang in languages
+        # Skip a language that already has ANY sidecar on disk — `.srt` from a
+        # prior OpenSubtitles run, or `.ass`/`.vtt` from embedded extraction —
+        # so the two sources compose without downloading a duplicate.
+        if not any(
+            Path(path).with_name(subtitle_sidecar_name(path, lang, ext=e)).exists()
+            for e in ("srt", "ass", "vtt")
+        )
+    ]
+    if not languages:
+        return []
+
+    os_client = OpenSubtitlesClient(api_key, client)
+
+    moviehash = None
+    bytesize = None
+    try:
+        from kira.providers._osdbhash import compute_osdb_hash
+        moviehash = compute_osdb_hash(path)
+        bytesize = _os.path.getsize(path)
+    except Exception:
+        pass
+
+    candidates = await os_client.search(
+        moviehash=moviehash, moviebytesize=bytesize,
+        tmdb_id=tmdb_id, imdb_id=imdb_id, season=season, episode=episode,
+        languages=languages,
+    )
+    if not candidates:
+        return []
+    best = pick_best_per_language(candidates, languages)
+    if not best:
+        return []
+
+    token = await os_client.login(username, password) if (username and password) else None
+
+    saved: list[str] = []
+    for lang, cand in best.items():
+        link = await os_client.download_link(cand["file_id"], token)
+        if not link:
+            continue
+        try:
+            # The download link comes from OpenSubtitles' JSON, so route it
+            # through the SSRF guard and stream it under a hard size cap.
+            fetched = await fetch_capped(client, link, max_bytes=_MAX_SUB_BYTES, timeout=30.0)
+            if not fetched:
+                continue
+            content, ct = fetched
+            # Reject a 200-OK error page (OpenSubtitles / its CDN sometimes
+            # serves an HTML notice or JSON error with status 200) — otherwise
+            # it'd be written as a permanent, corrupt .srt that's never retried.
+            if looks_like_error_page(content, ct):
+                _log.info("%s download was a non-subtitle payload (HTML/JSON), skipping", lang)
+                continue
+            dest = Path(path).with_name(subtitle_sidecar_name(path, lang))
+            # Don't clobber an existing sub, and never follow a symlink planted
+            # at the sidecar path (could redirect the write outside the library).
+            if dest.exists() or dest.is_symlink():
+                continue
+            # Atomic: write to a sibling .part then rename, so a crash mid-write
+            # never leaves a half-written sidecar.
+            tmp = dest.with_name(dest.name + ".part")
+            try:
+                if tmp.is_symlink():
+                    tmp.unlink()
+                tmp.write_bytes(content)
+                _os.replace(tmp, dest)
+            except Exception:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+            saved.append(str(dest))
+        except Exception as e:
+            _log.warning("save %s failed: %r", lang, e)
+    return saved
 
 
 async def identify_file_by_hash(

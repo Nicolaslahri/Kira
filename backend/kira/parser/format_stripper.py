@@ -30,12 +30,23 @@ SOURCES = [
     "DVBRip", "SATRip", "TVRip", "VODRip", "DSR",
     "HDCAM", "HDTS", "TELESYNC", "TELECINE", "WORKPRINT", "SCREENER",
     "CAM", "TC", "PPV",
-    "AMZN", "ATVP", "DSNP", "HULU", "NFLX", "PCOK", "PMTP", "CRAV",
 ]
+# Streaming PLATFORM tags — the service a web release came from. These are NOT a
+# source TYPE: a file is `AMZN WEB-DL`, where WEB-DL is the delivery method and
+# AMZN is the platform. They're stripped from titles like any tech token, but a
+# platform tag DEFINES the source only when no real delivery type is present, in
+# which case it implies WEB-DL (a platform tag alone is virtually always a web
+# download). Keeping them in SOURCES made "...AMZN.WEB-DL..." store source=AMZN
+# (whichever matched first), which the dedupe ranker doesn't recognize — so a
+# real WEB-DL mis-ranked below a WEBRip.
+PLATFORMS = ["AMZN", "ATVP", "DSNP", "HULU", "NFLX", "PCOK", "PMTP", "CRAV"]
 # Sources that double as ordinary English when title-cased ("Max", "Ts", "Nf",
 # "Bd", "Stan"). Matched case-SENSITIVELY (must be ALL-CAPS) AND must be
 # preceded by a separator so they can't be the first token of a filename.
 SOURCES_AMBIGUOUS = ["HMAX", "MAX", "NF", "TS", "BD", "STAN"]
+# The ALL-CAPS-ambiguous tokens that are actually streaming platforms (HBO Max,
+# Netflix, Stan) → like PLATFORMS, they imply WEB-DL rather than being a source.
+_STREAMING_AMBIG = {"HMAX", "NF", "STAN"}
 
 CODECS = [
     "x265", "x264", "x266", "H\\.265", "H\\.264", "H\\.266",
@@ -145,9 +156,12 @@ _LEFT_SEP_NOSTART = r"(?<=[ \[\]\(\)._\-+])"
 _RIGHT_SEP        = r"(?=$|[ \[\]\(\)._\-+])"
 
 
-# Curated snapshots — extras from scene-rules.json fold ON TOP of these in
-# `_build()`. Keeping the originals means `reload_rules()` rebuilds from a clean
-# base rather than re-merging an already-merged table.
+# In-code defaults — the guaranteed fallback. Phase 17 ships the SAME tables as
+# `release_tokens.json` (loaded as the editable BASE); these literals are what we
+# fall back to if that file is missing or malformed, so the parser never breaks
+# on a bad data file. Extras from scene-rules.json fold ON TOP of the base in
+# `_build()`. Snapshotting here means `reload_rules()` rebuilds from a clean base
+# rather than re-merging an already-merged table.
 _CURATED: dict[str, list[str]] = {
     "sources":       list(SOURCES),
     "codecs":        list(CODECS),
@@ -158,6 +172,37 @@ _CURATED: dict[str, list[str]] = {
     "hdr":           list(HDR),
     "release_flags": list(RELEASE_FLAGS),
 }
+# These tables don't take user extras (they're structural), but Phase 17 still
+# lets the shipped JSON retune them — pristine in-code fallbacks live here.
+_DEFAULT_BIT_DEPTH = list(BIT_DEPTH)
+_DEFAULT_SOURCES_AMBIGUOUS = list(SOURCES_AMBIGUOUS)
+_DEFAULT_WXH_TO_P = dict(_WXH_TO_P)
+
+# Shipped base-table data file (co-located with this module). Edit it to retune
+# the curated tables globally without touching code.
+import json as _json
+from pathlib import Path as _Path
+_BASE_TABLE_FILE = _Path(__file__).resolve().parent / "release_tokens.json"
+
+
+def _load_base_tables() -> dict:
+    """Load the shipped base token tables (Phase 17). Returns {} (→ the in-code
+    literals act as defaults) when the file is missing / unreadable / malformed,
+    so a bad data file can never break parsing."""
+    try:
+        if _BASE_TABLE_FILE.exists():
+            data = _json.loads(_BASE_TABLE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"format_stripper: base token file unreadable ({e!r}); using in-code defaults")
+    return {}
+
+
+def _base_list(loaded: dict, key: str, fallback: list[str]) -> list[str]:
+    """A base table from the JSON file, or the in-code fallback when absent/empty."""
+    v = loaded.get(key)
+    return [str(x) for x in v] if isinstance(v, list) and v else list(fallback)
 
 
 def _merge_extra(curated: list[str], extra: set[str]) -> list[str]:
@@ -205,19 +250,32 @@ def _build() -> None:
     regex globals in place.
     """
     global SOURCES, CODECS, RESOLUTIONS, AUDIO, SUBTITLES, EDITIONS, HDR, RELEASE_FLAGS
-    global _RESOLUTION_RE, _RESOLUTION_WXH_RE, _SOURCE_RE, _CODEC_RE, _AUDIO_RE
+    global SOURCES_AMBIGUOUS, BIT_DEPTH, _WXH_TO_P
+    global _RESOLUTION_RE, _RESOLUTION_WXH_RE, _SOURCE_RE, _PLATFORM_RE, _CODEC_RE, _AUDIO_RE
     global _SUBTITLES_RE, _EDITION_RE, _HDR_RE, _BIT_DEPTH_RE
     global _SOURCE_AMBIG_RE, _RELEASE_FLAGS_RE, _ALL_KNOWN
 
+    # Phase 17: shipped JSON is the editable BASE (falls back to the in-code
+    # _CURATED / _DEFAULT_* literals); user scene-rules extras fold ON TOP.
+    base = _load_base_tables()
     extras = _load_extras()
-    SOURCES       = _merge_extra(_CURATED["sources"],       extras.get("sources", set()))
-    CODECS        = _merge_extra(_CURATED["codecs"],        extras.get("codecs", set()))
-    RESOLUTIONS   = _merge_extra(_CURATED["resolutions"],   extras.get("resolutions", set()))
-    AUDIO         = _merge_extra(_CURATED["audio"],         extras.get("audio", set()))
-    SUBTITLES     = _merge_extra(_CURATED["subtitles"],     extras.get("subtitles", set()))
-    EDITIONS      = _merge_extra(_CURATED["editions"],      extras.get("editions", set()))
-    HDR           = _merge_extra(_CURATED["hdr"],           extras.get("hdr", set()))
-    RELEASE_FLAGS = _merge_extra(_CURATED["release_flags"], extras.get("release_flags", set()))
+
+    def _eg(key: str) -> set[str]:
+        return extras.get(key, set())
+
+    SOURCES       = _merge_extra(_base_list(base, "sources",       _CURATED["sources"]),       _eg("sources"))
+    CODECS        = _merge_extra(_base_list(base, "codecs",        _CURATED["codecs"]),         _eg("codecs"))
+    RESOLUTIONS   = _merge_extra(_base_list(base, "resolutions",   _CURATED["resolutions"]),    _eg("resolutions"))
+    AUDIO         = _merge_extra(_base_list(base, "audio",         _CURATED["audio"]),          _eg("audio"))
+    SUBTITLES     = _merge_extra(_base_list(base, "subtitles",     _CURATED["subtitles"]),      _eg("subtitles"))
+    EDITIONS      = _merge_extra(_base_list(base, "editions",      _CURATED["editions"]),       _eg("editions"))
+    HDR           = _merge_extra(_base_list(base, "hdr",           _CURATED["hdr"]),            _eg("hdr"))
+    RELEASE_FLAGS = _merge_extra(_base_list(base, "release_flags", _CURATED["release_flags"]),  _eg("release_flags"))
+    # Structural tables — JSON can retune them, no user-extra layer.
+    SOURCES_AMBIGUOUS = _base_list(base, "sources_ambiguous", _DEFAULT_SOURCES_AMBIGUOUS)
+    BIT_DEPTH         = _base_list(base, "bit_depth", _DEFAULT_BIT_DEPTH)
+    wxh = base.get("wxh_to_p")
+    _WXH_TO_P = {str(k): str(v) for k, v in wxh.items()} if isinstance(wxh, dict) and wxh else dict(_DEFAULT_WXH_TO_P)
 
     _RESOLUTION_RE = re.compile(rf"{_LEFT_SEP}({_alt(RESOLUTIONS)}){_RIGHT_SEP}", re.IGNORECASE)
     # WxH (Moozzi2's `1920x1080`) — only when both sides are a known pair, so
@@ -226,6 +284,7 @@ def _build() -> None:
         rf"{_LEFT_SEP}({_alt(list(_WXH_TO_P.keys()))}){_RIGHT_SEP}", re.IGNORECASE,
     )
     _SOURCE_RE    = re.compile(rf"{_LEFT_SEP}({_alt(SOURCES)}){_RIGHT_SEP}", re.IGNORECASE)
+    _PLATFORM_RE  = re.compile(rf"{_LEFT_SEP}({_alt(PLATFORMS)}){_RIGHT_SEP}", re.IGNORECASE)
     _CODEC_RE     = re.compile(rf"{_LEFT_SEP}({_alt(CODECS)}){_RIGHT_SEP}", re.IGNORECASE)
     _AUDIO_RE     = re.compile(rf"{_LEFT_SEP}({_alt(AUDIO)}){_RIGHT_SEP}", re.IGNORECASE)
     _SUBTITLES_RE = re.compile(rf"{_LEFT_SEP}({_alt(SUBTITLES)}){_RIGHT_SEP}", re.IGNORECASE)
@@ -361,13 +420,21 @@ def strip(name: str) -> tuple[str, FormatTokens]:
     #    resolution token (`UHD`), so grabbing the longest source first keeps
     #    the compound intact, then the leftover `2160p` becomes the quality.
     name, tokens.source   = _extract_first_strip_rest(_SOURCE_RE, name)
+    # Streaming PLATFORM tags (AMZN/NFLX/DSNP/…) are stripped from the title like
+    # any tech token, but only DEFINE the source when no real delivery type was
+    # found — then they imply WEB-DL (a platform tag alone is virtually always a
+    # web download). This keeps "...AMZN.WEB-DL..." → source=WEB-DL (not AMZN).
+    name, _platform = _extract_first_strip_rest(_PLATFORM_RE, name)
     # Ambiguous short sources (MAX, TS, HMAX) — case-sensitive ALL-CAPS and
     # must be preceded by a separator, so "Max.2015" isn't mauled. Always
     # strip if matched (a file can carry BOTH a network tag and a delivery
     # tag, e.g. "MAX.WEB-DL"); the main source wins for the stored value.
     name, _ambig_source = _extract(_SOURCE_AMBIG_RE, name)
-    if tokens.source is None and _ambig_source:
-        tokens.source = _ambig_source
+    if tokens.source is None:
+        if _ambig_source and _ambig_source.upper() not in _STREAMING_AMBIG:
+            tokens.source = _ambig_source                       # MAX / TS / BD → as-is
+        elif _platform or _ambig_source:                        # AMZN/… or HMAX/NF/STAN
+            tokens.source = "WEB-DL"                             # platform ⇒ web download
     name, tokens.quality  = _extract_first_strip_rest(_RESOLUTION_RE, name)
     # Fallback for `WxH` resolution syntax (Moozzi2's "1920x1080") when the
     # standard "1080p" form wasn't present. Normalize to the same `p` form
@@ -475,7 +542,7 @@ def _is_known_token(s: str) -> bool:
     global _ALL_KNOWN
     if _ALL_KNOWN is None:
         _ALL_KNOWN = set()
-        for table in (SOURCES, CODECS, RESOLUTIONS, AUDIO, EDITIONS, HDR, RELEASE_FLAGS):
+        for table in (SOURCES, PLATFORMS, CODECS, RESOLUTIONS, AUDIO, EDITIONS, HDR, RELEASE_FLAGS):
             for t in table:
                 _ALL_KNOWN.add(re.sub(r"\\", "", t).upper())
     return s.upper() in _ALL_KNOWN

@@ -65,6 +65,8 @@ export const PROVIDERS: Record<ProviderKey, ProviderMeta> = {
                  desc: 'Open music encyclopedia · artists, releases, recordings' },
   AcoustID:    { name: 'AcoustID',    for: ['music'],          color: '#28d9a0', icon: 'waveform',
                  desc: 'Audio fingerprint matching for music files with missing or wrong tags' },
+  'fanart.tv': { name: 'fanart.tv',   for: ['movie', 'tv', 'anime'], color: '#ff7575', icon: 'film',
+                 desc: 'Artwork only — clear logos, clear art, banners, disc & character art (used by Download artwork)' },
 };
 
 export const TYPE_COLOR: Record<MediaType, string> = {

@@ -51,6 +51,21 @@ against the database."
   retry. (`engine.py:_query_ladder`)
 - ✅ Anime episode-count aggregate sanity veto. (`cascade/metrics/
   episode_count_sanity.py`)
+- ✅ Absolute-numbered files (One Piece / AoT Final Season `- 60..89`) route into
+  their AniDB cours via an `absolute_number→episode` bridge
+  (`route_file_to_cour(abs_to_local=…)`), wired into scan + Re-identify +
+  manual-pick. The sanity veto ABSTAINS on a **whole-franchise** aggregate
+  (`aids_by_tvdb`) so a tail cour isn't vetoed against a series-absolute episode
+  max; the stored `episode_number` is the cour-local index so the popup pairs.
+  A known-anime TVDB id also folds into its AniDB franchise card
+  (`compute_series_group_id` reverse-Fribb). (roadmap Pass V)
+- ✅ Flat-umbrella local→absolute remap — the INVERSE of the bridge above. For a
+  single flat AniDB AID that numbers the whole long-runner absolutely (One Piece
+  69, `tvdb_season` None), a TVDB-season-LOCAL file (`S23E04`, paired to the
+  Elbaf cour's local ep 4) stores the ABSOLUTE `episode_number` (1159) so dupes
+  line up. `remap_umbrella_local_to_absolute(local_to_abs=…)`, wired into scan +
+  Re-identify + manual-pick; no-ops for per-season AIDs / normal TV / absolute-
+  named files. (roadmap Pass V — V8)
 
 This is already past the reference renamer on a few axes (cour graceful degradation under
 AniDB ban, franchise grouping UI). The gaps are specific.
@@ -511,7 +526,14 @@ Phase 11.
 
 ---
 
-### Phase 13 — Acronym + known-name index ✅ Shipped (acronym metric)
+### Phase 13 — Acronym + known-name index ✅ Shipped (acronym metric + offline AniDB index)
+
+> **Update:** the stretch "local name→id index" is done for AniDB (M2:
+> `_name_index` + `_acronym_index` from the title dump, consulted offline before
+> any network call). The TVDB/TMDB sliver is intentionally not built — no title
+> dump to index, and xattr persistence (below) covers cross-rescan recall better.
+> See roadmap #20 for the full rationale.
+
 
 **Shipped:** `cascade/metrics/acronym.py` `AcronymMetric` (tier 2). Two paths:
 (1) a curated fan-acronym map (AoT, JJK, SnK, FMA, MHA, LOTR, GoT…) →
@@ -634,7 +656,14 @@ confidence signal. (Also feeds template tokens in the rename roadmap.)
 
 ---
 
-### Phase 17 — Scene-rules / release-info dataset ✅ Shipped (groups; tokens staged)
+### Phase 17 — Scene-rules / release-info dataset ✅ Shipped (groups + base tables externalized)
+
+> **Update (roadmap #18 done):** the base source/codec/resolution/audio/subtitle/
+> edition/hdr/bit-depth/release-flag tables now load from a shipped
+> `parser/release_tokens.json` (in-code literals remain the fallback); user
+> `scene_rules.json` extras still fold on top. The `sources`/`codecs`/… keys are
+> now fully wired — no longer staged.
+
 
 **Shipped:** `parser/scene_rules.py` reads an OPTIONAL user JSON
 (`$KIRA_SCENE_RULES` or `<backend>/.cache/scene-rules.json`) so power users
@@ -772,6 +801,46 @@ Stronger signals:         12 → 15 → 6 → 13 → 7
 Correctness/perf:         16 → 18 → 8
 Safety / polish:          14 → 19 → 17 → 9 → 20 → 10
 ```
+
+---
+
+# Round 3 — final FileBot matching techniques
+
+A third review asked "is there anything left in FileBot's *matching* subsystem we
+haven't taken?" These two were the answer. Both shipped.
+
+### Phase 21 — Runtime corroboration (M4, the last EpisodeMetrics signal) ✅ Shipped
+
+**FileBot:** cross-checks the file's actual runtime against the episode/movie's
+expected runtime as a confidence signal.
+
+**Shipped (the runtime signal — the only corroborator the audit rated worth it):**
+MediaInfo now reads true container **duration** → `ParsedFile.duration` (free, on
+the same read that backfills quality); pure `runtime_similarity()` (±20% band,
+3-min floor, decay to 0); tier-3 `RuntimeCorroborationMetric` that fires only on
+**already-available** runtime (cached episode list / candidate metadata) — never
+fetches, never overrides identity. **Filesize** (weak for identity) and **region**
+(overlaps existing hints) deliberately skipped. The *active per-candidate runtime
+fetch* is the one documented tunable left off (rate-limit cost). See roadmap M4.
+
+### Phase 22 — Filesystem-persisted identity (xattr / NTFS ADS) ✅ Shipped (backend)
+
+**FileBot:** stamps `net.filebot.*` extended attributes on every processed file
+and reads them back on re-scan for instant, filename-independent re-identification.
+
+**Shipped:** `kira/xattr_store.py` — POSIX `os.*xattr` (`user.kira.ids`, the
+Docker/Linux + NAS path) with an NTFS Alternate-Data-Stream fallback on Windows
+and a silent no-op everywhere else (pure optimisation, never a correctness
+dependency). A successful rename stamps the destination with `{provider: id}`; the
+scan worker reads it back into `ParsedFile.provider_ids`, where the **existing
+Phase 14 embedded-ID bypass resolves it with zero search** — so a re-scan of a
+Kira-renamed library re-identifies instantly even if the filename was later
+mangled. The matcher needed no changes. See roadmap M6.
+
+**Verdict:** with Phases 21–22, every catalogued FileBot *matching* technique is
+either shipped or a documented, deliberately-deferred tunable. What's left
+(active runtime fetch, a TVDB learned-cache) is low-value / cost-gated, not a
+capability gap.
 
 ---
 

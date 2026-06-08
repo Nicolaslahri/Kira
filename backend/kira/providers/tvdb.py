@@ -518,11 +518,38 @@ class TVDBProvider(MetadataProvider):
             else:
                 candidates.append(s)
 
+        # ── Poster vs banner (the Loki S1 black-card bug) ──────────────────
+        # A season's inline `image` can point at a BANNER (wide 16:9 landscape),
+        # not a poster. Shoehorned into a portrait card it renders as a black
+        # strip. TVDB v4 artwork URLs encode the shape in the path
+        # (`…/posters/…` vs `…/banners/…`), so we treat a `/banners/` URL as a
+        # non-poster and keep looking for a real Season Poster (artwork type 7),
+        # finally falling back to the series-level poster — which is always
+        # portrait — rather than returning a banner.
+        def _is_poster(url: str | None) -> bool:
+            # NB: ALL TVDB v4 artwork URLs live under `…/banners/v4/…` (that's
+            # the CDN path, not the type). The artwork TYPE is the segment after
+            # the entity id: `…/season/{id}/posters/…` (poster) vs
+            # `…/season/{id}/banners/…` (wide banner). So inspect the tail after
+            # `/v4/`, not the whole URL.
+            if not url:
+                return False
+            tail = url.split("/v4/", 1)[-1]
+            if "/posters/" in tail:
+                return True
+            if "/banners/" in tail:
+                return False
+            return True  # unknown shape → assume usable rather than over-filter
+
+        banner_seen = False
         for season in candidates:
             inline = season.get("image") or season.get("image_url")
-            if inline:
+            if _is_poster(inline):
                 return inline
-            # No inline image — try the season's extended endpoint for artwork.
+            if inline:
+                banner_seen = True  # remember we saw *some* art, just wrong-shape
+            # Inline missing or a banner — try the season's extended endpoint,
+            # preferring a poster-shaped image / a type-7 Season Poster.
             sid = season.get("id")
             if not sid:
                 continue
@@ -531,22 +558,28 @@ class TVDBProvider(MetadataProvider):
             except Exception:
                 continue
             spayload = (sdata or {}).get("data") or {}
-            inline = spayload.get("image") or spayload.get("image_url")
-            if inline:
-                return inline
-            # Some seasons only carry artwork in an `artwork[]` array; prefer
-            # type 7 (Season Poster), fall back to any image.
+            sp_inline = spayload.get("image") or spayload.get("image_url")
+            if _is_poster(sp_inline):
+                return sp_inline
             artwork = spayload.get("artwork") or []
             posters = [a for a in artwork if isinstance(a, dict) and a.get("type") == 7]
-            other = [a for a in artwork if isinstance(a, dict)]
-            for a in (posters + other):
+            for a in posters:
                 url = a.get("image") or a.get("thumbnail")
-                if url:
+                if _is_poster(url) or url:  # type-7 is a poster even if path differs
                     return url
 
-        # Nothing season-specific found — fall back to the series poster so
-        # the card isn't blank.
-        return payload.get("image") or payload.get("image_url") or await self.get_series_poster(series_id)
+        # No poster-shaped season art. Prefer the series poster (always
+        # portrait) over a wrong-shape banner so the card isn't a black strip.
+        series = payload.get("image") or payload.get("image_url") or await self.get_series_poster(series_id)
+        if series:
+            return series
+        # Last resort — return whatever banner we saw (better than a blank card).
+        if banner_seen:
+            for season in candidates:
+                inline = season.get("image") or season.get("image_url")
+                if inline:
+                    return inline
+        return None
 
     # TVDB episode-ordering schemes. Anime sometimes uses DVD order, which
     # differs from broadcast (aired) order — the same episodes in a different

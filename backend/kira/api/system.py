@@ -14,8 +14,37 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from kira.database import get_session
 from kira.models import Match, MediaFile, Notification, RenameHistory, Scan, Setting
+from kira.schemas import UtcDateTime
 
 router = APIRouter(tags=["system"])
+
+
+# Optional confinement for the folder picker. The picker intentionally browses
+# the filesystem (you can't pick a library root you can't see), so it's NOT
+# locked to configured roots — that would break first-run setup. Instead, an
+# admin can set KIRA_BROWSE_ROOT (e.g. the media volume in a Docker deploy:
+# `KIRA_BROWSE_ROOT=/media`) to hard-confine browsing to that subtree. Unset =
+# full browse, the desktop/dev default. resolve()-based containment also blocks
+# `..` traversal out of the confinement root.
+_BROWSE_ROOT = os.environ.get("KIRA_BROWSE_ROOT", "").strip()
+
+
+def _confined_root() -> Path | None:
+    if not _BROWSE_ROOT:
+        return None
+    try:
+        return Path(_BROWSE_ROOT).resolve()
+    except OSError:
+        return None
+
+
+def _within(path: Path, root: Path) -> bool:
+    """True iff `path` resolves to `root` or a descendant of it."""
+    try:
+        rp = path.resolve()
+    except OSError:
+        return False
+    return rp == root or root in rp.parents
 
 
 class FolderEntry(BaseModel):
@@ -37,7 +66,13 @@ async def list_folder(path: str = Query("")) -> FolderListing:
     """List sub-directories under `path`. If empty, lists Windows drive roots
     (C:\\, D:\\, …) or POSIX root ("/").
     """
+    confine = _confined_root()
+
     if not path:
+        # Confined: start at the permitted root (no drive/`/` enumeration).
+        if confine is not None:
+            entries = await asyncio.to_thread(_list_subdirs, confine)
+            return FolderListing(path=str(confine), parent=None, entries=entries)
         # Drives on Windows; "/" on POSIX.
         if os.name == "nt":
             drives: list[FolderEntry] = []
@@ -52,6 +87,10 @@ async def list_folder(path: str = Query("")) -> FolderListing:
         )
 
     p = Path(path)
+    # Confinement (+ traversal guard): a `..`-laden or out-of-root path is
+    # refused before any disk access.
+    if confine is not None and not _within(p, confine):
+        raise HTTPException(403, "Path is outside the permitted browse root.")
     if not p.exists():
         raise HTTPException(404, f"Path does not exist: {path}")
     if not p.is_dir():
@@ -66,6 +105,10 @@ async def list_folder(path: str = Query("")) -> FolderListing:
         raise HTTPException(403, f"Permission denied: {path}") from e
 
     parent = str(p.parent) if p.parent != p else None
+    # Under confinement, never hand back a parent at/above the browse root —
+    # the picker shouldn't offer an "up" link that escapes it.
+    if confine is not None and parent is not None and not _within(Path(parent), confine):
+        parent = None
     return FolderListing(path=str(p), parent=parent, entries=entries)
 
 
@@ -94,6 +137,15 @@ def _list_subdirs(p: Path) -> list[FolderEntry]:
             file_count=file_count,
         ))
     return entries
+
+
+@router.get("/activity")
+async def get_activity() -> dict:
+    """Background-activity snapshot for the frontend's activity indicator:
+    the boot recovery summary plus any running heal / warm-up job. In-memory
+    and best-effort — a restart clears it because the work restarts too."""
+    from kira import activity
+    return activity.snapshot()
 
 
 @router.post("/database/reset")
@@ -141,7 +193,7 @@ class NotificationOut(BaseModel):
     title: str
     body: str | None
     read: bool
-    created_at: datetime
+    created_at: UtcDateTime
 
 
 notif_router = APIRouter(prefix="/notifications", tags=["notifications"])
@@ -150,7 +202,7 @@ notif_router = APIRouter(prefix="/notifications", tags=["notifications"])
 @notif_router.get("", response_model=list[NotificationOut])
 async def list_notifications(
     unread_only: bool = False,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
 ) -> list[Notification]:
     from sqlalchemy import select

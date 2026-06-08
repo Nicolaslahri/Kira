@@ -125,12 +125,93 @@ def normalize_audio(fmt: str | None, commercial: str | None = None) -> str | Non
     return None
 
 
+def duration_to_seconds(raw) -> int | None:
+    """Map a MediaInfo Duration value to whole seconds.
+
+    pymediainfo reports General/Video `duration` in MILLISECONDS (as an int,
+    float, or numeric string — occasionally with a trailing decimal). Returns
+    None for missing / zero / unparseable values so callers can abstain
+    cleanly. A 22-minute episode → 1320; a 2h movie → 7200."""
+    try:
+        ms = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if ms <= 0:
+        return None
+    secs = int(round(ms / 1000.0))
+    return secs or None
+
+
+# ISO-639-1 / -639-2 codes and English names → canonical 639-2/B 3-letter code.
+# Covers the languages a real media library realistically carries. Unknown but
+# plausibly-valid short codes pass through (lowercased) so nothing's silently
+# dropped; long unrecognized names are ignored as noise.
+_LANG_NORMALIZE = {
+    "en": "eng", "eng": "eng", "english": "eng",
+    "ja": "jpn", "jp": "jpn", "jpn": "jpn", "japanese": "jpn",
+    "fr": "fre", "fre": "fre", "fra": "fre", "french": "fre",
+    "de": "ger", "ger": "ger", "deu": "ger", "german": "ger",
+    "es": "spa", "spa": "spa", "spanish": "spa", "castilian": "spa",
+    "it": "ita", "ita": "ita", "italian": "ita",
+    "pt": "por", "por": "por", "portuguese": "por",
+    "ru": "rus", "rus": "rus", "russian": "rus",
+    "zh": "chi", "chi": "chi", "zho": "chi", "chinese": "chi",
+    "mandarin": "chi", "cantonese": "chi",
+    "ko": "kor", "kor": "kor", "korean": "kor",
+    "nl": "dut", "dut": "dut", "nld": "dut", "dutch": "dut",
+    "pl": "pol", "pol": "pol", "polish": "pol",
+    "sv": "swe", "swe": "swe", "swedish": "swe",
+    "no": "nor", "nor": "nor", "norwegian": "nor",
+    "da": "dan", "dan": "dan", "danish": "dan",
+    "fi": "fin", "fin": "fin", "finnish": "fin",
+    "ar": "ara", "ara": "ara", "arabic": "ara",
+    "hi": "hin", "hin": "hin", "hindi": "hin",
+    "th": "tha", "tha": "tha", "thai": "tha",
+    "tr": "tur", "tur": "tur", "turkish": "tur",
+    "cs": "cze", "cze": "cze", "ces": "cze", "czech": "cze",
+    "hu": "hun", "hun": "hun", "hungarian": "hun",
+    "el": "gre", "gre": "gre", "ell": "gre", "greek": "gre",
+    "he": "heb", "heb": "heb", "hebrew": "heb",
+    "id": "ind", "ind": "ind", "indonesian": "ind",
+    "vi": "vie", "vie": "vie", "vietnamese": "vie",
+    "uk": "ukr", "ukr": "ukr", "ukrainian": "ukr",
+}
+
+# MediaInfo placeholders that mean "no real language" — never surfaced.
+_LANG_IGNORE = {"und", "undetermined", "unknown", "mul", "mis", "zxx", ""}
+
+
+def normalize_language(raw) -> str | None:
+    """Map a MediaInfo track `language` to a canonical lowercase ISO-639-2/B
+    3-letter code (eng, jpn, fre, …) for stable comparison + display.
+
+    Handles 2-letter codes ("en"), 3-letter codes ("eng"), English names
+    ("English"), and locale forms ("en-US", "pt-BR" → primary subtag). Returns
+    None for missing / undetermined ("und") / unrecognized long strings. Unknown
+    short alpha codes pass through (lowercased) so a rarer language still shows."""
+    if not raw:
+        return None
+    t = str(raw).strip().lower()
+    if t in _LANG_IGNORE:
+        return None
+    # locale → primary subtag: "en-us" → "en", "pt/br" → "pt"
+    t = t.replace("_", "-").split("-")[0].split("/")[0].strip()
+    if t in _LANG_NORMALIZE:
+        return _LANG_NORMALIZE[t]
+    # Unknown but plausibly a 2-3 letter code → keep; long names → drop as noise.
+    if t.isalpha() and 2 <= len(t) <= 3:
+        return t
+    return None
+
+
 def read_media_info(path: str) -> dict[str, Any] | None:
-    """Read {quality, codec, hdr, channels, audio} from the file. None when
-    the lib is unavailable, the file can't be read, or it has no tracks.
+    """Read {quality, codec, hdr, channels, audio, duration} from the file.
+    None when the lib is unavailable, the file can't be read, or it has no
+    tracks. `duration` is whole seconds (M4 runtime corroboration).
 
     Video fields come from the first Video track; audio fields from the first
-    Audio track (the default/primary track in practice)."""
+    Audio track (the default/primary track in practice). Duration prefers the
+    General track (whole-container length) and falls back to the Video track."""
     if not _AVAILABLE:
         return None
     try:
@@ -138,11 +219,25 @@ def read_media_info(path: str) -> dict[str, Any] | None:
     except Exception:
         return None
     out: dict[str, Any] = {}
+    audio_langs: list[str] = []
+    sub_langs: list[str] = []
     got_video = got_audio = False
+    # Walk ALL tracks (no early break): video/primary-audio fields come from the
+    # first of each, but languages are collected across every audio + text track
+    # so dual-audio / multi-sub files surface every language.
     for track in getattr(info, "tracks", []):
         ttype = getattr(track, "track_type", None)
-        if ttype == "Video" and not got_video:
+        if ttype == "General":
+            if "duration" not in out:
+                d = duration_to_seconds(getattr(track, "duration", None))
+                if d:
+                    out["duration"] = d
+        elif ttype == "Video" and not got_video:
             got_video = True
+            if "duration" not in out:
+                d = duration_to_seconds(getattr(track, "duration", None))
+                if d:
+                    out["duration"] = d
             q = height_to_quality(_safe_int(getattr(track, "height", None)))
             if q:
                 out["quality"] = q
@@ -155,22 +250,57 @@ def read_media_info(path: str) -> dict[str, Any] | None:
             )
             if hdr:
                 out["hdr"] = hdr
-        elif ttype == "Audio" and not got_audio:
-            got_audio = True
-            ch = channels_label(_safe_int(getattr(track, "channel_s", None)
-                                          or getattr(track, "channels", None)))
-            if ch:
-                out["channels"] = ch
-            ac = normalize_audio(
-                getattr(track, "format", None),
-                getattr(track, "format_commercial_name", None)
-                or getattr(track, "commercial_name", None),
-            )
-            if ac:
-                out["audio"] = ac
-        if got_video and got_audio:
-            break
+        elif ttype == "Audio":
+            if not got_audio:
+                got_audio = True
+                ch = channels_label(_safe_int(getattr(track, "channel_s", None)
+                                              or getattr(track, "channels", None)))
+                if ch:
+                    out["channels"] = ch
+                ac = normalize_audio(
+                    getattr(track, "format", None),
+                    getattr(track, "format_commercial_name", None)
+                    or getattr(track, "commercial_name", None),
+                )
+                if ac:
+                    out["audio"] = ac
+            lang = normalize_language(getattr(track, "language", None))
+            if lang and lang not in audio_langs:
+                audio_langs.append(lang)
+        elif ttype == "Text":
+            lang = normalize_language(getattr(track, "language", None))
+            if lang and lang not in sub_langs:
+                sub_langs.append(lang)
+    if audio_langs:
+        out["audio_langs"] = audio_langs
+    if sub_langs:
+        out["sub_langs"] = sub_langs
     return out or None
+
+
+def read_embedded_title(path: str) -> str | None:
+    """Read the container's embedded title (General track ``title``, falling
+    back to ``movie_name``). None when the lib is unavailable, the file can't
+    be read, or no title tag is present.
+
+    Caveat for callers: this tag is INCONSISTENT in the wild — scene/p2p
+    releases routinely leave it blank or stuff the release-name junk in it, so
+    it is a best-effort HINT, not a reliable identifier. Worth a shot only for
+    a file whose FILENAME yielded nothing (it'd otherwise never match)."""
+    if not _AVAILABLE:
+        return None
+    try:
+        info = _MediaInfo.parse(path)  # type: ignore[union-attr]
+    except Exception:
+        return None
+    for track in getattr(info, "tracks", []):
+        if getattr(track, "track_type", None) == "General":
+            for attr in ("title", "movie_name"):
+                v = getattr(track, attr, None)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return None
+    return None
 
 
 def enrich_parsed(parsed, mi: dict[str, Any] | None, authoritative: bool = False) -> bool:
@@ -208,6 +338,15 @@ def enrich_parsed(parsed, mi: dict[str, Any] | None, authoritative: bool = False
     changed |= _set("hdr", "hdr", parsed.hdr)
     changed |= _set("channels", "channels", parsed.channels)
 
+    # Duration (seconds) is NEVER carried by a filename, so it's always a
+    # pure fill — there's nothing for it to conflict with. Set it whenever
+    # MediaInfo read one and ParsedFile doesn't already have it (M4 runtime
+    # corroboration). `duration` may be absent on ParsedFile for older rows.
+    mi_dur = mi.get("duration")
+    if mi_dur and not getattr(parsed, "duration", None):
+        parsed.duration = mi_dur
+        changed = True
+
     # audio is a list on ParsedFile; MediaInfo gives one primary codec.
     mi_audio = mi.get("audio")
     if mi_audio:
@@ -217,6 +356,22 @@ def enrich_parsed(parsed, mi: dict[str, Any] | None, authoritative: bool = False
                 changed = True
         elif not parsed.audio:
             parsed.audio = [mi_audio]
+            changed = True
+
+    # Per-track languages (lists). Authoritative overwrites; fallback fills only
+    # when empty. The container is the sole source for these — the filename
+    # parser never sets them — so even fallback mode effectively always fills.
+    for attr in ("audio_langs", "sub_langs"):
+        mi_val = mi.get(attr)
+        if not mi_val:
+            continue
+        cur = list(getattr(parsed, attr, None) or [])
+        if authoritative:
+            if cur != list(mi_val):
+                setattr(parsed, attr, list(mi_val))
+                changed = True
+        elif not cur:
+            setattr(parsed, attr, list(mi_val))
             changed = True
     return changed
 

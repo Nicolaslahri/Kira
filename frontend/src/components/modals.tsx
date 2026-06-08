@@ -2,8 +2,9 @@ import { useState, useMemo, useRef, useEffect } from 'react';
 import type { MediaFile, SearchResult, CandidateData, ProviderKey, MatchData, MediaType } from '../lib/types';
 import { PROVIDERS, NAMING_PROFILES, TYPE_COLOR, formatPath, poster } from '../lib/data';
 import { api, ApiError, type ApiSearchResult, type ApiProvider } from '../lib/api';
-import { IcSearch, IcCheck, IcX, IcArrowRight, IcShieldCheck, IcUndo, IcExternal, IcWaveform, IcSpin, IcAlertTri } from '../lib/icons';
+import { IcSearch, IcCheck, IcX, IcArrowRight, IcShieldCheck, IcUndo, IcExternal, IcWaveform, IcSpin, IcAlertTri, IcDownload } from '../lib/icons';
 import { Modal, Poster, ConfidenceBadge, StatusPill, Segmented } from './ui';
+import { confLevel } from '../lib/confBands';
 
 /** Returns the fraction (0..1) of a string's letters that are plain ASCII.
  *  Used to rank provider aliases — English / romaji titles score ~1.0,
@@ -40,6 +41,7 @@ const PROVIDER_SLUG: Record<ProviderKey, string> = {
   AniDB: 'anidb',
   MusicBrainz: 'musicbrainz',
   AcoustID: 'acoustid',
+  'fanart.tv': 'fanarttv',
 };
 
 // Preference order per media type — picks the first one that's actually
@@ -62,10 +64,13 @@ function pickDefault(file: MediaFile, providers: ApiProvider[]): ProviderKey {
   return (PROVIDER_PREFERENCE[file.mediaType] || ['TVDB'])[0];
 }
 
-export function ManualSearchModal({ file, onClose, onSelect }: {
+export function ManualSearchModal({ file, onClose, onSelect, onIdentifyByContent }: {
   file: MediaFile;
   onClose: () => void;
   onSelect: (r: SearchResult & { _provider?: ProviderKey; _providerId?: string }) => void;
+  /** Content-hash identify (OpenSubtitles). Resolves on success (modal then
+   *  closes), throws on failure (modal stays open — error already toasted). */
+  onIdentifyByContent?: (f: MediaFile) => Promise<void>;
 }) {
   // Seed the input with the parsed title so the first search is relevant.
   // Seed priority: the parser's title first (clean filename-derived text),
@@ -93,6 +98,7 @@ export function ManualSearchModal({ file, onClose, onSelect }: {
   const [anidbApiError, setAnidbApiError] = useState<string | null>(null);
   const [anidbErrorKind, setAnidbErrorKind] = useState<'banned' | 'rejected' | 'error' | null>(null);
   const [sel, setSel] = useState<ApiSearchResult | null>(null);
+  const [identifying, setIdentifying] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Pull provider catalogue once and pick the default tab from it.
@@ -250,8 +256,25 @@ export function ManualSearchModal({ file, onClose, onSelect }: {
       size="lg"
       footer={
         <>
-          <div className="text-muted text-sm">
-            Couldn't find it? <a href={providerRootUrl(provider)} target="_blank" rel="noreferrer" style={{ color: 'var(--accent)' }}>Open {provider}.org</a>
+          <div className="flex items-center gap-3">
+            {onIdentifyByContent ? (
+              <button
+                className="btn btn-ghost btn-sm"
+                disabled={identifying}
+                title="Hash the file's content and identify it via OpenSubtitles — works even when the filename is garbage"
+                onClick={async () => {
+                  setIdentifying(true);
+                  try { await onIdentifyByContent(file); onClose(); }
+                  catch { /* error already toasted; keep the modal open */ }
+                  finally { setIdentifying(false); }
+                }}
+              >
+                {identifying ? <IcSpin /> : <IcShieldCheck />} Identify by content
+              </button>
+            ) : null}
+            <div className="text-muted text-sm">
+              Couldn't find it? <a href={providerRootUrl(provider)} target="_blank" rel="noreferrer" style={{ color: 'var(--accent)' }}>Open {provider}.org</a>
+            </div>
           </div>
           <div className="right">
             <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
@@ -406,9 +429,11 @@ export function ManualSearchModal({ file, onClose, onSelect }: {
                 : r.overview
               : null;
             return (
-              <div key={`${r.provider_id}-${i}`}
+              <button key={`${r.provider_id}-${i}`}
+                type="button"
                 className={`search-result ${sel === r ? 'selected' : ''}`}
                 style={{ ['--i' as never]: i }}
+                aria-pressed={sel === r}
                 onClick={() => setSel(r)}
                 onDoubleClick={() => handleSelect(r)}>
                 {showAniDBShimmer ? (
@@ -451,7 +476,7 @@ export function ManualSearchModal({ file, onClose, onSelect }: {
                     {r.popularity ? <span style={{ marginLeft: 'auto', color: 'var(--ink-3)' }}>★ {r.popularity.toFixed(1)}</span> : null}
                   </div>
                 </div>
-              </div>
+              </button>
             );
           })}
         </div>
@@ -475,7 +500,6 @@ export function RenamePreviewModal({ files, onClose, onApply, defaultProfile = '
 }) {
   const [profile, setProfile] = useState(defaultProfile);
   const [op, setOp] = useState(defaultOp);
-  const [includeArt, setIncludeArt] = useState(true);
 
   // A file is renameable only when it has a REAL provider match — the
   // adapter synthesises a placeholder `match` object from parsed data
@@ -611,13 +635,6 @@ export function RenamePreviewModal({ files, onClose, onApply, defaultProfile = '
           </div>
         </div>
       </div>
-
-      <div style={{ marginTop: 16, display: 'flex', gap: 10, alignItems: 'center' }}>
-        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 12, color: 'var(--ink-2)' }}>
-          <input type="checkbox" checked={includeArt} onChange={() => setIncludeArt(!includeArt)} style={{ accentColor: 'var(--accent)' }} />
-          Also download artwork and metadata sidecars (.nfo)
-        </label>
-      </div>
     </Modal>
   );
 }
@@ -662,27 +679,6 @@ export function KeyboardShortcutsModal({ onClose }: { onClose: () => void }) {
       </div>
     </Modal>
   );
-}
-
-// Fake album tracklist for music FileDetails
-function fakeTracklist(match: MatchData) {
-  const SAMPLE = [
-    'Airbag', 'Paranoid Android', 'Subterranean Homesick Alien', 'Exit Music (For a Film)',
-    'Let Down', 'Karma Police', 'Fitter Happier', 'Electioneering', 'Climbing Up the Walls',
-    'No Surprises', 'Lucky', 'The Tourist',
-  ];
-  const dur = (sec: number) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
-  const total = match.totalTracks || 10;
-  const out: { n: number; t: string; d: string }[] = [];
-  for (let i = 1; i <= total; i++) {
-    const isMatch = i === match.track;
-    out.push({
-      n: i,
-      t: isMatch ? (match.trackTitle || `Track ${i}`) : (SAMPLE[(i - 1) % SAMPLE.length] || `Track ${i}`),
-      d: dur(180 + ((i * 47) % 180)),
-    });
-  }
-  return out;
 }
 
 function Meta({ label, value }: { label: string; value: React.ReactNode }) {
@@ -761,14 +757,17 @@ function providerRootUrl(provider: string): string {
   return map[provider] ?? '#';
 }
 
-export function FileDetailsModal({ file, onClose, onApprove, onReject, onManualSearch, onPickCandidate }: {
+export function FileDetailsModal({ file, onClose, onApprove, onReject, onManualSearch, onPickCandidate, onFetchSubtitles }: {
   file: MediaFile;
   onClose: () => void;
   onApprove: (id: string, status?: string) => void;
   onReject: (id: string) => void;
   onManualSearch: (f: MediaFile) => void;
   onPickCandidate: (id: string, c: CandidateData) => void;
+  /** Download OpenSubtitles subtitles for this file as .srt sidecars. */
+  onFetchSubtitles?: (f: MediaFile) => Promise<void>;
 }) {
+  const [fetchingSubs, setFetchingSubs] = useState(false);
   if (!file) return null;
 
   const isMusic = file.mediaType === 'music';
@@ -802,9 +801,25 @@ export function FileDetailsModal({ file, onClose, onApprove, onReject, onManualS
       size="lg"
       footer={
         <>
-          <button className="btn btn-ghost" onClick={() => onManualSearch(file)}>
-            <IcSearch /> Search {providerName} manually
-          </button>
+          <div className="flex items-center gap-2">
+            <button className="btn btn-ghost" onClick={() => onManualSearch(file)}>
+              <IcSearch /> Search {providerName} manually
+            </button>
+            {m && onFetchSubtitles ? (
+              <button
+                className="btn btn-ghost"
+                disabled={fetchingSubs}
+                title="Download subtitles from OpenSubtitles as .srt sidecars (carried along on rename)"
+                onClick={async () => {
+                  setFetchingSubs(true);
+                  try { await onFetchSubtitles(file); }
+                  finally { setFetchingSubs(false); }
+                }}
+              >
+                {fetchingSubs ? <IcSpin /> : <IcDownload />} Fetch subtitles
+              </button>
+            ) : null}
+          </div>
           <div className="right">
             {file.status === 'pending' ? (
               <>
@@ -859,35 +874,6 @@ export function FileDetailsModal({ file, onClose, onApprove, onReject, onManualS
             <p style={{ margin: 0, fontSize: 13, lineHeight: 1.55, color: 'var(--ink-2)' }}>{m.overview}</p>
           ) : null}
 
-          {isMusic && m ? (
-            <div style={{ marginTop: 2 }}>
-              <div className="opt-label" style={{ marginBottom: 6 }}>Track context</div>
-              <div style={{
-                background: 'rgba(0,0,0,0.22)',
-                border: '1px solid var(--line)',
-                borderRadius: 10,
-                padding: '6px 8px',
-                fontFamily: 'var(--font-mono)',
-                fontSize: 11.5,
-                color: 'var(--ink-3)',
-                lineHeight: 1.7,
-                maxHeight: 132,
-                overflowY: 'auto',
-              }}>
-                {fakeTracklist(m).map((t, i) => (
-                  <div key={i} className="flex items-center justify-between gap-3"
-                    style={{ padding: '1px 4px', borderRadius: 4, background: t.n === m.track ? 'var(--accent-soft)' : 'transparent', color: t.n === m.track ? 'var(--accent)' : 'inherit' }}>
-                    <span>
-                      <span style={{ display: 'inline-block', minWidth: 26, color: t.n === m.track ? 'var(--accent)' : 'var(--ink-4)' }}>{String(t.n).padStart(2, '0')}</span>
-                      <span style={{ color: t.n === m.track ? 'var(--accent)' : 'var(--ink-2)', fontWeight: t.n === m.track ? 600 : 400 }}>{t.t}</span>
-                    </span>
-                    <span style={{ color: 'var(--ink-4)' }}>{t.d}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : null}
-
           <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '6px 14px', alignItems: 'center', fontSize: 12, marginTop: 4 }}>
             <Meta label="Filename" value={<span className="text-mono" style={{ color: 'var(--ink-2)' }}>{file.filename}</span>} />
             <Meta label="Source folder" value={<span className="text-mono" style={{ color: 'var(--ink-3)' }}>{file.folder}</span>} />
@@ -921,7 +907,7 @@ export function FileDetailsModal({ file, onClose, onApprove, onReject, onManualS
                 isMusic ? (m?.album === c.album && m?.track === c.track)
                         : (m?.title === c.title && m?.year === c.year)
               );
-              const level = c.confidence >= 85 ? 'high' : c.confidence >= 50 ? 'mid' : 'low';
+              const level = confLevel(c.confidence);
               return (
                 <div key={i} className={`candidate ${isChosen ? 'chosen' : ''}`} style={{ ['--i' as never]: i }}>
                   <Poster data={isMusic ? c.art : c.poster} imgUrl={c.posterUrl} size="xs" shape={isMusic ? 'square' : 'poster'} />

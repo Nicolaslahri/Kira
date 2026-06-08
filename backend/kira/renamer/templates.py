@@ -123,6 +123,13 @@ class NamingProfile:
     tv: str
     anime: str
     music: str
+    # Optional alternate anime template, selected when the user sets
+    # `naming.anime_numbering = "absolute"`. Flat, absolute-numbered layout
+    # (e.g. "One Piece/One Piece - 1156 - Title.mkv"). None → fall back to the
+    # standard seasonal `anime` template, so a custom profile that omits it
+    # simply keeps seasonal naming. New numbering/ordering "styles" plug in the
+    # same way: add a field here + an entry in _TEMPLATE_STYLE_FIELD.
+    anime_absolute: str | None = None
 
 
 DEFAULT_PROFILES: dict[str, NamingProfile] = {
@@ -138,24 +145,53 @@ DEFAULT_PROFILES: dict[str, NamingProfile] = {
     # `Frieren - S01E01.JAP.mkv` + `Frieren - S01E01.ENG.mkv` — both
     # files survive on disk with distinguishable names.
     "Plex": NamingProfile(
-        movie="{{n}} ({{y}})/{{n}} ({{y}}){{variant}} [{{q}}].{{x}}",
+        movie="{{n}} ({{y}})/{{n}} ({{y}}){{disc}}{{variant}} [{{q}}].{{x}}",
         tv="{{n}} ({{y}})/Season {{s2}}/{{n}} - S{{s2}}E{{e2}}{{variant}} - {{t}} [{{q}}].{{x}}",
         anime="{{n}}/Season {{s2}}/{{n}} - S{{s2}}E{{e2}}{{variant}} - {{t}} [{{rg}}].{{x}}",
+        anime_absolute="{{n}}/{{n}} - {{absx}}{{variant}} - {{t}} [{{rg}}].{{x}}",
         music="{{artist}}/{{album}} ({{y}})/{{tn}}{{variant}} - {{title}}.{{x}}",
     ),
     "Jellyfin": NamingProfile(
-        movie="{{n}} ({{y}})/{{n}} ({{y}}){{variant}}.{{x}}",
+        movie="{{n}} ({{y}})/{{n}} ({{y}}){{disc}}{{variant}}.{{x}}",
         tv="{{n}} ({{y}})/Season {{s2}}/{{n}} ({{y}}) - S{{s2}}E{{e2}}{{variant}} - {{t}}.{{x}}",
         anime="{{n}} ({{y}})/Season {{s2}}/{{n}} - S{{s2}}E{{e2}}{{variant}} - {{t}}.{{x}}",
+        anime_absolute="{{n}} ({{y}})/{{n}} - {{absx}}{{variant}} - {{t}}.{{x}}",
         music="{{artist}}/{{album}}/{{tn}}{{variant}} {{title}}.{{x}}",
     ),
     "Kodi": NamingProfile(
-        movie="{{n}} ({{y}})/{{n}} ({{y}}){{variant}} - {{q}}.{{x}}",
+        movie="{{n}} ({{y}})/{{n}} ({{y}}){{disc}}{{variant}} - {{q}}.{{x}}",
         tv="{{n}}/Season {{s2}}/{{n}}.S{{s2}}E{{e2}}{{variant}}.{{t}}.{{x}}",
         anime="{{n}}/S{{s2}}/{{n}} - {{abs}}{{variant}} - {{t}}.{{x}}",
+        anime_absolute="{{n}}/{{n}} - {{absx}}{{variant}} - {{t}}.{{x}}",
         music="{{artist}} - {{album}}/{{tn}}{{variant}}. {{title}}.{{x}}",
     ),
 }
+
+
+# Style → the NamingProfile field that overrides the base `media_type` template
+# when that style is active. A style with no matching variant on the profile
+# (e.g. a Custom profile that didn't define `anime_absolute`) falls back to the
+# base template. THIS is the single place to extend: a new numbering/ordering
+# style is one entry here + one field on NamingProfile + one setting.
+_TEMPLATE_STYLE_FIELD: dict[tuple[str, str], str] = {
+    ("anime", "absolute"): "anime_absolute",
+}
+
+
+def select_template(profile: NamingProfile, media_type: str, *, anime_numbering: str = "seasonal") -> str:
+    """Resolve the template string for a media_type, honoring style variants.
+
+    `anime_numbering` is the only style today ("seasonal" default | "absolute").
+    Modular: the (media_type, style) → field mapping lives in
+    _TEMPLATE_STYLE_FIELD, and an absent variant transparently falls back to the
+    base `media_type` template, so nothing downstream needs to branch.
+    """
+    field = _TEMPLATE_STYLE_FIELD.get((media_type, anime_numbering))
+    if field:
+        variant = getattr(profile, field, None)
+        if variant:
+            return variant
+    return getattr(profile, media_type, profile.movie)
 
 
 SUBFOLDER = {"movie": "Movies", "tv": "TV", "anime": "Anime", "music": "Music"}
@@ -321,6 +357,14 @@ def _build_ctx(
     e2 = f"{parsed.episode:02d}" if parsed.episode is not None else ""
     tn = f"{parsed.track:02d}" if parsed.track is not None else ""
     abs_ep = f"{parsed.absolute_episode:03d}" if parsed.absolute_episode is not None else e2
+    # `absx`: absolute-number-or-SxE, used by the absolute anime templates. With
+    # a real absolute number it IS the name ("One Piece - 1156"); without one it
+    # falls back to the SxE form (NOT a bare episode number) so a flat absolute
+    # layout can't collide two different seasons that both have an episode 5.
+    absx = (
+        f"{parsed.absolute_episode:03d}" if parsed.absolute_episode is not None
+        else (f"S{s2}E{e2}" if s2 and e2 else (e2 or s2 or ""))
+    )
 
     # Quality tag — prefer parser-extracted, otherwise fall back to common defaults.
     quality_bits = [parsed.quality, parsed.source]
@@ -408,6 +452,7 @@ def _build_ctx(
         "s2":     s2,
         "e2":     e2,
         "abs":    abs_ep,
+        "absx":   absx,
         # `episode_title` lives on the Match row, NOT on ParsedFile — callers
         # pass it in. Earlier code did `parsed.episode_title` which raised
         # AttributeError on every rename, killing the entire flow silently.
@@ -426,6 +471,11 @@ def _build_ctx(
         # `variant` is dot-prefixed when present, empty when not — templates
         # can interpolate freely without producing stray dots on default files.
         "variant": variant_suffix,
+        # #15: multi-disc movie marker, pre-formatted Plex-style (" - cd1") so
+        # the two halves of a split film land on distinct, stack-detectable
+        # paths. Empty for single-file movies and every non-movie type
+        # (parsed.disc is None there), so it's a no-op in normal templates.
+        "disc":   f" - cd{parsed.disc}" if getattr(parsed, "disc", None) else "",
         "artist": _safe(parsed.artist or ""),
         "album":  _safe(parsed.album or ""),
         "tn":     tn,
@@ -505,6 +555,7 @@ def format_target_path(
     type_target_root: str | None = None,
     metadata: dict[str, Any] | None = None,
     file_size: int | None = None,
+    anime_numbering: str = "seasonal",
 ) -> Path:
     """Build the destination Path for a renamed file.
 
@@ -522,7 +573,7 @@ def format_target_path(
     When None, the legacy `library_root + SUBFOLDER` layout is used so
     existing installs don't change behavior.
     """
-    template = getattr(profile, parsed.media_type, profile.movie)
+    template = select_template(profile, parsed.media_type, anime_numbering=anime_numbering)
     ctx = _build_ctx(
         parsed,
         library_title or parsed.title or "",

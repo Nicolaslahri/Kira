@@ -1,7 +1,27 @@
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timezone
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
+
+
+def _utc_iso(dt: datetime) -> str:
+    """Serialize a datetime as an unambiguous UTC ISO-8601 string ending in 'Z'.
+
+    Our timestamps are stored NAIVE but always represent UTC (`func.now()` /
+    `datetime.now(timezone.utc)`). Emitted without a timezone, the browser's
+    `new Date("...")` parses them as LOCAL time — so every "x ago" was off by the
+    viewer's UTC offset (the "5 hours ago" bug). Stamping UTC here makes the wire
+    format self-describing and the frontend needs no timezone handling."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+# Drop-in for `datetime` response fields: same validation, but JSON output is
+# always UTC with a trailing 'Z'. Use wherever a timestamp crosses the wire.
+UtcDateTime = Annotated[datetime, PlainSerializer(_utc_iso, return_type=str, when_used="json")]
 
 
 class ScanCreate(BaseModel):
@@ -29,8 +49,8 @@ class ScanOut(BaseModel):
     # for real-% banner + ETA display. Null while Phase 1 is in progress.
     estimated_total: int | None = None
     current_path: str | None = None
-    created_at: datetime
-    completed_at: datetime | None = None
+    created_at: UtcDateTime
+    completed_at: UtcDateTime | None = None
 
 
 class MatchOut(BaseModel):
@@ -80,8 +100,8 @@ class MediaFileOut(BaseModel):
     # chip on the file row + prevents rename collisions between same-episode
     # variants. See MediaFile.variant_key in models.py for the schema notes.
     variant_key: str | None = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: UtcDateTime
+    updated_at: UtcDateTime
     matches: list[MatchOut] = []  # ranked by confidence desc
 
 

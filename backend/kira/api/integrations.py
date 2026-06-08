@@ -222,6 +222,14 @@ async def sonarr_test(
         )
     except SonarrError as e:
         return SonarrTestResponse(ok=False, detail=str(e))
+    except Exception as e:
+        # Safety net: a "Test connection" must NEVER raise an uncaught 500. A
+        # non-ASCII / malformed key, for instance, makes httpx fail to encode the
+        # X-Api-Key header (UnicodeEncodeError) before any request goes out — and
+        # an uncaught error, served cross-origin, reaches the browser WITHOUT
+        # CORS headers, surfacing as a misleading "Failed to fetch" instead of a
+        # real message. Return it as a normal failed test.
+        return SonarrTestResponse(ok=False, detail=f"Sonarr test failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -423,17 +431,26 @@ async def _get_cached_queue(cfg: SonarrConfig) -> list[SonarrQueueItem]:
     reality is more misleading than showing nothing.
     """
     now = time.monotonic()
-    cached = _QUEUE_CACHE.get("queue")
+    # Key the cache by the CONFIG identity, not a constant string — otherwise a
+    # queue fetched for one Sonarr (url/key) would be served to a different one
+    # after a settings change (or a hypothetical second instance). \x00 can't
+    # occur in a URL or API key, so it's a safe field separator.
+    cache_key = f"{cfg.base_url}\x00{cfg.api_key}"
+    cached = _QUEUE_CACHE.get(cache_key)
     if cached is not None and (now - cached[1]) < _QUEUE_CACHE_TTL_SEC:
         return cached[0]
     async with _QUEUE_LOCK:
         # Re-check inside the lock — first request fills, second one
         # finds the cache warm and skips the network round-trip.
-        cached = _QUEUE_CACHE.get("queue")
+        cached = _QUEUE_CACHE.get(cache_key)
         if cached is not None and (time.monotonic() - cached[1]) < _QUEUE_CACHE_TTL_SEC:
             return cached[0]
         items = await get_queue(cfg)
-        _QUEUE_CACHE["queue"] = (items, time.monotonic())
+        # Single Sonarr per install: drop any entry for a previous (url/key)
+        # identity before inserting, so a settings change can't leave the old
+        # config's items — and credentials — lingering in memory unbounded.
+        _QUEUE_CACHE.clear()
+        _QUEUE_CACHE[cache_key] = (items, time.monotonic())
         return items
 
 

@@ -35,7 +35,7 @@ class FileToEpisode:
     episode_season: int | None
     episode_number: int | None
     episode_title: str | None
-    matched_via: str   # "exact" | "absolute" | "episode_number" | "unpaired"
+    matched_via: str   # "exact"|"absolute"|"absolute_sxe"|"episode_number"|"air_date"|"title"|"unpaired"
 
 
 def assign_files_to_episodes(
@@ -60,9 +60,13 @@ def assign_files_to_episodes(
         }
 
     out: dict[int, FileToEpisode] = {}
-    remaining_files = list(files)
     remaining_eps = list(episodes)
     used_ep_keys: set[tuple[int, int]] = set()
+    # Track claimed files in a set and skip them with an O(1) membership test,
+    # instead of rebuilding the whole `remaining_files` list on every claim
+    # (which made each pass O(n²) in cluster size). Each pass now iterates the
+    # original `files` once and skips already-claimed ids.
+    claimed_fids: set[int] = set()
 
     def _ep_key(ep) -> tuple[int, int]:
         s = getattr(ep, "season", None)
@@ -85,13 +89,23 @@ def assign_files_to_episodes(
             v = ep.get("air_date")
         return (v[:10] if isinstance(v, str) and len(v) >= 10 else None)
 
-    def _claim(fid: int, parsed, ep, via: str) -> None:
+    def _claim(fid: int, parsed, ep, via: str, episode_override: int | None = None) -> None:
         s, e = _ep_key(ep)
-        out[fid] = FileToEpisode(fid, s, e, _ep_title(ep), via)
+        # episode_override stores the file's REAL number when it was paired by
+        # ABSOLUTE identity against a per-season list that numbers episodes
+        # locally (One Piece S23E1156 paired via absolute_number → store 1156,
+        # not the local index 1). The claim KEY stays (s, e) so the episode
+        # slot still can't be double-assigned. Defaults to the local number, so
+        # every existing caller is byte-identical.
+        stored_ep = episode_override if episode_override is not None else e
+        out[fid] = FileToEpisode(fid, s, stored_ep, _ep_title(ep), via)
         used_ep_keys.add((s, e))
+        claimed_fids.add(fid)
 
     # Pass 1 — exact (parsed.season, parsed.episode) match.
-    for fid, parsed in list(remaining_files):
+    for fid, parsed in files:
+        if fid in claimed_fids:
+            continue
         if parsed.season is None or parsed.episode is None:
             continue
         for ep in remaining_eps:
@@ -100,7 +114,6 @@ def assign_files_to_episodes(
                 continue
             if s == parsed.season and e == parsed.episode:
                 _claim(fid, parsed, ep, "exact")
-                remaining_files = [(f, p) for f, p in remaining_files if f != fid]
                 break
 
     # Pass 2 — absolute episode pairing. Two provider conventions:
@@ -112,7 +125,9 @@ def assign_files_to_episodes(
     # 1158-vs-5 comparison always failed, orphaning every absolute-
     # numbered file. Resolution order: provider's absolute_number first
     # when set, fall back to ep.episode (the AniDB-native case).
-    for fid, parsed in list(remaining_files):
+    for fid, parsed in files:
+        if fid in claimed_fids:
+            continue
         abs_ep = parsed.absolute_episode
         if abs_ep is None:
             continue
@@ -125,8 +140,10 @@ def assign_files_to_episodes(
                 provider_absolute = ep.get("absolute_number")
             target_ep = provider_absolute if provider_absolute is not None else e
             if target_ep == abs_ep:
-                _claim(fid, parsed, ep, "absolute")
-                remaining_files = [(f, p) for f, p in remaining_files if f != fid]
+                # Store the ABSOLUTE number, not the provider-LOCAL index — a
+                # TVDB per-season list pairs a [1158] file via absolute_number
+                # but its local episode is 3; storing 3 was the collapse.
+                _claim(fid, parsed, ep, "absolute", episode_override=abs_ep)
                 break
 
     # Pass 3 — season-agnostic episode-number match (the One Piece
@@ -135,7 +152,9 @@ def assign_files_to_episodes(
     # hits). Only fire for anime to avoid TV cross-season collisions.
     is_anime = any(getattr(p, "media_type", None) == "anime" for _, p in files)
     if is_anime:
-        for fid, parsed in list(remaining_files):
+        for fid, parsed in files:
+            if fid in claimed_fids:
+                continue
             if parsed.episode is None:
                 continue
             for ep in remaining_eps:
@@ -144,13 +163,59 @@ def assign_files_to_episodes(
                     continue
                 if e == parsed.episode:
                     _claim(fid, parsed, ep, "episode_number")
-                    remaining_files = [(f, p) for f, p in remaining_files if f != fid]
+                    break
+
+    # Pass 3.5 — anime long-runner ABSOLUTE-by-episode (the One Piece S23E1156
+    # fix). The SxE form "S23E1156" parses as episode=1156 with
+    # absolute_episode=None, so Pass 2 (which gates on parsed.absolute_episode)
+    # can't fire, and Pass 3's local `e == 1156` misses a per-season list
+    # numbered 1..13. Pair by the provider's absolute_number == parsed.episode
+    # and STORE the file's real number (1156). Without this the only remaining
+    # pass is the title pass — which stores the LOCAL index (1156 → 1), the
+    # exact collapse. Hard-gated so it can't change any working shape:
+    #   • anime only;
+    #   • file has NO parsed.absolute_episode (Pass 2 owns those);
+    #   • runs AFTER Pass 3 so per-cour LOCAL numbering (Frieren S2E03) wins;
+    #   • requires ep.absolute_number set AND != ep.episode, so single-season
+    #     lists (absolute == local) are a strict no-op;
+    #   • the file's number must EXCEED every local episode in the list
+    #     (parsed.episode > max local index) — that's what proves it's an
+    #     absolute, not a local. This stops a low per-cour number from ever
+    #     colliding with a sibling episode's absolute_number (e.g. a 12-ep
+    #     cour where some ep's absolute_number happens to equal a small local
+    #     number elsewhere); such a file isn't > max_local, so it's skipped.
+    if is_anime:
+        # max_local must be the maximum LOCAL index across the WHOLE episode
+        # list (not a subset): the "file number exceeds every local index"
+        # test is what proves a number is an absolute rather than a local, so
+        # it has to see all episodes. (`remaining_eps` is the full list today,
+        # but compute from `episodes` directly so this stays correct even if a
+        # future pass starts pruning the remaining set.)
+        max_local = max((_ep_key(ep)[1] for ep in episodes), default=0)
+        for fid, parsed in files:
+            if fid in claimed_fids:
+                continue
+            if parsed.episode is None or parsed.absolute_episode is not None:
+                continue
+            if parsed.episode <= max_local:
+                continue
+            for ep in remaining_eps:
+                s, e = _ep_key(ep)
+                if (s, e) in used_ep_keys:
+                    continue
+                ep_abs = getattr(ep, "absolute_number", None)
+                if ep_abs is None and isinstance(ep, dict):
+                    ep_abs = ep.get("absolute_number")
+                if ep_abs is not None and ep_abs != e and ep_abs == parsed.episode:
+                    _claim(fid, parsed, ep, "absolute_sxe", episode_override=parsed.episode)
                     break
 
     # Pass 4 — air-date match (Phase 9). Daily / talk / news files numbered
     # by date pair against the provider's air_date field. Exact date match,
     # so it runs ahead of the fuzzier title pass.
-    for fid, parsed in list(remaining_files):
+    for fid, parsed in files:
+        if fid in claimed_fids:
+            continue
         ad = getattr(parsed, "air_date", None)
         if not ad:
             continue
@@ -160,7 +225,6 @@ def assign_files_to_episodes(
                 continue
             if _ep_air_date(ep) == target:
                 _claim(fid, parsed, ep, "air_date")
-                remaining_files = [(f, p) for f, p in remaining_files if f != fid]
                 break
 
     # Pass 5 — episode-title similarity (Phase 6). For files STILL unpaired
@@ -170,7 +234,9 @@ def assign_files_to_episodes(
     # episode-title matching. Additive: only touches files passes 1-3 left
     # orphaned, and only claims an episode on a strong (≥0.6) title match.
     from kira.matcher.similarity import trigram_similarity
-    for fid, parsed in list(remaining_files):
+    for fid, parsed in files:
+        if fid in claimed_fids:
+            continue
         guess = getattr(parsed, "episode_title_guess", None)
         if not guess:
             continue
@@ -188,10 +254,10 @@ def assign_files_to_episodes(
                 best_ep = ep
         if best_ep is not None and best_sim >= 0.6:
             _claim(fid, parsed, best_ep, "title")
-            remaining_files = [(f, p) for f, p in remaining_files if f != fid]
 
     # Anything still unmatched is genuinely orphan.
-    for fid, _parsed in remaining_files:
-        out[fid] = FileToEpisode(fid, None, None, None, "unpaired")
+    for fid, _parsed in files:
+        if fid not in claimed_fids:
+            out[fid] = FileToEpisode(fid, None, None, None, "unpaired")
 
     return out

@@ -30,6 +30,10 @@ from kira.renamer import (
 
 router = APIRouter(prefix="/rename", tags=["rename"])
 
+# Artwork download bounds (defence against a hostile/oversized image host).
+_ARTWORK_MAX_BYTES = 25 * 1024 * 1024   # 25 MiB — generous for an "original" backdrop
+_IMG_CACHE_MAX_ENTRIES = 64             # cap the per-batch dedupe cache (FIFO eviction)
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Live template preview (Tier 1.5 step 6 backend)
@@ -156,30 +160,38 @@ def _filesystem_reachable(src: Path) -> bool:
     even though nothing moved. The user only notices weeks later when
     the DB has drifted irrecoverably from the actual filesystem.
 
-    Strategy: probe the volume root. iterating it (one entry, or a clean
-    StopIteration on an empty drive) means the mount is responsive.
-    OSError = the mount itself is unreachable; no claim about files
-    beneath it should be trusted.
+    Strategy: probe the DEEPEST EXISTING ancestor of `src` and confirm it's
+    actually listable. Iterating a live directory close to the file is a
+    truthful "this subtree is responsive" signal — the old drive-root probe
+    missed the case where a nested mount drops (e.g. `Z:\media` is a junction
+    to a down NAS) while the system drive `Z:\` stays up and happily lists. A
+    degraded mount can also answer exists()==True for its reparse point yet
+    raise on iterdir; the listability check catches that too.
+
+    Walking up terminates at the volume root (`parent == probe`), which works
+    uniformly for Windows drives, UNC shares, and POSIX paths. If nothing in
+    the chain is reachable, the mount is down and no exists()==False answer
+    about files beneath it can be trusted.
     """
     try:
-        if os.name == "nt":
-            drive = src.drive  # e.g. "Z:"
-            if not drive:
-                # UNC path (\\server\share\…). Probe the share root.
-                anchor = src.anchor  # "\\\\server\\share\\"
-                if not anchor:
-                    return True  # nothing to probe — assume reachable
-                return Path(anchor).exists()
-            root = Path(drive + "\\")
-            it = iter(root.iterdir())  # raises OSError if drive unmounted
+        probe = src.parent
+        while True:
             try:
-                next(it)
-            except StopIteration:
-                pass  # empty drive but mounted — that's fine
-            return True
-        # POSIX: walk up to the mount anchor and confirm it's a directory.
-        anchor = src.anchor or "/"
-        return Path(anchor).is_dir()
+                here = probe.exists()
+            except OSError:
+                return False
+            if here:
+                # exists() said yes — confirm the directory truly responds.
+                it = iter(probe.iterdir())  # OSError → outer except → False
+                try:
+                    next(it)
+                except StopIteration:
+                    pass  # empty but live — fine
+                return True
+            parent = probe.parent
+            if parent == probe:
+                return False  # reached the volume root; nothing existed
+            probe = parent
     except OSError:
         return False
 
@@ -227,6 +239,9 @@ async def _resolve_profile(session: AsyncSession, name: str) -> NamingProfile:
             tv=row.value.get("tv", DEFAULT_PROFILES["Plex"].tv),
             anime=row.value.get("anime", DEFAULT_PROFILES["Plex"].anime),
             music=row.value.get("music", DEFAULT_PROFILES["Plex"].music),
+            # Optional: a custom profile may define its own absolute-numbering
+            # anime variant. Absent → select_template falls back to `anime`.
+            anime_absolute=row.value.get("anime_absolute"),
         )
     return DEFAULT_PROFILES["Plex"]
 
@@ -406,6 +421,326 @@ async def _resolve_cleanup_artifacts(session: AsyncSession) -> bool:
     return True
 
 
+async def _resolve_bool_setting(session: AsyncSession, key: str, default: bool) -> bool:
+    """Read a boolean setting that may be stored bare or wrapped in {"value": …}.
+    Used by the Pass 7 output toggles (write_nfo, download_artwork)."""
+    from kira.models import Setting
+    row = await session.get(Setting, key)
+    if not row:
+        return default
+    val = row.value
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, dict):
+        v = val.get("value")
+        if isinstance(v, bool):
+            return v
+    return default
+
+
+async def _resolve_str_setting(session: AsyncSession, key: str, default: str) -> str:
+    """Read a string setting that may be stored bare or wrapped in {"value": …}.
+    Used by the anime episode-numbering style toggle (seasonal | absolute)."""
+    from kira.models import Setting
+    row = await session.get(Setting, key)
+    if not row:
+        return default
+    val = row.value
+    if isinstance(val, str):
+        return val
+    if isinstance(val, dict):
+        v = val.get("value")
+        if isinstance(v, str):
+            return v
+    return default
+
+
+async def _resolve_int_setting(session: AsyncSession, key: str, default: int, *, lo: int, hi: int) -> int:
+    """Read an int setting (bare or wrapped, possibly a numeric string), clamped
+    to [lo, hi]. Used by the concurrency knob (Settings → Advanced)."""
+    from kira.models import Setting
+    row = await session.get(Setting, key)
+    if not row:
+        return default
+    val = row.value
+    if isinstance(val, dict):
+        val = val.get("value")
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
+async def _resolve_nfo_fields(session: AsyncSession) -> set[str] | None:
+    """Which optional NFO fields the user enabled (Settings → Naming).
+
+    Stored as a bare dict under `naming.nfo_fields`, e.g. `{"cast": false}`.
+    A field absent from the dict defaults to ON, so:
+      - unset / empty   → None (write everything — the default behaviour)
+      - `{"cast": false}` → every field except cast
+    Returns the SET of enabled keys, or None for "all on" (back-compat)."""
+    from kira.models import Setting
+    from kira.renamer.nfo import NFO_TOGGLEABLE
+    row = await session.get(Setting, "naming.nfo_fields")
+    val = row.value if row else None
+    # Defensive unwrap in case a writer wrapped it as {"value": {...}}.
+    if isinstance(val, dict) and isinstance(val.get("value"), dict):
+        val = val["value"]
+    if not isinstance(val, dict) or not val:
+        return None
+    return {k for k in NFO_TOGGLEABLE if val.get(k, True)}
+
+
+async def _write_nfo_files(target: Path, parsed: ParsedFile, selected: Match, meta: dict | None,
+                           fields: set[str] | None = None) -> None:
+    """#12: write Kodi/Emby .nfo sidecars beside the renamed video. Best-effort
+    output from data already on the Match — no API calls. `fields` selects which
+    optional tags to include (None = all)."""
+    from kira.renamer import nfo
+    plan = nfo.plan_nfo_writes(target, parsed.media_type)
+    if not plan:
+        return
+    meta = meta or {}
+    # The Match column always carries the chosen poster; older metadata_blobs
+    # may predate the poster_url key. Backfill it so the NFO <thumb> is written.
+    if not meta.get("poster_url") and selected.poster_url:
+        meta = {**meta, "poster_url": selected.poster_url}
+    prov, pid = selected.provider, selected.provider_id
+    title = selected.title or parsed.title
+    year = selected.year if selected.year is not None else parsed.year
+    # The file's own container/tech data → Kodi <fileinfo><streamdetails>. From
+    # the filename strip (codec/quality) + MediaInfo when `parsing.read_mediainfo`
+    # is on (hdr/channels/audio/duration). Emits only what's known.
+    tech = {
+        "codec": parsed.codec, "quality": parsed.quality, "hdr": parsed.hdr,
+        "channels": parsed.channels, "audio": parsed.audio,
+        "duration": getattr(parsed, "duration", None),
+        # Per-track languages (MediaInfo) → one <audio>/<subtitle> each in the NFO.
+        "audio_langs": getattr(parsed, "audio_langs", None) or [],
+        "sub_langs": getattr(parsed, "sub_langs", None) or [],
+    }
+    if "movie" in plan:
+        content = nfo.build_movie_nfo(title, year, meta, prov, pid, fields=fields, tech=tech)
+        await asyncio.to_thread(plan["movie"].write_text, content, encoding="utf-8")
+    if "episode" in plan:
+        season = selected.season_number
+        episode = selected.episode_number if selected.episode_number is not None else parsed.episode
+        content = nfo.build_episode_nfo(selected.episode_title, season, episode, meta,
+                                        series_name=selected.series_name, fields=fields, tech=tech)
+        await asyncio.to_thread(plan["episode"].write_text, content, encoding="utf-8")
+    if "tvshow" in plan:
+        tv_path = plan["tvshow"]
+        # Write-if-absent — one tvshow.nfo per series, not per episode.
+        if not tv_path.exists():
+            content = nfo.build_tvshow_nfo(selected.series_name or title, year, meta, prov, pid, fields=fields)
+            await asyncio.to_thread(tv_path.write_text, content, encoding="utf-8")
+
+
+# Default per-kind enablement for artwork download. Poster + background +
+# clearlogo are the everyday set (clearlogo is the headline fanart.tv type most
+# Plex/Jellyfin/Kodi skins use); the rest are opt-in via Settings → Naming.
+_ARTWORK_DEFAULTS: dict[str, bool] = {
+    "poster": True, "fanart": True, "clearlogo": True,
+    "clearart": False, "banner": False, "landscape": False,
+    "disc": False, "characterart": False,
+}
+
+
+async def _resolve_artwork_kinds(session: AsyncSession) -> set[str]:
+    """Which artwork kinds to download (Settings → Naming). Stored as a bare
+    dict `{kind: bool}` under `naming.artwork_types`; a kind absent falls back to
+    its default. Unset → the default set (poster + fanart + clearlogo)."""
+    from kira.models import Setting
+    from kira.providers.fanarttv import ALL_KINDS
+    row = await session.get(Setting, "naming.artwork_types")
+    val = row.value if row else None
+    if isinstance(val, dict) and isinstance(val.get("value"), dict):
+        val = val["value"]
+    if not isinstance(val, dict):
+        val = {}
+    return {k for k in ALL_KINDS if val.get(k, _ARTWORK_DEFAULTS.get(k, False))}
+
+
+async def _resolve_artwork_ids(selected: Match, meta: dict, media_type: str):
+    """(tmdb_id, tvdb_id, imdb_id) for fanart.tv lookups, from the match + its
+    metadata blob. fanart.tv keys movies by TMDB/IMDb and TV by TheTVDB; anime
+    (matched to AniDB) resolves its TVDB id via the Fribb cross-ref so it can use
+    the /tv endpoint too. Returns string ids (or None)."""
+    tmdb_id = tvdb_id = imdb_id = None
+    prov, pid = selected.provider, selected.provider_id
+    if prov == "tmdb":
+        tmdb_id = pid
+    elif prov == "tvdb":
+        tvdb_id = pid
+    elif prov == "anidb":
+        try:
+            from kira.providers.anime_mappings import AnimeMappings
+            tvdb_id = await AnimeMappings.tvdb_id(int(pid))
+        except Exception:
+            tvdb_id = None
+    # Cross-ref ids the provider may have attached to the metadata blob.
+    tmdb_id = tmdb_id or meta.get("tmdb_id")
+    tvdb_id = tvdb_id or meta.get("tvdb_id")
+    imdb_id = meta.get("imdbid") or meta.get("imdb_id")
+    return (
+        str(tmdb_id) if tmdb_id else None,
+        str(tvdb_id) if tvdb_id else None,
+        str(imdb_id) if imdb_id else None,
+    )
+
+
+async def _download_artwork_files(
+    target: Path, parsed: ParsedFile, selected: Match, meta: dict | None,
+    *,
+    client: "httpx.AsyncClient | None" = None,
+    kinds: set[str] | None = None,
+    fanart_key: str = "",
+    fanart_client_key: str = "",
+    languages: list[str] | None = None,
+    fanart_cache: dict | None = None,
+    img_cache: dict | None = None,
+) -> None:
+    """#13: download artwork beside the renamed video (Plex/Kodi local-asset
+    convention `<stem>-<kind>.<ext>`). Poster + background come from the matched
+    provider (TMDB/TVDB/AniDB); the richer kinds (clearlogo, clearart, banner,
+    disc, character art) come from fanart.tv when a key is configured. Best-
+    effort, write-if-absent — a slow/down image host never affects the rename.
+    `fanart_cache` (a dict shared across the batch) caches the single fanart.tv
+    response per series id so a 24-episode season makes ONE API call.
+
+    CR-06: `client` is a SINGLE httpx.AsyncClient owned by the batch scope
+    (`perform_rename`) and threaded through here so the fanart.tv lookup AND the
+    image-byte fetches reuse one connection pool across the whole season's
+    episodes — instead of opening (and tearing down) two fresh clients per file.
+    Mirrors the shared `_sc` subtitle client. Per-request timeouts (15s fanart /
+    20s image) are applied at the call sites so those budgets are preserved.
+    When `client` is None (e.g. a direct unit-test call) the function opens its
+    own short-lived client for the duration, so it stays self-contained.
+    """
+    import httpx
+    meta = meta or {}
+    if kinds is None:
+        kinds = {"poster", "fanart"}   # back-compat default when caller omits
+    if not kinds:
+        return
+
+    # Resolve the working client: reuse the batch-shared one, or open a local
+    # fallback (closed on exit) when called standalone. The fallback is entered
+    # lazily so the no-op/empty-jobs early returns don't open a connection.
+    from contextlib import AsyncExitStack
+    async with AsyncExitStack() as _stack:
+        if client is None:
+            client = await _stack.enter_async_context(
+                httpx.AsyncClient(timeout=20.0, follow_redirects=True)
+            )
+        await _download_artwork_with_client(
+            target, parsed, selected, meta, client,
+            kinds=kinds, fanart_key=fanart_key,
+            fanart_client_key=fanart_client_key, languages=languages,
+            fanart_cache=fanart_cache, img_cache=img_cache,
+        )
+
+
+async def _download_artwork_with_client(
+    target: Path, parsed: ParsedFile, selected: Match, meta: dict,
+    client: "httpx.AsyncClient",
+    *,
+    kinds: set[str],
+    fanart_key: str = "",
+    fanart_client_key: str = "",
+    languages: list[str] | None = None,
+    fanart_cache: dict | None = None,
+    img_cache: dict | None = None,
+) -> None:
+    """Inner artwork worker that operates on an ALREADY-RESOLVED client (the
+    batch-shared one, or the local fallback `_download_artwork_files` opened).
+    Split out so the client lifetime is managed in exactly one place."""
+    media_type = parsed.media_type or "movie"
+    fanart_for = "movie" if media_type == "movie" else "tv"
+
+    # fanart.tv (logos / clear art / banner / disc / character art + higher-res
+    # poster+background). One request per series id, cached across the batch.
+    fanart_urls: dict[str, str] = {}
+    if fanart_key:
+        tmdb_id, tvdb_id, imdb_id = await _resolve_artwork_ids(selected, meta, media_type)
+        cache_key = (fanart_for, tmdb_id, tvdb_id, imdb_id)
+        if fanart_cache is not None and cache_key in fanart_cache:
+            fanart_urls = fanart_cache[cache_key]
+        elif tmdb_id or tvdb_id or imdb_id:
+            from kira.providers import fanarttv
+            # Reuse the batch-shared client; apply the fanart lookup's 15s
+            # budget per-request so connections pool across episodes.
+            fanart_urls = await fanarttv.fetch_artwork(
+                media_type=media_type, client=client, api_key=fanart_key,
+                tmdb_id=tmdb_id, tvdb_id=tvdb_id, imdb_id=imdb_id,
+                client_key=fanart_client_key or None, languages=languages,
+                wanted=kinds,
+            )
+            if fanart_cache is not None:
+                fanart_cache[cache_key] = fanart_urls
+
+    from kira.providers.fanarttv import EXT_FOR_KIND
+    # Per-kind source: fanart.tv first; the matched provider backstops poster +
+    # background (so the toggle still produces art with no fanart.tv key).
+    provider_poster = selected.poster_url or meta.get("poster_url")
+    provider_fanart = meta.get("fanart_url") or meta.get("backdrop_url")
+    jobs: list[tuple[str, Path]] = []
+    for kind in kinds:
+        url = fanart_urls.get(kind)
+        if not url and kind == "poster":
+            url = provider_poster
+        if not url and kind == "fanart":
+            url = provider_fanart
+        if not url:
+            continue
+        ext = EXT_FOR_KIND.get(kind, "jpg")
+        jobs.append((url, target.with_name(f"{target.stem}-{kind}.{ext}")))
+    if not jobs:
+        return
+    from kira.download_guard import fetch_capped, sniff_image
+
+    def _atomic_write(tmp: Path, final: Path, data: bytes) -> None:
+        tmp.write_bytes(data)
+        os.replace(tmp, final)
+
+    for url, dest in jobs:
+        try:
+            if dest.exists():
+                continue
+            # Per-batch byte cache: a TV season shares one show clearlogo /
+            # poster URL across every episode — fetch it ONCE, write it to
+            # each episode's sidecar (still write-if-absent on disk).
+            data = img_cache.get(url) if img_cache is not None else None
+            if data is None:
+                # The URL comes from fanart.tv / provider JSON, so route it
+                # through the SSRF guard and stream it under a hard size cap
+                # (preserve the old 20s per-image budget).
+                fetched = await fetch_capped(client, url, max_bytes=_ARTWORK_MAX_BYTES, timeout=20.0)
+                if not fetched:
+                    continue
+                content, _ct = fetched
+                # Validate by magic bytes: an image host that 200s with an
+                # HTML "not found"/rate-limit page or a JSON error would
+                # otherwise be saved as a permanent corrupt file
+                # (write-if-absent → no retry).
+                if sniff_image(content) is None:
+                    print(f"artwork: {url} returned a non-image payload, skipping")
+                    continue
+                data = content
+                if img_cache is not None:
+                    # Bounded per-batch cache: evict the oldest entry once at
+                    # capacity so a large, art-diverse batch can't grow process
+                    # memory without limit (insertion-ordered dict → FIFO).
+                    if len(img_cache) >= _IMG_CACHE_MAX_ENTRIES:
+                        img_cache.pop(next(iter(img_cache)), None)
+                    img_cache[url] = data
+            tmp = dest.with_name(dest.name + ".part")
+            await asyncio.to_thread(_atomic_write, tmp, dest, data)
+        except Exception as e:
+            print(f"artwork: failed {url} -> {dest} (non-fatal): {e!r}")
+
+
 async def _resolve_type_target_root(
     session: AsyncSession,
     media_type: str,
@@ -476,10 +811,54 @@ async def _resolve_library_root(session: AsyncSession, name: str | None) -> str:
 
 
 @router.post("", response_model=RenameResult)
+async def _resolve_franchise_absolute(anidb, selected, parsed) -> int | None:
+    """Franchise-ABSOLUTE episode number for a locally-named anime file matched
+    to a per-cour/season AniDB AID — or None.
+
+    Closes the locally-named→absolute rename-output gap: `AoT S4E01` matched to
+    the Final-Season cour AID has no absolute in its name, so `{{absx}}` had
+    nothing to render. `get_franchise_offsets` (cache-first on disk; returns []
+    when AniDB is banned/unresolvable → ban-safe) gives the cour's absolute
+    range, and `franchise_absolute` adds the AID-local episode
+    (`Match.episode_number` after cour routing). Any miss → None, so the filename
+    falls back to its SxE form exactly as it did before."""
+    from kira.matcher.cour_routing import franchise_absolute
+    try:
+        aid = int(selected.provider_id)
+    except (TypeError, ValueError):
+        return None
+    local_ep = selected.episode_number if selected.episode_number is not None else parsed.episode
+    try:
+        offsets = await anidb.get_franchise_offsets(aid)
+    except Exception as e:
+        print(f"_resolve_franchise_absolute: get_franchise_offsets failed (non-fatal): {e!r}")
+        return None
+    return franchise_absolute(offsets, aid, local_ep)
+
+
 async def rename(
     payload: RenameRequest,
     session: AsyncSession = Depends(get_session),
 ) -> RenameResult:
+    """Thin HTTP wrapper — preserves FastAPI routing (path/method/response
+    model) while delegating the full pipeline to the `perform_rename` service
+    function. The daemon (watcher.maybe_auto_rename) calls `perform_rename`
+    directly with its own session, so the executor is no longer coupled to the
+    API layer / `Depends(get_session)`."""
+    return await perform_rename(payload, session)
+
+
+async def perform_rename(
+    payload: RenameRequest,
+    session: AsyncSession,
+) -> RenameResult:
+    """Execute the rename pipeline for a batch of files.
+
+    Plain service function (NO `Depends`): `session` is a normal parameter so
+    both the HTTP endpoint and the watcher daemon can drive it with their own
+    AsyncSession. This is the batch scope — shared per-batch resources (fanart
+    cache, image cache, the shared artwork httpx client) live here so they're
+    reused across every file/episode in the season."""
     op = FileOp(payload.op)
     profile = await _resolve_profile(session, payload.profile)
     library_root = await _resolve_library_root(session, payload.library_root_name)
@@ -490,7 +869,71 @@ async def rename(
     # Settings → Folder cleanup if they want strict "only touch what's
     # already empty" semantics.
     cleanup_artifacts = await _resolve_cleanup_artifacts(session)
+    # Recoverable cleanup (Settings → Folder cleanup): when on, swept artifacts
+    # are MOVED into a managed trash folder instead of deleted, so a mistaken
+    # sweep can be recovered from the user's file browser. Defaults to
+    # <library_root>/.kira-trash; user may override the path. Off → hard delete
+    # (the prior behavior).
+    cleanup_trash_dir: Path | None = None
+    if await _resolve_bool_setting(session, "rename.cleanup_trash", False):
+        _trash_override = await _resolve_str_setting(session, "rename.trash_dir", "")
+        if _trash_override:
+            cleanup_trash_dir = Path(_trash_override)
+        elif library_root:
+            cleanup_trash_dir = Path(library_root) / ".kira-trash"
     rename_mode = await _resolve_rename_mode(session)
+    # Pass 7 output toggles (both default OFF — opt-in metadata sidecars).
+    write_nfo = await _resolve_bool_setting(session, "naming.write_nfo", False)
+    nfo_fields = await _resolve_nfo_fields(session) if write_nfo else None
+    download_artwork = await _resolve_bool_setting(session, "naming.download_artwork", False)
+    # Artwork sources: provider poster/background always; fanart.tv (when a key
+    # is set) adds logos / clear art / banner / disc / character art. Resolve the
+    # enabled kinds + key ONCE; `_artwork_cache` dedupes the fanart.tv call to one
+    # request per series id across a whole season's worth of files.
+    artwork_kinds = await _resolve_artwork_kinds(session) if download_artwork else set()
+    fanart_key = await _resolve_str_setting(session, "providers.fanarttv.api_key", "") if download_artwork else ""
+    fanart_client_key = await _resolve_str_setting(session, "providers.fanarttv.client_key", "") if download_artwork else ""
+    # Language preference for artwork (logos/posters): reuse the subtitle
+    # languages as the "my language" hint, falling back to English.
+    _art_langs_raw = await _resolve_str_setting(session, "subtitles.languages", "en") if download_artwork else "en"
+    artwork_langs = [l.strip() for l in _art_langs_raw.split(",") if l.strip()] or ["en"]
+    artwork_cache: dict = {}       # fanart.tv response per series id (1 API call/season)
+    artwork_img_cache: dict = {}   # downloaded image bytes per URL (1 fetch/image)
+    # CR-06: ONE shared httpx client for ALL artwork I/O across the batch — the
+    # fanart.tv lookup AND every image-byte fetch reuse this single connection
+    # pool instead of opening/closing two fresh clients per file. Created only
+    # when artwork download is actually enabled (opt-in), and closed in the
+    # `finally` after the file loop. Mirrors the shared `_sc` subtitle client.
+    # Per-request timeouts (15s fanart / 20s image) are applied at the call
+    # sites, so this default timeout is just a backstop.
+    # Use the process-shared client (warm pool across batches) for artwork; no
+    # per-batch open/close, so the file loop below doesn't need a try/finally
+    # just to tear a client down. Downloads go through fetch_capped (guarded,
+    # no redirects); the fanart.tv API returns JSON directly — neither needs the
+    # old follow_redirects client.
+    artwork_client = None
+    if download_artwork:
+        from kira import net
+        artwork_client = net.shared_client()
+    # Anime episode-numbering style: "seasonal" (S04E05, default) | "absolute"
+    # (flat "One Piece - 1156"). Only affects anime templates; see select_template.
+    anime_numbering = await _resolve_str_setting(session, "naming.anime_numbering", "seasonal")
+
+    # Locally-named anime → franchise-ABSOLUTE output (the {{absx}} token). Built
+    # ONCE per batch, and ONLY when the user picked absolute numbering — seasonal
+    # renames (the default) never touch AniDB here. None when AniDB isn't
+    # configured; `get_franchise_offsets` is cache-first + ban-safe, so even with
+    # it built a banned/cold lookup just leaves the filename on its SxE fallback.
+    anidb_for_abs = None
+    if anime_numbering == "absolute":
+        try:
+            from kira.matcher.engine import registry_from_settings
+            from kira import net
+            _abs_reg = await registry_from_settings(net.shared_client())
+            if _abs_reg.has("anidb"):
+                anidb_for_abs = _abs_reg.build("anidb")
+        except Exception as e:
+            print(f"perform_rename: anidb build for absolute numbering failed (non-fatal): {e!r}")
 
     files = list(await session.scalars(
         select(MediaFile)
@@ -568,6 +1011,24 @@ async def rename(
             except (ValueError, AttributeError):
                 pass  # series_group_id wasn't well-formed; keep original title
 
+        # Locally-named anime → franchise-absolute number for {{absx}}. The file
+        # was named per-cour-local (e.g. "S4E01") so parsed.absolute_episode is
+        # None; derive it from the matched AID's franchise offset table. Set
+        # BEFORE the target-root computation below so both the folder render and
+        # the filename render see it. Render-only: we mutate this local `parsed`,
+        # never the stored row. No-op unless absolute numbering is on (so
+        # `anidb_for_abs` is None otherwise).
+        if (
+            anidb_for_abs is not None
+            and parsed.media_type == "anime"
+            and parsed.absolute_episode is None
+            and (selected.provider or "").lower() == "anidb"
+            and selected.provider_id
+        ):
+            _abs_ep = await _resolve_franchise_absolute(anidb_for_abs, selected, parsed)
+            if _abs_ep is not None:
+                parsed.absolute_episode = _abs_ep
+
         # Determine where this file's renamed copy should land.
         # Priority:
         #   1. rename_mode == 'in-place' (new default): the file STAYS in
@@ -581,13 +1042,22 @@ async def rename(
         #   3. Fallback: library_root + SUBFOLDER[type] (legacy).
         type_target_root: str | None = None
         if rename_mode == "in-place":
-            type_target_root = _compute_inplace_target_root(
-                Path(f.file_path), parsed, profile,
-                library_title=library_title,
-                library_year=library_year,
-                episode_title=selected.episode_title,
-                season_override=selected.season_number,
-            )
+            try:
+                type_target_root = _compute_inplace_target_root(
+                    Path(f.file_path), parsed, profile,
+                    library_title=library_title,
+                    library_year=library_year,
+                    episode_title=selected.episode_title,
+                    season_override=selected.season_number,
+                )
+            except Exception as e:
+                # The in-place root computation ALSO renders the naming template.
+                # A template error here must be a PER-FILE failure — same
+                # contract as format_target_path below — not an uncaught raise
+                # that 500s the whole batch (and crashes the dry-run preview,
+                # so the user can't even see which file/template is broken).
+                results.append(RenameItemResult(file_id=fid, ok=False, error=f"Template error: {e}"))
+                continue
         if type_target_root is None:
             type_target_root = await _resolve_type_target_root(session, parsed.media_type)
         # Tier 1.5 step 2b: assemble provider-metadata for the rich naming
@@ -614,6 +1084,7 @@ async def rename(
                 type_target_root=type_target_root,
                 metadata=_meta,
                 file_size=f.file_size,
+                anime_numbering=anime_numbering,
             )
         except Exception as e:
             results.append(RenameItemResult(file_id=fid, ok=False, error=f"Template error: {e}"))
@@ -716,6 +1187,7 @@ async def rename(
                 cleanup_stop_at=Path(library_root) if library_root else None,
                 cleanup_max_levels=cleanup_max_levels,
                 cleanup_artifacts=cleanup_artifacts,
+                cleanup_trash_dir=cleanup_trash_dir,
             ) or 0
         except Exception as e:
             results.append(RenameItemResult(
@@ -740,6 +1212,40 @@ async def rename(
             poster_url=selected.poster_url if selected else None,
         )
         session.add(video_history)
+
+        # Stamp the renamed file with its resolved provider ID (xattr / NTFS
+        # ADS) so a future re-scan re-identifies it instantly via the Phase 14
+        # embedded-ID bypass — even if the filename is later changed. Pure
+        # optimisation: a no-op on filesystems that don't support it, never
+        # fails the rename.
+        if selected and selected.provider and selected.provider_id:
+            try:
+                from kira import xattr_store
+                xattr_store.write_ids(str(target), {selected.provider: str(selected.provider_id)})
+            except Exception as e:
+                print(f"rename: xattr stamp failed for {fid} (non-fatal): {e!r}")
+
+        # ── #12: Kodi/Emby NFO sidecars (opt-in, best-effort) ─────────
+        # Write metadata .nfo files beside the renamed video from the data
+        # already on the Match. Pure output — never fails the rename.
+        if write_nfo and selected:
+            try:
+                await _write_nfo_files(target, parsed, selected, _meta, fields=nfo_fields)
+            except Exception as e:
+                print(f"rename: NFO write failed for {fid} (non-fatal): {e!r}")
+
+        # ── #13: artwork download (opt-in, best-effort) ───────────────
+        if download_artwork and selected and artwork_client is not None:
+            try:
+                await _download_artwork_files(
+                    target, parsed, selected, _meta,
+                    client=artwork_client,
+                    kinds=artwork_kinds, fanart_key=fanart_key,
+                    fanart_client_key=fanart_client_key, languages=artwork_langs,
+                    fanart_cache=artwork_cache, img_cache=artwork_img_cache,
+                )
+            except Exception as e:
+                print(f"rename: artwork download failed for {fid} (non-fatal): {e!r}")
 
         # ── Tier 1.2: Subtitle / sidecar co-renaming ─────────────────
         # Now that the video has moved, hunt for sidecars (.srt, .ass,
@@ -795,6 +1301,7 @@ async def rename(
                         cleanup_stop_at=Path(library_root) if library_root else None,
                         cleanup_max_levels=cleanup_max_levels,
                         cleanup_artifacts=cleanup_artifacts,
+                        cleanup_trash_dir=cleanup_trash_dir,
                     ) or 0
                     # Aggregate artifact count across all sidecar moves
                     # for this video. The LAST sidecar move triggers the
@@ -910,6 +1417,89 @@ async def rename(
         # inside the loop, so a failure here only loses the notification
         # rows (annoying, not catastrophic).
         await session.commit()
+
+        # ── Pass 6 post-rename hooks (best-effort, never affect the result) ──
+        if succeeded:
+            # Run on a FRESH session: the rename loop above may have left
+            # `session` in a pending-rollback state after a caught per-file
+            # IntegrityError, which would make these follow-up reads raise
+            # PendingRollbackError and silently skip media-server refresh +
+            # subtitle fetch for an otherwise-successful batch.
+            from kira.database import SessionLocal
+            async with SessionLocal() as hook_session:
+                # #9: nudge Plex/Jellyfin to re-scan so the renames show up now.
+                try:
+                    from kira.integrations.media_server import refresh_all
+                    await refresh_all(hook_session)
+                except Exception as e:
+                    print(f"rename: media-server refresh failed (non-fatal): {e!r}")
+                # #10: fan out the summary to external sinks (Discord / webhook).
+                try:
+                    from kira import notify
+                    await notify.fan_out(
+                        "success",
+                        f"Renamed {succeeded} file{'' if succeeded == 1 else 's'}",
+                        f"Operation: {op.value} · Profile: {payload.profile}"
+                        + (f" · {failed} failed" if failed else ""),
+                    )
+                except Exception as e:
+                    print(f"rename: notification fan-out failed (non-fatal): {e!r}")
+                # #11: auto-fetch subtitles for the renamed files (opt-in). The
+                # aggregator runs the enabled sources cheapest/most-reliable first
+                # (embedded → OpenSubtitles → YIFY), each skipping a language already
+                # on disk so they compose without duplicating. Best-effort — a
+                # subtitle failure never affects the rename result.
+                try:
+                    if await _resolve_bool_setting(hook_session, "subtitles.auto_fetch", False):
+                        from kira import net
+                        from kira.api.matches import load_opensubtitles_settings
+                        from kira.subtitles.aggregate import fetch_subtitles
+                        api_key, sub_user, sub_pw, sub_langs = await load_opensubtitles_settings(hook_session)
+                        if sub_langs:
+                            # Per-source toggles: embedded on by default (free,
+                            # offline); OpenSubtitles whenever a key exists;
+                            # yifysubtitles a scraper → opt-in (default off).
+                            sub_enabled = {
+                                "embedded": await _resolve_bool_setting(hook_session, "subtitles.embedded", True),
+                                "opensubtitles": True,
+                                "yifysubtitles": await _resolve_bool_setting(hook_session, "subtitles.yifysubtitles", False),
+                            }
+                            # Each file's subtitle work (embedded MediaInfo parse +
+                            # the network sources) is INDEPENDENT, so run them with
+                            # bounded concurrency instead of strictly serial — a
+                            # whole-season batch no longer waits on each file in
+                            # turn. The shared client keeps the connection pool warm
+                            # across the batch.
+                            _sc = net.shared_client()
+                            # Settings → Advanced → "Concurrent file operations":
+                            # how many sidecar fetches/writes run in parallel.
+                            _conc = await _resolve_int_setting(
+                                hook_session, "rename.concurrency", 4, lo=1, hi=32)
+                            _sem = asyncio.Semaphore(_conc)
+
+                            async def _fetch_one(r):
+                                f = by_id.get(r.file_id)
+                                sel = next((m for m in (f.matches if f else []) if m.is_selected), None) if f else None
+                                tmdb_id = (int(sel.provider_id) if sel and sel.provider == "tmdb"
+                                           and (sel.provider_id or "").isdigit() else None)
+                                # YIFY is IMDb-indexed — pull the imdb id off the
+                                # match's metadata blob when present (movies).
+                                imdb_id = None
+                                if sel and isinstance(getattr(sel, "metadata_blob", None), dict):
+                                    imdb_id = sel.metadata_blob.get("imdbid") or sel.metadata_blob.get("imdb_id")
+                                async with _sem:
+                                    await fetch_subtitles(
+                                        r.new_path, sub_langs, client=_sc, enabled=sub_enabled,
+                                        os_api_key=api_key, os_user=sub_user, os_pw=sub_pw,
+                                        tmdb_id=tmdb_id, imdb_id=imdb_id,
+                                        season=sel.season_number if sel else None,
+                                        episode=sel.episode_number if sel else None,
+                                    )
+
+                            targets = [r for r in results if r.ok and r.new_path]
+                            await asyncio.gather(*(_fetch_one(r) for r in targets), return_exceptions=True)
+                except Exception as e:
+                    print(f"rename: subtitle auto-fetch failed (non-fatal): {e!r}")
 
     succeeded = sum(1 for r in results if r.ok)
     return RenameResult(

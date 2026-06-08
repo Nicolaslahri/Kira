@@ -35,49 +35,62 @@ from kira.providers.base import (
 from kira.providers.factory import KEYLESS_PROVIDERS
 
 
-# Retry policy for transient provider errors.
-# Sleeps approximately 1s, 2s, 4s with up to 250ms jitter so simultaneous
-# retries don't thunder onto a recovering upstream. Total worst-case wall
-# time per provider call: ~7s + the call latency.
-_RETRY_BACKOFFS = (1.0, 2.0, 4.0)
+# Retry policy. TWO schedules, picked by error class — this matters a LOT:
+#   • RATE-LIMIT / server-busy (HTTP 429/5xx → ProviderTransientError): the
+#     upstream is asking us to slow down, so back off for real (1s→2s→4s).
+#   • CONNECTION BLIP (dropped TCP/TLS, brief network stall → httpx.TransportError
+#     / asyncio.TimeoutError): the endpoint is UP, a single connect just failed.
+#     Retrying immediately almost always succeeds, so a long backoff is pure
+#     dead time. With a flaky-but-up provider (e.g. ~20% of TMDB connects drop)
+#     and several provider calls per file, the old "always 1-2-4s" turned every
+#     blip into a 7s stall and tanked matching ~20x. Fast retry fixes that:
+#     worst case ~1.7s, typically ~0.2s.
+_RETRY_BACKOFFS = (1.0, 2.0, 4.0)                    # rate-limit / 5xx — back off
+_CONNECT_BACKOFFS = (0.2, 0.4, 0.6, 0.8, 1.0)        # connection/TLS blip — retry fast
 
 
 async def _provider_call_with_retry(coro_factory, *, what: str):
-    """Run a provider coroutine with exponential backoff on transient errors.
-
-    `coro_factory` is a no-arg callable that returns a fresh awaitable each
-    invocation (you can't await the same coroutine twice). `what` is a
-    short label included in retry log lines.
+    """Run a provider coroutine with retry. The schedule depends on the error
+    class: connection / TLS-handshake blips retry FAST and more times
+    (`_CONNECT_BACKOFFS`); rate-limits back off harder but fewer times
+    (`_RETRY_BACKOFFS`). With warm keep-alive connections (see kira.net), a
+    scan re-handshakes ~once, so these connection retries mostly cover that one
+    cold handshake rather than firing per file.
 
     Raises:
-      ProviderTransientError after all retries exhausted (caller decides
-        what to do — usually skip this provider and try the next one).
+      ProviderTransientError after all retries exhausted.
       ProviderPermanentError immediately, no retry.
-      Other exceptions: re-raised verbatim (treated as transient by the
-        caller's broad except).
     """
     import random
 
     last_err: Exception | None = None
-    for attempt in range(len(_RETRY_BACKOFFS) + 1):
+    attempt = 0
+    while True:
         try:
             return await coro_factory()
         except ProviderPermanentError:
             # 4xx auth/invalid-ID — retry won't help.
             raise
-        except (ProviderTransientError, httpx.HTTPError, asyncio.TimeoutError) as e:
-            last_err = e
-            if attempt >= len(_RETRY_BACKOFFS):
-                break
-            delay = _RETRY_BACKOFFS[attempt] + random.uniform(0, 0.25)
-            print(f"matcher: {what} transient error ({e!r}); retry {attempt + 1}/{len(_RETRY_BACKOFFS)} in {delay:.1f}s")
-            await asyncio.sleep(delay)
-    # Out of retries — raise the last transient error as a typed exception
-    # so callers can distinguish "tried hard, gave up" from "didn't try".
-    raise ProviderTransientError(f"{what} failed after {len(_RETRY_BACKOFFS)} retries: {last_err!r}") from last_err
+        except (httpx.TransportError, asyncio.TimeoutError) as e:
+            # Dropped/refused connection or reset TLS handshake — reconnect fast.
+            last_err, backoffs, kind, jitter = e, _CONNECT_BACKOFFS, "connection", 0.1
+        except (ProviderTransientError, httpx.HTTPError) as e:
+            # 429 / 5xx / other HTTP-level transient — respect a real backoff.
+            last_err, backoffs, kind, jitter = e, _RETRY_BACKOFFS, "transient", 0.25
+        if attempt >= len(backoffs):
+            break
+        delay = backoffs[attempt] + random.uniform(0, jitter)
+        print(f"matcher: {what} {kind} error ({last_err!r}); retry {attempt + 1}/{len(backoffs)} in {delay:.2f}s")
+        await asyncio.sleep(delay)
+        attempt += 1
+    # Out of retries — raise as a typed exception so callers can distinguish
+    # "tried hard, gave up" from "didn't try".
+    raise ProviderTransientError(f"{what} failed after {attempt} retries: {last_err!r}") from last_err
 
-# Per media_type, which providers to try in order. First with a real key wins;
-# fallbacks kick in if the primary returns no usable result.
+# Per media_type, the DEFAULT providers to try in order. First with a real key
+# wins; fallbacks kick in if the primary returns no usable result. This is only
+# the default — `resolve_provider_order()` lets the user override it per
+# media_type via the `matching.provider_order.<type>` setting.
 PROVIDER_PREFERENCE: dict[str, list[ProviderKey]] = {
     "movie": ["tmdb", "tvdb"],
     "tv":    ["tvdb", "tmdb"],
@@ -85,6 +98,39 @@ PROVIDER_PREFERENCE: dict[str, list[ProviderKey]] = {
     "anime": ["anidb", "tvdb", "tmdb"],
     "music": [],                  # MusicBrainz lives in a separate engine (audio path)
 }
+
+# Provider keys we accept when validating a user-supplied order. Anything not
+# in here (typo, dropped provider, junk) is silently filtered out.
+_KNOWN_PROVIDER_KEYS: frozenset[str] = frozenset({"tmdb", "tvdb", "anidb", "musicbrainz"})
+
+
+def resolve_provider_order(media_type: str, settings: dict | None) -> list[ProviderKey]:
+    """The provider cascade for `media_type`, honoring a user override.
+
+    Default = the PROVIDER_PREFERENCE table above. The user may override per
+    media_type via the setting `matching.provider_order.<type>`, whose value is
+    an ordered list of provider keys, e.g. ["tvdb", "anidb", "tmdb"].
+
+    SOFT preference, on purpose: the user's chosen providers come FIRST in their
+    stated order, then any default providers they DIDN'T list are appended as
+    trailing fallbacks. So a preference can never strand a title as no-match
+    just because the preferred source happens not to carry it — the others still
+    get a turn (coverage gaps, not just provider outages). Unknown / junk keys
+    are dropped; an empty or missing setting yields the default order unchanged.
+    """
+    default = PROVIDER_PREFERENCE.get(media_type, [])
+    if not settings:
+        return list(default)
+    raw = settings.get(f"matching.provider_order.{media_type}")
+    if isinstance(raw, dict):            # tolerate a {"value": [...]} wrapper
+        raw = raw.get("value")
+    if not isinstance(raw, list):
+        return list(default)
+    chosen = [p for p in raw if isinstance(p, str) and p in _KNOWN_PROVIDER_KEYS]
+    if not chosen:
+        return list(default)
+    tail = [p for p in default if p not in chosen]   # soft: keep omitted defaults as fallback
+    return chosen + tail  # type: ignore[return-value]
 
 
 @dataclass
@@ -217,7 +263,13 @@ class MatchEngine:
         if parsed.media_type == "music":
             return []  # handled by separate AudioProvider path (future)
 
-        provider_order = PROVIDER_PREFERENCE.get(parsed.media_type, [])
+        # User-overridable per media_type (Settings → Matching). Falls back to
+        # the PROVIDER_PREFERENCE default. _load_db_settings is cached (30s) and
+        # invalidated on PUT /settings, so this is cheap per-file and picks up
+        # a preference change without a restart.
+        provider_order = resolve_provider_order(
+            parsed.media_type, await _load_db_settings()
+        )
 
         # Phase 14: explicit embedded provider ID → resolve directly, skip
         # title search entirely. Runs BEFORE the title guard because an
@@ -317,7 +369,18 @@ class MatchEngine:
             if not pid or not self.registry.has(key):
                 continue
             meta = await _basic_meta_by_id(key, str(pid), mt, self.registry)
-            title = (meta or {}).get("title") or parsed.title or f"{key}:{pid}"
+            # An embedded ID is only authoritative if it actually RESOLVES.
+            # `_basic_meta_by_id` returns None when the get-by-id details call
+            # finds nothing — a stale/typo'd ID, or one of the WRONG media type
+            # (a movie TMDB id on a file we classified tv). Don't fabricate a
+            # confidence-1.0 match for an ID that points at nothing: skip to the
+            # next provider, else fall through to normal title search. (AniDB is
+            # exempt — it returns a dict even with no display title, because the
+            # AID itself is a valid identity.)
+            if meta is None:
+                print(f"matcher: embedded-id {key}:{pid} did not resolve ({mt}) — skipping")
+                continue
+            title = meta.get("title") or parsed.title or f"{key}:{pid}"
             print(f"matcher: embedded-id match {key}:{pid} -> {title!r}")
             return [ScoredMatch(
                 provider=key, provider_id=str(pid), match_type=mt,
@@ -395,7 +458,12 @@ class MatchEngine:
         # (rematch path, popup hover) can render "why this confidence?"
         # without re-running the matcher.
         from kira.matcher.cascade import build_default_cascade, CascadeContext
-        cascade = build_default_cascade(provider_key=key, media_type=parsed.media_type)
+        # Labs flags (opt-in, default off — Settings → Labs).
+        runtime_on = await labs_flag("runtime_corroboration")
+        boost_on = await labs_flag("episode_title_boost")
+        cascade = build_default_cascade(
+            provider_key=key, media_type=parsed.media_type, include_runtime=runtime_on,
+        )
         _global_registry_ref.set(self.registry)
         ctx = CascadeContext(
             parsed=parsed,
@@ -404,6 +472,26 @@ class MatchEngine:
             cluster_signal=getattr(parsed, "_cluster_signal", None),
             provider_key=key,
         )
+        # Labs: episode-title series-boost (opt-in, BOUNDED + ban-safe). Pre-
+        # populate the episode-title cache for the top-2 candidates so
+        # EpisodeTitleMetric can boost the right same-titled show. ONLY for
+        # TVDB/TMDB (fast, reliable get_episodes); NEVER AniDB — its rate-limited
+        # get_episodes is exactly what froze scans, so the boost stays dormant
+        # for anime (where AniDB's title dump already disambiguates). Capped at
+        # 2 fetches per cluster, each through the connection-blip-tolerant retry.
+        if boost_on and key in ("tvdb", "tmdb") and getattr(parsed, "episode_title_guess", None):
+            _season = parsed.season if parsed.season is not None else 1
+            for _cand in scored[:2]:
+                _ck = ("ep_titles", key, _cand.provider_id, _season)
+                if _ck not in ctx.enrich_cache:
+                    try:
+                        _eps = await _provider_call_with_retry(
+                            lambda c=_cand: provider.get_episodes(c.provider_id, _season),
+                            what=f"{key}.get_episodes(boost)",
+                        )
+                        ctx.enrich_cache[_ck] = _eps or []
+                    except Exception:
+                        ctx.enrich_cache[_ck] = []
         traces = await cascade.score_all(scored, ctx)
         for sm, trace in zip(scored, traces):
             sm.confidence = trace.final_score
@@ -1298,12 +1386,42 @@ def _query_ladder(parsed: ParsedFile) -> list[tuple[str, bool]]:
 async def compute_series_group_id(provider_key: str, provider_id: str, registry: ProviderRegistry) -> str:
     """Identity used to visually group cards from the same franchise.
 
-    For TMDB / TVDB / MusicBrainz one ID already covers all seasons —
-    just echo it. For AniDB, walk the sequel/prequel chain to find every
-    related AID and use the lowest one as canonical (e.g. all 5 seasons
-    of Rent-a-Girlfriend resolve to `anidb:15299`). First call per AID
-    is rate-limited (~4s); cached on disk afterwards.
+    For TMDB / MusicBrainz one ID already covers all seasons — just echo it.
+    For AniDB, walk the sequel/prequel chain to find every related AID and
+    use the lowest one as canonical (e.g. all 5 seasons of Rent-a-Girlfriend
+    resolve to `anidb:15299`). First call per AID is rate-limited (~4s);
+    cached on disk afterwards.
+
+    TVDB gets one extra step: a long-runner whose files are pure-absolute-
+    numbered (Attack on Titan's Final Season — "Shingeki no Kyojin - 60")
+    can't be placed in any single AniDB cour, so the matcher routes it to
+    TVDB. That used to leave it as its OWN card (`tvdb:267440`) while S1-S3,
+    which matched AniDB cours, folded into `anidb:9541`. If the TVDB id is a
+    known anime (has a Fribb AID), we resolve it THROUGH the AniDB franchise
+    so it lands in the same card as its siblings. Live-action TVDB shows have
+    no Fribb AID and fall through to `tvdb:<id>` unchanged.
     """
+    # ── Cross-provider anime fold (TVDB → AniDB franchise) ────────────────
+    # Scoped to TVDB on purpose: anime *movies* carry TMDB ids, and folding
+    # TMDB here would wrongly collapse a film into a TV franchise group.
+    # Movies never match TVDB, so a TVDB id is always a series — and only
+    # anime series have a Fribb reverse mapping, so live-action is untouched.
+    if provider_key == "tvdb":
+        try:
+            from kira.providers.anime_mappings import AnimeMappings
+            aid = await AnimeMappings.aid_by_tvdb(int(provider_id))
+            if aid is not None:
+                # Delegate to the AniDB branch so the franchise root is
+                # resolved by the SAME sequel-walk the AniDB-matched siblings
+                # used → identical group id (anidb:9541). Under an AniDB ban
+                # the walk falls back to anidb:<aid> — the same best-effort
+                # behavior AniDB-matched rows already get; self-heals later.
+                return await compute_series_group_id("anidb", str(aid), registry)
+        except (ValueError, TypeError):
+            pass  # non-numeric provider_id → not a Fribb-mappable TVDB id
+        except Exception:
+            pass  # Fribb/registry hiccup → fall through to tvdb:<id>
+
     if provider_key != "anidb":
         return f"{provider_key}:{provider_id}"
     try:
@@ -1410,6 +1528,51 @@ async def _load_db_settings() -> dict[str, str]:
     return _SETTINGS_CACHE
 
 
+async def labs_flag(name: str, default: bool = False) -> bool:
+    """Read a Labs feature toggle (`labs.<name>`) from the cached settings.
+
+    These gate the experimental / cost-bearing features the user opts into in
+    Settings → Labs. Default OFF. Robust to bare-bool or `{"value": bool}`
+    storage, and never raises (a settings read failure just yields the default).
+    """
+    try:
+        db = await _load_db_settings()
+    except Exception:
+        return default
+    v = db.get(f"labs.{name}")
+    if isinstance(v, dict):
+        v = v.get("value")
+    return v if isinstance(v, bool) else default
+
+
+# Maps the Settings → Connections TMDB language dropdown (which stores its
+# human label) to a TMDB ISO language tag. Already-valid tags (e.g. "fr-FR")
+# pass through, so a future free-text/code value keeps working. Unknown →
+# None, which the provider treats as its en-US default.
+_TMDB_LANGUAGE_LABELS = {
+    "english (us)": "en-US",
+    "english (uk)": "en-GB",
+    "français": "fr-FR",
+    "deutsch": "de-DE",
+    "日本語": "ja-JP",
+}
+
+
+def _tmdb_language_code(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    mapped = _TMDB_LANGUAGE_LABELS.get(v.lower())
+    if mapped:
+        return mapped
+    # Looks like an ISO tag already (xx or xx-YY) — pass through.
+    if 2 <= len(v) <= 5 and all(c.isalpha() or c == "-" for c in v):
+        return v
+    return None
+
+
 # Convenience constructor reading from app settings (one client per app).
 async def registry_from_settings(client: httpx.AsyncClient) -> ProviderRegistry:
     from kira.config import settings
@@ -1420,7 +1583,10 @@ async def registry_from_settings(client: httpx.AsyncClient) -> ProviderRegistry:
     # TMDB / TVDB keys: DB wins over env so UI edits take effect without restart.
     tmdb_key = db.get("providers.tmdb.api_key") or settings.tmdb_api_key
     if tmdb_key:
-        configs["tmdb"] = ProviderConfig(mode=ProviderMode.DIRECT, api_key=tmdb_key)
+        configs["tmdb"] = ProviderConfig(
+            mode=ProviderMode.DIRECT, api_key=tmdb_key,
+            tmdb_language=_tmdb_language_code(db.get("providers.tmdb.language")),
+        )
     tvdb_key = db.get("providers.tvdb.api_key") or settings.tvdb_api_key
     if tvdb_key:
         configs["tvdb"] = ProviderConfig(mode=ProviderMode.DIRECT, api_key=tvdb_key)

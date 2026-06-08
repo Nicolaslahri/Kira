@@ -12,6 +12,8 @@ import shutil
 from enum import Enum
 from pathlib import Path
 
+from kira.scanner import MEDIA_EXTENSIONS
+
 
 class FileOp(str, Enum):
     MOVE = "move"
@@ -233,6 +235,16 @@ def discover_sidecars(video_src: Path) -> list[Path]:
     except OSError:
         return []
 
+    # Other media files (video/audio) whose stem could ALSO prefix a sidecar.
+    # Used to resolve prefix collisions: a sidecar belongs to the LONGEST
+    # matching media stem, so `Show.S01E01.mkv` (stem "Show.S01E01") doesn't
+    # steal `Show.S01E01.Extended.eng.srt` — that sidecar belongs to the
+    # longer-stemmed `Show.S01E01.Extended.mkv` sitting in the same folder.
+    other_media_stems = [
+        e.stem for e in entries
+        if e.suffix.lower() in MEDIA_EXTENSIONS and e.stem != stem and e.is_file()
+    ]
+
     matches: list[Path] = []
     video_resolved: Path | None
     try:
@@ -270,6 +282,14 @@ def discover_sidecars(video_src: Path) -> list[Path]:
             # non-empty (`Movie..srt` is malformed but harmless to skip).
             tail = name[len(stem):]  # ".eng.srt" or ".srt"
             if tail and tail != entry.suffix:
+                # Defer to a longer-stemmed sibling media file that also claims
+                # this sidecar — it's theirs (more specific), not ours.
+                if any(
+                    len(s2) > len(stem)
+                    and (name == s2 + entry.suffix or name.startswith(f"{s2}."))
+                    for s2 in other_media_stems
+                ):
+                    continue
                 matches.append(entry)
     return matches
 
@@ -313,6 +333,7 @@ def execute_op(
     cleanup_stop_at: Path | None = None,
     cleanup_max_levels: int = 2,
     cleanup_artifacts: bool = True,
+    cleanup_trash_dir: Path | None = None,
 ) -> int:
     """Run the requested operation. Idempotent for already-correct hardlinks.
 
@@ -368,14 +389,32 @@ def execute_op(
                 # true no-op (file already where it needs to be).
                 if op == FileOp.MOVE and _same_inode(src, dst):
                     try:
-                        src_resolved = src.resolve()
-                        dst_resolved = dst.resolve()
+                        # Case-FOLDED resolved compare. On a case-insensitive
+                        # volume (NTFS, APFS), a case-only rename ("show" →
+                        # "Show") leaves src and dst as the SAME directory
+                        # entry — `resolve()` may preserve the input case, so
+                        # a plain string compare sees them as different and
+                        # falls through to unlink(), DESTROYING the only entry
+                        # (data loss). normcase folds case on those volumes; on
+                        # case-sensitive POSIX it's a no-op, so genuinely
+                        # distinct hardlinks still compare unequal there.
+                        src_r = os.path.normcase(str(src.resolve()))
+                        dst_r = os.path.normcase(str(dst.resolve()))
                     except OSError:
                         # Path resolution failed — be conservative, treat as no-op.
                         return artifacts_cleaned
-                    if src_resolved == dst_resolved:
-                        # Literal same path: nothing to do. File is already
-                        # exactly where it should be.
+                    if src_r == dst_r:
+                        # Same directory entry. If the on-disk spelling already
+                        # equals dst, it's a literal no-op. Otherwise it's a
+                        # case-only rename — do it via a temp hop so the entry
+                        # is NEVER unlinked (which would delete the file).
+                        if str(src) != str(dst):
+                            try:
+                                tmp = dst.with_name(dst.name + ".kira-casefix-tmp")
+                                os.rename(str(src), str(tmp))
+                                os.rename(str(tmp), str(dst))
+                            except OSError:
+                                pass  # best-effort; leave as-is rather than risk loss
                         return artifacts_cleaned
                     # Two distinct paths sharing one inode — genuine hardlink
                     # case. Safe to unlink the source; bytes remain at dst.
@@ -384,6 +423,7 @@ def execute_op(
                         artifacts_cleaned += _cleanup_empty_source_parents(
                             src.parent, cleanup_stop_at, cleanup_max_levels,
                             sweep_artifacts=cleanup_artifacts,
+                            trash_root=cleanup_trash_dir,
                         )
                     return artifacts_cleaned
                 # SYMLINK + dst is already a symlink to src: idempotent success.
@@ -414,6 +454,7 @@ def execute_op(
                 artifacts_cleaned += _cleanup_empty_source_parents(
                     src_parent_before, cleanup_stop_at, cleanup_max_levels,
                     sweep_artifacts=cleanup_artifacts,
+                    trash_root=cleanup_trash_dir,
                 )
         elif op == FileOp.COPY:
             shutil.copy2(str(src), str(dst))
@@ -459,7 +500,32 @@ def _mkdir_tracked(dst_parent: Path) -> list[Path]:
     return created
 
 
-def _cleanup_media_server_artifacts(parent: Path) -> int:
+def _move_to_trash(entry: Path, trash_root: Path) -> bool:
+    """Move `entry` into Kira's managed trash folder instead of deleting it, so
+    a cleanup sweep is recoverable from the user's file browser. Returns True on
+    success; any OSError returns False so the caller behaves exactly as a failed
+    delete would (leave the item, stop the walk).
+
+    OS recycle bins are useless in a Docker container (the XDG trash is
+    ephemeral and has no restore UI), so Kira keeps its own trash dir under the
+    library. The trashed name is prefixed with the source folder so two
+    `poster.jpg` files from different shows don't collide; a numeric suffix
+    breaks any remaining tie."""
+    try:
+        trash_root.mkdir(parents=True, exist_ok=True)
+        base = f"{entry.parent.name}__{entry.name}" if entry.parent.name else entry.name
+        target = trash_root / base
+        n = 1
+        while target.exists():
+            target = trash_root / f"{base}.{n}"
+            n += 1
+        shutil.move(str(entry), str(target))
+        return True
+    except OSError:
+        return False
+
+
+def _cleanup_media_server_artifacts(parent: Path, *, trash_root: Path | None = None) -> int:
     """Delete known-safe Plex/Jellyfin/Kodi media-server artifacts from
     `parent` so the now-source-empty directory can actually be rmdir'd.
 
@@ -500,6 +566,10 @@ def _cleanup_media_server_artifacts(parent: Path) -> int:
                 # Symlinked artifact dirs get unlinked, not recursed.
                 # We never follow a symlink into who-knows-where.
                 if _is_artifact_dir(entry.name):
+                    if trash_root is not None:
+                        if _move_to_trash(entry, trash_root):
+                            removed += 1
+                        continue
                     shutil.rmtree(str(entry), ignore_errors=True)
                     # rmtree with ignore_errors=True doesn't tell us if
                     # the dir is actually gone. Verify; only count on
@@ -510,6 +580,10 @@ def _cleanup_media_server_artifacts(parent: Path) -> int:
                 continue
             if entry.is_file() or entry.is_symlink():
                 if _is_artifact_file(entry.name):
+                    if trash_root is not None:
+                        if _move_to_trash(entry, trash_root):
+                            removed += 1
+                        continue
                     try:
                         entry.unlink()
                         removed += 1
@@ -522,12 +596,44 @@ def _cleanup_media_server_artifacts(parent: Path) -> int:
     return removed
 
 
+def _is_artifacts_only(parent: Path) -> bool:
+    """True iff `parent` contains NOTHING but recognized media-server
+    artifacts (or is already empty).
+
+    This is the data-loss guard for cleanup: we only ever delete artifacts
+    from a folder that is otherwise empty and therefore about to be removed.
+    A folder that still holds real user content (a video, a sub, a folder
+    that isn't a known cache dir, anything we can't classify) returns False,
+    so the caller deletes NOTHING there — its `poster.jpg`, hand-authored
+    `tvshow.nfo`, or album `cover.jpg` stay put. Previously the sweep ran
+    unconditionally before the rmdir check, stripping artifacts even from
+    folders that survived."""
+    try:
+        entries = list(parent.iterdir())
+    except OSError:
+        return False  # can't inspect → assume content, don't delete
+    for entry in entries:
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                if not _is_artifact_dir(entry.name):
+                    return False
+            elif entry.is_file() or entry.is_symlink():
+                if not _is_artifact_file(entry.name):
+                    return False
+            else:
+                return False  # unknown entry type → treat as content
+        except OSError:
+            return False  # classification failed → keep the folder
+    return True
+
+
 def _cleanup_empty_source_parents(
     start: Path,
     stop_at: Path | None,
     max_levels: int = 2,
     *,
     sweep_artifacts: bool = True,
+    trash_root: Path | None = None,
 ) -> int:
     """User-requested: after a Move, walk UP the source's parent chain
     and rmdir each ancestor that's now empty. Saves the user from manually
@@ -598,14 +704,23 @@ def _cleanup_empty_source_parents(
             except ValueError:
                 # current is outside stop_at — definitely stop.
                 return total_artifacts_deleted
-        # Sweep Plex/Jellyfin/Kodi cache files in THIS directory before
-        # attempting rmdir. The sweep is conservative (allow-list only)
-        # so user content stays put — if user content is in this folder,
-        # the rmdir below will fail and we stop. When the user disables
-        # this via Settings, we still rmdir genuinely-empty folders but
-        # leave any media-server cache files alone.
+        # DATA-LOSS GUARD: only sweep + remove a folder that is ENTIRELY
+        # media-server artifacts (or already empty). If ANY real user content
+        # remains, leave this folder — and everything in it (poster.jpg,
+        # hand-authored tvshow.nfo, album cover.jpg, that stray personal
+        # image) — completely untouched, and stop walking up. Previously the
+        # sweep ran before this check, so a folder that ultimately SURVIVED
+        # (rmdir failed) had already lost its artifacts. Computing
+        # removability first means a deletion only ever happens for a folder
+        # that is about to disappear.
+        if not _is_artifacts_only(current):
+            return total_artifacts_deleted
+        # Folder is artifacts-only (or empty). Now it's safe to clear the
+        # cache files so the rmdir can succeed. With sweep disabled, we skip
+        # the delete; the folder then still contains artifacts, rmdir fails,
+        # and we stop — preserving the strict "only genuinely-empty" semantics.
         if sweep_artifacts:
-            total_artifacts_deleted += _cleanup_media_server_artifacts(current)
+            total_artifacts_deleted += _cleanup_media_server_artifacts(current, trash_root=trash_root)
         try:
             current.rmdir()
         except OSError:
@@ -669,25 +784,45 @@ def _atomic_move(src: Path, dst: Path) -> None:
         if not is_cross_device:
             raise
 
-    # Cross-device path. Copy with copy2 (preserves mtime + metadata),
-    # verify size matches, then unlink source. On failure at any step
-    # we remove the partial dst so the operation looks unstarted.
-    src_size = src.stat().st_size
+    # Cross-device path. We stream-copy OURSELVES (not shutil.copy2) for two
+    # reasons the old code got wrong and which risk deleting the only copy:
+    #   1. fsync the WRITE handle before closing it. The previous code opened
+    #      `dst` READ-only and fsync'd that — which flushes nothing the writer
+    #      dirtied (copy2 already closed its own write fd), so on a network
+    #      volume the "durability" guarantee was a no-op.
+    #   2. Verify by CONTENT (hash), not size. The next step unlinks the
+    #      source; a size-only check read through a network attribute cache
+    #      can pass on a truncated/corrupt destination, destroying the original.
+    # On any failure we remove the partial dst so the operation looks unstarted
+    # and the source remains the canonical copy.
+    import hashlib
+    _CHUNK = 8 * 1024 * 1024
     try:
-        shutil.copy2(str(src), str(dst))
-        # Some filesystems (network) need an fsync to commit before we
-        # trust the size check. Best-effort; ignore if the FS rejects it.
+        h_src = hashlib.blake2b()
+        with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+            while True:
+                chunk = fsrc.read(_CHUNK)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+                h_src.update(chunk)
+            fdst.flush()
+            os.fsync(fdst.fileno())   # commit the WRITE fd before it closes
         try:
-            with open(dst, "rb") as f:
-                os.fsync(f.fileno())
+            shutil.copystat(str(src), str(dst))  # mtime/mode like copy2 — best effort
         except OSError:
             pass
-        dst_size = dst.stat().st_size
-        if dst_size != src_size:
-            raise OSError(
-                f"Cross-device copy size mismatch: src={src_size} dst={dst_size}"
-            )
-        # All good — remove the source to complete the "move".
+        # Re-read the destination from disk and compare content hashes.
+        h_dst = hashlib.blake2b()
+        with open(dst, "rb") as f:
+            while True:
+                chunk = f.read(_CHUNK)
+                if not chunk:
+                    break
+                h_dst.update(chunk)
+        if h_dst.digest() != h_src.digest():
+            raise OSError(f"Cross-device copy verification failed (content mismatch): {src} -> {dst}")
+        # Content confirmed durable at dst — only now is it safe to delete src.
         src.unlink()
     except Exception:
         # Roll back partial destination so the next attempt isn't blocked

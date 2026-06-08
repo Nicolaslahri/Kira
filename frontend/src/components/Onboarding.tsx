@@ -81,10 +81,10 @@ function ContentTypeStep({ types, setTypes }: ContentTypeStepProps) {
       ex: 'Severance · The Bear · Shōgun', color: 'var(--info)' },
     { key: 'anime',  icon: <IcAnime />, label: 'Anime',
       desc: 'Uses release groups and absolute episode numbers.',
-      ex: 'Frieren · Jujutsu Kaisen · Spy × Family', color: '#c89bff' },
+      ex: 'Frieren · Jujutsu Kaisen · Spy × Family', color: 'var(--media-anime)' },
     { key: 'music',  icon: <IcMusic />, label: 'Music',
       desc: 'Albums and individual tracks.',
-      ex: 'Radiohead · Pink Floyd · Kendrick Lamar', color: '#ffb14a' },
+      ex: 'Radiohead · Pink Floyd · Kendrick Lamar', color: 'var(--media-music)' },
   ];
   return (
     <>
@@ -97,11 +97,15 @@ function ContentTypeStep({ types, setTypes }: ContentTypeStepProps) {
         Pick all that apply. We'll only set up the providers you actually need.
       </div>
 
-      <div className="ct-grid" style={idx(3)}>
+      <div className="ct-grid" style={idx(3)} role="group" aria-label="Content types">
         {items.map(it => {
           const on = !!types[it.key];
           return (
-            <div key={it.key}
+            <button key={it.key}
+                 type="button"
+                 role="checkbox"
+                 aria-checked={on}
+                 aria-label={`${it.label} — ${it.desc}`}
                  className={`ct-card ${on ? 'selected' : ''}`}
                  onClick={() => setTypes({ ...types, [it.key]: !on })}>
               <div className="ct-card-head">
@@ -115,7 +119,7 @@ function ContentTypeStep({ types, setTypes }: ContentTypeStepProps) {
                 <div className={`ct-check ${on ? 'on' : ''}`}>{on ? <IcCheck /> : null}</div>
               </div>
               <div className="ct-ex">{it.ex}</div>
-            </div>
+            </button>
           );
         })}
       </div>
@@ -320,10 +324,14 @@ function NamingStep({ profile, setProfile }: NamingStepProps) {
         Kira will rename files into folders that your media server understands. You can change this anytime.
       </div>
 
-      <div className="onboarding-naming" style={idx(3)}>
+      <div className="onboarding-naming" style={idx(3)} role="radiogroup" aria-label="Naming style">
         {profiles.map(p => (
-          <div
+          <button
             key={p.key}
+            type="button"
+            role="radio"
+            aria-checked={profile === p.key}
+            aria-label={`${p.name} — ${p.desc}`}
             className={`naming-card ${profile === p.key ? 'selected' : ''}`}
             onClick={() => setProfile(p.key)}
           >
@@ -335,7 +343,7 @@ function NamingStep({ profile, setProfile }: NamingStepProps) {
               <div className="naming-card-check">{profile === p.key ? <IcCheck /> : null}</div>
             </div>
             <div className="naming-card-tree">{p.tree}</div>
-          </div>
+          </button>
         ))}
       </div>
 
@@ -391,7 +399,7 @@ function ReadyStep({ data, gotoStep }: ReadyStepProps) {
           <div className="onboarding-summary-icon"><IcFolder /></div>
           <div>
             <div className="lbl">Media folder</div>
-            <div className="val">{data.folder} <span style={{ color: 'var(--ink-3)', fontWeight: 400 }}>· 342 files</span></div>
+            <div className="val">{data.folder}</div>
           </div>
           <button className="edit" onClick={() => gotoStep(3)}>Edit</button>
         </div>

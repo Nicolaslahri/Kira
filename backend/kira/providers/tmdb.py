@@ -16,6 +16,13 @@ from kira.providers.base import (
 class TMDBProvider(MetadataProvider):
     key: ClassVar[ProviderKey] = "tmdb"
 
+    # ISO language tag for localized titles/overviews/genre names. The factory
+    # overrides this per-instance from `providers.tmdb.language` (Settings →
+    # Connections); the class default is English (US). Search stays
+    # language-agnostic on purpose — matching is keyed off canonical/alias
+    # titles, so localizing search results would only add noise.
+    language: str = "en-US"
+
     # KI-15: in-memory cache for per-season poster URLs. Without this,
     # every cluster's poster fetch re-hits `/tv/{id}/season/{N}` even
     # when an earlier cluster in the same scan already resolved it for
@@ -88,13 +95,13 @@ class TMDBProvider(MetadataProvider):
         # (TMDB has no DVD/absolute ordering API). Both exist to satisfy the
         # shared provider signature.
         del include_specials, order
-        # `language=en-US` forces English titles + overviews. TMDB's default
+        # Explicit `language` forces localized titles + overviews. TMDB's default
         # falls back to the show's master record language for non-localized
-        # shows (e.g. anime returns Japanese names). Explicit `language` lets
-        # the popup always render readable English text.
+        # shows (e.g. anime returns Japanese names). `self.language` is the
+        # user's pick (Settings → Connections), defaulting to en-US.
         r = await self.client.get(
             f"{self.base_url}/tv/{series_id}/season/{season}",
-            params={**self._auth_params(), "language": "en-US"},
+            params={**self._auth_params(), "language": self.language},
             headers=self._auth_headers(),
             timeout=15.0,
         )
@@ -122,7 +129,7 @@ class TMDBProvider(MetadataProvider):
         try:
             r = await self.client.get(
                 f"{self.base_url}/movie/{movie_id}",
-                params={**self._auth_params(), "append_to_response": "credits"},
+                params={**self._auth_params(), "append_to_response": "credits", "language": self.language},
                 headers=self._auth_headers(),
                 timeout=15.0,
             )
@@ -134,6 +141,11 @@ class TMDBProvider(MetadataProvider):
         crew = credits.get("crew") or []
         directors = [c.get("name") for c in crew if c.get("job") == "Director" and c.get("name")]
         cast = [c.get("name") for c in (credits.get("cast") or [])[:5] if c.get("name")]
+        # #14: movie-collection identity ("belongs_to_collection") for franchise
+        # grouping. None for standalone films.
+        coll = d.get("belongs_to_collection") or {}
+        coll_id = str(coll.get("id")) if isinstance(coll, dict) and coll.get("id") else None
+        coll_name = coll.get("name") if isinstance(coll, dict) else None
         return {
             # Phase 14: identity fields so the embedded-ID bypass can build a
             # ScoredMatch from a get-by-id call (additive — existing
@@ -141,6 +153,7 @@ class TMDBProvider(MetadataProvider):
             "title": d.get("title") or d.get("original_title"),
             "year": _year_from(d.get("release_date")),
             "poster_url": _poster_url(d.get("poster_path")),
+            "fanart_url": _backdrop_url(d.get("backdrop_path")),  # #13 artwork
             "genres": [g.get("name") for g in (d.get("genres") or []) if g.get("name")],
             "cast": cast,
             "director": directors[0] if directors else None,
@@ -151,6 +164,8 @@ class TMDBProvider(MetadataProvider):
             "network": None,
             "label": None,
             "overview": d.get("overview"),
+            "collection_id": coll_id,        # #14
+            "collection_name": coll_name,    # #14
         }
 
     async def get_season_poster(self, series_id: str, season_number: int) -> str | None:
@@ -226,7 +241,7 @@ class TMDBProvider(MetadataProvider):
         try:
             r = await self.client.get(
                 f"{self.base_url}/tv/{series_id}",
-                params={**self._auth_params(), "append_to_response": "credits"},
+                params={**self._auth_params(), "append_to_response": "credits", "language": self.language},
                 headers=self._auth_headers(),
                 timeout=15.0,
             )
@@ -243,6 +258,7 @@ class TMDBProvider(MetadataProvider):
             "title": d.get("name") or d.get("original_name"),
             "year": _year_from(d.get("first_air_date")),
             "poster_url": _poster_url(d.get("poster_path")),
+            "fanart_url": _backdrop_url(d.get("backdrop_path")),  # #13 artwork
             "genres": [g.get("name") for g in (d.get("genres") or []) if g.get("name")],
             "cast": cast,
             "director": creators[0].get("name") if creators else None,
@@ -271,6 +287,14 @@ def _poster_url(path: str | None) -> str | None:
     if not path:
         return None
     return f"https://image.tmdb.org/t/p/w500{path}"
+
+
+def _backdrop_url(path: str | None) -> str | None:
+    """Full-res backdrop (fanart) URL. `original` size — fanart is a big
+    background image, so we want the high-res variant, not w500."""
+    if not path:
+        return None
+    return f"https://image.tmdb.org/t/p/original{path}"
 
 
 def _aliases_from(primary: str | None, original: str | None) -> list[str] | None:

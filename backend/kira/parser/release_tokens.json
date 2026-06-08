@@ -1,0 +1,64 @@
+{
+  "_comment": "Phase 17 — base release-token tables for format_stripper. Shipped defaults; edit to retune globally. Values are regex fragments (backslashes escaped per JSON). Users ADD their own tokens via scene-rules.json (extra_*); this file is the curated BASE. If this file is missing or malformed, format_stripper falls back to the in-code literals, so the parser never breaks.",
+  "sources": [
+    "UHD-BluRay", "UHDBD", "UHDRip", "BluRay", "Blu-Ray",
+    "BDRemux", "BDRip", "BRRip", "BDMV", "REMUX",
+    "WEB-DL", "WEBRip", "WEB-Rip", "WEBDL", "WEB",
+    "HD-DVD", "HDDVD", "HDRip", "HDTV", "PDTV", "SDTV",
+    "DVDRip", "DVDScr", "DVDR", "DVD",
+    "DVBRip", "SATRip", "TVRip", "VODRip", "DSR",
+    "HDCAM", "HDTS", "TELESYNC", "TELECINE", "WORKPRINT", "SCREENER",
+    "CAM", "TC", "PPV"
+  ],
+  "_comment_platforms": "Streaming platform tags (AMZN/NFLX/…) live in code (PLATFORMS in format_stripper.py), NOT here — they're stripped from titles but imply WEB-DL rather than being treated as a source TYPE.",
+  "sources_ambiguous": ["HMAX", "MAX", "NF", "TS", "BD", "STAN"],
+  "codecs": [
+    "x265", "x264", "x266", "H\\.265", "H\\.264", "H\\.266",
+    "H265", "H264", "H266", "HEVC", "AVC", "VVC",
+    "VC-1", "VC1", "VP9", "VP8", "AV1", "XviD", "DivX",
+    "MPEG-2", "MPEG2", "MPEG-4", "MPEG4"
+  ],
+  "resolutions": [
+    "2160p", "1440p", "1080p", "720p", "576p", "540p", "480p", "360p",
+    "4K", "8K", "2K", "UHD", "QHD", "FHD"
+  ],
+  "wxh_to_p": {
+    "3840x2160": "2160p",
+    "1920x1080": "1080p",
+    "1280x720":  "720p",
+    "854x480":   "480p",
+    "720x576":   "576p",
+    "720x480":   "480p",
+    "640x480":   "480p"
+  },
+  "audio": [
+    "DTS-HD\\.MA", "DTS-HD\\.HRA", "DTS-HD", "DTSHD", "DTS-X", "DTS-ES", "DTS",
+    "TrueHD\\.?Atmos", "TrueHD", "Atmos",
+    "DDPA", "DDP5\\.1", "DDP7\\.1", "DDP2\\.0", "DDP", "DD\\+",
+    "DD5\\.1", "DD7\\.1", "DD2\\.0", "DD",
+    "Dolby\\.?Digital\\.?Plus", "Dolby\\.?Digital",
+    "AC3", "EAC3", "E-AC-3", "AC4",
+    "AAC2\\.0", "AAC5\\.1", "AAC-LC", "AAC", "FLAC", "ALAC",
+    "LPCM", "PCM", "MP3", "MP2", "WMA", "OGG"
+  ],
+  "subtitles": [
+    "Multi-Subs", "Multi-Sub", "MSubs", "Subbed", "Dubbed",
+    "VOSTFR", "VOST", "SoftSubs", "HardSubs",
+    "JAP", "ENG", "FRE", "GER", "ITA", "SPA"
+  ],
+  "editions": [
+    "Director'?s\\.?Cut", "Extended\\.?Edition", "Extended\\.?Cut", "Extended",
+    "Theatrical\\.?Cut", "Theatrical", "Unrated\\.?Cut", "Unrated",
+    "Ultimate\\.?Edition", "Collector'?s?\\.?Edition", "Collector'?s?\\.?Cut",
+    "Deluxe\\.?Edition", "Limited\\.?Edition", "Definitive\\.?Edition",
+    "Special\\.?Edition", "Final\\.?Cut", "Uncut", "Recut", "Redux",
+    "Open\\.?Matte", "Fan\\.?Edit", "Despecialized", "Restored",
+    "Remastered", "IMAX", "Anniversary", "Criterion", "LIMITED"
+  ],
+  "hdr": ["HDR10\\+", "HDR10", "HDR", "DoVi", "DV", "Dolby\\.?Vision", "HLG"],
+  "bit_depth": ["10[\\.\\-]?bit", "Hi10P", "Hi10", "8[\\.\\-]?bit"],
+  "release_flags": [
+    "PROPER", "REPACK", "RERIP", "INTERNAL", "iNTERNAL",
+    "READNFO", "DIRFIX", "NFOFIX", "SUBFIX", "RETAIL", "FESTIVAL", "MULTI"
+  ]
+}

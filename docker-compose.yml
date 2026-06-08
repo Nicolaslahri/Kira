@@ -1,0 +1,36 @@
+# Kira — self-hosted, Docker-native media renamer.
+#   docker compose up -d   →   http://localhost:8000
+services:
+  kira:
+    build: .
+    # Once a published image exists, swap `build: .` for:
+    #   image: ghcr.io/nicolaslahri/kira:latest
+    container_name: kira
+    ports:
+      - "8000:8000"
+    volumes:
+      # SQLite DB + persisted state. Keep this to survive container recreation.
+      - ./config:/config
+      # YOUR media library — mounted read-write so Kira can rename/move in place.
+      # Change the left side to wherever your library lives.
+      - /path/to/your/media:/media
+    environment:
+      - KIRA_DATABASE_URL=sqlite+aiosqlite:////config/kira.db
+      - KIRA_MEDIA_ROOT=/media
+      - KIRA_BROWSE_ROOT=/media          # the folder-picker can browse here
+      # Provider API keys are also settable in the UI (Settings → Connections);
+      # set them here to bootstrap a fresh container:
+      # - KIRA_TMDB_API_KEY=
+      # - KIRA_TVDB_API_KEY=
+      # Optional HTTP Basic auth — set BOTH to require login on every request
+      # (recommended if Kira is reachable beyond localhost):
+      # - KIRA_AUTH_USER=admin
+      # - KIRA_AUTH_PASS=change-me
+    restart: unless-stopped
+    healthcheck:
+      # No curl in python:slim — use the interpreter that's already here.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s

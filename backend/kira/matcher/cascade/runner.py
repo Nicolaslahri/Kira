@@ -126,7 +126,7 @@ class Cascade:
                 # A metric raising must NEVER kill the whole cascade —
                 # log and skip with a zero contribution. Provider HTTP
                 # failures + transient errors are the realistic cause.
-                print(f"cascade: metric {m.name} raised: {e!r}")
+                _funnel_log.warning("metric %s raised: %r", m.name, e)
                 r = MetricResult(
                     metric=m.name,
                     tier=m.tier,
@@ -277,7 +277,7 @@ class Cascade:
         return traces
 
 
-def build_default_cascade(provider_key: str, media_type: str) -> Cascade:
+def build_default_cascade(provider_key: str, media_type: str, *, include_runtime: bool = False) -> Cascade:
     """Construct the cascade for one (provider, media_type) combo.
 
     Imported lazily so circular imports don't bite (metrics import from
@@ -298,6 +298,8 @@ def build_default_cascade(provider_key: str, media_type: str) -> Cascade:
         LevenshteinMetric, LCSMetric, NumericDistanceMetric,
     )
     from kira.matcher.cascade.metrics.acronym import AcronymMetric
+    from kira.matcher.cascade.metrics.episode_title import EpisodeTitleMetric
+    from kira.matcher.cascade.metrics.corroboration import RuntimeCorroborationMetric
     from kira.matcher.cascade.metrics.year_rank import YearMetric, RankMetric
 
     metrics: list[Metric] = []
@@ -332,6 +334,8 @@ def build_default_cascade(provider_key: str, media_type: str) -> Cascade:
     metrics.append(LCSMetric())
     metrics.append(NumericDistanceMetric())
     metrics.append(AcronymMetric())
+    if media_type in ("tv", "anime"):
+        metrics.append(EpisodeTitleMetric())
     if media_type == "anime" and provider_key == "tvdb":
         metrics.append(AnimeTVDBJPMetric())
     if media_type == "anime":
@@ -340,5 +344,11 @@ def build_default_cascade(provider_key: str, media_type: str) -> Cascade:
     # Tier 3 — weak corroboration.
     metrics.append(YearMetric())
     metrics.append(RankMetric())
+    # M4: runtime corroboration — Labs opt-in (Settings → Labs). Only registered
+    # when enabled; it needs file duration (MediaInfo) to do anything anyway, so
+    # off by default it's pure dead weight. Self-gates to free/cached data even
+    # when on (never fetches).
+    if include_runtime:
+        metrics.append(RuntimeCorroborationMetric())
 
     return Cascade(metrics=metrics)

@@ -1,0 +1,37 @@
+# Keep the build context small + reproducible. The frontend is rebuilt inside
+# the image (stage 1), and Python deps are pip-installed — so none of the local
+# build artifacts or virtualenvs should ship into the context.
+
+# Node / frontend build artifacts (rebuilt in the image)
+**/node_modules
+frontend/dist
+
+# Python virtualenvs + caches
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+*.egg-info
+
+# Local databases + logs (never bake these in)
+*.db
+*.db-wal
+*.db-shm
+**/kira.db*
+
+# Secrets / local env (KEEP frontend/.env.production — it's the same-origin
+# API base, not a secret, and stage 1 needs it for `vite build`)
+**/.env
+**/.env.local
+
+# VCS + editor + OS cruft
+.git
+.gitignore
+**/.DS_Store
+.claude
+.vscode
+.idea
+
+# Docs / notes not needed at runtime
+PLAN.md

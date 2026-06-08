@@ -26,6 +26,13 @@ import { cacheGet, cacheSet } from './cache';
 export interface ProviderEpisode {
   season: number;
   episode: number;
+  /** Series-wide absolute number, when the provider exposes it. For
+   *  cross-ref anime (TVDB/TMDB) a "Season 4" lists local E1..E30 but
+   *  carries absolute 60..89; the popup pairs absolute-named files
+   *  ("- 60") against THIS, not the local episode number. Null for
+   *  providers/episodes that don't supply it (AniDB-native: episode IS
+   *  the absolute, so pairing falls back to `.episode`). */
+  absolute_number: number | null;
   title: string | null;
   air_date: string | null;
   overview: string | null;

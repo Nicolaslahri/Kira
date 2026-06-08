@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import type { PosterData, ToastData, Page, MediaType } from '../lib/types';
 import type { SettingsSection } from '../App';
@@ -9,6 +9,7 @@ import {
 } from '../lib/icons';
 import { NotificationsBell } from './NotificationsBell';
 import { cn } from '../lib/utils';
+import { confLevel } from '../lib/confBands';
 import { Button } from './base/buttons/button';
 import { FeaturedIcon } from './base/featured-icons/featured-icon';
 
@@ -69,7 +70,7 @@ export function ConfidenceBadge({ value }: { value: number | null | undefined })
   );
   // Score → plain-English verdict. New users immediately know whether to
   // trust the match; the % becomes secondary detail.
-  const level = value >= 85 ? 'high' : value >= 50 ? 'mid' : 'low';
+  const level = confLevel(value);
   const label = value >= 90 ? 'Strong match'
     : value >= 75 ? 'Likely match'
     : value >= 50 ? 'Needs review'
@@ -132,6 +133,7 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
     { key: 'naming', label: 'Naming & format' },
     { key: 'cleanup', label: 'Folder cleanup' },
     { key: 'confidence', label: 'Confidence' },
+    { key: 'labs', label: 'Labs' },
     { key: 'advanced', label: 'Advanced' },
   ];
   const statusColor = backendOk === false ? 'var(--conf-low)'
@@ -380,13 +382,20 @@ export function Checkbox({ on, onChange, indeterminate }: {
   indeterminate?: boolean;
 }) {
   return (
-    <div className={`cb ${on || indeterminate ? 'on' : ''}`} onClick={(e) => { e.stopPropagation(); onChange?.(); }}>
+    <button
+      type="button"
+      role="checkbox"
+      aria-checked={indeterminate ? 'mixed' : on}
+      className={`cb ${on || indeterminate ? 'on' : ''}`}
+      style={{ padding: 0 }}
+      onClick={(e) => { e.stopPropagation(); onChange?.(); }}
+    >
       {on ? <IcCheck /> : indeterminate ? (
         <svg viewBox="0 0 24 24" style={{ width: 12, height: 12, color: '#061814' }}>
           <rect x="5" y="11" width="14" height="2" rx="1" fill="currentColor" />
         </svg>
       ) : null}
-    </div>
+    </button>
   );
 }
 
@@ -517,6 +526,17 @@ export function Select<T>({
           open ? 'border-accent-line bg-glass-2' : 'border-line',
         )}
         onClick={handleOpen}
+        onKeyDown={(e) => {
+          // Open with Arrow keys from the closed trigger (Enter/Space already
+          // open via the native button click). Once open, the document-level
+          // handler drives Up/Down/Enter navigation.
+          if (disabled || open) return;
+          if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            setActiveIdx(selected ? options.findIndex(o => keyOf(o.value) === selectedKey) : 0);
+            setOpen(true);
+          }
+        }}
         disabled={disabled}
         aria-haspopup="listbox"
         aria-expanded={open}
@@ -669,24 +689,53 @@ export function Modal({ title, sub, onClose, children, footer, size }: {
   footer?: ReactNode;
   size?: string;
 }) {
+  const titleId = useId();
+  const modalRef = useRef<HTMLDivElement | null>(null);
+
+  // Escape to close + Tab focus-trap + focus-in/restore. Without this the
+  // base modal was weaker for AT users than the bespoke CoverPopup dialog:
+  // focus could escape behind the overlay and never returned to the opener.
   useEffect(() => {
-    const fn = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', fn);
-    return () => window.removeEventListener('keydown', fn);
+    const prevFocused = document.activeElement as HTMLElement | null;
+    const node = modalRef.current;
+    node?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { onClose(); return; }
+      if (e.key !== 'Tab' || !node) return;
+      const focusables = node.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      );
+      if (focusables.length === 0) { e.preventDefault(); return; }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      // Restore focus to whatever opened the modal (a row/card/button).
+      prevFocused?.focus?.();
+    };
   }, [onClose]);
 
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div
+        ref={modalRef}
         className={`modal ${size ? 'size-' + size : ''}`}
         onClick={e => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
       >
         <div className="modal-head">
           <div>
-            <div className="modal-title">{title}</div>
+            <div className="modal-title" id={titleId}>{title}</div>
             {sub ? <div className="modal-sub">{sub}</div> : null}
           </div>
-          <button className="close-x" onClick={onClose} title="Close (Esc)"><IcX /></button>
+          <button className="close-x" onClick={onClose} title="Close (Esc)" aria-label="Close"><IcX /></button>
         </div>
         <div className="modal-body">{children}</div>
         {footer ? <div className="modal-foot">{footer}</div> : null}

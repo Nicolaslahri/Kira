@@ -75,6 +75,10 @@ class ProviderConfig(BaseModel):
     # config shape to read from. Other providers ignore these fields.
     anidb_client: str | None = None
     anidb_clientver: str | None = None
+    # TMDB-only: ISO language tag (e.g. "en-US", "fr-FR") for localized titles,
+    # overviews and genre names in the popup. None → the provider's "en-US"
+    # default. Other providers ignore it.
+    tmdb_language: str | None = None
 
 
 @dataclass(frozen=True)

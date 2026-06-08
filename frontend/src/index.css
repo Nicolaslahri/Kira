@@ -8,7 +8,10 @@
   --ink:          #ffffff;
   --ink-2:        #bdc1d0;
   --ink-3:        #71778e;
-  --ink-4:        #4a4f63;
+  /* --ink-4 was #4a4f63 (~2.6:1 on black — fails WCAG AA for the small
+     mono paths/timestamps that use it). Lifted to ~4.1:1 while staying the
+     dimmest text tier. Use --line/--line-strong for non-text hairlines. */
+  --ink-4:        #6b7088;
   --line:         rgba(255,255,255,0.08);
   --line-strong:  rgba(255,255,255,0.16);
   --glass:        rgba(255,255,255,0.04);
@@ -40,6 +43,12 @@
   --info:          #49b8fe;
   --info-bg:       rgba(73,184,254,0.12);
 
+  /* Media-type accents — were hardcoded inline in several components
+     (ReviewPage pills, Dashboard TYPE_META, Onboarding cards). Tokenized so
+     anime/music keep one consistent, themeable colour. */
+  --media-anime:   #c89bff;
+  --media-music:   #ffb14a;
+
   /* Rainbow button (Magic UI) — gradient stops as HSL triplets */
   --color-1: 0 100% 63%;
   --color-2: 270 100% 63%;
@@ -62,6 +71,18 @@
 
   /* Row density */
   --row-py: 10px;
+
+  /* Motion — single source of truth for easing + duration. The signature
+     "smooth" curve (decelerate with a slight settle) drives card / row /
+     modal entrances and most transitions; the spring variant overshoots
+     for playful pops. Durations follow a 3-step scale so motion reads as
+     one system instead of ad-hoc per-rule numbers. */
+  --ease-out:    var(--ease-out);    /* entering / decelerate */
+  --ease-spring: cubic-bezier(0.2, 0.9, 0.3, 1.1);  /* entering with overshoot */
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);    /* moving between states */
+  --dur-1: 0.12s;  /* micro-feedback: hovers, presses */
+  --dur-2: 0.18s;  /* small transitions: toggles, dropdowns */
+  --dur-3: 0.32s;  /* medium: row / card entrance, page changes */
 }
 
 * { box-sizing: border-box; }
@@ -474,6 +495,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   font-weight: 500;
   display: inline-flex; align-items: center; gap: 6px;
   font-family: inherit;
+  transition: background var(--dur-1) ease, color var(--dur-1) ease, box-shadow var(--dur-1) ease;
 }
 .filter-pill:hover { color: var(--ink); }
 /* F-11: stronger active state — solid bg + inset ring so users can
@@ -574,7 +596,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   from { opacity: 0; transform: translateY(-6px); background: rgba(40, 217, 160, 0.08); }
   to   { opacity: 1; transform: translateY(0); background: transparent; }
 }
-.review-list > .row { animation: rowSlideIn 0.32s cubic-bezier(0.2, 0.9, 0.3, 1) both; }
+.review-list > .row { animation: rowSlideIn 0.32s var(--ease-out) both; }
 
 .row {
   display: grid;
@@ -820,7 +842,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   display: flex; flex-direction: column;
   overflow: hidden;
   box-shadow: 0 30px 100px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.02);
-  animation: modalIn 0.18s cubic-bezier(0.2, 0.9, 0.3, 1.1) forwards;
+  animation: modalIn var(--dur-2) var(--ease-spring) forwards;
 }
 @keyframes modalIn {
   from { opacity: 0; transform: translateY(8px) scale(0.98); }
@@ -879,7 +901,15 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   margin: -6px;
   border-radius: 10px;
   transition: background 0.1s;
+  /* Rendered as a <button> for keyboard/AT access — reset native chrome. */
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  appearance: none;
+  -webkit-appearance: none;
 }
+.search-result:focus-visible { outline: 2px solid #6ea8fe; outline-offset: 2px; }
 .search-result:hover { background: var(--hover); }
 .search-result.selected { background: var(--accent-soft); outline: 1px solid var(--accent-line); }
 .search-result .poster {
@@ -1135,121 +1165,9 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .input:focus { border-color: var(--accent-line); background: var(--glass-2); }
 .input.mono { font-family: var(--font-mono); font-size: 12px; }
 
-/* ── Themed Select dropdown ───────────────────────────────────────
-   Drop-in replacement for the native <select> element, which
-   ignored every CSS rule we threw at it and rendered a glaring
-   white-on-blue Windows dropdown in the middle of our dark theme.
-   The trigger button reuses .input styles so it lines up visually
-   with neighbouring fields; the popup is a fully-styled custom
-   panel we paint ourselves. */
-.select { display: block; }
-.select-trigger {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  text-align: left;
-  cursor: pointer;
-  /* Inherit .input padding/border/bg but override one default —
-     buttons get an inset focus ring by default in some browsers
-     which fights our border-radius. Suppress it; the :focus state
-     comes from .input above. */
-  -webkit-appearance: none;
-  appearance: none;
-}
-.select-trigger:hover:not(:disabled) {
-  border-color: var(--accent-line);
-}
-.select-trigger.is-open {
-  border-color: var(--accent-line);
-  background: var(--glass-2);
-}
-.select-trigger:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-.select-value {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.select-value.is-placeholder { color: var(--ink-3); }
-.select-caret {
-  font-size: 10px;
-  color: var(--ink-3);
-  flex-shrink: 0;
-}
-
-.select-menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  right: 0;
-  background: var(--bg-2, #0e0f14);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 4px;
-  z-index: 1000;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.4);
-  max-height: 280px;
-  overflow-y: auto;
-  /* Slight in-from-top animation so the menu feels intentional
-     rather than snapping into place. */
-  animation: select-menu-in 90ms ease-out;
-}
-@keyframes select-menu-in {
-  from { opacity: 0; transform: translateY(-4px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-.select-option {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 8px 10px;
-  background: transparent;
-  border: 0;
-  border-radius: 7px;
-  color: var(--ink);
-  font-size: 13px;
-  font-family: inherit;
-  text-align: left;
-  cursor: pointer;
-  /* Disabled by default so the keyboard navigation's "active"
-     row gets a hover even when the mouse hasn't moved. */
-  transition: background 60ms ease-out;
-}
-.select-option.is-active,
-.select-option:hover {
-  background: var(--glass-2);
-}
-.select-option.is-selected {
-  color: var(--accent);
-  font-weight: 500;
-}
-.select-option-label {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.select-option-secondary {
-  font-size: 11px;
-  color: var(--ink-3);
-  flex-shrink: 0;
-}
-.select-option.mono .select-option-label {
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
-.select-empty {
-  padding: 12px 10px;
-  color: var(--ink-3);
-  font-size: 12px;
-  text-align: center;
-}
+/* The legacy `.select-*` custom-dropdown styles were removed (M9) — the
+   themed <Select> in components/ui.tsx is now pure Tailwind and these
+   classes had no remaining references. */
 
 /* ── Integrations panel layout ────────────────────────────────────
    Each external tool (Sonarr, Radarr, Plex, …) gets one self-
@@ -1681,7 +1599,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   display: grid; place-items: center;
   filter: drop-shadow(0 16px 50px rgba(126, 20, 255, 0.55));
   margin-bottom: 8px;
-  animation: heroBreathe 4s ease-in-out infinite, riseIn 0.55s cubic-bezier(0.2, 0.9, 0.3, 1) both;
+  animation: heroBreathe 4s ease-in-out infinite, riseIn 0.55s var(--ease-out) both;
 }
 .onboarding-hero .mark img,
 .onboarding-hero .mark svg { width: 72px; height: 68px; }
@@ -1822,7 +1740,15 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   transition: border-color 0.18s ease, background 0.18s ease, transform 0.14s ease;
   display: flex; flex-direction: column;
   gap: 10px;
+  /* Rendered as a <button> — reset native chrome (see .ct-card). */
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  appearance: none;
+  -webkit-appearance: none;
 }
+.naming-card:focus-visible { outline: 2px solid #6ea8fe; outline-offset: 2px; }
 .naming-card:hover { border-color: var(--line-strong); background: var(--glass-2); transform: translateY(-1px); }
 .naming-card.selected {
   border-color: var(--accent-line);
@@ -1926,11 +1852,11 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   to   { transform: none; opacity: 1; }
 }
 .onboarding-hero > * {
-  animation: riseIn 0.5s cubic-bezier(0.2, 0.9, 0.3, 1) both;
+  animation: riseIn 0.5s var(--ease-out) both;
   animation-delay: calc(var(--i, 0) * 80ms + 100ms);
 }
 .onboarding-body > * {
-  animation: riseInSm 0.42s cubic-bezier(0.2, 0.9, 0.3, 1) both;
+  animation: riseInSm 0.42s var(--ease-out) both;
   animation-delay: calc(var(--i, 0) * 60ms + 80ms);
 }
 
@@ -2226,6 +2152,85 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .token-chip.clickable:active { transform: translateY(1px); }
 .token-chip:disabled { cursor: default; }
 
+/* ── Rich chip editor for the naming template ──────────────
+   A contentEditable field that renders {{tokens}} / {%stmts%} as inline
+   chips among editable literal text. WRAPS to multiple lines (no horizontal
+   scroll) and grows in height. Reuses the .input look so it lines up with the
+   rest of Settings. */
+.tpl-editor {
+  background: var(--glass);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 8px 10px;
+  min-height: 40px;
+  width: 100%;
+  outline: 0;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 2;            /* room for chips between wrapped lines */
+  white-space: pre-wrap;     /* keep literal spaces, allow wrapping */
+  word-break: break-word;
+  overflow-wrap: anywhere;   /* never force horizontal scroll */
+  cursor: text;
+}
+.tpl-editor:focus { border-color: var(--accent-line); background: var(--glass-2); }
+.tpl-editor-locked { cursor: default; color: var(--ink-2); }
+.tpl-editor-drop {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+/* Inline token chip — sits in the text flow, non-editable as a unit. Matches
+   the palette `.token-chip` look (neutral glass pill + `.kbd` keycap) so the
+   chips in the editor read the same as the ones in the token palette below. */
+.tpl-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  vertical-align: baseline;
+  margin: 0 1px;
+  padding: 3px 8px 3px 4px;
+  background: var(--glass);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink);
+  white-space: nowrap;
+  user-select: none;
+}
+/* Keycap sits flush inside the chip (palette zeroes the .kbd margin too). */
+.tpl-chip .kbd { margin: 0; }
+.tpl-chip-label { color: var(--ink-2); }
+/* Editable chips pick up the same hover tint as the palette chips. */
+.tpl-editor:not(.tpl-editor-locked) .tpl-chip:hover {
+  border-color: var(--accent-line);
+  background: var(--glass-3);
+}
+/* {% if %} / {% endif %} statements: muted, distinct from token chips. */
+.tpl-chip-stmt {
+  background: rgba(255,255,255,0.05);
+  border-color: var(--line-strong);
+  border-style: dashed;
+  color: var(--ink-2);
+  font-style: italic;
+}
+.tpl-chip-stmt .tpl-chip-label { color: var(--ink-2); }
+/* Per-chip delete affordance (Custom profile). Hidden until hover. */
+.tpl-chip-x {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 15px; height: 15px;
+  margin-right: -2px;
+  border-radius: 4px;
+  font-size: 15px; line-height: 1; font-weight: 600;
+  color: var(--ink);
+  background: rgba(255,255,255,0.08);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .1s ease, color .1s ease, background .1s ease;
+}
+.tpl-chip:hover .tpl-chip-x { opacity: 1; }
+.tpl-chip-x:hover { color: var(--conf-low); background: rgba(255,91,110,0.18); }
+.tpl-editor-locked .tpl-chip-x { display: none; }
+
 /* ── Naming template editor: 2-pane editor | live preview ── */
 .naming-editor {
   display: grid;
@@ -2299,7 +2304,16 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   transition: border-color 0.16s ease, background 0.16s ease, transform 0.12s ease;
   display: flex; flex-direction: column;
   gap: 8px;
+  /* Rendered as a <button> for keyboard/AT access — reset the native
+     button chrome so it looks identical to the old <div>. */
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  appearance: none;
+  -webkit-appearance: none;
 }
+.ct-card:focus-visible { outline: 2px solid #6ea8fe; outline-offset: 2px; }
 .ct-card:hover { border-color: var(--line-strong); background: var(--glass-2); }
 .ct-card.selected {
   border-color: var(--accent-line);
@@ -2351,6 +2365,13 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   display: flex; flex-direction: column;
   gap: 14px;
   margin-bottom: 32px;
+  /* M11: skip layout+paint of off-screen sections so a large library (hundreds
+     of cards across many sections) doesn't pay full render cost up front.
+     Applied to the SECTION, not the cards, so a card's own hover shadow/scale
+     isn't paint-clipped. `auto` remembers each section's real height after first
+     render; 600px is just the pre-render placeholder estimate. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 600px;
 }
 .lib-section-head {
   display: flex; align-items: baseline; gap: 14px;
@@ -2479,8 +2500,11 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   display: flex; flex-direction: column;
   gap: 10px;
   cursor: pointer;
-  animation: cardIn 0.42s cubic-bezier(0.2, 0.9, 0.3, 1) both;
-  animation-delay: calc(var(--i, 0) * 22ms);
+  animation: cardIn 0.42s var(--ease-out) both;
+  /* Stagger by grid index, but cap the cohort at ~16 so a 200-card library
+     doesn't make the last rows wait 4s+ to appear — beyond a screenful the
+     stagger is invisible anyway (those cards are below the fold). */
+  animation-delay: calc(min(var(--i, 0), 16) * 22ms);
   /* keep room for hovered scale */
   padding: 4px;
   margin: -4px;
@@ -2923,6 +2947,25 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .cc-act.approve:hover { background: var(--accent); color: #061814; border-color: var(--accent); }
 .cc-act.reject:hover  { background: var(--conf-low); color: #2a0c10; border-color: var(--conf-low); }
 
+/* C2 — keyboard parity: reveal the hover-only quick actions when focus
+   enters the card/row, so keyboard users get the same affordances as
+   mouse users (the :hover rules alone strand them). */
+.cc:focus-within .cc-actions { opacity: 1; transform: none; }
+
+/* C2 — touch devices have no hover, so the primary review actions
+   (approve / reject / manual-search) were permanently hidden AND below
+   the 44px touch target. On coarse pointers, reveal them and grow the
+   hit areas so the core workflow is actually usable on tablet/phone. */
+@media (hover: none) {
+  .cc-actions { opacity: 1; transform: none; }
+  .cc-act { width: 44px; height: 44px; }
+  .cx-rowact { opacity: 1; }
+  .cx-rowact button { width: 44px; height: 44px; }
+  .cx-ep-act-row { opacity: 1; }
+  .cx-row-actions { opacity: 1; }
+  .act { width: 40px; height: 40px; }
+}
+
 /* Anime card — subtle purple frame */
 .cc.is-anime .cc-cover {
   box-shadow:
@@ -2976,7 +3019,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   background: linear-gradient(to top,
     rgba(8,6,16,0.96) 0%, rgba(8,6,16,0.86) 34%, rgba(8,6,16,0.42) 66%, transparent 100%);
   pointer-events: none;
-  transition: padding 0.28s cubic-bezier(0.2, 0.9, 0.3, 1);
+  transition: padding 0.28s var(--ease-out);
 }
 .cc.cinema .cc-meta > * { pointer-events: auto; }
 .cc.cinema .cc-cover.shape-square + .cc-meta,
@@ -3061,7 +3104,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 
 /* Poster zoom on hover — the camera-push that sells the reveal. Replaces the
    base card's 2px lift (which would desync from the absolute caption). */
-.cc.cinema .cc-cover > img { transition: transform 0.45s cubic-bezier(0.2, 0.9, 0.3, 1); }
+.cc.cinema .cc-cover > img { transition: transform 0.45s var(--ease-out); }
 .cc.cinema:hover .cc-cover > img,
 .cc.cinema:focus-within .cc-cover > img { transform: scale(1.07); }
 .cc.cinema:hover .cc-cover { transform: none; }
@@ -3473,6 +3516,18 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .cx-col-head .col-meta { color: var(--ink-2); font-size: 11px; text-transform: none; letter-spacing: 0; font-weight: 500; }
 .cx-col-head.left { color: var(--info); }
 
+/* "Show N missing" toggle in the episode-column header — collapses the blank
+   (missing-episode) rows on long-runners so the files you have aren't buried.
+   Link-styled to read as an inline action, not a chunky button. */
+.cx-missing-toggle {
+  appearance: none; border: none; background: none; padding: 0; margin: 0;
+  font: inherit; color: var(--info); cursor: pointer;
+  text-decoration: underline; text-underline-offset: 2px;
+  transition: color 0.12s ease;
+}
+.cx-missing-toggle:hover { color: var(--ink-1); }
+.cx-missing-toggle:focus-visible { outline: 2px solid var(--info); outline-offset: 2px; border-radius: 3px; }
+
 .cx-col-body {
   flex: 1; overflow-y: auto;
   /* scroll-sync handled in JS via wheel handler */
@@ -3502,8 +3557,14 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   border-bottom: 1px solid var(--line);
   min-height: 96px;
   position: relative;
-  transition: background 0.12s;
+  transition: background var(--dur-1);
 }
+/* Real rows settle in with a soft fade as the episode list resolves
+   (replacing the shimmer skeletons). Keyed by r.key, so this plays once
+   on first mount — NOT on status re-renders — and deliberately carries no
+   transform so it never competes with the cover's shared-element flight. */
+.cx-col-body .cx-row:not(.cx-row-skeleton) { animation: cxRowIn var(--dur-3) var(--ease-out) both; }
+@keyframes cxRowIn { from { opacity: 0; } to { opacity: 1; } }
 .cx-row:hover { background: rgba(255,255,255,0.025); }
 .cx-row.focused { background: rgba(255,255,255,0.04); }
 .cx-row.blank { color: var(--ink-4); background: rgba(0,0,0,0.18); }
@@ -3562,7 +3623,8 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   opacity: 0;
   transition: opacity 0.12s ease;
 }
-.cx-row:hover .cx-rowact { opacity: 1; }
+.cx-row:hover .cx-rowact,
+.cx-row:focus-within .cx-rowact { opacity: 1; }
 .cx-rowact button {
   width: 26px; height: 26px;
   border-radius: 6px;
@@ -4188,6 +4250,20 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   border-color: rgba(200, 155, 255, 0.28);
   color: #c89bff;
 }
+/* HDR — a premium signal, so a warm amber accent sets it apart from the
+   neutral quality/codec tags. */
+.cx-row-tag.hdr {
+  background: rgba(255, 184, 74, 0.12);
+  border-color: rgba(255, 184, 74, 0.32);
+  color: #ffb84a;
+}
+/* Dual/multi-audio language ([JPN+ENG]) — a cyan accent marks the notable
+   multi-track signal apart from the neutral tech tags. */
+.cx-row-tag.lang {
+  background: rgba(90, 200, 215, 0.12);
+  border-color: rgba(90, 200, 215, 0.30);
+  color: #5ac8d7;
+}
 
 /* Right column — confidence pill + action icons stacked */
 .cx-row-aside {
@@ -4346,7 +4422,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 /* Content column never tries to exceed the row height */
 .cx-row-content {
   min-width: 0;
-  max-height: 80px;
+  max-height: 96px;
   overflow: hidden;
   gap: 3px !important;
 }
@@ -4354,15 +4430,28 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 /* Episode overview hidden — too tall for compact rows */
 .cx-ep-overview { display: none !important; }
 
-/* Tags row capped at one line */
+/* Tags wrap to a second line instead of clipping to one (the content box
+   above caps the height so paired left/right rows stay aligned). A single
+   over-long pill (release group) ellipsis-truncates rather than blowing
+   the line — see .cx-row-tag.rg below. */
 .cx-row-tags {
-  flex-wrap: nowrap !important;
+  flex-wrap: wrap !important;
   overflow: hidden;
   max-width: 100%;
 }
 .cx-row-tag {
   flex-shrink: 0;
   white-space: nowrap;
+  max-width: 100%;
+}
+/* Release-group names are the usual long offender — cap + ellipsis so they
+   never push the rest of the tags off-screen. Full value is on the title. */
+.cx-row-tag.rg {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline-block;
+  vertical-align: bottom;
 }
 
 /* Blank rows also exactly 104px so they pair perfectly */
@@ -4476,7 +4565,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
    from pushing the row taller than 104px. The warning collapses into
    the tags row instead of a separate row. */
 .cx-row .cx-row-content {
-  max-height: 80px;
+  max-height: 96px;
   overflow: hidden;
 }
 
@@ -4799,7 +4888,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   transform-style: preserve-3d;
   perspective: 1000px;
   transition:
-    transform 0.18s cubic-bezier(0.2, 0.9, 0.3, 1),
+    transform 0.18s var(--ease-out),
     box-shadow 0.22s ease,
     border-color 0.18s ease,
     background 0.18s ease !important;
@@ -4860,8 +4949,8 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 }
 
 /* The cc-meta and cc-cover need to be on their own 3d planes */
-.cc-cover { transition: transform 0.22s cubic-bezier(0.2, 0.9, 0.3, 1), box-shadow 0.22s ease !important; }
-.cc-meta { transition: transform 0.22s cubic-bezier(0.2, 0.9, 0.3, 1); }
+.cc-cover { transition: transform 0.22s var(--ease-out), box-shadow 0.22s ease !important; }
+.cc-meta { transition: transform 0.22s var(--ease-out); }
 
 /* Reduced motion fallback */
 @media (prefers-reduced-motion: reduce) {
@@ -5813,6 +5902,22 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 /* Respect users who've asked for reduced motion. */
 @media (prefers-reduced-motion: reduce) {
   .cx-skel { animation: none; opacity: 0.6; }
+  /* Entrance / continuity animations that the earlier scoped reduced-motion
+     blocks didn't cover. Snap straight to the resting state — the content
+     is what matters, the movement isn't. The indeterminate scan sweep keeps
+     running as a non-moving fill so the user still reads "work in progress"
+     without the horizontal motion. */
+  .cc { animation: none; }
+  .review-list > .row { animation: none; }
+  .cx-col-body .cx-row:not(.cx-row-skeleton) { animation: none; }
+  .modal { animation: none; }
+  .modal-overlay { animation: none; }
+  .bulkbar { animation: none; }
+  .global-scan-bar.indeterminate .global-scan-bar-fill {
+    animation: none;
+    width: 100%;
+    inset: 0;
+  }
 }
 
 /* PB-2 contrast bump on "Needs review" badge. Previous yellow text was
@@ -6195,7 +6300,11 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   letter-spacing: 0.02em;
   padding: 4px 9px 4px 7px;
   border-radius: 999px;
-  z-index: 2;
+  /* Above the cinema-mode title overlay (.cc.cinema .cc-meta is z-index:5),
+     which sits at the bottom of the cover and was painting over this pill.
+     .cc-cover isn't a stacking context (its hover-transform is overridden to
+     none — the whole card lifts), so this reliably wins in every state. */
+  z-index: 6;
   pointer-events: auto;   /* so the title tooltip is reachable */
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);

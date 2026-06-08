@@ -13,6 +13,7 @@ import {
 import { MediaTypeIcon } from './ui';
 import { fetchAnidbPoster, getCachedAnidbPoster } from '../lib/posters';
 import { api } from '../lib/api';
+import { confLevel, getConfBands } from '../lib/confBands';
 
 // ─────────────────────────────────────────────────────────────────────
 // Sonarr live queue — library-grid scope
@@ -172,15 +173,14 @@ export function libraryStats(item: LibraryItem): LibStats {
 }
 
 export function confTier(v: number): 'high' | 'mid' | 'low' {
-  if (v >= 85) return 'high';
-  if (v >= 50) return 'mid';
-  return 'low';
+  return confLevel(v);
 }
 
 
 function ccStatChipColor(s: LibStats): string {
-  if (s.cardState === 'approved' || s.avgConf >= 85) return 'var(--conf-high)';
-  if (s.cardState === 'rejected' || s.avgConf < 50) return 'var(--conf-low)';
+  const { high, mid } = getConfBands();
+  if (s.cardState === 'approved' || s.avgConf >= high) return 'var(--conf-high)';
+  if (s.cardState === 'rejected' || s.avgConf < mid) return 'var(--conf-low)';
   return 'var(--conf-mid)';
 }
 
@@ -277,6 +277,11 @@ export function CoverCard({
     anidbAid ? (getCachedAnidbPoster(String(anidbAid)) ?? null) : null
   );
   const effectivePosterUrl = item.posterUrl ?? lazyPoster;
+  // Any poster that fails to load (404, dead host) falls back to the initials
+  // card instead of a blank gradient. Reset when the URL changes so a fresh
+  // poster gets a fair retry.
+  const [imgFailed, setImgFailed] = useState(false);
+  useEffect(() => { setImgFailed(false); }, [effectivePosterUrl]);
   useEffect(() => {
     if (item.posterUrl || lazyPoster || !anidbAid) return;
     let cancelled = false;
@@ -289,9 +294,21 @@ export function CoverCard({
   const handleCardClick = (e: React.MouseEvent<HTMLDivElement>) => {
     // Don't trigger expand when clicking an inner action/checkbox.
     const target = e.target as HTMLElement;
-    if (target.closest('.cc-act, .cc-select, .cc-no-match-cta')) return;
+    if (target.closest('.cc-act, .cc-select, .cc-no-match-cta, .cc-nm-search-link')) return;
     const coverEl = e.currentTarget.querySelector('.cc-cover');
     if (coverEl instanceof HTMLElement) onOpen(item, coverEl);
+  };
+
+  // Keyboard access for the card itself (it's role="button"). Only act when
+  // focus is on the card, not an inner control — Enter/Space on a nested
+  // action button must run THAT button, not also expand the card.
+  const handleCardKey = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      const coverEl = e.currentTarget.querySelector('.cc-cover');
+      if (coverEl instanceof HTMLElement) onOpen(item, coverEl);
+    }
   };
 
   const cardClass = [
@@ -310,6 +327,10 @@ export function CoverCard({
       className={cardClass}
       style={{ ['--i' as never]: index } as React.CSSProperties}
       onClick={handleCardClick}
+      onKeyDown={handleCardKey}
+      role="button"
+      tabIndex={0}
+      aria-label={`Open ${item.title || 'file'}${item.year ? `, ${item.year}` : ''}`}
       data-cardid={item.id}
     >
       {item.noMatch ? (
@@ -343,13 +364,13 @@ export function CoverCard({
           className={`cc-cover shape-${shape}`}
           style={{ background: `linear-gradient(135deg, ${tint[0]}, ${tint[1]})` }}
         >
-          {effectivePosterUrl ? (
+          {effectivePosterUrl && !imgFailed ? (
             <img
               src={effectivePosterUrl}
               alt=""
               loading="lazy"
               referrerPolicy="no-referrer"
-              onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+              onError={() => setImgFailed(true)}
               style={{
                 position: 'absolute', inset: 0, width: '100%', height: '100%',
                 objectFit: 'cover', zIndex: 0, display: 'block',
@@ -468,16 +489,19 @@ export function CoverCard({
                 className="cc-act approve"
                 onClick={(e) => { e.stopPropagation(); onApprove(item); }}
                 title="Approve all matched"
+                aria-label={`Approve all matched for ${item.title || 'this title'}`}
               ><IcCheck /></button>
               <button
                 className="cc-act reject"
                 onClick={(e) => { e.stopPropagation(); onReject(item); }}
                 title="Reject all"
+                aria-label={`Reject all for ${item.title || 'this title'}`}
               ><IcX /></button>
               <button
                 className="cc-act"
                 onClick={(e) => { e.stopPropagation(); onManualSearch(item); }}
                 title="Search manually"
+                aria-label={`Search manually for ${item.title || 'this file'}`}
               ><IcSearch /></button>
             </div>
           ) : null}
@@ -641,14 +665,14 @@ export function LibraryGrid({
               <span className="step-num">1</span>
               <div>
                 <strong>Pick your media folder</strong>
-                <a className="step-link" href="#/settings">Open Paths settings →</a>
+                <a className="step-link" href="#/settings/paths">Open Paths settings →</a>
               </div>
             </li>
             <li>
               <span className="step-num">2</span>
               <div>
                 <strong>Add a TMDB API key</strong> <span className="step-meta">(free, takes 60s)</span>
-                <a className="step-link" href="#/settings">Open Providers settings →</a>
+                <a className="step-link" href="#/settings/connections">Open Providers settings →</a>
               </div>
             </li>
             <li>
@@ -921,32 +945,69 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
     // Sort by canonical season when available (Fribb cross-ref ground truth),
     // fall back to year for franchises whose seasons aren't catalogued.
     // Season 0 (Specials) sorts last so the regular run reads 1, 2, 3, … 0.
+    // Title helpers — shared by the sort tiebreak AND the per-card label below.
+    const stripYear = (t: string) => (t || '').replace(/\s*\(\d{4}\)\s*$/, '');
+    const hasYear = (t: string) => /\(\d{4}\)\s*$/.test(t || '');
+    // Year embedded in the title ("(2019)"); bare (no year) → 0 = earliest,
+    // matching AniDB's convention of leaving the FIRST cour of a season unyeared.
+    const titleYear = (t: string) => {
+      const m = (t || '').match(/\((\d{4})\)\s*$/);
+      return m ? parseInt(m[1], 10) : 0;
+    };
     const sorted = [...b.items].sort((a, b) => {
       const sa = typeof a.season === 'number' ? (a.season === 0 ? 9999 : a.season) : null;
       const sb = typeof b.season === 'number' ? (b.season === 0 ? 9999 : b.season) : null;
       if (sa !== null && sb !== null && sa !== sb) return sa - sb;
-      return (a.year ?? 0) - (b.year ?? 0);
+      // Tiebreak by year — the item's own year, else a year embedded in the
+      // title ("(2019)"); bare titles sort first. Keeps cards in the same
+      // chronological order as their "Part N" labels.
+      const ya = (a.year ?? 0) || titleYear(a.title || '');
+      const yb = (b.year ?? 0) || titleYear(b.title || '');
+      if (ya !== yb) return ya - yb;
+      return (a.title || '').localeCompare(b.title || '');
     });
     const earliest = sorted[0];
-    const franchiseTitle = (earliest.title || '').replace(/\s*\(\d{4}\)\s*$/, '');
+    // #14: movie collections name the band by the TMDB collection ("The Matrix
+    // Collection") rather than the earliest film's bare title. Falls back to
+    // the earliest title (anime franchises / collections without a name).
+    const collectionLabel = sorted.find(it => it.collectionName)?.collectionName;
+    const franchiseTitle = collectionLabel
+      || (earliest.title || '').replace(/\s*\(\d{4}\)\s*$/, '');
 
-    // Per-card title disambiguation. Normally we drop the trailing "(YYYY)"
-    // inside a franchise group (the heading already names the show). But when
-    // two cours of one TVDB season carry the SAME base name and AniDB only
-    // disambiguates them by year — Attack on Titan "Season 3" + "Season 3
-    // (2019)", or "The Final Season" + "(2022)" + "(2023)" — stripping the
-    // year makes the cards read identically. So: strip only when the result
-    // stays unique within the block; otherwise keep the year.
-    const stripYear = (t: string) => (t || '').replace(/\s*\(\d{4}\)\s*$/, '');
-    const strippedCounts = new Map<string, number>();
+    // Per-card title disambiguation. Inside a franchise group we drop the
+    // trailing "(YYYY)" (the heading already names the show). The wrinkle:
+    // AniDB tags only the LATER cours of a split season with a year and leaves
+    // the first bare — so a group reads "The Final Season", "…(2022)",
+    // "…(2023)": some cards with years, some without. That's the inconsistency.
+    //
+    // Rule (uniform distinguisher per collision group):
+    //   - unique base name        → drop the year, show the bare name
+    //   - collision, ALL have years → keep them (already consistent)
+    //   - collision, mixed/none    → relabel the whole group "<base> Part N"
+    //                                in chronological order (bare/earliest = 1)
+    // So "Season 3" + "Season 3 (2019)" → "… Season 3 Part 1" + "Part 2", and
+    // the three Final Season cours → "… The Final Season Part 1/2/3".
+    // (stripYear / hasYear / titleYear are defined above, by the sort.)
+    const byBase = new Map<string, LibraryItem[]>();
     for (const it of sorted) {
-      const s = stripYear(it.title || '');
-      strippedCounts.set(s, (strippedCounts.get(s) || 0) + 1);
+      const base = stripYear(it.title || '');
+      const arr = byBase.get(base);
+      if (arr) arr.push(it); else byBase.set(base, [it]);
     }
-    const displayTitleFor = (it: LibraryItem): string => {
-      const s = stripYear(it.title || '');
-      return (strippedCounts.get(s) || 0) > 1 ? (it.title || s) : s;
-    };
+    const titleById = new Map<string, string>();
+    for (const [base, members] of byBase) {
+      if (members.length <= 1) {
+        titleById.set(members[0].id, base);
+      } else if (members.every(m => hasYear(m.title || ''))) {
+        for (const m of members) titleById.set(m.id, m.title || base);
+      } else {
+        [...members]
+          .sort((a, b) => titleYear(a.title || '') - titleYear(b.title || ''))
+          .forEach((m, i) => titleById.set(m.id, `${base} Part ${i + 1}`));
+      }
+    }
+    const displayTitleFor = (it: LibraryItem): string =>
+      titleById.get(it.id) ?? stripYear(it.title || '');
     const totalSeasons = b.items.length;
     const totalEpisodes = b.items.reduce((s, it) => s + (it.episodes?.length ?? 0), 0);
     const counter = totalEpisodes > 0

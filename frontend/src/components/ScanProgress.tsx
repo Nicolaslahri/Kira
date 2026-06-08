@@ -22,7 +22,7 @@ export function ScanProgress({ phase, progress, found, message }: {
 
   return (
     <div
-      className="w-[340px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl border border-white/[0.1] bg-[rgba(8,9,12,0.6)] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.55)] backdrop-blur-2xl"
+      className="relative w-[340px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl border border-white/[0.1] bg-[rgba(8,9,12,0.6)] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.55)] backdrop-blur-2xl"
       role="status"
       aria-live="polite"
     >

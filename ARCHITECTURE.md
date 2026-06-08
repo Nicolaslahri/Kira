@@ -16,12 +16,13 @@ This doc reflects what's **actually built** right now.
 | Matcher | ✅ working | Trigram similarity, weighted scoring, provider fallback ladder |
 | TVDB provider | ✅ working | v4 login flow, English title/overview preference, search + episodes |
 | TMDB provider | ✅ implemented | Code complete, only enabled if user adds an API key |
-| AniDB / MusicBrainz / AcoustID | 🚧 stubs | Wired into factory + registry, `search_*` methods raise NotImplemented |
+| AniDB | ✅ implemented | Offline title-dump search (keyless), episodes, relations + franchise offsets, per-cour routing, ban-aware rate limiting — the core anime path |
+| MusicBrainz / AcoustID | 🚧 wired, inactive | Present in factory + registry, but the music match path is **cut** (see roadmap) — not used by the engine |
 | Rename engine | ✅ working | Move / copy / hardlink / symlink, template-driven, undoable |
 | Onboarding | ✅ working | 5-step flow, real TMDB key validation against backend |
 | Review queue | ✅ working | Live data, approve/reject/manual-search/pick-candidate all persist |
 | History | ✅ working | Real list, filters, undo, CSV export |
-| Settings | ✅ working | All 5 provider keys, paths (browse), naming, confidence, advanced |
+| Settings | ✅ working | Provider keys + **per-type provider preference**, paths (browse), naming (+ **anime absolute/seasonal** toggle), confidence, advanced |
 | Notifications | ✅ working | Bell + popover, polls every 15s, derived from rename events |
 | Kira Cloud | 🚧 hook only | Provider factory has `ProviderMode.CLOUD` branch; no actual cloud server |
 

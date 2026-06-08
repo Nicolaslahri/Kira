@@ -5,23 +5,35 @@ polls /scans/{id} for live progress while rows appear in real time.
 import asyncio
 from collections import defaultdict
 from datetime import datetime, timezone
-from pathlib import Path  # noqa: F401  (used by _compute_series_key for EE-5 disambig)
+from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from kira import activity
 from kira import scanner
+from kira import xattr_store as _xattr_store
 from kira.api.match_cleanup import detach_and_delete_matches
 from kira.database import SessionLocal, get_session
 from kira.matcher import MatchEngine
+from kira.matcher.cour_routing import remap_umbrella_local_to_absolute
 from kira.matcher.engine import compute_series_group_id, fetch_match_metadata, registry_from_settings, resolve_canonical_season
-from kira.matcher.similarity import normalize
+# CR-07: pure key logic moved to kira.matcher.keys. Re-exported under the old
+# private names below as back-compat aliases (matches.py / files.py / tests do
+# `from kira.api.scans import _compute_series_key, _compute_variant_key`).
+from kira.matcher.keys import compute_series_key as _compute_series_key
+from kira.matcher.keys import compute_variant_key as _compute_variant_key
+# CR-09: shared media_type correction + key recompute helper.
+from kira.matcher.media_type import apply_media_type_and_recompute_keys
 from kira.models import Match, MediaFile, Scan
 from kira.parser import ParsedFile, parse as parse_path
 from kira.parser import mediainfo as _mediainfo
 from kira.schemas import ScanCreate, ScanOut
+# CR-11: canonical strong-ref fire-and-forget helper (replaces this module's
+# old `_MI_ENRICH_TASKS` registry).
+from kira.tasks import spawn_tracked
 
 router = APIRouter(prefix="/scans", tags=["scans"])
 
@@ -58,29 +70,316 @@ _SCAN_LOCK_MAX_AGE_SEC = 6 * 3600
 
 async def _read_mediainfo_setting(session) -> bool:
     """Whether to backfill missing quality/codec/HDR from real file metadata
-    (Phase 16). Default True; a no-op anyway unless pymediainfo is installed."""
+    (Phase 16) during a scan.
+
+    Default FALSE. Reading a file's container headers opens the file and pulls
+    bytes off disk — over a NAS that's a slow round-trip PER tag-less file,
+    right on the matching critical path, and it's only a cosmetic win (quality
+    chips for files whose filename lacks `1080p`/`x265`/etc.). Off by default
+    keeps scans fast; opt in via Settings if you want chips on tag-less files
+    and accept the per-file I/O. (No-op regardless if pymediainfo isn't installed.)"""
     try:
         from kira.models import Setting
         row = await session.get(Setting, "parsing.read_mediainfo")
         if row is None:
-            return True
+            return False
         return bool(row.value)
     except Exception:
-        return True
+        return False
 
 
-async def _maybe_enrich_mediainfo(parsed: ParsedFile, path: str, enabled: bool) -> None:
-    """Phase 16: fill missing quality/codec/HDR from the file's real metadata.
-    Fallback only — fires solely when the FILENAME yielded no quality (bounds
-    the per-file I/O) and pymediainfo is available. Read runs off the event
-    loop. Fully no-op when the lib is absent."""
-    if not enabled or parsed.quality is not None or not _mediainfo.available():
+async def _read_mediainfo_authoritative_setting(session) -> bool:
+    """Whether the file's REAL container metadata should OVERRIDE filename-derived
+    tech tags (vs. only filling gaps). Default FALSE.
+
+    When on, the background enrichment pass (`enrich_mediainfo_background`) trusts
+    MediaInfo over the release name — so a file mislabelled `1080p` in its name but
+    actually 720p on disk gets corrected, and EVERY file is read (not just tag-less
+    ones). Off keeps the filename's explicit tags and only fills blanks.
+    Independent of `parsing.read_mediainfo`, which gates reading at all.
+
+    Key is `parsing.mediainfo_authoritative` — matches the Settings UI toggle
+    ("Authoritative tech tags")."""
+    try:
+        from kira.models import Setting
+        row = await session.get(Setting, "parsing.mediainfo_authoritative")
+        if row is None:
+            return False
+        return bool(row.value)
+    except Exception:
+        return False
+
+
+async def _read_auto_approve_setting(session) -> tuple[bool, float]:
+    """Auto-approve config for the scan match phase (Settings → Confidence).
+
+    When enabled, a freshly-matched file whose SELECTED match scores at or above
+    the threshold is marked ``approved`` straight out of matching instead of
+    ``matched`` (held for review) — so high-confidence hits skip the Review queue.
+    Approval only pre-clears the file for the user's rename action; it never
+    moves anything on disk.
+
+    Returns ``(enabled, threshold)`` where threshold is a 0..1 fraction. Defaults
+    mirror the Settings UI: enabled, 95%. ``matching.auto_threshold`` is stored as
+    a 0-100 percent, so it's normalised here."""
+    try:
+        from kira.models import Setting
+        from kira.settings_store import unwrap
+
+        en_row = await session.get(Setting, "matching.auto_approve")
+        th_row = await session.get(Setting, "matching.auto_threshold")
+        enabled = True if en_row is None else bool(unwrap(en_row.value))
+        raw_th = 95 if th_row is None else unwrap(th_row.value)
+        try:
+            th = float(raw_th)
+        except (TypeError, ValueError):
+            th = 95.0
+        return enabled, max(0.0, min(100.0, th)) / 100.0
+    except Exception:
+        return True, 0.95
+
+
+async def _apply_xattr_ids(parsed: ParsedFile, file_path: str | None) -> None:
+    """At MATCH time, fill `parsed.provider_ids` from a Kira-stamped xattr / NTFS
+    ADS id (set on a prior rename) when the filename didn't carry one.
+
+    Done here, not in the discovery walk: this read sits right beside the network
+    search it might replace, so a stamped file skips the search entirely and an
+    unstamped one pays a single cheap read that's noise next to the search. Once
+    per cluster/singleton (not per file) → cheap even on a NAS. Off the event
+    loop; never raises."""
+    if not file_path or getattr(parsed, "provider_ids", None):
         return
     try:
+        stamped = await asyncio.to_thread(_xattr_store.read_ids, file_path)
+        if stamped:
+            parsed.provider_ids = stamped
+    except Exception as e:
+        print(f"_apply_xattr_ids: read failed for {file_path} (non-fatal): {e!r}")
+
+
+async def _maybe_enrich_mediainfo(
+    parsed: ParsedFile, path: str, enabled: bool, authoritative: bool = False
+) -> bool:
+    """Phase 16: merge the file's REAL container metadata (quality/codec/HDR/
+    channels/audio/duration + per-track languages) onto a ParsedFile. Reads off
+    the event loop; a full no-op when disabled or the native lib is absent.
+    Returns True if anything changed.
+
+    Always reads the container when enabled. `enrich_parsed` then FILLS missing
+    fields (fallback) or OVERRIDES them (authoritative) — so fallback still keeps
+    an explicit filename quality tag, it just no longer SKIPS the read. We used to
+    skip any quality-tagged file to bound I/O, but that also skipped channels /
+    duration / per-track LANGUAGES, which have no filename source and so would
+    never populate (the "no dual-audio chips on most files" bug). The read is
+    paced + off the critical path in `enrich_mediainfo_background`, so reading
+    every file the pass is handed (new files on a scan; the whole library on an
+    explicit backfill) is affordable.
+
+    NOTE: a NAS round-trip per file — heavy. Callers on a hot path (scan/match)
+    must defer this to `enrich_mediainfo_background`, not await it inline."""
+    if not enabled or not _mediainfo.available():
+        return False
+    try:
         mi = await asyncio.to_thread(_mediainfo.read_media_info, path)
-        _mediainfo.enrich_parsed(parsed, mi)
+        return _mediainfo.enrich_parsed(parsed, mi, authoritative=authoritative)
     except Exception as e:
         print(f"_maybe_enrich_mediainfo failed for {path}: {e!r}")
+        return False
+
+
+# CR-11: the strong-ref registry + done-callback fire-and-forget pattern now
+# lives once in kira.tasks.spawn_tracked (imported at module top). This module
+# used to keep its own `_MI_ENRICH_TASKS` set duplicating it.
+
+# Stable activity-job name (reused per run, not accumulated) for the live
+# "Reading file media info · N/total" pill at GET /api/v1/activity.
+_MI_ENRICH_JOB = "mediainfo_enrich"
+
+
+async def _post_notification(kind: str, title: str, body: str) -> None:
+    """Write a durable Notification on its own short session (so it survives the
+    transient activity pill and shows up in the popover + dashboard 'Recent
+    activity'). Never raises."""
+    try:
+        from kira.models import Notification
+        async with SessionLocal() as session:
+            session.add(Notification(kind=kind, title=title, body=body))
+            await session.commit()
+    except Exception as e:
+        print(f"_post_notification failed (non-fatal): {e!r}")
+
+
+def _spawn_mediainfo_enrich(file_ids: list[int], *, reason: str | None = None) -> None:
+    """Fire-and-forget the background tech-tag enrichment for `file_ids`.
+
+    Detached on purpose: the caller (scan completion / reparse / a settings
+    toggle) returns immediately and the slow per-file container reads happen
+    afterwards, so nothing waits on MediaInfo. No-op without a running loop
+    (e.g. a sync/test context) — enrichment is best-effort cosmetic.
+
+    `reason="settings"` marks an explicit user action (just enabled the toggle):
+    it gets a durable completion Notification, since the live pill alone is easy
+    to miss on a fast pass."""
+    if not file_ids:
+        return
+    # CR-11: keep the no-running-loop no-op (sync/test contexts) — enrichment is
+    # best-effort cosmetic — then delegate the strong-ref/exception-logging
+    # fire-and-forget bookkeeping to the shared kira.tasks.spawn_tracked.
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    spawn_tracked(
+        enrich_mediainfo_background(list(file_ids), reason=reason),
+        label="mediainfo_enrich",
+    )
+
+
+async def enrich_mediainfo_background(file_ids: list[int], *, reason: str | None = None) -> int:
+    """Read true container metadata for `file_ids` OFF any critical path and write
+    it into each row's `parsed_data`.
+
+    This is the slow half of MediaInfo — a NAS round-trip per file — deliberately
+    detached from the scan so discovery/matching stay fast. The UI fills in the
+    richer chips (and the dupe-ranker sharpens) on its next `/files` poll.
+
+    Gated by `parsing.read_mediainfo`. Authoritative vs. fallback per
+    `parsing.mediainfo_authoritative`. Best-effort, **paced**, and fully
+    exception-isolated: a slow NAS or one bad file never blocks the others or
+    raises out of the task. Returns the number of rows updated.
+
+    Only `parsed_data` is written — the enriched fields (quality/codec/HDR/
+    channels/audio/duration) don't feed `series_key`/`variant_key`/`media_type`,
+    so there's nothing else to recompute and no UNIQUE-collision risk.
+
+    Progress is published to the activity surface (GET /api/v1/activity) so the
+    UI shows a live "Reading file media info · N/total" pill — the user can watch
+    the pass churn through the library instead of guessing how far it's got.
+
+    `reason="settings"` (the user just enabled the toggle) adds a durable
+    completion Notification — and, if the native lib is missing, an explanatory
+    one — so an explicit action is never met with silence."""
+    if not file_ids:
+        return 0
+    if not _mediainfo.available():
+        # An explicit toggle deserves an explanation, not silence: tell the user
+        # WHY enabling it did nothing (no native lib → no reads possible).
+        if reason == "settings":
+            await _post_notification(
+                "warning",
+                "Can't read file metadata — MediaInfo not installed",
+                "You enabled “Read file metadata”, but the native MediaInfo "
+                "library (libmediainfo / pymediainfo) isn't available on the "
+                "server, so no tech tags can be read from your files. The Docker "
+                "image bundles it; on a bare install, install libmediainfo and "
+                "pymediainfo, then toggle the setting again.",
+            )
+        return 0
+    updated = 0
+    started = False
+    total = len(file_ids)
+    try:
+        async with SessionLocal() as session:
+            if not await _read_mediainfo_setting(session):
+                return 0
+            authoritative = await _read_mediainfo_authoritative_setting(session)
+            activity.begin(_MI_ENRICH_JOB, "Reading file media info", total=total)
+            started = True
+            for i, fid in enumerate(file_ids, start=1):
+                try:
+                    mf = await session.get(MediaFile, fid)
+                    if mf is None or not mf.file_path or not mf.parsed_data:
+                        continue
+                    parsed = ParsedFile(**mf.parsed_data)
+                    changed = await _maybe_enrich_mediainfo(
+                        parsed, mf.file_path, True, authoritative
+                    )
+                    if changed:
+                        mf.parsed_data = parsed.to_dict()
+                        await session.commit()
+                        updated += 1
+                except Exception as e:
+                    print(f"enrich_mediainfo_background: file {fid} failed (non-fatal): {e!r}")
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        pass
+                # Report after every file: cheap in-memory write, and it keeps the
+                # job from being marked stale during a slow NAS read.
+                activity.progress(_MI_ENRICH_JOB, i, total)
+                # Pace: yield the loop (and ease NAS pressure) between files so a
+                # big backfill never monopolises the worker.
+                await asyncio.sleep(0.02)
+    except Exception as e:
+        print(f"enrich_mediainfo_background: aborted (non-fatal): {e!r}")
+    finally:
+        # Clear the pill even on early-abort. Guarded so a disabled/no-op run
+        # (returned before begin) never flashes an empty job.
+        if started:
+            activity.end(_MI_ENRICH_JOB)
+    if updated:
+        print(f"enrich_mediainfo_background: enriched {updated}/{len(file_ids)} file(s)")
+    # Durable completion record for an explicit user action (just toggled it on).
+    # Fires even when 0 changed — "checked N, updated 0" is the reassurance that
+    # it ran and covered everything (their filenames simply already had the tags).
+    # Per-scan / reparse runs stay quiet: they have their own completion signals
+    # and would otherwise post a media-info notification on every single scan.
+    if reason == "settings" and started:
+        plural = "" if total == 1 else "s"
+        if updated:
+            body = (f"Read media info for {total} file{plural} and refreshed tech "
+                    f"tags on {updated}. Re-open a title in Review to see the new chips.")
+        else:
+            body = (f"Read media info for {total} file{plural}; nothing changed — "
+                    "your filenames already carried these tags. (Turn on "
+                    "“Authoritative tech tags” to override them with the container's.)")
+        await _post_notification("success", "Finished reading file media info", body)
+    return updated
+
+
+async def _maybe_rescue_title_from_mediainfo(mf: MediaFile) -> bool:
+    """Last-ditch identity for a file the FILENAME couldn't crack: read the
+    container's embedded title and re-parse from it.
+
+    Fires ONLY when the parse yielded no usable title or media_type 'unknown'
+    — i.e. files the matcher would otherwise skip entirely (no title → []; no
+    providers for 'unknown'). Because those files never match anyway, we read
+    MediaInfo here even when the global MediaInfo-on-scan setting is OFF: the
+    single bounded read is worth a shot at rescuing an otherwise-dead file.
+
+    The embedded title is unreliable (often blank / release-name junk), so we
+    adopt the re-parse only when it actually produces a title and doesn't
+    regress a file that already had one. Best-effort; never raises. Returns
+    True when the parse was rescued. (For truly nameless files the dependable
+    path remains 'Identify by content' — the OSDb byte-hash.)"""
+    if not mf.file_path or not _mediainfo.available():
+        return False
+    parsed_now = mf.parsed_data or {}
+    has_title = bool((parsed_now.get("title") or "").strip())
+    if has_title and mf.media_type != "unknown":
+        return False  # filename already gave us something usable
+    try:
+        embedded = await asyncio.to_thread(_mediainfo.read_embedded_title, mf.file_path)
+    except Exception:
+        return False
+    if not embedded or not embedded.strip():
+        return False
+    from pathlib import Path as _P
+    from kira.parser import parse_filename
+    src = _P(mf.file_path)
+    fresh = parse_filename(f"{embedded.strip()}{src.suffix}", parent_path=str(src.parent))
+    if not fresh.title:
+        return False
+    # Don't regress a file that already had a title into a vaguer 'unknown'.
+    if has_title and fresh.media_type == "unknown":
+        return False
+    mf.parsed_data = fresh.to_dict()
+    mf.media_type = fresh.media_type
+    mf.series_key = _compute_series_key(fresh)
+    mf.variant_key = _compute_variant_key(fresh)
+    print(f"title-rescue: {src.name!r} -> {fresh.title!r} ({fresh.media_type}) via embedded title")
+    return True
 
 
 async def _match_singleton(session, engine, fid: int) -> None:
@@ -95,6 +394,9 @@ async def _match_singleton(session, engine, fid: int) -> None:
     if mf is None or not mf.parsed_data:
         return
     parsed = ParsedFile(**mf.parsed_data)
+    # Identify-time xattr read: a file Kira stamped on a prior rename resolves
+    # by its embedded id (zero search). One cheap read beside the search.
+    await _apply_xattr_ids(parsed, mf.file_path)
     # Same exception-vs-empty discipline as _match_cluster: a TMDB outage
     # must NOT wipe the user's existing matches. Skip the file entirely
     # if the matcher throws; only the empty-result case clears Match rows.
@@ -142,9 +444,19 @@ async def _match_singleton(session, engine, fid: int) -> None:
     # description, but the TVDB/TMDB cross-ref does).
     top_overview_fallback = (top_metadata or {}).get("overview") if top_metadata else None
 
+    # #14: a movie that belongs to a TMDB collection groups under one band in
+    # the grid via series_group_id="tmdb-collection:<id>" (reusing the anime
+    # franchise mechanism). Pulled from the selected match's metadata_blob.
+    coll_id = (top_metadata or {}).get("collection_id") if top_metadata else None
+    coll_name = (top_metadata or {}).get("collection_name") if top_metadata else None
+
     await detach_and_delete_matches(session, media_file_id=fid)
     for rank, m in enumerate(scored):
         gid = await compute_series_group_id(m.provider, m.provider_id, engine.registry)
+        # For the selected movie match with a collection, the collection IS the
+        # group so sibling films share a card-band.
+        if rank == 0 and m.match_type == "movie" and coll_id:
+            gid = f"tmdb-collection:{coll_id}"
         canonical_season = await resolve_canonical_season(m.provider, m.provider_id, parsed.season)
         row_overview = m.overview or (top_overview_fallback if rank == 0 else None)
         session.add(Match(
@@ -158,6 +470,8 @@ async def _match_singleton(session, engine, fid: int) -> None:
             poster_url=m.poster_url, overview=row_overview,
             is_selected=(rank == 0),
             series_group_id=gid,
+            collection_id=coll_id if rank == 0 else None,
+            collection_name=coll_name if rank == 0 else None,
             metadata_blob=top_metadata if rank == 0 else None,
         ))
 
@@ -223,6 +537,10 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
     if rep_mf and rep_mf.file_path:
         from pathlib import Path as _P
         rep_parsed._parent_path = str(_P(rep_mf.file_path).parent)  # type: ignore[attr-defined]
+
+    # Identify-time xattr read for the cluster rep: a stamped id resolves the
+    # whole cluster by id (no search). One read per cluster, not per file.
+    await _apply_xattr_ids(rep_parsed, rep_mf.file_path if rep_mf else None)
 
     # Differentiate "API said no results" from "API call failed". On a
     # network failure we MUST NOT delete existing matches — a TMDB outage
@@ -422,7 +740,8 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
                     )
                     dvd_dicts = [
                         {"season": e.season, "episode": e.episode,
-                         "title": e.title, "air_date": getattr(e, "air_date", None)}
+                         "title": e.title, "air_date": getattr(e, "air_date", None),
+                         "absolute_number": getattr(e, "absolute_number", None)}
                         for e in dvd_eps
                     ]
                     if dvd_dicts:
@@ -431,6 +750,62 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
                                 bipartite_assignments[fid] = a
                 except Exception as e:
                     print(f"_match_cluster: DVD-order retry failed: {e!r}")
+
+    # Absolute→season-local map for cour routing. Lets pure-absolute-numbered
+    # files (AoT Final Season "- 60".."- 89") reach the season-local cour table:
+    # 60→S4E1 … 89→S4E30 → routed to AID 14977 / 16177 / 17303. Built from the
+    # fetched episode list's absolute_number↔episode pairs; empty (harmless) for
+    # shows whose provider list carries no absolute numbers.
+    abs_to_local: dict[int, int] = {
+        d["absolute_number"]: d["episode"]
+        for d in ep_dicts
+        if d.get("absolute_number") is not None and d.get("episode") is not None
+    }
+    # ── Flat-umbrella detection (the One Piece "S23E04" → 1159 fix) ──
+    # A FLAT umbrella is a single AniDB AID that holds the WHOLE long-runner as
+    # one absolute list (One Piece 69, Naruto, Detective Conan — Fribb has NO
+    # `season.tvdb`, so `tvdb_season() is None`). For such an AID the canonical
+    # episode number IS the absolute, so a file that arrived in TVDB-season-
+    # LOCAL form ("One Piece 1999 S23E04") must be remapped to its absolute
+    # (1159) to line up with its absolute-numbered siblings ("S23E1159") — which
+    # are in fact the SAME episode (the local file is a dup). `local_to_abs` is
+    # the reverse of `abs_to_local`; the remap (in the write loop) only fires
+    # when the bipartite-stored number IS a known local index whose absolute
+    # DIFFERS — so absolute-named files (1159, not a local key) are untouched,
+    # and an early-cour file where absolute == local (One Piece ep 4 in 1999)
+    # remaps to itself (no-op).
+    #
+    # Per-SEASON AIDs are deliberately EXCLUDED: Frieren S2 (tvdb_season=2) and
+    # AoT's Final-Season cours (tvdb_season=4) carry a real `season.tvdb`, and
+    # their AniDB episode lists ARE local — remapping them to absolute would be
+    # the bug, not the fix. Verified: tvdb_season(69)=None, (18886)=2, (14977)=4.
+    is_flat_umbrella = False
+    if top.match_type == "tv_episode" and top.provider == "anidb":
+        try:
+            from kira.providers.anime_mappings import AnimeMappings
+            is_flat_umbrella = (await AnimeMappings.tvdb_season(int(top.provider_id))) is None
+        except (ValueError, TypeError):
+            is_flat_umbrella = False
+        except Exception as e:
+            print(f"_match_cluster: flat-umbrella check failed for {top.provider_id}: {e!r}")
+            is_flat_umbrella = False
+    # Reverse abs→local into local→abs for the flat-umbrella remap. `abs_to_local`
+    # is keyed by absolute (unique), but the REVERSE can collide: if the episode
+    # list spans seasons that reuse a local number, a naive dict comprehension
+    # would let last-writer-wins pick an arbitrary — possibly wrong-season —
+    # absolute. Drop any ambiguous local key (maps to >1 absolute) so its file is
+    # simply left un-remapped rather than mis-mapped. For a true flat umbrella
+    # (unique locals) this is identical to the old comprehension.
+    local_to_abs: dict[int, int] = {}
+    _ambiguous_locals: set[int] = set()
+    for ab, loc in abs_to_local.items():
+        if loc in _ambiguous_locals:
+            continue
+        if loc in local_to_abs and local_to_abs[loc] != ab:
+            del local_to_abs[loc]
+            _ambiguous_locals.add(loc)
+        else:
+            local_to_abs[loc] = ab
 
     # Write one Match per file. Same series identity for all; per-file
     # episode info from each file's own parsed_data OR the bipartite
@@ -459,7 +834,7 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
                 else parsed.absolute_episode
             )
             from kira.matcher.cour_routing import route_file_to_cour
-            routed = route_file_to_cour(cour_routing, file_ep_for_routing)
+            routed = route_file_to_cour(cour_routing, file_ep_for_routing, abs_to_local)
             if routed is not None:
                 routed_aid, routed_local_ep = routed
 
@@ -470,13 +845,12 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
             ep_num = assignment.episode_number
             ep_title = assignment.episode_title
         else:
-            # episode_number is the user's filename-typed episode number
-            # (parsed.episode = 27 for "Bleach.S17E27.mkv"). We do NOT
-            # overwrite this with the cour-local number, even when cour
-            # routing fires — preserving the user's filename intent means
-            # the rename output keeps "S17E27" rather than collapsing to
-            # "S17E01" of Cour 3. Cour routing only affects provider_id
-            # (canonical AID per file).
+            # Default episode_number: the file's own parsed number (absolute
+            # if present, else season-local). For cour-routed files this is
+            # OVERRIDDEN below to the cour-local number so the stored Match
+            # stays consistent with its cour AID's own episode list (which is
+            # what the popup pairs against). The rename FILENAME is unaffected
+            # either way — it renders from parsed.episode / {{absx}}.
             ep_num = parsed.absolute_episode if parsed.absolute_episode is not None else parsed.episode
             local_ep = (top.raw or {}).get("local_episode") if top.raw else None
             # First attempt: look up via the TOP match's episode list
@@ -510,6 +884,35 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
                     ep_title = _lookup_episode_title(
                         routed_eb_key, "anidb", parsed, routed_local_ep,
                     )
+
+        # ── Episode number MUST match the matched AID's own numbering ──
+        # When cour routing fires, the Match identity is the cour AID, whose
+        # episode list is LOCAL (cour 17303 = AoT Final Chapters has eps 1-2).
+        # So Match.episode_number has to be the cour-local number — otherwise
+        # the popup, which fetches that AID's own 1..N list, can't pair the
+        # file (AoT's "- 88" → cour 17303 needs episode_number=1, not the
+        # season-absolute 88 or a TVDB-lumped bipartite index of 29). The
+        # rename FILENAME is unaffected: it renders from parsed.episode /
+        # {{absx}} (the absolute), wholly independent of episode_number, so
+        # "Absolute" output still yields "Attack on Titan - 088".
+        if routed_aid is not None and routed_local_ep is not None:
+            ep_num = routed_local_ep
+
+        # ── Flat-umbrella absolute remap (the One Piece "S23E04" → 1159 fix) ──
+        # A TVDB-season-LOCAL file ("One Piece 1999 S23E04" → bipartite pairs it
+        # to the Elbaf cour's LOCAL episode 4 and stores 4) matched to the flat
+        # AniDB umbrella (AID 69) must store the ABSOLUTE (1159) so it lines up
+        # with its absolute-numbered siblings ("S23E1159" → 1159) and is seen as
+        # the dup it is. The helper no-ops for absolute-named files, per-season
+        # AIDs (Frieren S2 / AoT cours, is_flat_umbrella False), normal TV (empty
+        # map), and early-cour self-maps. The rename FILENAME is independent.
+        ep_num = remap_umbrella_local_to_absolute(
+            ep_num,
+            is_flat_umbrella=is_flat_umbrella,
+            routed_aid=routed_aid,
+            local_to_abs=local_to_abs,
+        )
+
         # When cour routing fires, look up the cour AID's display
         # title from AniDB's in-memory cache so each cour-card carries
         # its OWN canonical title ("Bleach Cour 1" / "Bleach Cour 2" /
@@ -739,12 +1142,16 @@ async def _validate_and_rerank_by_episodes(
     from kira.matcher.episode_validation import coverage, should_promote
 
     def _to_dicts(eps) -> list[dict]:
-        # Rich episode dicts (incl. air_date) for the bipartite pairing —
-        # Phase 9's air-date pass needs air_date, which the title-only
-        # `by_key` map drops.
+        # Rich episode dicts for the bipartite pairing. air_date feeds Phase 9's
+        # air-date pass; absolute_number is LOAD-BEARING for long-runners — a
+        # provider per-season list numbers episodes LOCALLY (One Piece S23 →
+        # episode 1..13) but carries absolute_number 1156..1168. Dropping it
+        # disarmed bipartite's absolute passes, so the only thing left was the
+        # title pass, which stored the LOCAL index (1156→1). Keep it.
         return [
             {"season": e.season, "episode": e.episode,
-             "title": e.title, "air_date": getattr(e, "air_date", None)}
+             "title": e.title, "air_date": getattr(e, "air_date", None),
+             "absolute_number": getattr(e, "absolute_number", None)}
             for e in eps
         ]
 
@@ -904,119 +1311,9 @@ async def _apply_folder_series_lock(session, all_new: list[int]) -> int:
     return relocked
 
 
-def _compute_series_key(parsed: ParsedFile, file_path: str | None = None) -> str | None:
-    """Build the clustering key for series consolidation.
-
-    Files with the same key cluster into one card on the Review page.
-    - Movies → null (each is its own row).
-    - TV/anime → "{type}|{normalized_title}|{season or ''}|{disambig}".
-      Season is kept distinct for BOTH tv and anime: AniDB assigns a
-      separate AID to every sequel-season, so merging My Hero Academia
-      S01 + S02 under one cluster would mis-stamp every S02 file with
-      S01's AID. Visual franchise grouping on the Review page happens
-      AFTER matching via Match.series_group_id (which walks AniDB's
-      sequel chain).
-
-      EE-5 disambig: without a year or parent-folder fingerprint, two
-      shows with the same normalized title (The Office UK 2001 / The
-      Office US 2005) collapse into ONE cluster. The matcher then picks
-      whichever the provider returns first and stamps every file across
-      both shows with the wrong ID. We add a third key component:
-        - `parsed.year` when known (strongest signal)
-        - else the parent series-folder name (e.g. "The.Office.UK"),
-          walked up past any "Season N" subfolder
-        - else empty (current behavior — files still cluster together)
-    - Music → "music|{normalized_artist}|{normalized_album}" when both
-      artist and album exist; otherwise null.
-    """
-    if parsed.media_type == "movie":
-        return None
-    if parsed.media_type in ("tv", "anime"):
-        if not parsed.title:
-            return None
-        title_n = normalize(parsed.title)
-        if not title_n:
-            return None
-        season = str(parsed.season) if parsed.season is not None else ""
-
-        # EE-5 disambiguator: year > parent folder > empty.
-        disambig = ""
-        if parsed.year is not None:
-            disambig = str(parsed.year)
-        elif file_path:
-            try:
-                p = Path(file_path)
-                parent = p.parent
-                # Walk up past "Season N" / "S01" folders to the series root.
-                pname_lower = parent.name.lower()
-                if pname_lower.startswith("season") or (
-                    len(parent.name) <= 4 and pname_lower.startswith("s")
-                    and pname_lower[1:].isdigit()
-                ):
-                    parent = parent.parent
-                disambig = normalize(parent.name) or ""
-            except Exception:
-                disambig = ""
-
-        return f"{parsed.media_type}|{title_n}|{season}|{disambig}"
-    if parsed.media_type == "music":
-        if not (parsed.artist and parsed.album):
-            return None
-        return f"music|{normalize(parsed.artist)}|{normalize(parsed.album)}"
-    return None
-
-
-# Audio-language tags the format-stripper extracts into `subtitles` (the
-# field name is historical — these are AUDIO language indicators in
-# real-world media filenames). Used for variant disambiguation.
-_LANG_TAGS = ("jap", "eng", "fre", "ger", "ita", "spa")
-
-
-def _compute_variant_key(parsed: ParsedFile) -> str:
-    """Build the identity-variant suffix for a file.
-
-    Empty string when no variant signal is detected — most files. Non-empty
-    when the file carries any of these differentiators real libraries
-    multiplex on:
-      - **audio language** (`JAP`, `ENG`, …) — caught from the parser's
-        `subtitles` list (misnamed but actually language tags).
-        R2-C3 hardening: ALL matching language tags are surfaced (not just
-        the first), so a `[JAP, ENG]` multi-audio file gets a distinct
-        `jap-eng` key from a `[JAP]`-only sibling. Prevents UNIQUE collisions
-        when the same episode has multiple sub/audio variants.
-      - **edition** (`Director's Cut`, `IMAX`, `Extended`).
-      - **bit depth** (`10bit` only — 8bit is default and excluded so
-        legacy files don't suddenly look like "variants of themselves").
-      - **cour** (R2-H12) — when present and no other signal is set,
-        cour 1/2/3 of a split-cour anime gets surfaced to keep the
-        cluster identity distinct. Folded into the key only when no
-        other variant is present (audio/edition trump cour for naming).
-
-    Format: "lang-edition-bitdepth[-courN]", components separated by `-`,
-    empties skipped. Example: `jap-eng-directors-cut-10bit`, `eng`,
-    `10bit`, `cour2`, `""`. Lowercased so equality is reliable across
-    "JAP" / "jap" / "Jap" spellings the same release group sometimes mixes.
-    """
-    lang_tokens = [s for s in (parsed.subtitles or []) if isinstance(s, str)]
-    # R2-C3: collect ALL matching languages (deduped, sorted for stable keys)
-    # rather than just the first one. A `[JAP, ENG]` file is a distinct
-    # variant from a `[JAP]`-only file because it carries an extra audio
-    # track — they shouldn't collide on the same variant_key.
-    langs = sorted({t.lower() for t in lang_tokens if t.lower() in _LANG_TAGS})
-    lang = "-".join(langs)
-    edition_raw = parsed.edition or ""
-    edition = "".join(c.lower() if c.isalnum() else "-" for c in str(edition_raw)).strip("-")
-    bit = (parsed.bit_depth or "").lower()
-    if bit == "8bit":
-        bit = ""  # 8bit is default, not a variant indicator
-    parts = [p for p in (lang, edition, bit) if p]
-    # R2-H12: surface cour when nothing else distinguishes — avoids two
-    # cour-1 / cour-2 files of the same TVDB season generating the same
-    # rename path. Skipped when audio/edition already disambiguate.
-    cour = getattr(parsed, "cour", None)
-    if cour and not parts:
-        parts.append(f"cour{cour}")
-    return "-".join(parts)
+# CR-07: `_compute_series_key` / `_compute_variant_key` are imported at module
+# top from kira.matcher.keys (as back-compat aliases). Their old bodies lived
+# here; see the top-of-file import.
 
 
 async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
@@ -1027,6 +1324,11 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
     Shared by the scan worker (new files) and the re-parse worker (existing
     files) so both paths cluster + match identically.
     """
+    # Auto-approve config (Settings → Confidence). Read once per phase — a file
+    # whose selected match clears the threshold is approved straight out of
+    # matching instead of being held in the Review queue.
+    auto_enabled, auto_th = await _read_auto_approve_setting(session)
+
     clusters: dict[str | int, list[int]] = defaultdict(list)
     for fid in fids:
         mf = await session.get(MediaFile, fid)
@@ -1035,6 +1337,15 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
         bucket = mf.series_key if mf.series_key else fid
         clusters[bucket].append(fid)
 
+    # NOTE: tech-tag MediaInfo enrichment does NOT run here anymore. Reading a
+    # file's container headers is a slow NAS round-trip per file; doing it on the
+    # match critical path made matching crawl whenever `parsing.read_mediainfo`
+    # was on. It's now deferred to `enrich_mediainfo_background`, kicked off
+    # AFTER the scan completes (see the scan worker) — so quality/codec/HDR/
+    # channels chips fill in shortly after results appear, never blocking them.
+    # The title rescue below stays inline: it's matching-essential (a file with no
+    # parseable title would otherwise never match at all) and bounded to those.
+
     matched = 0
     for bucket_key, cfids in clusters.items():
         # Shimmer the cluster's rows while it resolves.
@@ -1042,6 +1353,14 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
             mf = await session.get(MediaFile, fid)
             if mf:
                 mf.status = "matching"
+                # Title rescue for files the filename couldn't identify — reads
+                # the container's embedded title and re-parses. Bounded to files
+                # with no usable title (they'd never match otherwise), so the one
+                # read is worth it even on a NAS.
+                try:
+                    await _maybe_rescue_title_from_mediainfo(mf)
+                except Exception as e:
+                    print(f"_match_phase: title rescue failed for {fid}: {e!r}")
         await session.commit()
         await asyncio.sleep(0)
 
@@ -1050,15 +1369,54 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
         else:
             await _match_singleton(session, engine, cfids[0])
 
-        for fid in cfids:
-            has_match = await session.scalar(
-                select(Match.id).where(Match.media_file_id == fid).limit(1)
+        # Resolve "which files got a match" and "their selected provider" in
+        # TWO grouped queries for the whole cluster, instead of 1-2 SELECTs per
+        # file inside the loop. (`session.get(MediaFile, fid)` below stays
+        # per-file but is served from the identity map — the rows were just
+        # loaded by the cluster matcher — so it costs no extra round-trip.)
+        matched_fids = set((await session.scalars(
+            select(Match.media_file_id).where(Match.media_file_id.in_(cfids))
+        )).all())
+        sel_rows = (await session.execute(
+            select(Match.media_file_id, Match.provider, Match.confidence).where(
+                Match.media_file_id.in_(cfids), Match.is_selected.is_(True)
             )
+        )).all()
+        sel_provider_by_fid = {fid: prov for fid, prov, _ in sel_rows}
+        sel_conf_by_fid = {fid: conf for fid, _, conf in sel_rows}
+
+        for fid in cfids:
+            has_match = fid in matched_fids
             mf = await session.get(MediaFile, fid)
             if has_match:
                 matched += 1
                 if mf and mf.status == "matching":
-                    mf.status = "matched"
+                    # Auto-approve high-confidence hits past the threshold so they
+                    # skip Review; everything else stays "matched" for the user.
+                    sel_conf = sel_conf_by_fid.get(fid)
+                    if auto_enabled and sel_conf is not None and sel_conf >= auto_th:
+                        mf.status = "approved"
+                    else:
+                        mf.status = "matched"
+                # Correct media_type from the matched provider. AniDB is an
+                # anime-only source, so an AniDB match means this file IS anime
+                # even when the parser guessed "tv" (e.g. the file lives outside
+                # an /anime/ path, like a release-named download folder). Without
+                # this the show lands in the "TV Series" group and splits from
+                # its anime siblings. Recompute the series/variant keys off the
+                # corrected media_type so it re-clusters under the anime identity.
+                if mf and mf.media_type != "anime" and mf.parsed_data:
+                    if sel_provider_by_fid.get(fid) == "anidb":
+                        # CR-09: shared helper sets media_type FIRST then
+                        # recomputes the keys, so even if the recompute raises
+                        # the grouping fix ("at least set media_type=anime")
+                        # still lands. Surrounding try/except preserves the
+                        # original best-effort + log behavior.
+                        try:
+                            apply_media_type_and_recompute_keys(mf, "anime")
+                        except Exception as e:
+                            mf.media_type = "anime"  # at least fix the grouping
+                            print(f"_match_phase: media_type correction key recompute failed for {fid}: {e!r}")
             elif mf and mf.status == "matching":
                 mf.status = "no_match"
 
@@ -1072,7 +1430,75 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
     return matched
 
 
-async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> None:
+async def _prune_missing_files(
+    session, root_paths: list[str], walked_norm: set[str], norm_fn,
+) -> int:
+    """The OTHER half of a scan: drop tracked files that VANISHED from disk, so
+    deleting a file (in Kira or your file manager) clears it from Review on the
+    next scan instead of lingering forever.
+
+    A row is pruned only when ALL hold:
+      • its path is UNDER a root this scan walked (never touches libraries this
+        scan didn't cover), AND
+      • the walk didn't see it (fast pre-filter via `walked_norm`), AND
+      • `stat()` raises FileNotFoundError — i.e. CONFIRMED gone. A permission /
+        NAS error counts as "can't tell → keep", never as deleted.
+
+    The row + its Match rows go (RenameHistory preserved, exactly like the manual
+    delete via `_delete_one(keep_on_disk=True)`); nothing is removed from disk —
+    the file's already gone.
+
+    CALLER CONTRACT: invoke ONLY after a fully healthy walk (no unreachable root,
+    no scandir error) — otherwise an unreadable subtree makes present files look
+    missing and this would nuke them. Returns the number of rows pruned."""
+    from kira.api.webhooks import path_under_roots
+    from kira.api.files import _delete_one
+
+    def _confirmed_gone(p: str) -> bool:
+        try:
+            Path(p).stat()
+            return False                 # still there
+        except FileNotFoundError:
+            return True                  # definitively gone → safe to prune
+        except OSError:
+            return False                 # permission / NAS hiccup → keep
+
+    rows = (await session.execute(select(MediaFile.id, MediaFile.file_path))).all()
+    candidates: list[int] = []
+    for fid, fp in rows:
+        if not fp or not path_under_roots(fp, root_paths):
+            continue                     # outside the scanned scope
+        if norm_fn(fp) & walked_norm:
+            continue                     # the walk saw it this scan → present
+        if await asyncio.to_thread(_confirmed_gone, fp):
+            candidates.append(fid)
+
+    removed = 0
+    for fid in candidates:
+        mf = await session.get(MediaFile, fid)
+        if mf is None:
+            continue
+        try:
+            await _delete_one(session, mf, keep_on_disk=True, roots=[])
+            removed += 1
+        except Exception as e:
+            print(f"_prune_missing_files: {fid} failed (non-fatal): {e!r}")
+
+    if removed:
+        from kira.models import Notification
+        plural = "" if removed == 1 else "s"
+        session.add(Notification(
+            kind="info",
+            title=f"Removed {removed} file{plural} no longer on disk",
+            body=("These were deleted from your library folder, so Kira dropped "
+                  "them from Review. Rename history is kept."),
+        ))
+        await session.commit()
+        print(f"_scan_worker: pruned {removed} file(s) gone from disk")
+    return removed
+
+
+async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] | None:
     """Walk the tree, parse each file, then match each new file in turn.
 
     Two distinct phases, both reported via Scan.status:
@@ -1082,6 +1508,11 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> None:
     Phase 1, accumulating all discovered files into a single Phase 2
     matching pass. A bare string is promoted to `[string]` for
     back-compat with internal callers that haven't been updated.
+
+    CR-10: returns the list of new MediaFile ids that should be auto-renamed
+    (auto-source scan that found new files), or None. The auto-rename phase is
+    deliberately NOT run here — `_scan_worker_locked` runs it AFTER releasing
+    the scan lock so a slow rename can't block the next scan.
     """
     # Defensive normalization — `_scan_worker_locked` already promotes
     # single strings to lists, but a hand-spawned task or test could
@@ -1119,18 +1550,41 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> None:
         # finished renaming. We pre-compute lowercased + .resolve()'d
         # variants of every stored path so the per-file lookup below
         # can match against either form cheaply.
-        def _norm(p: str) -> set[str]:
-            """Return the set of equivalent lower-cased strings for `p`.
-            We never trust a single form because OS path normalization
-            differs by mount: drive-letter, UNC, forward-slash, etc."""
-            forms = {p.lower(), p.replace("/", "\\").lower(), p.replace("\\", "/").lower()}
+        # PERF (NAS walk speed): bridge drive-letter ↔ UNC ONCE per scan, not
+        # per file. `Path.resolve()` is a filesystem round-trip (symlink
+        # resolution); calling it inside `_norm` for every walked file is what
+        # made scanning a network share crawl — thousands of extra round-trips.
+        # Resolve each ROOT a single time; if its resolved form differs (mapped
+        # drive → UNC), record the prefix pair so `_norm` can swap prefixes with
+        # pure string ops and ZERO per-file filesystem access.
+        _root_aliases: list[tuple[str, str]] = []
+        for _r in root_paths:
             try:
-                resolved = str(Path(p).resolve()).lower()
-                forms.add(resolved)
-                forms.add(resolved.replace("/", "\\"))
-                forms.add(resolved.replace("\\", "/"))
+                _resolved = str(Path(_r).resolve())
             except OSError:
-                pass
+                continue
+            if _resolved and _resolved.lower() != str(_r).lower():
+                _root_aliases.append((str(_r), _resolved))
+
+        def _norm(p: str) -> set[str]:
+            """Equivalent lower-cased string forms for `p` — FILESYSTEM-FREE.
+
+            Emits both slash styles, and (when `p` sits under a root whose
+            resolved form differs) the prefix-swapped variant so a drive-letter
+            walk still matches a UNC-stored path. No per-file `resolve()`."""
+            bases = {p}
+            pl = p.lower()
+            for raw, resolved in _root_aliases:
+                if pl.startswith(raw.lower()):
+                    bases.add(resolved + p[len(raw):])
+                elif pl.startswith(resolved.lower()):
+                    bases.add(raw + p[len(resolved):])
+            forms: set[str] = set()
+            for b in bases:
+                bl = b.lower()
+                forms.add(bl)
+                forms.add(bl.replace("/", "\\"))
+                forms.add(bl.replace("\\", "/"))
             return forms
         renamed_paths_lc: set[str] = set()
         for p in renamed_paths_raw:
@@ -1140,6 +1594,9 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> None:
         existing_lc: set[str] = set()
         for p in (await session.scalars(select(MediaFile.file_path))).all():
             existing_lc |= _norm(p)
+        # CR-10: ids to auto-rename AFTER lock release (see return below). None
+        # unless this is an auto-source scan that found new files.
+        auto_rename_ids: list[int] | None = None
         try:
             # ── Phase 1: walk + parse ─────────────────────────────────────
             # EE-2: reset the thread-local walk-error list BEFORE iteration
@@ -1169,9 +1626,17 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> None:
             # Review page. Path-set dedup keeps the inner loop
             # idempotent regardless of how many roots overlap.
             walked_paths_this_scan: set[str] = set()
-            # Phase 16: read the mediainfo-backfill toggle once for the scan.
-            read_mi = await _read_mediainfo_setting(session)
+            # A configured root that's gone/unmounted (NAS down, typo'd path)
+            # must mark the scan completed_partial, not silently 'completed' with
+            # 0 files — scanner.walk() returns empty for a dead root WITHOUT
+            # recording a walk error, so we detect it here at the top level.
+            dead_roots: list[str] = []
+            # NOTE: MediaInfo enrichment is NOT read here anymore — it moved to
+            # `_match_phase` so the discovery walk does no file-content reads.
             for root_path in root_paths:
+              if not _root_reachable(root_path):
+                dead_roots.append(str(root_path))
+                continue
               for path in scanner.walk(root_path):
                 spath_str = str(path)
                 # Skip-if-already-walked-this-scan. Lowercase + both
@@ -1198,9 +1663,14 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> None:
                 except OSError:
                     file_size = None
                 parsed = parse_path(path)
-                # Phase 16: backfill missing quality/codec/HDR from the file
-                # itself (no-op without pymediainfo / when the filename had tags).
-                await _maybe_enrich_mediainfo(parsed, str(path), read_mi)
+                # NOTE: NEITHER the xattr ID read NOR the MediaInfo header read
+                # happens here. The discovery walk must stay fast — one `stat`
+                # (for size) + pure-string parse per file, nothing that opens
+                # the file or does an extra filesystem round-trip. On a NAS each
+                # such per-file I/O is a network hit that makes scanning crawl.
+                # Both moved to the MATCH phase (`_apply_xattr_ids`,
+                # `_enrich_mediainfo_phase`), off the discovery critical path —
+                # FileBot's "list fast, read at identify-time" model.
                 mf = MediaFile(
                     scan_id=scan_id,
                     file_path=str(path),
@@ -1226,20 +1696,100 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> None:
                     await session.commit()
                     await asyncio.sleep(0)
 
-            scan = await session.get(Scan, scan_id)
-            if scan:
-                scan.file_count = count
-                # PB-4: snapshot the Phase 2 universe size. Frontend uses
-                # this as the denominator for real % + ETA computation.
-                scan.estimated_total = count
-                scan.current_path = None
-                scan.status = "matching"
-            await session.commit()
-
             # After the final commit every mf.id is populated; no need to
             # re-query. This is also faster than running a SELECT over the
             # whole scan_id (the old "all_new" query scaled with library size).
             all_new = [mf.id for mf in new_files if mf.id is not None]
+
+            # ── Sweep: prune files that vanished from disk ────────────────
+            # The walk above is the "mark"; this is the "sweep". A tracked file
+            # under a scanned root that the walk didn't find AND that stat()
+            # confirms is gone gets dropped, so a deleted file auto-clears from
+            # Review. ONLY when the walk was fully healthy: a dead root or a
+            # scandir error means part of the tree was unreadable, so "not seen"
+            # ≠ "deleted" and pruning would wipe present files (NAS-blip guard).
+            if not dead_roots and not scanner.get_walk_errors():
+                try:
+                    await _prune_missing_files(
+                        session, root_paths, walked_paths_this_scan, _norm,
+                    )
+                except Exception as e:
+                    print(f"_scan_worker: prune-missing failed (non-fatal): {e!r}")
+
+            # RESUME: also match files a prior interrupted scan left in
+            # "discovered" (boot reset stuck "matching" → "discovered"). The
+            # walk's dedup skips re-adding existing files, so without this a
+            # re-scan would finish in seconds and leave the leftover files
+            # stuck/pending forever — exactly the "click Scan, nothing happens"
+            # symptom after a kill. Merge them into the match set.
+            # Scope the resume to files UNDER the roots being scanned NOW.
+            # Without this, a targeted re-scan of one folder vacuums the ENTIRE
+            # 'discovered' backlog (e.g. thousands of files a post-crash boot
+            # reset left across the whole library), turning a quick scan into a
+            # massive, ban-risky provider burst. A full-library scan still
+            # resumes everything — every path is under its root.
+            # CR-04: push the per-root path scoping into SQL instead of loading
+            # EVERY 'discovered' row in the DB and filtering in Python. We OR
+            # together a `file_path LIKE root%` clause per root. The filter is
+            # deliberately COARSE/INCLUSIVE — for each root we emit BOTH the raw
+            # stored form and a forward-slash-normalized form, with and without a
+            # trailing separator, so Windows backslash vs POSIX slash and
+            # trailing-sep differences can't make SQL drop a row the precise
+            # Python `path_under_roots` check below would have accepted. (SQLite
+            # LIKE is case-insensitive for ASCII, matching `_norm`'s case-fold.)
+            # The Python check stays as the exact final safety net on the now
+            # much-narrower result, so correctness can't regress.
+            from kira.api.webhooks import path_under_roots
+            _roots = list(root_paths)
+            _new_set = set(all_new)
+
+            def _like_escape(s: str) -> str:
+                # Neutralize LIKE wildcards so a literal % or _ in a root path
+                # can't widen the match. Paired with escape="\\" below.
+                return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+            _like_clauses = []
+            for _r in _roots:
+                if not _r:
+                    continue
+                _variants = set()
+                _fwd = _r.replace("\\", "/")
+                for _base in (_r, _fwd):
+                    _base = _base.rstrip("/\\")
+                    if not _base:
+                        continue
+                    # Match the root itself AND anything beneath it (either sep).
+                    _variants.add(_base)
+                    _variants.add(_base + "/")
+                    _variants.add(_base + "\\")
+                for _v in _variants:
+                    _like_clauses.append(
+                        MediaFile.file_path.like(_like_escape(_v) + "%", escape="\\")
+                    )
+
+            _stmt = select(MediaFile.id, MediaFile.file_path).where(
+                MediaFile.status == "discovered"
+            )
+            if _like_clauses:
+                _stmt = _stmt.where(or_(*_like_clauses))
+            _leftover = [
+                i for (i, fp) in (await session.execute(_stmt)).all()
+                if i not in _new_set and fp and path_under_roots(fp, _roots)
+            ]
+            match_ids = all_new + _leftover
+            if _leftover:
+                print(f"_scan_worker: resuming {len(_leftover)} leftover file(s) from a prior interrupted scan")
+
+            scan = await session.get(Scan, scan_id)
+            if scan:
+                scan.file_count = count
+                # PB-4: progress denominator = everything we'll match (new +
+                # resumed leftover), so the bar reflects real work, not 100%-in-
+                # 2-seconds when only leftover files remain.
+                scan.estimated_total = len(match_ids)
+                scan.current_path = None
+                scan.status = "matching"
+            await session.commit()
 
             # Phase 11: folder-level series lock. Pull outlier files (a
             # mangled "Final Season Part 3-01" / "Special 05") into their
@@ -1262,14 +1812,18 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> None:
 
                 # Cluster by series_key + match each cluster/singleton,
                 # pushing live progress. Shared with the re-parse worker.
-                matched = await _match_phase(session, engine, all_new, scan_id)
+                # `match_ids` = this scan's new files + any leftover "discovered"
+                # files resumed from a prior interrupted scan.
+                matched = await _match_phase(session, engine, match_ids, scan_id)
 
             # EE-2: did the directory walk hit any unreachable paths?
             # If so, the scan technically completed but is INCOMPLETE.
             # Mark it `completed_partial` (frontend can render a warning
             # badge instead of a green check) and notify so the user
             # knows to retry once the NAS/permissions are stable.
-            walk_failures = scanner.get_walk_errors()
+            # In-walk scandir failures PLUS any top-level root that was entirely
+            # unreachable — both make the scan INCOMPLETE.
+            walk_failures = scanner.get_walk_errors() + dead_roots
 
             scan = await session.get(Scan, scan_id)
             if scan:
@@ -1304,25 +1858,51 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> None:
             if scan and getattr(scan, "source", "manual") == "auto" and count > 0:
                 from kira.models import Notification as _Notif
                 plural = "s" if count != 1 else ""
+                _auto_title = f"Auto-scan: {count} new file{plural} found"
                 session.add(_Notif(
                     kind="info",
-                    title=f"Auto-scan: {count} new file{plural} found",
+                    title=_auto_title,
                     body=(
                         "New media appeared in a watched folder and was matched. "
                         "Open Review to approve the renames."
                     ),
                 ))
+                # #10: fan out to external sinks (best-effort, never blocks).
+                try:
+                    from kira import notify
+                    await notify.fan_out("info", _auto_title,
+                                         "New media was found in a watched folder and matched.")
+                except Exception as e:
+                    print(f"_scan_worker: notification fan-out failed (non-fatal): {e!r}")
             await session.commit()
 
-            # Watched-folders: per-folder auto_rename hook. Currently log-only
-            # (no files are moved); the real rename execution is a planned
-            # follow-up. Runs only for auto-source scans that found new files.
+            # Self-prune the rename log to the configured retention window.
+            # Scans are the natural recurring event on a long-running instance,
+            # so pruning here keeps the "pruned daily" promise without a
+            # separate scheduler. Best-effort — never fails a completed scan.
+            try:
+                from kira.api.history import prune_old_history
+                await prune_old_history(session)
+            except Exception as e:
+                print(f"_scan_worker: history prune failed (non-fatal): {e!r}")
+
+            # CR-10: the per-folder auto_rename hook USED to run here, INSIDE
+            # the `_SCAN_LOCK` + DB scan-lock. A slow rename (artwork download
+            # over a NAS) therefore blocked the next scan from starting. We now
+            # only DECIDE here whether it should run and hand the work back to
+            # `_scan_worker_locked`, which fires it AFTER releasing both locks.
+            # Gate unchanged: auto-source scans that actually found new files.
             if scan and getattr(scan, "source", "manual") == "auto" and all_new:
-                try:
-                    from kira.watcher import maybe_auto_rename
-                    await maybe_auto_rename(scan_id, all_new)
-                except Exception as e:
-                    print(f"_scan_worker: auto_rename hook failed (non-fatal): {e!r}")
+                auto_rename_ids = list(all_new)
+
+            # Background tech-tag enrichment (ALL scan sources). Reads true
+            # container metadata (resolution/codec/HDR/channels/audio) for this
+            # scan's new files OFF the critical path — detached so the scan is
+            # already "completed" and results are on screen; the chips + dupe
+            # ranker just sharpen on the next /files poll. No-op unless
+            # `parsing.read_mediainfo` is on (and the native lib is present).
+            # (Fire-and-forget — returns immediately, doesn't hold the lock.)
+            _spawn_mediainfo_enrich(all_new)
         except Exception as e:
             scan = await session.get(Scan, scan_id)
             if scan:
@@ -1331,6 +1911,10 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> None:
                 # — comparing aware vs naive 500s every downstream filter.
                 scan.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
             await session.commit()
+    # CR-10: returned to `_scan_worker_locked` so the auto-rename phase runs
+    # OUTSIDE the scan lock. None ⇒ nothing to auto-rename (manual scan, no new
+    # files, or the worker errored before deciding).
+    return auto_rename_ids
 
 
 async def _release_db_scan_lock() -> None:
@@ -1354,6 +1938,65 @@ async def _release_db_scan_lock() -> None:
         await sess.commit()
 
 
+def _root_reachable(root: str | Path) -> bool:
+    """A configured scan root is reachable only if it IS a listable directory.
+    A dead/unmounted NAS root (or a typo'd path) returns False so the scan is
+    marked `completed_partial` — with a notification naming the root — instead
+    of a misleading `completed` with 0 files. A root that exists but degrades
+    mid-walk is caught separately by scanner's onerror callback."""
+    try:
+        return Path(str(root)).is_dir()
+    except OSError:
+        return False
+
+
+async def reconcile_orphaned_scans() -> tuple[int, int]:
+    """Settle scan + file rows left mid-flight by a crash/restart.
+
+    A scan runs as an in-process background task — a process restart means NO
+    worker is driving any 'pending'/'scanning'/'matching' row anymore, yet the
+    rows stay in that status forever. That leaves (a) the Scan row a perpetual
+    "scanning" in history, (b) the frontend re-attaching to a dead scan, and
+    (c) MediaFile covers stuck in the match animation. Called once on boot
+    (alongside the scan-lock reset) to settle them. Returns
+    ``(scans_failed, files_reset)``."""
+    from datetime import datetime, timezone
+    from sqlalchemy import or_, update as sql_update
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    async with SessionLocal() as sess:
+        res = await sess.execute(
+            sql_update(Scan)
+            .where(Scan.completed_at.is_(None))
+            .where(or_(Scan.status == "pending", Scan.status == "scanning", Scan.status == "matching"))
+            .values(status="failed: interrupted (restart)", completed_at=now)
+        )
+        # ALSO reset MediaFile rows the killed scan left mid-flight. A file stuck
+        # in "matching"/"parsing" animates its cover forever and the row never
+        # reaches a terminal state; reset to "discovered" so (a) the cover stops
+        # spinning and (b) the next scan re-matches it (see the scan worker's
+        # leftover-files merge). This is the other half of crash recovery — the
+        # Scan row alone wasn't enough.
+        file_res = await sess.execute(
+            sql_update(MediaFile)
+            .where(or_(MediaFile.status == "matching", MediaFile.status == "parsing"))
+            .values(status="discovered")
+        )
+        n_files = file_res.rowcount or 0
+        if n_files:
+            from kira.models import Notification
+            sess.add(Notification(
+                kind="warning",
+                title="Scan interrupted by a restart",
+                body=(
+                    f"{n_files} file(s) were mid-match when the backend stopped, and "
+                    f"were reset to pending. Click Scan to finish matching them — it "
+                    f"resumes the leftover files without re-walking your library."
+                ),
+            ))
+        await sess.commit()
+        return (res.rowcount or 0, n_files)
+
+
 async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None:
     """EE-3: Process-locked wrapper around `_scan_worker` with orphan cleanup.
 
@@ -1372,15 +2015,32 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
     promoted to `[string]` for back-compat with any internal caller that
     hasn't been updated. The endpoint always passes a list now; this
     fallback is defensive for tests / hand-spawned tasks.
+
+    CR-10: the post-scan per-folder auto_rename phase runs OUTSIDE the lock.
+    `_scan_worker` no longer renames inline; it returns the new-file ids to
+    auto-rename, and we invoke `maybe_auto_rename` only after BOTH `_SCAN_LOCK`
+    and the DB scan-lock flag have been released — so a slow artwork-download
+    rename can't block the next scan from starting.
     """
     if isinstance(root_paths, str):
         root_paths = [root_paths]
+    auto_rename_ids: list[int] | None = None
     async with _SCAN_LOCK:
         try:
             try:
-                await _scan_worker(scan_id, root_paths)
+                auto_rename_ids = await _scan_worker(scan_id, root_paths)
             except Exception:
                 async with SessionLocal() as cleanup:
+                    # Delete dependent Match rows FIRST. The matches FK has no
+                    # ON DELETE CASCADE on already-created DBs, so with
+                    # foreign_keys=ON the bulk MediaFile delete below would be
+                    # rejected with a constraint error (which would then mask
+                    # the real exception we're trying to re-raise). A failed
+                    # scan's rows rarely have matches yet, but be correct anyway.
+                    mf_ids = select(MediaFile.id).where(MediaFile.scan_id == scan_id)
+                    await cleanup.execute(
+                        delete(Match).where(Match.media_file_id.in_(mf_ids))
+                    )
                     await cleanup.execute(
                         delete(MediaFile).where(MediaFile.scan_id == scan_id)
                     )
@@ -1394,6 +2054,18 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
                 await _release_db_scan_lock()
             except Exception as e:
                 print(f"_scan_worker_locked: failed to release scan lock: {e!r}")
+
+    # CR-10: BOTH locks are now released (the `async with _SCAN_LOCK` block has
+    # exited and its finally dropped the DB flag). Run the auto-rename phase
+    # unlocked so the next scan's 409 concurrency guard is already clear. On the
+    # error path `_scan_worker` re-raised above, so `auto_rename_ids` stays None
+    # and we skip — never renaming a failed scan's rows.
+    if auto_rename_ids:
+        try:
+            from kira.watcher import maybe_auto_rename
+            await maybe_auto_rename(scan_id, auto_rename_ids)
+        except Exception as e:
+            print(f"_scan_worker_locked: auto_rename hook failed (non-fatal): {e!r}")
 
 
 async def _reparse_worker(scan_id: int) -> None:
@@ -1475,7 +2147,21 @@ async def _reparse_worker(scan_id: int) -> None:
                 scan.status = "completed"
                 scan.current_path = None
                 scan.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            from kira.models import Notification
+            matched_count = len(to_match)
+            session.add(Notification(
+                kind="success",
+                title=f"Re-parse complete: {total} file{'s' if total != 1 else ''}",
+                body=f"Re-parsed all files and re-matched {matched_count} ({total - matched_count} manual pins preserved).",
+            ))
             await session.commit()
+
+            # Background tech-tag enrichment over the whole re-parsed library —
+            # detached so re-parse reports "complete" immediately; chips fill in
+            # after. No-op unless `parsing.read_mediainfo` is on. This is also
+            # how an authoritative-mode re-parse applies container truth to every
+            # file without blocking the request.
+            _spawn_mediainfo_enrich(all_ids)
         except Exception as e:
             print(f"_reparse_worker failed: {e!r}")
             scan = await session.get(Scan, scan_id)
@@ -1619,13 +2305,15 @@ async def _start_scan(paths: list[str], source: str = "manual") -> int | None:
                 print(f"_start_scan: lock release after failure also failed: {e!r}")
             raise
 
-    # Launch outside the session context. asyncio.create_task keeps the worker
-    # alive for the lifetime of the event loop (same as the BackgroundTasks
-    # path), and the worker's finally block releases both locks.
+    # Launch outside the session context. CR-11: route through spawn_tracked so
+    # a strong reference is retained (asyncio only weakly refs a bare
+    # create_task result — it could be GC'd / silently cancelled mid-scan) and
+    # any escaping exception is logged rather than swallowed. The worker's
+    # finally block still releases both locks.
     # NB: source is persisted on the Scan row (above); the worker reads it
     # back from the DB at completion to decide whether to fire the auto-scan
     # notification. _scan_worker_locked therefore takes only (id, roots).
-    asyncio.create_task(_scan_worker_locked(scan_id, effective_roots))
+    spawn_tracked(_scan_worker_locked(scan_id, effective_roots), label="scan_worker")
     return scan_id
 
 

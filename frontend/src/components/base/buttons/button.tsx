@@ -9,6 +9,11 @@ export const styles = sortCx({
     common: {
         root: [
             "group relative inline-flex h-max cursor-pointer items-center justify-center whitespace-nowrap outline-brand transition duration-100 ease-linear before:absolute focus-visible:outline-2 focus-visible:outline-offset-2",
+            // Tactile press feedback — a subtle scale-down on pointer/keyboard
+            // press so clicks feel responsive instead of dead. react-aria drives
+            // `data-pressed`. Neutralized for link-style buttons below (scaling
+            // inline text reads as a glitch, not a press).
+            "pressed:scale-[0.97]",
             // When button is used within `InputGroup`
             "in-data-input-wrapper:shadow-xs in-data-input-wrapper:focus:!z-50 in-data-input-wrapper:in-data-leading:-mr-px in-data-input-wrapper:in-data-leading:rounded-r-none in-data-input-wrapper:in-data-leading:before:rounded-r-none in-data-input-wrapper:in-data-trailing:-ml-px in-data-input-wrapper:in-data-trailing:rounded-l-none in-data-input-wrapper:in-data-trailing:before:rounded-l-none",
             // Disabled styles
@@ -218,6 +223,7 @@ export const Button = ({
                 styles.sizes[size].root,
                 styles.colors[color].root,
                 isLinkType && styles.sizes[size].linkRoot,
+                isLinkType && "pressed:scale-100",
                 (loading || (href && (disabled || loading))) && "pointer-events-none",
                 // If in `loading` state, hide everything except the loading icon (and text if `showTextWhileLoading` is true).
                 loading && (showTextWhileLoading ? "[&>*:not([data-icon=loading]):not([data-text])]:hidden" : "[&>*:not([data-icon=loading])]:invisible"),

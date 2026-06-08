@@ -84,6 +84,21 @@ def test_discover_sidecars_self_excluded(tmp_path: Path) -> None:
     assert fake_video not in found
 
 
+def test_discover_sidecars_longest_stem_wins(tmp_path: Path) -> None:
+    """Two videos share a stem prefix. A sidecar belonging to the LONGER-stemmed
+    cut must not be stolen by the shorter-stemmed sibling (audit: sidecar
+    mis-attribution)."""
+    short = _touch(tmp_path / "Show.S01E01.mkv")            # stem "Show.S01E01"
+    long = _touch(tmp_path / "Show.S01E01.Extended.mkv")    # stem "Show.S01E01.Extended"
+    short_sub = _touch(tmp_path / "Show.S01E01.eng.srt")
+    long_sub = _touch(tmp_path / "Show.S01E01.Extended.eng.srt")
+
+    # The shorter video keeps ONLY its own sub — the Extended cut's is not its.
+    assert discover_sidecars(short) == [short_sub]
+    # The longer-stemmed video claims its own sub.
+    assert discover_sidecars(long) == [long_sub]
+
+
 def test_compute_sidecar_target_plain(tmp_path: Path) -> None:
     src = tmp_path / "Movie (2010).mkv"
     sub = tmp_path / "Movie (2010).srt"

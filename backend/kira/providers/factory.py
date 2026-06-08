@@ -91,7 +91,10 @@ def build_provider(
     # Lazy import to avoid pulling all providers into every call.
     if key == "tmdb":
         from kira.providers.tmdb import TMDBProvider
-        return TMDBProvider(base_url=base_url, auth=auth, client=client)
+        provider = TMDBProvider(base_url=base_url, auth=auth, client=client)
+        if config.tmdb_language:
+            provider.language = config.tmdb_language
+        return provider
     if key == "tvdb":
         from kira.providers.tvdb import TVDBProvider
         return TVDBProvider(base_url=base_url, auth=auth, client=client)

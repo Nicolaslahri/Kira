@@ -23,5 +23,13 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173",
     ]
 
+    # Optional HTTP Basic auth on the API. OFF by default (both unset) so
+    # localhost / existing setups are untouched. Set BOTH (env KIRA_AUTH_USER +
+    # KIRA_AUTH_PASS) to require credentials on every API request — recommended
+    # whenever Kira is reachable beyond localhost. Health + token-gated webhooks
+    # stay exempt so container probes and *arr callbacks keep working.
+    auth_user: str | None = Field(default=None)
+    auth_pass: str | None = Field(default=None)
+
 
 settings = Settings()

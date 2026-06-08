@@ -153,10 +153,13 @@ class AniDBProvider(MetadataProvider):
         try:
             tmp.write_text(f"{when:.3f}")
             os.replace(str(tmp), str(cls._LAST_CALL_PATH))
-        except OSError:
+        except OSError as e:
             # Disk full / permission denied / read-only mount — don't crash
             # the AniDB call; we just lose the inter-worker rate guarantee
             # for this one request. Better than blowing up the whole scan.
+            # Log it though: a RECURRING failure here means the 4s rate guard
+            # is silently off, which is exactly what precedes a 12h AniDB ban.
+            print(f"anidb: rate-guard timestamp write failed (rate guarantee lost this call): {e!r}")
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:

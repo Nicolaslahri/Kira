@@ -17,7 +17,12 @@
  * becomes nullable). Old keys are ignored.
  */
 
-const CACHE_VERSION = 1;
+// v2: episode-list entries gained `absolute_number`. Old v1 entries lack it,
+// so the popup would keep pairing absolute-named anime files (e.g. AoT
+// "Shingeki no Kyojin - 60") against local episode numbers and show them
+// "orphaned" until the stale entry was evicted. Bumping ignores all v1 keys
+// → the popup refetches /series fresh (now carrying absolute_number).
+const CACHE_VERSION = 2;
 const PREFIX = `kira:cache:v${CACHE_VERSION}:`;
 
 export function cacheGet<T>(key: string): T | null {

@@ -40,8 +40,12 @@ class SxEMatch:
 #    `_sane`'s episode cap rises to 2000 (see below) so explicit 4-digit
 #    SxE patterns are accepted while compressed-3-digit patterns (P6)
 #    still keep the conservative 500 cap.
+#    Multi-episode end (group 3) covers the SEPARATED forms (`-E03`, `-03`,
+#    `~03`, `& E02`, ` and 02`). Group 4 covers the GLUED form `S01E01E02`
+#    (no separator at all) that batch rippers emit — without it the second
+#    episode silently dropped and a 2-parter imported as a single episode.
 _P1_STANDARD = re.compile(
-    r"\bS(\d{1,2})E(\d{1,4})(?:(?:\s*[-~&+]\s*|\s+and\s+)E?(\d{1,4}))?\b",
+    r"\bS(\d{1,2})E(\d{1,4})(?:(?:\s*[-~&+]\s*|\s+and\s+)E?(\d{1,4})|E(\d{1,4}))?\b",
     re.IGNORECASE,
 )
 
@@ -182,6 +186,26 @@ def _has_title_before(name: str, start: int) -> bool:
     return len(before) >= 2 and any(c.isalpha() for c in before)
 
 
+def _bracket_absolute(name: str) -> int | None:
+    """A SEPARATE bracketed absolute number `[36]` in the name, if any —
+    excluding release years and stray resolution values.
+
+    Lets a file carrying BOTH a season-local dash-episode AND a bracket-
+    absolute (`[Moozzi2] Kanojo S3 - 12 [36]`) keep 12 as the (season-local)
+    episode while taking 36 as the absolute, instead of P4 overloading the
+    dash-number as both episode and absolute and discarding the real `[36]`.
+
+    Prefer the LAST qualifying bracket: the absolute is conventionally the
+    trailing `[NN]`, whereas a leading numeric bracket is more often a group
+    tag / index (`[12] Show - 05 [36]` → 36, not 12)."""
+    result: int | None = None
+    for bm in _P5B_BRACKET_ABS.finditer(name):
+        v = int(bm.group(1))
+        if 1 <= v <= 9999 and not (1900 <= v <= 2049) and v not in _RESOLUTION_NUMBERS:
+            result = v
+    return result
+
+
 def extract_sxe(name: str) -> SxEMatch | None:
     """Return the highest-confidence SxE match found, or None."""
 
@@ -190,7 +214,10 @@ def extract_sxe(name: str) -> SxEMatch | None:
     if m:
         s = int(m.group(1))
         e = int(m.group(2))
-        end = int(m.group(3)) if m.group(3) else None
+        # group(3) = separated end (`-E03` / `-03` / `& E02`); group(4) = the
+        # glued end (`S01E01E02`). Either supplies the multi-episode upper bound.
+        end_str = m.group(3) or m.group(4)
+        end = int(end_str) if end_str else None
         if _sane(s, e):
             return SxEMatch(s, e, end, confidence=0.95, pattern="SxxExx", match_span=m.span())
 
@@ -293,8 +320,13 @@ def extract_sxe(name: str) -> SxEMatch | None:
             and not (len(digit_str) == 1 and abs_ep < 10)
             and not (1900 <= abs_ep <= 2099)
         ):
-            return SxEMatch(None, abs_ep, absolute=abs_ep, confidence=0.70,
-                            pattern="anime -NN", match_span=m.span())
+            # If a SEPARATE bracket-absolute exists, IT is the real absolute and
+            # the dash-number is the season-local episode (`S3 - 12 [36]` → ep
+            # 12, abs 36). With no bracket, the dash-number IS the absolute for
+            # a pure long-runner (`One Piece - 1156`) — keep the prior behaviour.
+            bracket_abs = _bracket_absolute(name)
+            return SxEMatch(None, abs_ep, absolute=bracket_abs or abs_ep,
+                            confidence=0.70, pattern="anime -NN", match_span=m.span())
 
     # P5 — episode only (single-season shows / OVAs / long-running anime).
     # Upper bound 9999 covers One Piece (1100+), Detective Conan (1100+),

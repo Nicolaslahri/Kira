@@ -169,10 +169,54 @@ class EpisodeCountSanityMetric:
                         f"{len(sibling_aids)} siblings covers max {cluster_max_ep}"
                     ),
                 )
-            # Aggregate STILL doesn't cover — fall through to veto check
-            # below. (Bizarre case: Fribb says this is the right season
-            # but the cumulative episode count is still short. Usually
-            # means Fribb mapping is wrong; we trust the math.)
+            # Aggregate STILL doesn't cover — fall through to the whole-
+            # franchise check, then the veto. (Bizarre case: Fribb says this
+            # is the right season but the cumulative episode count is still
+            # short. Usually means Fribb mapping is wrong; we trust the math.)
+
+        # ── Whole-franchise aggregate (absolute-numbered clusters) ──
+        # A long-runner's files can be SERIES-ABSOLUTE numbered: AoT's Final
+        # Season files are "- 60".."- 89", so cluster_max_episode (89) is an
+        # index into the WHOLE franchise, NOT a count within one season. The
+        # same-season cours (16+12+2 = 30 eps) can't reach it, but the
+        # franchise's full absolute span does (S1..Final = 89). When THIS
+        # candidate is a Fribb cour (has a tvdb mapping) of a multi-AID
+        # franchise whose whole-tvdb-id aggregate covers the max, the cour
+        # legitimately owns its slice — abstain instead of vetoing, and let
+        # cour routing distribute the files across the parts. Tightly scoped:
+        # only a Fribb-mapped member of a >1-AID franchise reaches the abstain;
+        # a standalone OVA/movie (its tvdb_id maps to a single AID, or none)
+        # still falls through to the veto below.
+        if cand_tvdb is not None:
+            try:
+                franchise_aids = await AnimeMappings.aids_by_tvdb(cand_tvdb)
+            except Exception:
+                franchise_aids = []
+            if len(franchise_aids) > 1:
+                missing_fr = [a for a in franchise_aids if a not in count_cache]
+                if missing_fr:
+                    # Understated sum risk → abstain (never veto a real cour on
+                    # missing data; the safe direction).
+                    return MetricResult(
+                        metric=self.name, tier=self.tier,
+                        raw=0.0, score=0.0,
+                        reason=(
+                            f"AID {aid} is a fribb cour of tvdb={cand_tvdb}; "
+                            f"{len(missing_fr)}/{len(franchise_aids)} franchise "
+                            f"siblings missing count → abstain"
+                        ),
+                    )
+                franchise_sum = sum(count_cache[a] for a in franchise_aids)
+                if franchise_sum >= required:
+                    return MetricResult(
+                        metric=self.name, tier=self.tier,
+                        raw=0.0, score=0.0,
+                        reason=(
+                            f"AID {aid} whole-franchise aggregate {franchise_sum} eps "
+                            f"across {len(franchise_aids)} AIDs covers absolute max "
+                            f"{cluster_max_ep} — abstain (cour routing distributes)"
+                        ),
+                    )
 
         # ── The Veto (Autopsy 11) ──
         # Reaching this point means:

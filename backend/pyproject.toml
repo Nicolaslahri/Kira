@@ -11,7 +11,7 @@ dependencies = [
     "alembic>=1.14",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
-    "httpx>=0.28",
+    "httpx[http2]>=0.28",   # http2 (h2) → multiplex provider calls over one connection (fewer TLS handshakes)
     "python-multipart>=0.0.20",
     # PB-1: drop-in stdlib XML API hardened against XXE / billion-laughs /
     # external-entity attacks. Required because we parse XML fetched from
@@ -50,12 +50,21 @@ dev = [
     "ruff>=0.8",
 ]
 
+# `kira` console command — a scriptable client for a running Kira server.
+# See kira/cli.py. Also runnable as `python -m kira.cli`.
+[project.scripts]
+kira = "kira.cli:main"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["kira*"]
+
+[tool.setuptools.package-data]
+# Phase 17: shipped base release-token tables loaded by parser/format_stripper.py.
+kira = ["parser/release_tokens.json"]
 
 [tool.ruff]
 line-length = 110
@@ -68,3 +77,12 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Silence ONLY the benign aiosqlite + pytest-asyncio teardown race: a SQLite
+# connection's worker thread calls `call_soon_threadsafe` on a per-test event
+# loop that pytest-asyncio already closed → "RuntimeError: Event loop is closed",
+# surfaced as a PytestUnhandledThreadExceptionWarning. It's a test-harness
+# artifact (production runs one long-lived uvicorn loop) with zero functional
+# impact. Scoped to the exact message so a genuine thread exception still fails.
+filterwarnings = [
+    "ignore:Exception in thread .*_connection_worker_thread:pytest.PytestUnhandledThreadExceptionWarning",
+]

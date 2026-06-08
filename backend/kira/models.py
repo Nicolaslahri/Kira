@@ -71,7 +71,7 @@ class Match(Base):
     __tablename__ = "matches"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    media_file_id: Mapped[int] = mapped_column(ForeignKey("media_files.id"))
+    media_file_id: Mapped[int] = mapped_column(ForeignKey("media_files.id", ondelete="CASCADE"))
     provider: Mapped[str] = mapped_column(String)  # tmdb|tvdb|anidb|musicbrainz
     provider_id: Mapped[str] = mapped_column(String)
     # Canonical franchise identity used for visual grouping on the Review
@@ -90,6 +90,12 @@ class Match(Base):
     episode_title: Mapped[str | None] = mapped_column(String, nullable=True)
     poster_url: Mapped[str | None] = mapped_column(String, nullable=True)
     overview: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Pass 7 #14: TMDB movie-collection identity ("belongs_to_collection").
+    # Movies sharing a collection_id render under one franchise band in the
+    # Review grid (same mechanism as anime series_group_id). Null for TV /
+    # anime / standalone films. collection_name is the display label.
+    collection_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    collection_name: Mapped[str | None] = mapped_column(String, nullable=True)
     # `none_as_null=True` — without this, SQLAlchemy stores Python None as the
     # JSON text "null" (the 4-char string) instead of SQL NULL. The auto-heal
     # trigger uses `metadata_blob IS NULL` which only matches SQL NULL, so

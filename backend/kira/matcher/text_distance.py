@@ -97,3 +97,40 @@ def numeric_similarity(a: str, b: str) -> float | None:
     if not union:
         return None
     return len(na & nb) / len(union)
+
+
+def runtime_similarity(
+    file_seconds: int | None,
+    expected_minutes: int | None,
+    tolerance: float = 0.20,
+    floor_minutes: int = 3,
+) -> float | None:
+    """Agreement between a file's real duration and an expected runtime (M4).
+
+    `file_seconds` is the true container duration (MediaInfo); `expected_minutes`
+    is the provider's episode/movie runtime. Returns None to ABSTAIN when either
+    side is missing or non-positive (no signal) — the cascade treats None as
+    "didn't fire".
+
+    1.0 when the file is within ±`tolerance` of the expected runtime, decaying
+    linearly to 0.0 at 3× the tolerance band, so a 24-min file vs a 24-min
+    episode → 1.0, while a 90-min file vs a 24-min episode → 0.0. The absolute
+    `floor_minutes` slack keeps very short expected runtimes (a 4-min OP/ED)
+    from being absurdly strict.
+    """
+    if not file_seconds or file_seconds <= 0:
+        return None
+    if not expected_minutes or expected_minutes <= 0:
+        return None
+    file_min = file_seconds / 60.0
+    # Allowed deviation: the larger of the proportional band and an absolute
+    # floor (so a 4-min expected runtime gets ±3 min, not ±0.8 min).
+    band = max(expected_minutes * tolerance, float(floor_minutes))
+    delta = abs(file_min - expected_minutes)
+    if delta <= band:
+        return 1.0
+    # Linear decay from the band edge to 3× the band, then 0.
+    span = band * 2.0
+    if delta >= band + span:
+        return 0.0
+    return max(0.0, 1.0 - (delta - band) / span)

@@ -89,6 +89,11 @@ def _client(cfg: SonarrConfig) -> httpx.AsyncClient:
     persistently break the rest of Kira's HTTP pool. The client is
     short-lived; `async with` cleanup happens at the call site.
     """
+    from kira.url_guard import validate_outbound_url
+    try:
+        validate_outbound_url(cfg.base_url)  # SSRF guard (LAN URLs still allowed)
+    except ValueError as e:
+        raise SonarrError(f"Sonarr URL rejected: {e}") from e
     return httpx.AsyncClient(
         base_url=cfg.base_url.rstrip("/"),
         headers={
