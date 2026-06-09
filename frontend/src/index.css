@@ -2378,14 +2378,14 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   padding: 0 2px;
 }
 .lib-section-icon {
-  width: 26px; height: 26px;
-  border-radius: 8px;
+  width: 24px; height: 24px;
+  border-radius: var(--r-sm);
   display: inline-grid; place-items: center;
   background: var(--glass);
   border: 1px solid var(--line);
   align-self: center;
 }
-.lib-section-icon svg { width: 14px; height: 14px; }
+.lib-section-icon svg { width: 13px; height: 13px; }
 .lib-section-icon.tv    { color: var(--info);    background: var(--info-bg);    border-color: rgba(73,184,254,0.28); }
 .lib-section-icon.anime { color: #c89bff;        background: rgba(200,155,255,0.12); border-color: rgba(200,155,255,0.32); }
 .lib-section-icon.movie { color: var(--ink-2);   background: rgba(255,255,255,0.05); }
@@ -2403,15 +2403,16 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .lib-section-needs .lib-section-title { color: var(--ink); }
 
 .lib-section-title {
-  font-size: 17px;
-  font-weight: 700;
-  letter-spacing: -0.015em;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.012em;
+  color: var(--ink);
 }
 .lib-section-meta {
   font-size: 12px;
   color: var(--ink-3);
   display: inline-flex; align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 .lib-section-meta .dot-sep {
   width: 3px; height: 3px; border-radius: 50%; background: var(--ink-4);
@@ -2442,9 +2443,9 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   width: 2px;
   border-radius: 999px;
   background: linear-gradient(180deg,
-    rgba(229,75,186,0.45) 0%,
-    rgba(114,0,228,0.32) 50%,
-    rgba(255,255,255,0.06) 100%);
+    rgba(229,75,186,0.36) 0%,
+    rgba(114,0,228,0.26) 50%,
+    rgba(255,255,255,0.05) 100%);
 }
 .lib-franchise-head {
   display: flex; align-items: baseline; gap: 10px;
@@ -2452,10 +2453,10 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 }
 .lib-franchise-tick { display: none; }
 .lib-franchise-title {
-  font-size: 13.5px;
-  font-weight: 700;
+  font-size: 13px;
+  font-weight: 650;
   letter-spacing: -0.005em;
-  color: var(--ink);
+  color: var(--ink-2);
   margin: 0;
 }
 .lib-franchise-meta {
@@ -2617,7 +2618,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
     0 12px 28px -8px rgba(40,217,160,0.5),
     inset 0 0 0 1px rgba(255,255,255,0.08);
 }
-.cc.selected { background: rgba(40,217,160,0.04); }
+.cc.selected { background: var(--accent-soft); }
 
 /* Matching (loading skeleton pulse) — for in-progress matching */
 .cc.state-matching .cc-cover {
@@ -2946,6 +2947,15 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .cc-act svg { width: 13px; height: 13px; }
 .cc-act.approve:hover { background: var(--accent); color: #061814; border-color: var(--accent); }
 .cc-act.reject:hover  { background: var(--conf-low); color: #2a0c10; border-color: var(--conf-low); }
+/* Keyboard focus ring on the quick-action buttons — they were the only
+   interactive card controls without a visible focus state. Accent ring,
+   harmonized with the rest of the card's selection/focus language. */
+.cc-act:focus-visible,
+.cc-nm-search-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
 
 /* C2 — keyboard parity: reveal the hover-only quick actions when focus
    enters the card/row, so keyboard users get the same affordances as
@@ -3075,7 +3085,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   border-radius: 0 !important;
   font-size: 11px !important;
   font-weight: 500 !important;
-  color: rgba(255,255,255,0.74) !important;
+  color: rgba(255,255,255,0.78) !important;
 }
 .cc.cinema .cc-sub > span.cc-sub-strong { color: #fff !important; font-weight: 600 !important; }
 .cc.cinema .cc-sub > span:not(.dot-sep) + span:not(.dot-sep)::before {
@@ -3161,6 +3171,32 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .cc.cinema.is-anime:hover .cc-cover {
   box-shadow: 0 22px 44px -14px rgba(0,0,0,0.72) !important;
   transform: none !important;
+}
+
+/* ── Selection on cinema cards (the visual heart) ──
+   The cinema overrides above strip the card background and force a clean
+   cover drop-shadow with `!important`, which previously erased the
+   selection cue entirely — selected cards looked identical to unselected
+   ones. Re-assert an unmistakable emerald treatment, matching the popup's
+   selection language: an accent ring on the cover plus a soft accent wash
+   behind the card. `!important` is required to out-rank the cinema cover
+   shadow override (same specificity, also `!important`). */
+.cc.cinema.selected {
+  background: var(--accent-soft) !important;
+}
+.cc.cinema.selected .cc-cover,
+.cc.cinema.is-anime.selected .cc-cover {
+  box-shadow:
+    0 0 0 2.5px var(--accent),
+    0 14px 32px -10px rgba(40,217,160,0.45),
+    0 12px 28px -10px rgba(0,0,0,0.55) !important;
+}
+.cc.cinema.selected:hover .cc-cover,
+.cc.cinema.is-anime.selected:hover .cc-cover {
+  box-shadow:
+    0 0 0 2.5px var(--accent),
+    0 20px 44px -12px rgba(40,217,160,0.5),
+    0 22px 44px -14px rgba(0,0,0,0.62) !important;
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -3525,7 +3561,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   text-decoration: underline; text-underline-offset: 2px;
   transition: color 0.12s ease;
 }
-.cx-missing-toggle:hover { color: var(--ink-1); }
+.cx-missing-toggle:hover { color: var(--ink); }
 .cx-missing-toggle:focus-visible { outline: 2px solid var(--info); outline-offset: 2px; border-radius: 3px; }
 
 .cx-col-body {
@@ -3557,7 +3593,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   border-bottom: 1px solid var(--line);
   min-height: 96px;
   position: relative;
-  transition: background var(--dur-1);
+  transition: background var(--dur-1) var(--ease-out);
 }
 /* Real rows settle in with a soft fade as the episode list resolves
    (replacing the shimmer skeletons). Keyed by r.key, so this plays once
@@ -3565,8 +3601,8 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
    transform so it never competes with the cover's shared-element flight. */
 .cx-col-body .cx-row:not(.cx-row-skeleton) { animation: cxRowIn var(--dur-3) var(--ease-out) both; }
 @keyframes cxRowIn { from { opacity: 0; } to { opacity: 1; } }
-.cx-row:hover { background: rgba(255,255,255,0.025); }
-.cx-row.focused { background: rgba(255,255,255,0.04); }
+.cx-row:hover { background: var(--hover); }
+.cx-row.focused { background: var(--active); }
 .cx-row.blank { color: var(--ink-4); background: rgba(0,0,0,0.18); }
 
 /* FILE row (left) */
@@ -3621,7 +3657,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .cx-rowact {
   display: flex; gap: 2px;
   opacity: 0;
-  transition: opacity 0.12s ease;
+  transition: opacity var(--dur-1) var(--ease-out);
 }
 .cx-row:hover .cx-rowact,
 .cx-row:focus-within .cx-rowact { opacity: 1; }
@@ -3772,8 +3808,8 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
    still-pending. Previously the only indicator was a subtle line-through
    on the filename, which was nearly invisible. */
 .cx-row.approved {
-  box-shadow: inset 3px 0 0 var(--conf-high);
-  background: rgba(40,217,160,0.04);
+  box-shadow: inset 3px 0 0 var(--accent);
+  background: rgba(40,217,160,0.07);
 }
 .cx-row.approved .cx-file-name {
   text-decoration: line-through;
@@ -3782,8 +3818,8 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 /* Renamed files = done. Slightly stronger green tint + reduced opacity
    to communicate "this is sealed." */
 .cx-row.renamed {
-  box-shadow: inset 3px 0 0 var(--conf-high);
-  background: rgba(40,217,160,0.08);
+  box-shadow: inset 3px 0 0 var(--accent);
+  background: rgba(40,217,160,0.10);
   opacity: 0.75;
 }
 
@@ -3796,9 +3832,9 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   white-space: nowrap;
 }
 .cx-row-status.approved {
-  background: rgba(40,217,160,0.12);
+  background: var(--accent-soft);
   color: var(--conf-high);
-  border: 1px solid rgba(40,217,160,0.32);
+  border: 1px solid var(--accent-line);
 }
 .cx-row-status.renamed {
   background: rgba(40,217,160,0.18);
@@ -4031,11 +4067,13 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   gap: 14px !important;
 }
 
-/* The kind/year/runtime row at the top — make it a single label, not a chain */
+/* The kind/year/runtime row at the top — make it a single label, not a chain.
+   ink-2 (not ink-3) since year/runtime/episode-count is real info the user
+   reads, per the contrast rule. */
 .cx-hero .cx-hero-meta-row {
   font-size: 11.5px;
   gap: 8px;
-  color: var(--ink-3);
+  color: var(--ink-2);
   font-weight: 500;
   letter-spacing: 0.005em;
 }
@@ -4237,9 +4275,9 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .cx-row-tag {
   font-size: 10.5px;
   padding: 2px 8px;
-  border-radius: 6px;
-  background: rgba(255,255,255,0.06);
-  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: var(--r-sm);
+  background: var(--glass-2);
+  border: 1px solid var(--line-strong);
   color: var(--ink-2);
   font-weight: 500;
   letter-spacing: 0.01em;
@@ -4281,10 +4319,10 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   border-radius: 999px;
   letter-spacing: 0;
 }
-.cx-row-conf.high { background: var(--conf-high-bg); color: var(--conf-high); border: 1px solid rgba(40,217,160,0.3); }
-.cx-row-conf.mid  { background: var(--conf-mid-bg);  color: var(--conf-mid);  border: 1px solid rgba(255,201,74,0.3); }
-.cx-row-conf.low  { background: var(--conf-low-bg);  color: var(--conf-low);  border: 1px solid rgba(255,91,110,0.3); }
-.cx-row-conf.muted { background: rgba(255,255,255,0.04); color: var(--ink-3); border: 1px solid rgba(255,255,255,0.08); }
+.cx-row-conf.high { background: var(--conf-high-bg); color: var(--conf-high); border: 1px solid var(--accent-line); }
+.cx-row-conf.mid  { background: var(--conf-mid-bg);  color: var(--conf-mid);  border: 1px solid rgba(255,201,74,0.32); }
+.cx-row-conf.low  { background: var(--conf-low-bg);  color: var(--conf-low);  border: 1px solid rgba(255,91,110,0.32); }
+.cx-row-conf.muted { background: var(--glass); color: var(--ink-3); border: 1px solid var(--line); }
 
 .cx-row-actions {
   display: flex; gap: 4px;
@@ -4293,7 +4331,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
      hovering each row one-by-one. Faint-always with hover-bump strikes
      the balance: discoverable at a glance, not crowding the row. */
   opacity: 0.55;
-  transition: opacity 0.14s ease;
+  transition: opacity var(--dur-2) var(--ease-out);
 }
 .cx-row:hover .cx-row-actions { opacity: 1; }
 /* Keep disabled buttons (no file paired with the row) clearly muted
@@ -4303,13 +4341,15 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .cx-row-act:disabled { opacity: 0.25; }
 .cx-row-act {
   width: 26px; height: 26px;
-  border-radius: 7px;
+  border-radius: var(--r-sm);
   display: grid; place-items: center;
   background: var(--glass);
   border: 1px solid var(--line);
   color: var(--ink-2);
   cursor: pointer;
-  transition: all 0.12s ease;
+  transition: background var(--dur-1) var(--ease-out),
+              color var(--dur-1) var(--ease-out),
+              border-color var(--dur-1) var(--ease-out);
 }
 .cx-row-act:hover { background: var(--glass-2); color: var(--ink); border-color: var(--line-strong); }
 .cx-row-act:disabled { opacity: 0.3; cursor: not-allowed; }
@@ -4542,9 +4582,9 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .cx-rename-target {
   font-family: var(--font-mono);
   font-size: 12px;
-  background: rgba(40,217,160,0.04);
+  background: var(--accent-soft);
   border: 1px solid var(--accent-line);
-  border-radius: 10px;
+  border-radius: var(--r-md);
   padding: 12px 14px;
   word-break: break-all;
   line-height: 1.6;
@@ -5718,25 +5758,32 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .sr-sub > span { flex-shrink: 0 !important; }
 
 
-/* New cover confidence pill (replaces the media-type badge in the top-right) */
+/* New cover confidence pill (replaces the media-type badge in the top-right).
+   Stays a dark glass pill so it's legible over any poster art; the
+   confidence tier reads from the colored swatch + value, with a faint
+   tier-tinted border to harmonize it with the rest of the conf system. */
 .cc-conf-pill {
-  display: inline-flex; align-items: center; gap: 6px;
+  display: inline-flex; align-items: center; gap: 5px;
   font-size: 10.5px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
-  padding: 3px 9px 3px 7px;
+  padding: 3px 8px 3px 6px;
   border-radius: 999px;
-  background: rgba(0,0,0,0.55);
+  background: rgba(0,0,0,0.58);
   backdrop-filter: blur(8px);
-  border: 1px solid rgba(255,255,255,0.10);
+  border: 1px solid rgba(255,255,255,0.12);
   color: #fff;
-  line-height: 1.4;
-  letter-spacing: 0.02em;
+  line-height: 1.35;
+  letter-spacing: 0.01em;
 }
+.cc-conf-pill.high { border-color: rgba(40,217,160,0.42); }
+.cc-conf-pill.mid  { border-color: rgba(255,201,74,0.42); }
+.cc-conf-pill.low  { border-color: rgba(255,91,110,0.42); }
 .cc-conf-pill .swatch {
   width: 6px; height: 6px;
   border-radius: 50%;
   display: inline-block;
+  box-shadow: 0 0 0 2px rgba(0,0,0,0.25);
 }
 
 

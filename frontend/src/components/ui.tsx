@@ -593,10 +593,12 @@ export function FilterPill({ on, onClick, label, num }: {
   return (
     <button
       onClick={onClick}
+      aria-pressed={on}
       className={cn(
-        'inline-flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-[12.5px] font-medium transition-colors',
+        'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[12.5px] font-medium outline-none transition-colors duration-[var(--dur-1)] ease-[var(--ease-out)]',
+        'focus-visible:ring-2 focus-visible:ring-accent-line focus-visible:ring-offset-0',
         on
-          ? 'bg-white/[0.1] text-ink shadow-[0_1px_2px_rgba(0,0,0,0.3)]'
+          ? 'bg-accent-soft text-ink shadow-[inset_0_0_0_1px_var(--accent-line)]'
           : 'text-ink-muted hover:bg-white/[0.05] hover:text-ink',
       )}
     >
@@ -604,7 +606,7 @@ export function FilterPill({ on, onClick, label, num }: {
       {num != null ? (
         <span className={cn(
           'rounded-md px-1.5 py-0.5 text-[10px] font-semibold tabular-nums',
-          on ? 'bg-white/[0.16] text-ink' : 'bg-white/[0.06] text-ink-soft',
+          on ? 'bg-accent-line text-ink' : 'bg-white/[0.06] text-ink-soft',
         )}>{num}</span>
       ) : null}
     </button>
@@ -612,9 +614,11 @@ export function FilterPill({ on, onClick, label, num }: {
 }
 
 // Wraps a set of FilterPills into a tidy segmented group (subtle inset bar).
+// Each group reads as one cohesive control so the three filter dimensions
+// (status / confidence / media) stay visually separated from each other.
 export function FilterGroup({ children }: { children: ReactNode }) {
   return (
-    <div className="inline-flex flex-wrap items-center gap-1 rounded-xl border border-line bg-white/[0.025] p-1">
+    <div className="inline-flex flex-wrap items-center gap-0.5 rounded-xl border border-line bg-white/[0.025] p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
       {children}
     </div>
   );

@@ -810,7 +810,11 @@ async def _resolve_library_root(session: AsyncSession, name: str | None) -> str:
     return roots[chosen]
 
 
-@router.post("", response_model=RenameResult)
+# IMPORTANT: this helper MUST stay ABOVE the @router.post route below. If it
+# sits BETWEEN the decorator and `async def rename`, the decorator binds to THIS
+# function — FastAPI then routes POST /rename to it and treats its
+# (anidb, selected, parsed) params as REQUIRED QUERY params, 422-ing every
+# single rename ("query.anidb: Field required …"). Keep it here.
 async def _resolve_franchise_absolute(anidb, selected, parsed) -> int | None:
     """Franchise-ABSOLUTE episode number for a locally-named anime file matched
     to a per-cour/season AniDB AID — or None.
@@ -836,6 +840,7 @@ async def _resolve_franchise_absolute(anidb, selected, parsed) -> int | None:
     return franchise_absolute(offsets, aid, local_ep)
 
 
+@router.post("", response_model=RenameResult)
 async def rename(
     payload: RenameRequest,
     session: AsyncSession = Depends(get_session),

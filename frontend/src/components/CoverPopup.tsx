@@ -1169,9 +1169,9 @@ export function CoverPopup({
               gap: 12,
               padding: '12px 18px',
               margin: '0 0 -1px 0',
-              background: 'rgba(255, 91, 110, 0.10)',
-              borderBottom: '1px solid rgba(255, 91, 110, 0.28)',
-              color: 'var(--ink-1)',
+              background: 'var(--conf-low-bg)',
+              borderBottom: '1px solid rgba(255, 91, 110, 0.32)',
+              color: 'var(--ink)',
               fontSize: 13,
               lineHeight: 1.45,
             }}

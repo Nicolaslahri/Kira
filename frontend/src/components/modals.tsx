@@ -523,7 +523,12 @@ export function RenamePreviewModal({ files, onClose, onApply, defaultProfile = '
     if (preview.length === 0) { setTargets({}); return; }
     let cancelled = false;
     setPreviewLoading(true);
-    api.rename({ file_ids: preview.map(f => Number(f.id)), profile, op, dry_run: true })
+    // Guard: only ship valid integer file ids. A synthesised / non-numeric id
+    // would become NaN → JSON null → the backend's `file_ids: list[int]`
+    // rejects the whole request with a 422 (and here it's silently swallowed,
+    // so the preview just shows nothing). Matches the filtering every other
+    // rename path already does.
+    api.rename({ file_ids: preview.map(f => Number(f.id)).filter(Number.isInteger), profile, op, dry_run: true })
       .then(res => {
         if (cancelled) return;
         const next: Record<string, string> = {};

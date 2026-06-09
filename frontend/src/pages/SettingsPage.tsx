@@ -109,7 +109,9 @@ function LabsChip({ children }: { children: ReactNode }) {
 export function SettingsPage({ pushToast, section, setSection }: Props) {
   const [profile, setProfile] = useState('Plex');
   const [defaultOp, setDefaultOp] = useState('hardlink');
-  const [autoApprove, setAutoApprove] = useState(true);
+  // Default OFF — must match the backend (`_read_auto_approve_setting`): a fresh
+  // DB must not auto-approve a scanned library before the user reviews it.
+  const [autoApprove, setAutoApprove] = useState(false);
   const [autoThreshold, setAutoThreshold] = useState(95);
   const [highT, setHighT] = useState(85);
   const [midT, setMidT] = useState(50);

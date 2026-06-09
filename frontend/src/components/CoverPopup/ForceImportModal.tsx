@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { IcAlertTri, IcDownload } from '../../lib/icons';
 
@@ -34,6 +35,20 @@ export function ForceImportConfirmModal({
   const importableCount = candidates.filter(c => c.rejection_reasons.length === 0).length;
   const blockedCount = candidates.length - importableCount;
 
+  // Escape cancels — but not while an import is in flight (mirrors the
+  // backdrop/Cancel button, both disabled during `confirming`). Capture +
+  // stopPropagation so it dismisses THIS modal only, not the parent popup
+  // (and the DownloadProgressRow) behind it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || confirming) return;
+      e.stopPropagation();
+      onCancel();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [onCancel, confirming]);
+
   // Portal to document.body so the modal escapes the DownloadProgressRow's
   // stacking context. The row sits deep inside cx-shell → cx-main →
   // cx-body → cx-col → cx-row; the popup's transform on cx-shell creates
@@ -58,7 +73,7 @@ export function ForceImportConfirmModal({
         style={{
           background: '#14121b',
           color: 'var(--ink)',
-          borderRadius: 14,
+          borderRadius: 'var(--r-lg)',
           padding: 24,
           maxWidth: 760,
           width: '92%',
@@ -103,16 +118,16 @@ export function ForceImportConfirmModal({
               style={{
                 marginBottom: 12,
                 padding: '12px 14px',
-                borderRadius: 10,
+                borderRadius: 'var(--r-md)',
                 background: c.rejection_reasons.length > 0
-                  ? 'rgba(255, 91, 110, 0.06)'
-                  : 'rgba(40, 217, 160, 0.04)',
+                  ? 'var(--conf-low-bg)'
+                  : 'var(--accent-soft)',
                 border: '1px solid ' + (c.rejection_reasons.length > 0
                   ? 'rgba(255, 91, 110, 0.30)'
-                  : 'rgba(40, 217, 160, 0.24)'),
+                  : 'var(--accent-line)'),
               }}
             >
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-1)', marginBottom: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>
                 {c.series_title}
                 {c.episode_labels.length > 0 ? (
                   <span style={{ color: 'var(--ink-3)', fontWeight: 500, marginLeft: 8 }}>
@@ -171,7 +186,7 @@ export function ForceImportConfirmModal({
             lineHeight: 1.5,
           }}
         >
-          <div style={{ fontWeight: 600, marginBottom: 8, color: 'var(--ink-1)' }}>
+          <div style={{ fontWeight: 600, marginBottom: 8, color: 'var(--ink)' }}>
             Import mode
           </div>
           <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 8, cursor: 'pointer' }}>
@@ -183,7 +198,7 @@ export function ForceImportConfirmModal({
               style={{ accentColor: 'var(--conf-high)', marginTop: 3 }}
             />
             <div>
-              <div style={{ color: 'var(--ink-1)', fontWeight: 500 }}>
+              <div style={{ color: 'var(--ink)', fontWeight: 500 }}>
                 Copy <span style={{ color: 'var(--conf-high)', fontSize: 11 }}>(recommended)</span>
               </div>
               <div style={{ color: 'var(--ink-3)', fontSize: 11.5 }}>
@@ -203,7 +218,7 @@ export function ForceImportConfirmModal({
               style={{ accentColor: 'var(--conf-mid)', marginTop: 3 }}
             />
             <div>
-              <div style={{ color: 'var(--ink-1)', fontWeight: 500 }}>
+              <div style={{ color: 'var(--ink)', fontWeight: 500 }}>
                 Move <span style={{ color: 'var(--conf-mid)', fontSize: 11 }}>(deletes source)</span>
               </div>
               <div style={{ color: 'var(--ink-3)', fontSize: 11.5 }}>

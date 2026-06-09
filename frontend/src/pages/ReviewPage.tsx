@@ -324,12 +324,12 @@ export function ReviewPage({
         <div className="mb-4 flex flex-wrap items-end justify-between gap-4">
           <div>
             <h1 className="page-title">Library</h1>
-            <p className="mt-1 text-[13px] text-ink-muted">
+            <p className="mt-1.5 text-[13px] text-ink-muted [&>.sep]:px-1.5 [&>.sep]:text-ink-soft">
               <b className="font-semibold text-ink">{statusCounts.pending}</b> pending
-              {statusCounts.noMatch > 0 ? <> · <b className="font-semibold text-conf-low">{statusCounts.noMatch}</b> no match</> : null}
-              {' · '}<b className="font-semibold text-ink">{statusCounts.approved}</b> approved
-              {' · '}<b className="font-semibold text-conf-high">{statusCounts.renamed}</b> renamed
-              {' · '}<b className="font-semibold text-ink">{statusCounts.rejected}</b> rejected
+              {statusCounts.noMatch > 0 ? <><span className="sep">·</span><b className="font-semibold text-conf-low">{statusCounts.noMatch}</b> no match</> : null}
+              <span className="sep">·</span><b className="font-semibold text-ink">{statusCounts.approved}</b> approved
+              <span className="sep">·</span><b className="font-semibold text-conf-high">{statusCounts.renamed}</b> renamed
+              <span className="sep">·</span><b className="font-semibold text-ink">{statusCounts.rejected}</b> rejected
             </p>
           </div>
           {statusF === 'approved' && statusCounts.approved > 0 ? (
@@ -355,7 +355,7 @@ export function ReviewPage({
           )}
         </div>
 
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-2.5">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2.5">
           <FilterGroup>
             <FilterPill on={statusF === 'pending'}  onClick={() => setStatusF('pending')}  label="Pending"  num={statusCounts.pending} />
             <FilterPill
@@ -394,11 +394,12 @@ export function ReviewPage({
       )}
 
       {selected.size > 0 ? (
-        <div className="mb-3 flex flex-wrap items-center gap-3 rounded-xl border border-white/[0.12] bg-white/[0.045] px-4 py-2.5 shadow-[0_1px_3px_rgba(0,0,0,0.35)]">
-          <div className="text-[13px] text-ink">
-            <b className="font-semibold">{selected.size} selected</b>
+        <div className="mb-3 flex flex-wrap items-center gap-3 rounded-xl border border-accent-line bg-accent-soft px-4 py-2.5 shadow-[0_4px_16px_rgba(0,0,0,0.35),inset_0_1px_0_rgba(255,255,255,0.04)] backdrop-blur-sm">
+          <div className="flex items-center gap-2 text-[13px] text-ink">
+            <span className="grid size-5 place-items-center rounded-md bg-accent-line text-accent [&_svg]:size-3" aria-hidden="true"><IcCheck /></span>
+            <b className="font-semibold tabular-nums">{selected.size} selected</b>
             {selectedNoMatchInfo.items.length > 0 ? (
-              <span className="ml-2 text-[12px] text-ink-soft">
+              <span className="text-[12px] text-ink-muted">
                 · {selectedNoMatchInfo.items.length} need matching ({selectedNoMatchInfo.fileIds.length} files)
               </span>
             ) : null}
@@ -419,7 +420,7 @@ export function ReviewPage({
               }}
             >Reject</Button>
 
-            <span aria-hidden="true" className="mx-1 h-5 w-px bg-white/[0.12]" />
+            <span aria-hidden="true" className="mx-1 h-5 w-px bg-accent-line" />
 
             {selectedNoMatchInfo.items.length > 0 && selectedNoMatchInfo.seed ? (
               <Button
@@ -443,7 +444,9 @@ export function ReviewPage({
               isLoading={renaming}
               showTextWhileLoading
               onClick={async () => {
-                // Approve + rename in one shot using saved profile + op.
+                // Approve + rename in one shot using saved profile + op. On the
+                // Approved tab the approve is a no-op (already approved), so this
+                // is effectively just "rename" — hence the label below.
                 const ids = selectedFileIds;
                 if (!ids.length) return;
                 setRenaming(true);
@@ -455,7 +458,7 @@ export function ReviewPage({
                   setRenaming(false);
                 }
               }}
-            >Approve &amp; rename ({selectedFileIds.length})</Button>
+            >{statusF === 'approved' ? 'Rename' : 'Approve & rename'} ({selectedFileIds.length})</Button>
           </div>
         </div>
       ) : null}

@@ -35,6 +35,20 @@ export function DupesResolverModal({ item, episode, files, onClose, onRequestDel
     if (files.length <= 1) onClose();
   }, [files.length, onClose]);
 
+  // Escape closes the resolver (parity with the popup + backdrop click).
+  // Capture phase + stopPropagation so this sub-modal's Escape intercepts
+  // BEFORE the parent popup's window-level Escape handler — otherwise one
+  // press would close both the resolver and the whole popup.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      onClose();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [onClose]);
+
   const losers = files.filter(f => f.id !== keptId);
 
   return (
@@ -54,7 +68,7 @@ export function DupesResolverModal({ item, episode, files, onClose, onRequestDel
         style={{
           background: '#14121b',
           color: 'var(--ink)',
-          borderRadius: 14,
+          borderRadius: 'var(--r-lg)',
           padding: 24,
           maxWidth: 760,
           width: '92%',
@@ -172,10 +186,10 @@ function DupeFileCard({ file, isKept, suggested, onKeep, onDelete }: DupeFileCar
     <div
       style={{
         padding: '12px 14px',
-        borderRadius: 10,
-        background: isKept ? 'rgba(40, 217, 160, 0.06)' : 'rgba(255, 255, 255, 0.025)',
+        borderRadius: 'var(--r-md)',
+        background: isKept ? 'var(--accent-soft)' : 'var(--glass)',
         border: isKept
-          ? '1px solid rgba(40, 217, 160, 0.35)'
+          ? '1px solid var(--accent-line)'
           : '1px solid var(--line)',
         marginBottom: 10,
         display: 'flex', gap: 12, alignItems: 'flex-start',
@@ -189,7 +203,7 @@ function DupeFileCard({ file, isKept, suggested, onKeep, onDelete }: DupeFileCar
                 fontSize: 10, fontWeight: 700, letterSpacing: '0.05em',
                 textTransform: 'uppercase', padding: '3px 7px',
                 borderRadius: 4,
-                background: 'rgba(40, 217, 160, 0.18)', color: 'var(--conf-high)',
+                background: 'var(--accent-soft)', color: 'var(--conf-high)',
               }}
             >
               Keeping
@@ -244,9 +258,9 @@ function DupeFileCard({ file, isKept, suggested, onKeep, onDelete }: DupeFileCar
           <span
             style={{
               padding: '8px 12px', borderRadius: 8,
-              background: 'rgba(40, 217, 160, 0.14)',
+              background: 'var(--accent-soft)',
               color: 'var(--conf-high)',
-              border: '1px solid rgba(40, 217, 160, 0.35)',
+              border: '1px solid var(--accent-line)',
               fontSize: 12, fontWeight: 600,
               display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6,
             }}
@@ -305,6 +319,18 @@ interface DeleteConfirmModalProps {
 
 export function DeleteConfirmModal({ file, onCancel, onConfirm }: DeleteConfirmModalProps) {
   const [acknowledged, setAcknowledged] = useState(false);
+  // Escape cancels — destructive prompts must be dismissible by keyboard.
+  // Capture + stopPropagation so it dismisses THIS modal only, not the
+  // parent popup behind it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      onCancel();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [onCancel]);
   return (
     <div
       onClick={onCancel}
@@ -325,7 +351,7 @@ export function DeleteConfirmModal({ file, onCancel, onConfirm }: DeleteConfirmM
           // needs to dominate. Solid #14121b reads above the popup behind.
           background: '#14121b',
           color: 'var(--ink)',
-          borderRadius: 14,
+          borderRadius: 'var(--r-lg)',
           padding: 28,
           maxWidth: 540,
           width: '90%',
@@ -438,6 +464,18 @@ interface BulkDeleteConfirmModalProps {
 export function BulkDeleteConfirmModal({ files, keepCount, epCount, onCancel, onConfirm }: BulkDeleteConfirmModalProps) {
   const [acknowledged, setAcknowledged] = useState(false);
   const n = files.length;
+  // Escape cancels — destructive prompts must be dismissible by keyboard.
+  // Capture + stopPropagation so it dismisses THIS modal only, not the
+  // parent popup behind it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      onCancel();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [onCancel]);
   return (
     <div
       onClick={onCancel}
@@ -453,7 +491,7 @@ export function BulkDeleteConfirmModal({ files, keepCount, epCount, onCancel, on
         onClick={(e) => e.stopPropagation()}
         style={{
           background: '#14121b', color: 'var(--ink)',
-          borderRadius: 14, padding: 28, maxWidth: 620, width: '92%',
+          borderRadius: 'var(--r-lg)', padding: 28, maxWidth: 620, width: '92%',
           maxHeight: '82vh', display: 'flex', flexDirection: 'column',
           border: '1px solid rgba(255, 91, 110, 0.4)',
           boxShadow: '0 24px 60px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 91, 110, 0.18)',

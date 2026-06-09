@@ -185,11 +185,27 @@ async function request<T>(path: string, init?: RequestInit, _retried = false): P
   if (!res.ok) {
     if (res.status === 401) setStoredAuth(null);   // bad creds — don't keep them
     const text = await res.text().catch(() => '');
-    // FastAPI wraps errors as {"detail": "..."} — pull the inner message for clean toasts.
+    // FastAPI wraps errors as {"detail": ...} — pull the inner message for clean
+    // toasts. HTTPException uses a STRING detail; 422 validation errors use a
+    // LIST of {loc, msg, type}. Previously we only handled the string form, so a
+    // 422 surfaced as a bare "422 Unprocessable Entity" with no clue WHICH field
+    // failed — useless for debugging. Now we flatten the validation list to
+    // "field: message" so the toast (and logs) name the offending field.
     let message = `${res.status} ${res.statusText}`;
     try {
       const body = JSON.parse(text);
-      if (typeof body?.detail === 'string') message = body.detail;
+      if (typeof body?.detail === 'string') {
+        message = body.detail;
+      } else if (Array.isArray(body?.detail) && body.detail.length) {
+        message = body.detail
+          .map((d: { loc?: unknown[]; msg?: string }) => {
+            // loc is like ["body", "file_ids", 0] — drop the leading "body".
+            const field = Array.isArray(d.loc)
+              ? d.loc.filter((p) => p !== 'body').join('.') : '';
+            return field ? `${field}: ${d.msg ?? 'invalid'}` : (d.msg ?? 'invalid');
+          })
+          .join(' · ');
+      }
     } catch { /* not JSON, keep status line */ }
     throw new ApiError(message, res.status);
   }

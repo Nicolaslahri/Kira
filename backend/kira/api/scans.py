@@ -119,16 +119,19 @@ async def _read_auto_approve_setting(session) -> tuple[bool, float]:
     Approval only pre-clears the file for the user's rename action; it never
     moves anything on disk.
 
-    Returns ``(enabled, threshold)`` where threshold is a 0..1 fraction. Defaults
-    mirror the Settings UI: enabled, 95%. ``matching.auto_threshold`` is stored as
-    a 0-100 percent, so it's normalised here."""
+    Returns ``(enabled, threshold)`` where threshold is a 0..1 fraction.
+    DEFAULT DISABLED — a fresh DB / reset must NOT auto-approve a freshly-scanned
+    library out from under the user (they expect to review matches first); it's
+    opt-in via Settings → Confidence. Threshold is 95% once enabled.
+    ``matching.auto_threshold`` is stored as a 0-100 percent, so it's normalised
+    here."""
     try:
         from kira.models import Setting
         from kira.settings_store import unwrap
 
         en_row = await session.get(Setting, "matching.auto_approve")
         th_row = await session.get(Setting, "matching.auto_threshold")
-        enabled = True if en_row is None else bool(unwrap(en_row.value))
+        enabled = False if en_row is None else bool(unwrap(en_row.value))
         raw_th = 95 if th_row is None else unwrap(th_row.value)
         try:
             th = float(raw_th)
