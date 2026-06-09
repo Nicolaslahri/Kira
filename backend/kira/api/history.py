@@ -249,6 +249,122 @@ async def _undo_sidecar_children(
     return succeeded, failed
 
 
+async def _remove_orphaned_assets(video_new_path: str, roots: list[str]) -> int:
+    """Delete the artwork + NFO sidecars Kira wrote beside a renamed video, so
+    UNDOING the rename doesn't leave them orphaned.
+
+    The rename writes `<stem>-<kind>.<ext>` per artwork kind (rename.py) and
+    `<stem>.nfo`, all named after the rename TARGET's stem. Undo reverted the
+    video but left these, so repeated rename→undo→rename piled up a fresh artwork
+    set + NFO per attempt (each under that attempt's target name).
+
+    We match on the video's EXACT stem prefix — `<stem>-*.{jpg,jpeg,png,webp}`
+    plus `<stem>.nfo`. The stem is Kira's own generated filename, so these are
+    unambiguously Kira's (no kind-name list to drift out of sync with), while the
+    generic Kodi assets (`folder.jpg` / `backdrop.jpg`, which carry NO stem
+    prefix) are deliberately left untouched.
+
+    Best-effort + safe: removes only files that exist, carry the exact stem
+    prefix + an image/`.nfo` extension, and sit under a managed library root.
+    Never raises. Returns the count removed."""
+    from pathlib import Path as _P
+    from kira.api.webhooks import path_under_roots
+
+    p = _P(video_new_path)
+    parent, stem = p.parent, p.stem
+    prefix = f"{stem}-"
+    img_exts = {".jpg", ".jpeg", ".png", ".webp"}
+
+    def _collect() -> list[_P]:
+        out: list[_P] = []
+        nfo = parent / f"{stem}.nfo"
+        if nfo.is_file():
+            out.append(nfo)
+        try:
+            for e in parent.iterdir():
+                if (e.name.startswith(prefix)
+                        and e.suffix.lower() in img_exts and e.is_file()):
+                    out.append(e)
+        except OSError:
+            pass
+        return out
+
+    try:
+        targets = await asyncio.to_thread(_collect)
+    except Exception:
+        return 0
+    removed = 0
+    for t in targets:
+        try:
+            if roots and not path_under_roots(str(t), roots):
+                continue  # never delete outside a configured library root
+            await asyncio.to_thread(t.unlink)
+            removed += 1
+        except Exception as e:
+            print(f"_remove_orphaned_assets: {t} (non-fatal): {e!r}")
+    return removed
+
+
+async def _remove_recorded_assets(paths: list[str], roots: list[str]) -> int:
+    """Delete an EXPLICITLY recorded set of asset paths (RenameHistory.created_assets
+    — the NFO/artwork the rename actually wrote). Authoritative: no deriving names
+    from a stem, so it can't drift from the writer. Best-effort + safe — removes
+    only files that exist and sit under a managed library root. Never raises."""
+    from pathlib import Path as _P
+    from kira.api.webhooks import path_under_roots
+
+    removed = 0
+    for ps in paths or []:
+        try:
+            if roots and not path_under_roots(ps, roots):
+                continue  # never delete outside a configured library root
+            p = _P(ps)
+            if await asyncio.to_thread(p.is_file):
+                await asyncio.to_thread(p.unlink)
+                removed += 1
+        except Exception as e:
+            print(f"_remove_recorded_assets: {ps} (non-fatal): {e!r}")
+    return removed
+
+
+async def _cleanup_entry_assets(entry: RenameHistory, roots: list[str]) -> int:
+    """Remove the artwork/NFO a rename created, for undo. Prefers the AUTHORITATIVE
+    list recorded on the row (`created_assets`); falls back to the stem-derived
+    sweep for legacy rows written before that column existed."""
+    recorded = getattr(entry, "created_assets", None)
+    if recorded:
+        return await _remove_recorded_assets(recorded, roots)
+    return await _remove_orphaned_assets(entry.new_path, roots)
+
+
+async def sweep_superseded_assets(
+    session: AsyncSession, media_file_id: int, current_target: str, roots: list[str],
+) -> int:
+    """Forward-orphan cleanup, called from rename. When a file is re-renamed to a
+    DIFFERENT target without an undo in between, the artwork/NFO the PRIOR rename
+    wrote (named after the OLD target) is stranded. Each prior non-undone primary
+    history row recorded exactly what it created, so delete that set authoritatively.
+
+    Scoped tightly: same media_file, NOT undone, primary (parent_id IS NULL), and
+    new_path != the current target (never touches the rename we're doing now).
+    Returns the count removed."""
+    from kira.renamer.operations import FileOp  # noqa: F401 — keep import graph stable
+    rows = list(await session.scalars(
+        select(RenameHistory).where(
+            RenameHistory.media_file_id == media_file_id,
+            RenameHistory.undone_at.is_(None),
+            RenameHistory.parent_id.is_(None),
+            RenameHistory.new_path != current_target,
+        )
+    ))
+    removed = 0
+    for r in rows:
+        recorded = getattr(r, "created_assets", None)
+        if recorded:
+            removed += await _remove_recorded_assets(recorded, roots)
+    return removed
+
+
 @router.post("/{entry_id}/undo", response_model=HistoryOut)
 async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)) -> RenameHistory:
     entry = await session.get(RenameHistory, entry_id)
@@ -283,11 +399,20 @@ async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)
     # time — otherwise the user ends up with subs at the new location
     # and the video back at the old, breaking Plex/Jellyfin pairing.
     sub_ok, sub_failed = await _undo_sidecar_children(session, entry)
+    # Clean up the artwork + NFO this rename wrote, so undo doesn't orphan them
+    # (the rename→undo→rename pile-up). Primary video rows only — sidecar
+    # children (subtitles) carry no artwork.
+    assets_removed = 0
+    if entry.parent_id is None:
+        from kira.api.files import _managed_roots
+        assets_removed = await _cleanup_entry_assets(entry, await _managed_roots(session))
     body = f"Restored to {entry.old_path}"
     if sub_ok:
         body += f" (+ {sub_ok} sidecar{'s' if sub_ok != 1 else ''})"
     if sub_failed:
         body += f"; {sub_failed} sidecar{'s' if sub_failed != 1 else ''} failed to restore"
+    if assets_removed:
+        body += f"; removed {assets_removed} artwork/NFO file{'s' if assets_removed != 1 else ''}"
     session.add(Notification(
         kind="info",
         title=f"Undone: {entry.title or Path(entry.old_path).name}",
@@ -307,6 +432,9 @@ async def undo_bulk(
     failed = 0
     sidecar_succeeded = 0
     sidecar_failed = 0
+    assets_removed = 0
+    from kira.api.files import _managed_roots
+    bulk_roots = await _managed_roots(session)
     for entry_id in ids:
         entry = await session.get(RenameHistory, entry_id)
         if entry is None or entry.undone_at is not None:
@@ -341,6 +469,9 @@ async def undo_bulk(
             ok_subs, failed_subs = await _undo_sidecar_children(session, entry)
             sidecar_succeeded += ok_subs
             sidecar_failed += failed_subs
+            # Clean the artwork/NFO this rename wrote (primary video rows only).
+            if entry.parent_id is None:
+                assets_removed += await _cleanup_entry_assets(entry, bulk_roots)
         except Exception:
             failed += 1
     await session.commit()
@@ -348,6 +479,8 @@ async def undo_bulk(
     if sidecar_succeeded or sidecar_failed:
         out["sidecars_undone"] = sidecar_succeeded
         out["sidecars_failed"] = sidecar_failed
+    if assets_removed:
+        out["assets_removed"] = assets_removed
     return out
 
 

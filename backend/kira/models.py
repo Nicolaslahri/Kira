@@ -162,6 +162,37 @@ class RenameHistory(Base):
     poster_url: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     undone_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # ── #1: artifact provenance for authoritative undo ────────────────
+    # Absolute paths of the satellite files THIS rename created beside the
+    # video — the per-file NFO + `<stem>-<kind>` artwork (NOT the shared
+    # tvshow.nfo, which other episodes still need). Undo deletes exactly
+    # these, so it can't drift from the writer the way deriving names from
+    # the stem can, and a rename→undo→rename cycle stops piling up orphaned
+    # art. NULL on rows written before this column existed → undo falls back
+    # to the stem-derived sweep.
+    created_assets: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+
+
+class RenameIntent(Base):
+    """Write-ahead record of a rename that's ABOUT to happen on disk.
+
+    #4: the physical move (execute_op) commits to disk before the DB does. A
+    crash in that window leaves disk and DB diverged with no automatic repair.
+    An intent row is inserted + committed BEFORE the move and deleted in the SAME
+    commit that persists the MediaFile/RenameHistory changes — so a leftover row
+    means we died in the window. `reconcile_pending_renames()` (startup) inspects
+    disk for each leftover: dst-present+src-gone → finalize the DB to match;
+    src-present → the move never happened, discard. Steady state: empty."""
+
+    __tablename__ = "rename_intents"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # No FK: the file row may be gone by reconcile time; we still want to fix disk.
+    media_file_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    src: Mapped[str] = mapped_column(String)
+    dst: Mapped[str] = mapped_column(String)
+    operation: Mapped[str] = mapped_column(String)  # move|copy|symlink|hardlink
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class Notification(Base):

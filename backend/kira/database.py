@@ -138,6 +138,7 @@ _MIGRATION_COLUMNS: list[tuple[str, str, str]] = [
     ("scans",         "source",          "VARCHAR DEFAULT 'manual'"),  # watched-folders
     ("matches",       "collection_id",   "VARCHAR"),           # Pass 7 #14 movie collections
     ("matches",       "collection_name", "VARCHAR"),
+    ("rename_history", "created_assets", "JSON"),              # #1 authoritative-undo asset provenance
 ]
 
 

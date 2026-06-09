@@ -16,7 +16,7 @@ from sqlalchemy.orm import selectinload
 
 from kira.config import settings
 from kira.database import get_session
-from kira.models import Match, MediaFile, Notification, RenameHistory
+from kira.models import Match, MediaFile, Notification, RenameHistory, RenameIntent
 from kira.parser import ParsedFile
 from kira.renamer import (
     DEFAULT_PROFILES,
@@ -218,6 +218,12 @@ class RenameItemResult(BaseModel):
     old_path: str | None = None
     new_path: str | None = None
     error: str | None = None
+    # #6: dry-run side-effect preview. Populated only for dry_run items so the UI
+    # can show the FULL footprint of a rename before it runs. All optional/null
+    # on a real run → existing consumers are unaffected.
+    sidecars: list[str] | None = None   # sidecar filenames that would move with the video
+    nfo: list[str] | None = None        # .nfo filenames that would be written
+    artwork: list[str] | None = None    # artwork kinds that would be downloaded
 
 
 class RenameResult(BaseModel):
@@ -493,14 +499,20 @@ async def _resolve_nfo_fields(session: AsyncSession) -> set[str] | None:
 
 
 async def _write_nfo_files(target: Path, parsed: ParsedFile, selected: Match, meta: dict | None,
-                           fields: set[str] | None = None) -> None:
+                           fields: set[str] | None = None) -> list[str]:
     """#12: write Kodi/Emby .nfo sidecars beside the renamed video. Best-effort
     output from data already on the Match — no API calls. `fields` selects which
-    optional tags to include (None = all)."""
+    optional tags to include (None = all).
+
+    Returns the per-file NFO paths written (movie / episode) so the caller can
+    record them for authoritative undo. The shared `tvshow.nfo` is deliberately
+    EXCLUDED — it's one-per-series and other episodes depend on it, so undoing a
+    single episode must never delete it."""
     from kira.renamer import nfo
+    written: list[str] = []
     plan = nfo.plan_nfo_writes(target, parsed.media_type)
     if not plan:
-        return
+        return written
     meta = meta or {}
     # The Match column always carries the chosen poster; older metadata_blobs
     # may predate the poster_url key. Backfill it so the NFO <thumb> is written.
@@ -523,18 +535,23 @@ async def _write_nfo_files(target: Path, parsed: ParsedFile, selected: Match, me
     if "movie" in plan:
         content = nfo.build_movie_nfo(title, year, meta, prov, pid, fields=fields, tech=tech)
         await asyncio.to_thread(plan["movie"].write_text, content, encoding="utf-8")
+        written.append(str(plan["movie"]))
     if "episode" in plan:
         season = selected.season_number
         episode = selected.episode_number if selected.episode_number is not None else parsed.episode
         content = nfo.build_episode_nfo(selected.episode_title, season, episode, meta,
                                         series_name=selected.series_name, fields=fields, tech=tech)
         await asyncio.to_thread(plan["episode"].write_text, content, encoding="utf-8")
+        written.append(str(plan["episode"]))
     if "tvshow" in plan:
         tv_path = plan["tvshow"]
-        # Write-if-absent — one tvshow.nfo per series, not per episode.
+        # Write-if-absent — one tvshow.nfo per series, not per episode. NOT
+        # tracked in `written`: it's shared across the series, so undoing one
+        # episode must not delete it.
         if not tv_path.exists():
             content = nfo.build_tvshow_nfo(selected.series_name or title, year, meta, prov, pid, fields=fields)
             await asyncio.to_thread(tv_path.write_text, content, encoding="utf-8")
+    return written
 
 
 # Default per-kind enablement for artwork download. Poster + background +
@@ -600,7 +617,7 @@ async def _download_artwork_files(
     languages: list[str] | None = None,
     fanart_cache: dict | None = None,
     img_cache: dict | None = None,
-) -> None:
+) -> list[str]:
     """#13: download artwork beside the renamed video (Plex/Kodi local-asset
     convention `<stem>-<kind>.<ext>`). Poster + background come from the matched
     provider (TMDB/TVDB/AniDB); the richer kinds (clearlogo, clearart, banner,
@@ -623,7 +640,7 @@ async def _download_artwork_files(
     if kinds is None:
         kinds = {"poster", "fanart"}   # back-compat default when caller omits
     if not kinds:
-        return
+        return []
 
     # Resolve the working client: reuse the batch-shared one, or open a local
     # fallback (closed on exit) when called standalone. The fallback is entered
@@ -634,7 +651,7 @@ async def _download_artwork_files(
             client = await _stack.enter_async_context(
                 httpx.AsyncClient(timeout=20.0, follow_redirects=True)
             )
-        await _download_artwork_with_client(
+        return await _download_artwork_with_client(
             target, parsed, selected, meta, client,
             kinds=kinds, fanart_key=fanart_key,
             fanart_client_key=fanart_client_key, languages=languages,
@@ -652,10 +669,13 @@ async def _download_artwork_with_client(
     languages: list[str] | None = None,
     fanart_cache: dict | None = None,
     img_cache: dict | None = None,
-) -> None:
+) -> list[str]:
     """Inner artwork worker that operates on an ALREADY-RESOLVED client (the
     batch-shared one, or the local fallback `_download_artwork_files` opened).
-    Split out so the client lifetime is managed in exactly one place."""
+    Split out so the client lifetime is managed in exactly one place.
+
+    Returns the artwork paths actually written this call (skipped/already-present
+    files are not included) so the caller can record them for authoritative undo."""
     media_type = parsed.media_type or "movie"
     fanart_for = "movie" if media_type == "movie" else "tv"
 
@@ -696,8 +716,9 @@ async def _download_artwork_with_client(
             continue
         ext = EXT_FOR_KIND.get(kind, "jpg")
         jobs.append((url, target.with_name(f"{target.stem}-{kind}.{ext}")))
+    written: list[str] = []
     if not jobs:
-        return
+        return written
     from kira.download_guard import fetch_capped, sniff_image
 
     def _atomic_write(tmp: Path, final: Path, data: bytes) -> None:
@@ -737,8 +758,10 @@ async def _download_artwork_with_client(
                     img_cache[url] = data
             tmp = dest.with_name(dest.name + ".part")
             await asyncio.to_thread(_atomic_write, tmp, dest, data)
+            written.append(str(dest))
         except Exception as e:
             print(f"artwork: failed {url} -> {dest} (non-fatal): {e!r}")
+    return written
 
 
 async def _resolve_type_target_root(
@@ -853,6 +876,73 @@ async def rename(
     return await perform_rename(payload, session)
 
 
+async def _discard_intent(session: AsyncSession, intent: RenameIntent | None) -> None:
+    """Best-effort removal of a write-ahead intent whose move did NOT complete
+    (#4). Committed on its own so it can't be undone by a later per-file rollback."""
+    if intent is None:
+        return
+    try:
+        await session.delete(intent)
+        await session.commit()
+    except Exception as e:
+        print(f"rename: discard intent failed (non-fatal): {e!r}")
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+
+
+async def reconcile_pending_renames() -> tuple[int, int]:
+    """Settle rename intents a crash left in the move→commit window (#4). Called
+    once on boot, alongside the scan reconcile. Returns ``(finalized, discarded)``.
+
+    For each leftover ``RenameIntent`` it inspects disk:
+      • dst present & src gone  → the move landed but the DB commit didn't:
+        finalize — point the MediaFile at dst, mark it renamed, and add a
+        RenameHistory row if this move isn't already recorded — then drop the intent.
+      • src present (move never happened / was reverted) → the file is still at
+        src and the DB already points there: just drop the intent.
+      • neither present (vanished out-of-band) → log + drop.
+
+    Best-effort: a per-intent failure is logged and skipped; never raises into boot."""
+    from kira.database import SessionLocal
+    finalized = discarded = 0
+    async with SessionLocal() as session:
+        intents = list(await session.scalars(select(RenameIntent)))
+        for it in intents:
+            try:
+                src, dst = Path(it.src), Path(it.dst)
+                src_exists = await asyncio.to_thread(src.exists)
+                dst_exists = await asyncio.to_thread(dst.exists)
+                if dst_exists and not src_exists:
+                    mf = await session.get(MediaFile, it.media_file_id) if it.media_file_id else None
+                    if mf is not None:
+                        mf.file_path = it.dst
+                        mf.status = "renamed"
+                    already = await session.scalar(
+                        select(RenameHistory)
+                        .where(RenameHistory.old_path == it.src, RenameHistory.new_path == it.dst)
+                        .limit(1)
+                    )
+                    if already is None:
+                        session.add(RenameHistory(
+                            media_file_id=it.media_file_id,
+                            old_path=it.src, new_path=it.dst, operation=it.operation,
+                            title=Path(it.dst).stem,
+                        ))
+                    finalized += 1
+                else:
+                    discarded += 1
+                await session.delete(it)
+            except Exception as e:
+                print(f"reconcile_pending_renames: intent {getattr(it, 'id', None)} failed (non-fatal): {e!r}")
+        try:
+            await session.commit()
+        except Exception as e:
+            print(f"reconcile_pending_renames: commit failed (non-fatal): {e!r}")
+    return finalized, discarded
+
+
 async def perform_rename(
     payload: RenameRequest,
     session: AsyncSession,
@@ -867,6 +957,11 @@ async def perform_rename(
     op = FileOp(payload.op)
     profile = await _resolve_profile(session, payload.profile)
     library_root = await _resolve_library_root(session, payload.library_root_name)
+    # Managed library roots — the allowlist that bounds asset cleanup (#1): the
+    # forward-orphan sweep below (and undo) only ever delete satellite files that
+    # live under one of these, never anywhere else on disk.
+    from kira.api.files import _managed_roots
+    managed_roots = await _managed_roots(session)
     cleanup_empty_source = await _resolve_cleanup_empty_dirs(session)
     # Sub-toggle: when cleanup_empty_source is on, ALSO sweep Plex/
     # Jellyfin/Kodi metadata artifacts (poster.jpg, *-thumb.jpg, etc.)
@@ -948,18 +1043,31 @@ async def perform_rename(
     by_id = {f.id: f for f in files}
 
     results: list[RenameItemResult] = []
-    for fid in payload.file_ids:
-        f = by_id.get(fid)
-        if f is None:
-            results.append(RenameItemResult(file_id=fid, ok=False, error="File not found"))
-            continue
-        if not f.parsed_data:
-            results.append(RenameItemResult(file_id=fid, ok=False, error="File not parsed"))
-            continue
+    # #3: in-batch duplicate-target guard. Maps a normalized target path → the
+    # first file id that claimed it, so a second file rendering to the SAME
+    # destination fails loudly instead of silently overwriting the first
+    # (overwrite on) or erroring obscurely (off). Normalized via webhooks._norm
+    # (case-fold + separator-fold) so casing/slash differences still collide.
+    from kira.api.webhooks import _norm as _norm_path
+    claimed_targets: dict[str, int] = {}
+    async def _rename_one_file(f, fid):
+        """Run the full pipeline for ONE file: resolve match+target, guard
+        against duplicates/phantoms, journal intent, move, then write history /
+        NFO / artwork / sidecars and commit. Appends exactly one RenameItemResult
+        to the enclosing `results`; an early `return` is this file's terminal
+        outcome. Batch settings + shared caches are captured from perform_rename."""
         parsed = ParsedFile(**f.parsed_data)
         selected: Match | None = next((m for m in f.matches if m.is_selected), None)
         if selected is None and f.matches:
-            selected = f.matches[0]
+            # Deterministic fallback when nothing is explicitly selected: highest
+            # confidence wins, ties broken by lowest id (stable insertion order).
+            # NEVER `f.matches[0]` — relationship order is arbitrary, so among
+            # several real candidates that could silently rename to the WRONG
+            # match (and non-reproducibly, run to run).
+            selected = max(
+                f.matches,
+                key=lambda m: (m.confidence if m.confidence is not None else -1.0, -m.id),
+            )
         # Refuse to rename files that have no real provider match. Without
         # this, a no_match file (which has a synthesised display object on
         # the frontend but zero real Match rows) would be renamed using just
@@ -975,7 +1083,7 @@ async def perform_rename(
             else:
                 err = "No match to rename to — match the file first."
             results.append(RenameItemResult(file_id=fid, ok=False, error=err))
-            continue
+            return
         library_title = selected.title or parsed.title
         library_year = selected.year if selected.year is not None else parsed.year
 
@@ -1062,7 +1170,7 @@ async def perform_rename(
                 # that 500s the whole batch (and crashes the dry-run preview,
                 # so the user can't even see which file/template is broken).
                 results.append(RenameItemResult(file_id=fid, ok=False, error=f"Template error: {e}"))
-                continue
+                return
         if type_target_root is None:
             type_target_root = await _resolve_type_target_root(session, parsed.media_type)
         # Tier 1.5 step 2b: assemble provider-metadata for the rich naming
@@ -1093,14 +1201,50 @@ async def perform_rename(
             )
         except Exception as e:
             results.append(RenameItemResult(file_id=fid, ok=False, error=f"Template error: {e}"))
-            continue
+            return
 
         src = Path(f.file_path)
+
+        # #3: refuse to let two files in this batch land on the same path. The
+        # first claimant wins; later colliders fail with a pointer to it (rather
+        # than one silently clobbering the other). Checked for dry-run too, so the
+        # preview surfaces the collision before the user commits.
+        tgt_key = _norm_path(str(target))
+        if tgt_key in claimed_targets:
+            results.append(RenameItemResult(
+                file_id=fid, ok=False, old_path=str(src), new_path=str(target),
+                error=(
+                    f"Duplicate target — file id {claimed_targets[tgt_key]} in this "
+                    f"batch already maps to “{target.name}”. Resolve the duplicate "
+                    f"(or pick distinct matches) before renaming."
+                ),
+            ))
+            return
+        claimed_targets[tgt_key] = fid
+
         if payload.dry_run:
+            # #6: preview the FULL set of side effects, not just the video path,
+            # so the user sees everything a real run would touch before committing.
+            preview_sidecars: list[str] = []
+            try:
+                preview_sidecars = [s.name for s in discover_sidecars(src)]
+            except Exception:
+                pass
+            preview_nfo: list[str] = []
+            if write_nfo and selected:
+                try:
+                    from kira.renamer import nfo as _nfo_preview
+                    preview_nfo = [p.name for p in _nfo_preview.plan_nfo_writes(target, parsed.media_type).values()]
+                except Exception:
+                    pass
+            preview_art = sorted(artwork_kinds) if (download_artwork and selected) else []
             results.append(RenameItemResult(
                 file_id=fid, ok=True, old_path=str(src), new_path=str(target),
+                sidecars=preview_sidecars or None,
+                nfo=preview_nfo or None,
+                artwork=preview_art or None,
             ))
-            continue
+            return
 
         # Phantom-file guard: if the source doesn't exist on disk AND the
         # target already does, this file was likely renamed previously by
@@ -1134,7 +1278,7 @@ async def perform_rename(
                         "phantom rename. Check NAS / mount and retry."
                     ),
                 ))
-                continue
+                return
             if target.exists():
                 f.status = "renamed"
                 # Update the file_path so future actions point at where
@@ -1144,7 +1288,7 @@ async def perform_rename(
                     file_id=fid, ok=True, old_path=str(src), new_path=str(target),
                     error="[PHANTOM] Already at target — no move performed.",
                 ))
-                continue
+                return
             # Source missing AND target missing AND FS is alive — genuine
             # "file is gone". Mark as renamed anyway (nothing to do) but
             # flag in the response so the user knows the row was
@@ -1154,7 +1298,43 @@ async def perform_rename(
                 file_id=fid, ok=True, old_path=str(src), new_path=str(src),
                 error="[PHANTOM] Source missing — marked as renamed (no file to move).",
             ))
-            continue
+            return
+
+        # Idempotent no-op: the file is ALREADY exactly at its target — e.g. a
+        # re-submitted rename (file_path now equals the target). Moving a file onto
+        # itself and recording a src==dst history row is what produced the "renamed
+        # once but it shows up twice in history" report. Treat it like
+        # phantom-already-at-target: mark renamed, no move, no history row.
+        #
+        # CASE-SENSITIVE (separator-normalized only): a case-only rename
+        # (Movie.MKV → movie.mkv) is a REAL, intended operation, so it must NOT be
+        # swallowed here — that's why we don't reuse `_norm` (which case-folds).
+        if str(src).replace("\\", "/").rstrip("/") == str(target).replace("\\", "/").rstrip("/"):
+            f.status = "renamed"
+            results.append(RenameItemResult(
+                file_id=fid, ok=True, old_path=str(src), new_path=str(target),
+                error="[PHANTOM] Already at target — no rename needed.",
+            ))
+            return
+
+        # #4: write-ahead intent, committed BEFORE the physical move so a crash in
+        # the move→commit window is recoverable on next boot (reconcile_pending_renames).
+        # Only the video move is journaled (sidecars carry their own history rows).
+        # Best-effort: a journal failure degrades to the old narrower window rather
+        # than erroring the file.
+        intent: RenameIntent | None = RenameIntent(
+            media_file_id=fid, src=str(src), dst=str(target), operation=op.value,
+        )
+        try:
+            session.add(intent)
+            await session.commit()
+        except Exception as e:
+            print(f"rename: intent journal write failed for {fid} (non-fatal): {e!r}")
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            intent = None
 
         try:
             # cleanup_stop_at = the library_root setting. The cleanup
@@ -1195,11 +1375,14 @@ async def perform_rename(
                 cleanup_trash_dir=cleanup_trash_dir,
             ) or 0
         except Exception as e:
+            # The move never happened → discard the write-ahead intent so reconcile
+            # doesn't later inspect a rename that didn't occur.
+            await _discard_intent(session, intent)
             results.append(RenameItemResult(
                 file_id=fid, ok=False, old_path=str(src), new_path=str(target),
                 error=str(e),
             ))
-            continue
+            return
 
         # If we MOVEd, the source path no longer exists — update the row.
         if op == FileOp.MOVE:
@@ -1230,19 +1413,25 @@ async def perform_rename(
             except Exception as e:
                 print(f"rename: xattr stamp failed for {fid} (non-fatal): {e!r}")
 
+        # Provenance of the satellite files THIS rename creates (#1). Recorded
+        # on the video_history row so undo deletes exactly these — no deriving
+        # names from the stem, which can drift from the writer. Also drives the
+        # forward-orphan sweep below.
+        created_assets: list[str] = []
+
         # ── #12: Kodi/Emby NFO sidecars (opt-in, best-effort) ─────────
         # Write metadata .nfo files beside the renamed video from the data
         # already on the Match. Pure output — never fails the rename.
         if write_nfo and selected:
             try:
-                await _write_nfo_files(target, parsed, selected, _meta, fields=nfo_fields)
+                created_assets += await _write_nfo_files(target, parsed, selected, _meta, fields=nfo_fields)
             except Exception as e:
                 print(f"rename: NFO write failed for {fid} (non-fatal): {e!r}")
 
         # ── #13: artwork download (opt-in, best-effort) ───────────────
         if download_artwork and selected and artwork_client is not None:
             try:
-                await _download_artwork_files(
+                created_assets += await _download_artwork_files(
                     target, parsed, selected, _meta,
                     client=artwork_client,
                     kinds=artwork_kinds, fanart_key=fanart_key,
@@ -1251,6 +1440,21 @@ async def perform_rename(
                 )
             except Exception as e:
                 print(f"rename: artwork download failed for {fid} (non-fatal): {e!r}")
+
+        if created_assets:
+            video_history.created_assets = created_assets
+
+        # ── #1 forward-orphan sweep ───────────────────────────────────
+        # Re-renaming this file to a DIFFERENT target (without an undo in
+        # between) would strand the artwork/NFO the PRIOR rename wrote under the
+        # old target's name. Each prior non-undone history row recorded exactly
+        # what it created, so we can delete that set authoritatively now. Cheap
+        # (one indexed query per file), best-effort, never fails the rename.
+        try:
+            from kira.api.history import sweep_superseded_assets
+            await sweep_superseded_assets(session, fid, str(target), managed_roots)
+        except Exception as e:
+            print(f"rename: superseded-asset sweep failed for {fid} (non-fatal): {e!r}")
 
         # ── Tier 1.2: Subtitle / sidecar co-renaming ─────────────────
         # Now that the video has moved, hunt for sidecars (.srt, .ass,
@@ -1286,6 +1490,19 @@ async def perform_rename(
             except Exception as e:
                 print(f"rename: flush before sidecars failed for {fid}: {e!r}")
                 parent_history_id = None
+
+            if parent_history_id is None:
+                # #2: we couldn't get the video row's id to link children. Moving
+                # the sidecars anyway would leave them UNTRACKED — undo would
+                # revert the video but strand the subtitles at the new location.
+                # Refuse: leave them beside the source (re-running the rename once
+                # the DB issue clears picks them up cleanly). Emptying the list
+                # makes the move loop below a no-op without an extra indent level.
+                sidecar_msg = (
+                    f"[SIDECARS] Left {len(sidecars)} sidecar"
+                    f"{'s' if len(sidecars) != 1 else ''} in place — couldn't record them for undo."
+                )
+                sidecars = []
 
             moved_subs = 0
             failed_subs: list[str] = []
@@ -1375,6 +1592,13 @@ async def perform_rename(
         # on every previously-renamed row. Per-file commits keep DB
         # and disk in lockstep at every checkpoint.
         if not payload.dry_run:
+            # #4: clear the write-ahead intent in the SAME commit that persists the
+            # MediaFile/RenameHistory changes — so the disk move, the DB row, and
+            # the intent's removal all land atomically. If this commit fails, the
+            # intent SURVIVES (rolled back to its committed state) and reconcile
+            # finalizes from disk on next boot — exactly the recovery we want.
+            if intent is not None:
+                await session.delete(intent)
             try:
                 await session.commit()
             except Exception as e:
@@ -1396,11 +1620,21 @@ async def perform_rename(
                     await session.rollback()
                 except Exception:
                     pass
-                continue
+                return
         results.append(RenameItemResult(
             file_id=fid, ok=True, old_path=str(src), new_path=str(target),
             error=sidecar_msg,
         ))
+
+    for fid in payload.file_ids:
+        f = by_id.get(fid)
+        if f is None:
+            results.append(RenameItemResult(file_id=fid, ok=False, error="File not found"))
+            continue
+        if not f.parsed_data:
+            results.append(RenameItemResult(file_id=fid, ok=False, error="File not parsed"))
+            continue
+        await _rename_one_file(f, fid)
 
     if not payload.dry_run:
         succeeded = sum(1 for r in results if r.ok)

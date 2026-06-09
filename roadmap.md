@@ -1226,6 +1226,146 @@ gap. The misdiagnosed close-side change was reverted. `tsc` + `vite build` clean
 
 ---
 
+## Fix — undo orphaned artwork/NFO (rename→undo→rename pile-up) ✅ Shipped (backend)
+
+Symptom (user): "renamed a movie, undo it, renamed again… multiple times and I
+end up with so many files in that folder." An *Evil Dead Rise (2023)* folder held
+the MKV plus THREE artwork sets named after three different rename targets
+(`…[720p WEBRip]-{poster,fanart}`, `…[1080p WEBRip]-{poster,fanart,landscape,logo}`,
+`…PSA-{poster,landscape,backdrop,logo}`) + two `.nfo` files.
+
+Root cause: each rename writes `<target_stem>-<kind>.<ext>` artwork (`rename.py`)
+and `<target_stem>.nfo`, but `RenameHistory` only tracks the video move + subtitle
+sidecars (own rows via `parent_id`) — **NOT** the artwork/NFO. So undo reverted the
+video and left the artwork/NFO orphaned; the next rename wrote a *fresh* set under
+the new target's stem → accumulation, one set per attempt.
+
+Fix (`api/history.py`): new `_remove_orphaned_assets(video_new_path, roots)` called
+from both `undo_entry` and `undo_bulk`, for primary video rows only (`parent_id is
+None`; subtitle children carry no artwork). Because the names are deterministic from
+the video's own stem, it removes EXACTLY what Kira wrote — matched on the literal
+stem prefix `<stem>-*.{jpg,jpeg,png,webp}` plus `<stem>.nfo` — and nothing else:
+the generic Kodi assets (`folder.jpg`/`backdrop.jpg`, no stem prefix), subtitle
+sidecars (stem-prefixed but not images), and other titles' artwork all survive.
+Stem-prefix matching (via `iterdir` + `str.startswith`, NOT `Path.glob`) deliberately
+sidesteps two traps: (1) kind-name drift — on-disk `-logo`/`-backdrop` aren't even in
+the current `ALL_KINDS`, so a kind-list loop would miss them; (2) bracketed stems
+like `… [1080p WEBRip]` being mis-read as glob character classes. Guarded by
+`path_under_roots` (never deletes outside a managed library root) and fully
+best-effort (per-file try/except, off-thread `iterdir`/`unlink`, never raises). The
+undo notification now reports the count removed.
+
+Scope note: this fixes the reported rename→undo→rename cycle (every undo now cleans
+up after itself). It does NOT retroactively clean orphans already on disk from
+*past* undos, nor the rarer rename→**re-rename-to-a-different-target** case (no undo
+in between) — flagged as a follow-up if it surfaces.
+
+New tests `tests/test_undo_orphan_cleanup.py` (3): removes artwork+NFO / keeps
+video+generic+subtitle+other-title; bracket-stem matched literally; roots guard
+refuses outside-library deletion. Full history/undo/rename/nfo/artwork suite green
+(120 passed).
+
+> **Superseded by the Rename-hardening pass below.** The stem-derived sweep is now
+> the *fallback* for legacy rows; new renames record exact `created_assets` and undo
+> deletes those authoritatively. The forward re-rename case is now handled too.
+
+---
+
+## Pass — Rename-core hardening (the "main thing") ✅ Shipped (backend)
+
+After the orphan band-aid, the user asked what else the **rename itself** — the core
+of the app — needs. A read of `perform_rename` surfaced one structural weakness
+(it *creates* satellite files it doesn't *record*) plus a cluster of correctness/
+safety gaps. All seven were fixed, each with tests, full suite green (**831 → passing**).
+
+**First, a test net (prereq).** The suite only *spied* on `perform_rename`
+(`test_auto_rename_execute`) or checked route binding (`test_rename_route`) — nothing
+drove a real rename. Added `tests/test_rename_e2e.py`: real temp files + real SQLite,
+exercising move/copy/dry-run, sidecar co-move, history rows, and NFO — the behavioral
+net that made the later refactor safe. Grew to 18 cases across the pass.
+
+**#1 — `created_assets` provenance → authoritative undo** *(the headline; supersedes the
+band-aid).* New `RenameHistory.created_assets` JSON column (migrated via
+`_MIGRATION_COLUMNS`). `_write_nfo_files` + `_download_artwork_*` now RETURN the paths
+they wrote; `perform_rename` records them on the video's history row. Undo
+(`_cleanup_entry_assets`) deletes the **recorded** paths exactly — no stem-derivation
+drift — falling back to the old sweep only for legacy (null) rows. The per-file NFO +
+`<stem>-<kind>` artwork are tracked; the shared `tvshow.nfo` is deliberately NOT (other
+episodes need it). Plus a **forward-orphan sweep** (`sweep_superseded_assets`): re-renaming
+a file to a different target with no undo in between now removes the prior target's
+recorded assets — closing the case the band-aid couldn't.
+
+**#2 — never move an untrackable sidecar.** If the flush that assigns the parent
+history id failed, the sidecar was still physically moved but got no history row →
+undo orphaned it. Now: no parent id → the sidecars are left in place with a clear
+note, never moved without a row to undo them by.
+
+**#3 — in-batch duplicate-target guard.** Two source files rendering to the same
+destination used to silently overwrite (overwrite on) or error obscurely (off). A
+`claimed_targets` map (normalized via `webhooks._norm`) now fails the second
+collider with a pointer to the first — no clobber, no data loss. Surfaced in dry-run too.
+
+**#4 — write-ahead intent journal + boot reconcile.** The physical move commits to
+disk before the DB row does; a crash in that window diverged disk vs DB with no
+repair. New `RenameIntent` table: an intent is committed *before* the move and deleted
+in the *same* commit that persists the row. On boot, `reconcile_pending_renames()`
+(wired beside `reconcile_orphaned_scans`) finalizes intents whose move landed
+(dst present, src gone → fix `file_path` + add a recovery history row if missing) and
+discards those whose move never ran. Crash-recoverable renames.
+
+**#5 — deterministic match selection.** When nothing is `is_selected`, the fallback was
+`f.matches[0]` (arbitrary relationship order → could rename to the wrong match,
+non-reproducibly). Now: highest `confidence`, ties broken by lowest id.
+
+**#6 — dry-run previews the full footprint.** `RenameItemResult` gained optional
+`sidecars` / `nfo` / `artwork` lists, populated on dry-run, so the preview shows every
+side effect (subs that would move, NFO that would be written, artwork kinds) — not just
+the destination path. Null on real runs → existing consumers unaffected.
+
+**#7 — extracted `_rename_one_file`.** The ~550-line per-file loop body is now a named
+unit (a thin dispatcher loop calls it); each terminal outcome is an explicit `return`
+instead of an `append`+`continue` buried mid-loop. Chose the nested form (zero-dedent,
+compiler-verified `continue`→`return`) over a riskier module-level re-flow on the app's
+most dangerous function, since branch-level testability was already delivered by the
+e2e net.
+
+Tests: `tests/test_rename_e2e.py` (18) covers move/copy/dry-run + preview, deterministic
+selection, `created_assets` recording + authoritative undo + forward sweep, untrackable
+sidecar, duplicate-target, and all three reconcile branches; `tests/test_undo_orphan_cleanup.py`
+(5) covers the dispatcher (recorded vs legacy-derived) + the original sweep cases.
+
+Scope notes carried forward: existing on-disk orphans from *past* undos aren't
+retroactively cleaned (the fix is forward-looking); the intent journal covers the video
+move (sidecars carry their own history rows).
+
+---
+
+## Fix — re-submitted rename = idempotent no-op (the "twice in history" report) ✅ Shipped (backend)
+
+User renamed one movie but saw **two** history rows: `Z:\…` → `\\192.168.0.63\Data\…`
+(the real rename — `Z:` is a mapped drive for that UNC share) followed by
+`\\192.168.0.63\…` → `\\192.168.0.63\…` (a `src==dst` **self-move**). DB confirmed one
+`MediaFile` (id 480), zero intents → `perform_rename` simply ran **twice** on the same
+file (a frontend double-trigger), and the second pass moved the file onto itself and
+recorded a pointless row.
+
+Fix (`_rename_one_file`): after the phantom guard (src known to exist), if `src`
+already equals `target` it's a no-op — mark renamed, **no move, no history row**, return
+the same "[PHANTOM] Already at target" result the genuine already-at-target branch uses.
+Comparison is **separator-normalized but CASE-SENSITIVE** — a case-only rename
+(`Movie.MKV` → `movie.mkv`) is a real intended op and must NOT be swallowed, so it
+deliberately does NOT reuse `_norm` (which case-folds). This makes the rename idempotent:
+re-submitting (or the file already living at its destination) can't manufacture phantom
+history or self-moves.
+
+Note: the *root* double-trigger is on the frontend (CoverPopup's debounced per-row
+flush overlapping a direct approve/`onUpdate` call) — now harmless, flagged as a
+separate follow-up. Test: `test_re_submitting_same_rename_is_noop_no_duplicate_history`
+(re-run after the file is at its target adds no second row); the 11 case-rename tests
+still pass (case-only renames proceed).
+
+---
+
 ## Where we are now + what's next
 
 **Done:** Passes 5, M, the FileBot stretch, 6, 7, the Pass-S hardening arc,

@@ -120,6 +120,15 @@ async def lifespan(app: FastAPI):
             logger.info("startup: reconciled %d orphaned scan(s) + %d stuck file(s)", n_scans, n_files)
     except Exception as e:
         logger.warning("startup: scan-lock reset failed: %r", e)
+    # #4: settle rename intents a crash left in the move→DB-commit window — finalize
+    # the DB for moves that landed on disk, discard intents for moves that never ran.
+    try:
+        from kira.api.rename import reconcile_pending_renames
+        n_final, n_disc = await reconcile_pending_renames()
+        if n_final or n_disc:
+            logger.info("startup: reconciled rename intents — %d finalized, %d discarded", n_final, n_disc)
+    except Exception as e:
+        logger.warning("startup: rename-intent reconcile failed: %r", e)
     # Background warm-up: refresh the AniDB↔TVDB↔TMDB cross-reference table
     # (weekly), then start the auto-heal sweep for files matched before
     # later fixes landed.
