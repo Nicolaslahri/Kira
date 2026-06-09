@@ -2070,6 +2070,33 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
         except Exception as e:
             print(f"_scan_worker_locked: auto_rename hook failed (non-fatal): {e!r}")
 
+    # Opt-in: sweep leftover media-server artifacts (poster.jpg / <ep>-thumb.jpg /
+    # .tbn / .actors/ …) the server keeps dropping into already-organized folders.
+    # Default OFF since it deletes; runs over the managed roots after the scan +
+    # auto-rename settle, respects the recoverable-trash setting, best-effort.
+    try:
+        async with SessionLocal() as s:
+            from kira.api.rename import _resolve_bool_setting
+            if await _resolve_bool_setting(s, "cleanup.sweep_artifacts_on_scan", False):
+                from kira.api.cleanup import _resolve_trash_root
+                from kira.api.files import _managed_roots
+                from kira.models import Notification
+                from kira.renamer.operations import sweep_artifacts
+                roots = await _managed_roots(s)
+                trash_root = await _resolve_trash_root(s, roots)
+                removed, _items = await asyncio.to_thread(
+                    sweep_artifacts, roots, dry_run=False, trash_root=trash_root,
+                )
+                if removed:
+                    s.add(Notification(
+                        kind="info",
+                        title=f"Swept {removed} leftover artifact{'' if removed == 1 else 's'} after scan",
+                        body=("Moved to trash" if trash_root else "Deleted") + " from your library folders.",
+                    ))
+                    await s.commit()
+    except Exception as e:
+        print(f"_scan_worker_locked: artifact sweep hook failed (non-fatal): {e!r}")
+
 
 async def _reparse_worker(scan_id: int) -> None:
     """In-place re-parse of the EXISTING library.

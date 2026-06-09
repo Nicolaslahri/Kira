@@ -778,6 +778,9 @@ export default function App() {
       // failure (source moved, dest missing), the next call would phantom-
       // rename and silently double-record.
       try {
+        // Kick the activity pill so the rename progress bar shows up immediately
+        // — the backend emits begin/progress for the batch on /activity.
+        try { window.dispatchEvent(new Event('kira:activity-refresh')); } catch { /* no window */ }
         const res = await api.rename({ file_ids: backendIds, profile: savedProfile, op: savedOp });
         const rows = await api.listFiles({ limit: 1000 });
         bumpFilesGen(); setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
@@ -1017,6 +1020,8 @@ export default function App() {
       return;
     }
     try {
+      // Kick the activity pill so the rename progress bar appears immediately.
+      try { window.dispatchEvent(new Event('kira:activity-refresh')); } catch { /* no window */ }
       const res = await api.rename({ file_ids: backendIds, profile: opts.profile, op: opts.op });
       // Refresh from backend — files that moved have new paths + 'renamed' status.
       const rows = await api.listFiles({ limit: 1000 });

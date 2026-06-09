@@ -266,6 +266,13 @@ def _safe(part: str) -> str:
     # source already had a space after the colon ("Mission: Impossible"
     # becomes "Mission -  Impossible" → "Mission - Impossible").
     part = re.sub(r"\s{2,}", " ", part)
+    # Drop empty optional-token residue. A template like "{{n}} ({{y}})" with no
+    # year leaves "Title ()"; "[{{rg}}]" with no release group leaves "Title []"
+    # or "Title [_]" (the blank-token placeholder). Strip any bracket/paren/brace
+    # group containing only whitespace and/or "_" placeholders, plus the space
+    # before it, so missing metadata never litters names with "()" / "[_]".
+    part = re.sub(r"\s*(\([\s_]*\)|\[[\s_]*\]|\{[\s_]*\})", "", part)
+    part = re.sub(r"\s{2,}", " ", part)
     out = _INVALID_FS.sub("", part).strip()
     out = out.rstrip(". ")
     if not out:

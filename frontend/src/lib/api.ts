@@ -647,6 +647,13 @@ export const api = {
       items: { file_id: number; ok: boolean; old_path: string | null; new_path: string | null; error: string | null }[];
     }>('/rename', { method: 'POST', body: JSON.stringify(body) }),
 
+  // Sweep (or, with dry_run, preview) leftover media-server artifacts across the
+  // managed library roots. dry_run=true never deletes — it returns what WOULD go.
+  cleanupArtifacts: (dryRun: boolean) =>
+    request<{ removed: number; items: string[]; dry_run: boolean; trashed: boolean; roots: string[] }>(
+      '/cleanup/artifacts', { method: 'POST', body: JSON.stringify({ dry_run: dryRun }) },
+    ),
+
   listHistory: (params?: { period?: 'today' | 'week' | 'all'; operation?: string }) => {
     const q = new URLSearchParams();
     if (params?.period) q.set('period', params.period);

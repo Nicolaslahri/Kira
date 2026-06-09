@@ -311,3 +311,18 @@ def test_file_size_tokens() -> None:
 def test_filter_acronym() -> None:
     assert apply_template("{{ n | acronym }}", {"n": "The Lord of the Rings"}) == "TLOTR"
     assert apply_template("{{ n | acronym }}", {"n": "Breaking Bad"}) == "BB"
+
+
+def test_safe_strips_empty_optional_token_residue() -> None:
+    # Missing optional tokens leave empty bracket/paren groups in the rendered
+    # name ("{{n}} ({{y}})" with no year -> "Title ()"; "[{{rg}}]" with no group
+    # -> "Title []" or the "[_]" blank placeholder). _safe must scrub them.
+    from kira.renamer.templates import _safe
+    assert _safe("Bleach - Thousand-Year Blood War ()") == "Bleach - Thousand-Year Blood War"
+    assert _safe("Show - S01E01 - Title [_].mkv") == "Show - S01E01 - Title.mkv"
+    assert _safe("Show - S01E01 - Title [].mkv") == "Show - S01E01 - Title.mkv"
+    assert _safe("Movie {}") == "Movie"
+    # Non-empty groups are preserved.
+    assert _safe("Movie (2022)") == "Movie (2022)"
+    assert _safe("Show - S01E01 [1080p].mkv") == "Show - S01E01 [1080p].mkv"
+    assert _safe("Show [EMBER].mkv") == "Show [EMBER].mkv"

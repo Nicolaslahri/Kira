@@ -1060,12 +1060,23 @@ export function CoverPopup({
   // Flush on unmount so a click + immediate close doesn't lose the rename.
   useEffect(() => () => flushPendingRename(), [flushPendingRename]);
 
-  const updateFile = useCallback((idx: number, patch: Partial<LibFile>) => {
+  // Status-only patch: updates the item via `onUpdateItem` (which the
+  // parent turns into a status PATCH) WITHOUT arming the per-row rename
+  // debounce. The "act now" paths (hero / card / bulk) use this so they
+  // can flip status and then fire ONE direct `renameFilesDirectly` —
+  // routing through `updateFile` instead would secretly queue the same
+  // id, producing a redundant second rename when the debounce flushes
+  // (e.g. on unmount). See the movie hero branch below.
+  const applyFilePatch = useCallback((idx: number, patch: Partial<LibFile>) => {
     const next: LibraryItem = {
       ...item,
       files: item.files.map((f, i) => i === idx ? { ...f, ...patch } : f),
     };
     onUpdateItem(next);
+  }, [item, onUpdateItem]);
+
+  const updateFile = useCallback((idx: number, patch: Partial<LibFile>) => {
+    applyFilePatch(idx, patch);
     // When the per-row approve check is clicked (status flipped to
     // 'approved'), queue the file for rename — debounced so multiple
     // approves in quick succession fire ONE batched rename instead of
@@ -1080,7 +1091,7 @@ export function CoverPopup({
         renameTimerRef.current = setTimeout(flushPendingRename, 400);
       }
     }
-  }, [item, onUpdateItem, renameFilesDirectly, flushPendingRename]);
+  }, [item, applyFilePatch, renameFilesDirectly, flushPendingRename]);
 
   return (
     <div
@@ -1752,8 +1763,14 @@ export function CoverPopup({
                       renameTimerRef.current = null;
                     }
                     pendingRenameRef.current = new Set();
+                    // Flip status WITHOUT arming the per-row debounce
+                    // (applyFilePatch / handleApproveAll are status-only).
+                    // The single direct `renameFilesDirectly` below is the
+                    // one and only rename — going through `updateFile` here
+                    // would also queue id 0 and flush a duplicate rename on
+                    // close/unmount.
                     if (item.kind === 'movie') {
-                      if (item.files[0]?.status !== 'approved') updateFile(0, { status: 'approved' });
+                      if (item.files[0]?.status !== 'approved') applyFilePatch(0, { status: 'approved' });
                     } else {
                       handleApproveAll();
                     }

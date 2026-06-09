@@ -132,6 +132,53 @@ async def test_re_submitting_same_rename_is_noop_no_duplicate_history(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_anime_cours_unify_under_one_show_with_per_cour_seasons(tmp_path, monkeypatch):
+    # AniDB splits a franchise into per-cour AIDs with distinct titles; without
+    # unification each lands in its own folder (the Bleach TYBW report). With a
+    # shared series_group_id they collapse to the EARLIEST member's title, and in
+    # seasonal mode each cour becomes its own season so the (overlapping) episodes
+    # don't collide.
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    media = tmp_path / "anime" / "Bleach" / "Season 17"
+    media.mkdir(parents=True)
+    cours = [
+        (15449, "Bleach: Thousand-Year Blood War"),
+        (17765, "Bleach: Thousand-Year Blood War - The Separation"),
+        (18220, "Bleach: Thousand-Year Blood War - The Conflict"),
+    ]
+    ids = []
+    async with sm() as s:
+        for aid, title in cours:
+            pd = {"original_filename": f"{title} - 01.mkv", "media_type": "anime",
+                  "title": "Bleach", "season": 17, "episode": 1}
+            src = media / f"bleach {aid} e01.mkv"
+            src.write_bytes(b"v")
+            mf = MediaFile(file_path=str(src), parsed_data=pd, media_type="anime", status="matched")
+            s.add(mf)
+            await s.flush()
+            s.add(Match(media_file_id=mf.id, provider="anidb", provider_id=str(aid),
+                        match_type="tv_episode", series_group_id="anidb:2369", confidence=0.95,
+                        title=title, season_number=17, episode_number=1,
+                        is_selected=True, is_manual=False))
+            ids.append(mf.id)
+        await s.commit()
+
+    res = await _run(sm, RenameRequest(file_ids=ids, profile="Plex", op="move", dry_run=True))
+    paths = {i.file_id: i.new_path for i in res.items}
+
+    # One unified show folder, the earliest cour's title (":" is filesystem-sanitized
+    # to " - ") — and crucially NEVER the per-cour suffixes (proves they collapsed
+    # to the base title rather than each keeping its own folder).
+    for p in paths.values():
+        assert "Bleach - Thousand-Year Blood War" in p
+        assert "The Separation" not in p and "The Conflict" not in p
+    # Each cour gets its own sequential season (by AID order) → no episode collision.
+    assert "Season 01" in paths[ids[0]]
+    assert "Season 02" in paths[ids[1]]
+    assert "Season 03" in paths[ids[2]]
+
+
+@pytest.mark.asyncio
 async def test_copy_keeps_source_and_records_history(tmp_path, monkeypatch):
     sm, fid, src, srt = await _setup(tmp_path, monkeypatch)
 

@@ -378,16 +378,24 @@ async def _resolve_rename_mode(session: AsyncSession) -> str:
 async def _resolve_cleanup_empty_dirs(session: AsyncSession) -> bool:
     """Setting toggle: clean up empty source folders after a Move?
 
-    SAFETY: default is now FALSE. The previous default-on caused real
-    user pain — the walker rmdir'd up to 6 levels of empty ancestors,
-    which on a heavily-renamed library could wipe Show/Season/Type
-    folders the user expected to keep. Users must explicitly opt in
-    via Settings → Folder cleanup → "Remove empty folders after Move".
+    Default TRUE — and CRUCIALLY this now matches the Settings UI, which has always
+    shown "Remove empty folders after Move" as ON by default. The previous backend
+    default of FALSE silently disagreed with that toggle, so a user who renamed a
+    relocating batch (e.g. anime cours moving from `Bleach/Season 17/` to
+    `Bleach - Thousand-Year Blood War/Season 0X/`) saw the cleanup toggle ON yet
+    found the emptied source folders left behind — and was never prompted.
+
+    Safe to default on now: the original default-off was a reaction to the walker
+    rmdir'ing up to 6 levels of ancestors (wiping folders users wanted to keep) and
+    deleting artifacts from folders that ultimately survived. Both were fixed — the
+    walk is depth-capped per media type (movie 1 / tv+anime 2) and computes
+    removability FIRST, so it only ever touches a folder that is empty or entirely
+    media-server artifacts and is about to be removed. Users can still opt OUT.
     """
     from kira.models import Setting
     row = await session.get(Setting, "rename.cleanup_empty_source_dirs")
     if not row:
-        return False  # safety default
+        return True  # matches the UI's default-ON toggle
     val = row.value
     if isinstance(val, bool):
         return val
@@ -395,7 +403,7 @@ async def _resolve_cleanup_empty_dirs(session: AsyncSession) -> bool:
         v = val.get("value")
         if isinstance(v, bool):
             return v
-    return False
+    return True
 
 
 async def _resolve_cleanup_artifacts(session: AsyncSession) -> bool:
@@ -876,6 +884,33 @@ async def rename(
     return await perform_rename(payload, session)
 
 
+async def _anime_group_members(session: AsyncSession, group_id: str) -> list[tuple[int, str]]:
+    """All AniDB cours of a franchise group that are present (selected) in the
+    library, as ``(aid, title)`` sorted by AID ascending (≈ air order).
+
+    Read straight from the Match rows — reliable, unlike the in-memory AniDB title
+    dump the old collapse relied on (it's often unloaded at rename time, silently
+    no-opping and leaving every cour in its own folder). Drives BOTH the show-folder
+    unification (use the earliest-present cour's title) and seasonal cour-numbering
+    (each cour → its rank as a season)."""
+    rows = list(await session.scalars(
+        select(Match).where(
+            Match.series_group_id == group_id,
+            Match.provider == "anidb",
+            Match.is_selected.is_(True),
+        )
+    ))
+    seen: dict[int, str] = {}
+    for m in rows:
+        try:
+            aid = int(m.provider_id)
+        except (TypeError, ValueError):
+            continue
+        if aid not in seen and (m.title or "").strip():
+            seen[aid] = m.title
+    return sorted(seen.items())
+
+
 async def _discard_intent(session: AsyncSession, intent: RenameIntent | None) -> None:
     """Best-effort removal of a write-ahead intent whose move did NOT complete
     (#4). Committed on its own so it can't be undone by a later per-file rollback."""
@@ -1086,43 +1121,45 @@ async def perform_rename(
             return
         library_title = selected.title or parsed.title
         library_year = selected.year if selected.year is not None else parsed.year
+        season_override_val = selected.season_number
 
-        # Fix #3: AniDB franchise collapse. AniDB treats every sequel
-        # season as a separate AID with its own display title — Frieren
-        # S1 = AID 17617 ("Frieren: Beyond Journey's End"), S2 = AID 18886
-        # ("Sousou no Frieren (2026)"), S3 = AID 19977 ("Sousou no Frieren
-        # (2027)"). Without this collapse, each season produces a
-        # DIFFERENT show-folder name on disk and the user ends up with 3+
-        # folders for the same franchise. We use Match.series_group_id
-        # (the canonical-AID identity that's already computed at scan
-        # time, `anidb:<lowest_aid>` for the franchise) to look up the
-        # franchise root's title — the S1 title that all sequels collapse
-        # under. Pure in-memory; zero HTTP; safe during AniDB bans.
+        # AniDB franchise grouping. AniDB gives every cour/season its own AID +
+        # title, so without unification each lands in its OWN show folder — the user
+        # ends up with 3 "Bleach: Thousand-Year Blood War …" folders instead of one
+        # show with seasons. All cours of a franchise share Match.series_group_id
+        # (`anidb:<canonical_aid>`), so we unify the show folder to the title of the
+        # EARLIEST member PRESENT in the library (lowest AID) — read from the Match
+        # rows (reliable), NOT the in-memory AniDB title dump the old collapse used
+        # (it's often unloaded at rename time → returned None → silently no-op →
+        # fragmentation). For TYBW that's "Bleach: Thousand-Year Blood War"; for AoT,
+        # "Attack on Titan".
         #
-        # CRITICAL: SKIP THIS WHEN selected.is_manual IS TRUE. The user
-        # explicitly chose this show via Re-identify; their pick MUST
-        # win. Pre-fix bug: user picked "Bleach: Thousand Year Blood War"
-        # (AID 15449), but the canonical AID for the Bleach franchise is
-        # the original 2004 show (AID 269 — way lower number). The collapse
-        # lookup returned "Bleach", overwriting the user's pick. Resulting
-        # folder: "Z:/anime/Bleach/" instead of "Z:/anime/Bleach: Thousand
-        # Year Blood War/" as the popup promised. Now: manual pins bypass
-        # the collapse and the chosen title flows through verbatim.
+        # SKIP for manual pins — the user's explicit Re-identify choice wins verbatim.
         if (
             selected.provider == "anidb"
             and selected.series_group_id
             and not selected.is_manual
+            and parsed.media_type == "anime"
         ):
-            try:
-                # series_group_id format: "anidb:<canonical_aid>"
-                root_aid_str = selected.series_group_id.split(":", 1)[-1]
-                root_aid = int(root_aid_str)
-                from kira.providers.anidb import AniDBProvider
-                root_title = AniDBProvider._pick_display_title(root_aid)
-                if root_title:
-                    library_title = root_title
-            except (ValueError, AttributeError):
-                pass  # series_group_id wasn't well-formed; keep original title
+            members = await _anime_group_members(session, selected.series_group_id)
+            if members:
+                if members[0][1]:
+                    library_title = members[0][1]
+                # Seasonal numbering: cours each restart at episode 1, so several
+                # sharing one TVDB season (Bleach TYBW = all season 17) would COLLIDE
+                # once unified into one folder. Give each cour its own sequential
+                # season (by AID/air order) so episodes don't clash. Absolute
+                # numbering instead flattens to franchise-absolute episode numbers
+                # (handled just below), so the season is left alone there. Only for
+                # genuine multi-cour groups (>1 member present).
+                if anime_numbering != "absolute" and len(members) > 1:
+                    try:
+                        aid = int(selected.provider_id)
+                        rank = next((i for i, (a, _t) in enumerate(members) if a == aid), None)
+                        if rank is not None:
+                            season_override_val = rank + 1
+                    except (TypeError, ValueError):
+                        pass
 
         # Locally-named anime → franchise-absolute number for {{absx}}. The file
         # was named per-cour-local (e.g. "S4E01") so parsed.absolute_episode is
@@ -1161,7 +1198,7 @@ async def perform_rename(
                     library_title=library_title,
                     library_year=library_year,
                     episode_title=selected.episode_title,
-                    season_override=selected.season_number,
+                    season_override=season_override_val,
                 )
             except Exception as e:
                 # The in-place root computation ALSO renders the naming template.
@@ -1193,7 +1230,7 @@ async def perform_rename(
                 library_title=library_title,
                 library_year=library_year,
                 episode_title=selected.episode_title,
-                season_override=selected.season_number,
+                season_override=season_override_val,
                 type_target_root=type_target_root,
                 metadata=_meta,
                 file_size=f.file_size,
@@ -1626,15 +1663,29 @@ async def perform_rename(
             error=sidecar_msg,
         ))
 
-    for fid in payload.file_ids:
-        f = by_id.get(fid)
-        if f is None:
-            results.append(RenameItemResult(file_id=fid, ok=False, error="File not found"))
-            continue
-        if not f.parsed_data:
-            results.append(RenameItemResult(file_id=fid, ok=False, error="File not parsed"))
-            continue
-        await _rename_one_file(f, fid)
+    # Surface rename progress on the activity pill (a season's worth of files +
+    # artwork/subtitle fetches takes real time — the user needs feedback). Only
+    # for a real run; a dry-run preview is instant. Best-effort: the import +
+    # begin/progress/end never affect the rename outcome.
+    _track = (not payload.dry_run) and bool(payload.file_ids)
+    if _track:
+        from kira import activity
+        n = len(payload.file_ids)
+        activity.begin("rename", f"Renaming {n} file{'' if n == 1 else 's'}", total=n)
+    try:
+        for fid in payload.file_ids:
+            f = by_id.get(fid)
+            if f is None:
+                results.append(RenameItemResult(file_id=fid, ok=False, error="File not found"))
+            elif not f.parsed_data:
+                results.append(RenameItemResult(file_id=fid, ok=False, error="File not parsed"))
+            else:
+                await _rename_one_file(f, fid)
+            if _track:
+                activity.progress("rename", len(results))
+    finally:
+        if _track:
+            activity.end("rename")
 
     if not payload.dry_run:
         succeeded = sum(1 for r in results if r.ok)

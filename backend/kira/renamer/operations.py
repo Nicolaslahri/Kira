@@ -859,3 +859,90 @@ def _same_inode(a: Path, b: Path) -> bool:
         return a.stat().st_ino == b.stat().st_ino and a.stat().st_dev == b.stat().st_dev
     except OSError:
         return False
+
+
+def sweep_artifacts(
+    roots: list[str],
+    *,
+    dry_run: bool = False,
+    trash_root: Path | None = None,
+    sample_cap: int = 200,
+) -> tuple[int, list[str]]:
+    """Standalone library-wide media-server artifact sweep.
+
+    UNLIKE the move-time cleanup (`_cleanup_empty_source_parents`, which only
+    removes a folder that has become entirely artifacts after a move), this strips
+    artifact FILES out of folders that still hold media — so the leftover
+    `<episode>-thumb.jpg` / `poster.jpg` / `.tbn` / `extrathumbs/` your media
+    server sprinkled in stays gone while your renamed videos are untouched.
+
+    Allow-list ONLY: a file is removed solely when `_is_artifact_file` recognizes
+    it, a directory solely when `_is_artifact_dir` does. Videos, subtitles, and any
+    file/dir Kira doesn't positively classify as a server artifact are never
+    touched. Walks each root recursively; artifact dirs are removed whole and not
+    descended into. `dry_run=True` reports what WOULD go without deleting.
+    `trash_root` (when set) moves items to a recoverable trash instead of deleting.
+
+    Containment: callers pass the configured library roots, and os.walk stays
+    within them. Best-effort per item (never raises). Returns ``(count, sample)``
+    where `sample` is capped at `sample_cap` absolute paths for display.
+    """
+    removed = 0
+    sample: list[str] = []
+
+    def _record(p: Path) -> None:
+        nonlocal removed
+        removed += 1
+        if len(sample) < sample_cap:
+            sample.append(str(p))
+
+    for root in roots:
+        if not root:
+            continue
+        rp = Path(root)
+        try:
+            if not rp.is_dir():
+                continue
+        except OSError:
+            continue
+        for dirpath, dirnames, filenames in os.walk(rp):
+            # Artifact directories: remove whole, and prune from the descent so we
+            # don't waste time walking a tree we're about to delete.
+            keep: list[str] = []
+            for d in dirnames:
+                if not _is_artifact_dir(d):
+                    keep.append(d)
+                    continue
+                full = Path(dirpath) / d
+                if dry_run:
+                    _record(full)
+                    continue
+                try:
+                    if trash_root is not None:
+                        if _move_to_trash(full, trash_root):
+                            _record(full)
+                    else:
+                        shutil.rmtree(str(full), ignore_errors=True)
+                        if not full.exists():
+                            _record(full)
+                except OSError:
+                    pass
+            dirnames[:] = keep
+            # Artifact files.
+            for fn in filenames:
+                if not _is_artifact_file(fn):
+                    continue
+                full = Path(dirpath) / fn
+                if dry_run:
+                    _record(full)
+                    continue
+                try:
+                    if trash_root is not None:
+                        if _move_to_trash(full, trash_root):
+                            _record(full)
+                    else:
+                        full.unlink()
+                        _record(full)
+                except OSError:
+                    pass
+    return removed, sample

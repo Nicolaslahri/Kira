@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, Response
 # override below.
 from kira import net as _net  # noqa: F401  (import side-effect: net.install())
 
+from kira.api import cleanup as cleanup_api
 from kira.api import files as files_api
 from kira.api import health as health_api
 from kira.api import history as history_api
@@ -310,6 +311,7 @@ app.include_router(series_api.router, prefix="/api/v1")
 app.include_router(settings_api.router, prefix="/api/v1")
 app.include_router(rename_api.router, prefix="/api/v1")
 app.include_router(history_api.router, prefix="/api/v1")
+app.include_router(cleanup_api.router, prefix="/api/v1")
 app.include_router(system_api.router, prefix="/api/v1")
 app.include_router(system_api.notif_router, prefix="/api/v1")
 app.include_router(providers_api.router, prefix="/api/v1")

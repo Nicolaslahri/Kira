@@ -365,6 +365,48 @@ async def sweep_superseded_assets(
     return removed
 
 
+async def _cleanup_undo_vacated_folders(session: AsyncSession, entry: RenameHistory) -> int:
+    """After undo moves a video back, the destination Show/Season folders Kira
+    created for the rename are left behind — empty, or holding only show-level
+    artifacts (`tvshow.nfo`, `poster.jpg`) and the now-emptied season folder. Walk
+    UP from the vacated `new_path` and remove folders that are empty or ENTIRELY
+    media-server artifacts (allow-list only — a folder with any real content stops
+    the walk), bounded by the managed library root, honoring the trash setting.
+
+    Reuses the move-time `_cleanup_empty_source_parents` walker, just pointed at the
+    undo-vacated destination instead of a move source. Best-effort; never raises."""
+    try:
+        from pathlib import Path as _P
+        from kira.api.cleanup import _resolve_trash_root
+        from kira.api.files import _managed_roots
+        from kira.api.webhooks import _norm
+        from kira.renamer.operations import _cleanup_empty_source_parents
+
+        roots = await _managed_roots(session)
+        vacated = _P(entry.new_path).parent
+        # Find the managed root that contains the vacated path — the stop boundary
+        # so the walk can never rmdir the library root itself or anything above it.
+        np = _norm(str(vacated))
+        stop_at: _P | None = None
+        for r in roots:
+            if not r:
+                continue
+            rn = _norm(r)
+            if np == rn or np.startswith(rn + "/"):
+                stop_at = _P(r)
+                break
+        if stop_at is None:
+            return 0  # vacated path isn't under a managed root → don't touch it
+        trash_root = await _resolve_trash_root(session, roots)
+        return await asyncio.to_thread(
+            _cleanup_empty_source_parents, vacated, stop_at, 3,
+            sweep_artifacts=True, trash_root=trash_root,
+        )
+    except Exception as e:
+        print(f"_cleanup_undo_vacated_folders: {e!r} (non-fatal)")
+        return 0
+
+
 @router.post("/{entry_id}/undo", response_model=HistoryOut)
 async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)) -> RenameHistory:
     entry = await session.get(RenameHistory, entry_id)
@@ -403,9 +445,12 @@ async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)
     # (the rename→undo→rename pile-up). Primary video rows only — sidecar
     # children (subtitles) carry no artwork.
     assets_removed = 0
+    folders_removed = 0
     if entry.parent_id is None:
         from kira.api.files import _managed_roots
         assets_removed = await _cleanup_entry_assets(entry, await _managed_roots(session))
+        # Remove the now-empty Show/Season folders Kira created for this rename.
+        folders_removed = await _cleanup_undo_vacated_folders(session, entry)
     body = f"Restored to {entry.old_path}"
     if sub_ok:
         body += f" (+ {sub_ok} sidecar{'s' if sub_ok != 1 else ''})"
@@ -413,6 +458,8 @@ async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)
         body += f"; {sub_failed} sidecar{'s' if sub_failed != 1 else ''} failed to restore"
     if assets_removed:
         body += f"; removed {assets_removed} artwork/NFO file{'s' if assets_removed != 1 else ''}"
+    if folders_removed:
+        body += f"; cleaned {folders_removed} leftover folder/artifact{'s' if folders_removed != 1 else ''}"
     session.add(Notification(
         kind="info",
         title=f"Undone: {entry.title or Path(entry.old_path).name}",
@@ -469,9 +516,11 @@ async def undo_bulk(
             ok_subs, failed_subs = await _undo_sidecar_children(session, entry)
             sidecar_succeeded += ok_subs
             sidecar_failed += failed_subs
-            # Clean the artwork/NFO this rename wrote (primary video rows only).
+            # Clean the artwork/NFO this rename wrote (primary video rows only) +
+            # the now-empty Show/Season folders Kira created for it.
             if entry.parent_id is None:
                 assets_removed += await _cleanup_entry_assets(entry, bulk_roots)
+                await _cleanup_undo_vacated_folders(session, entry)
         except Exception:
             failed += 1
     await session.commit()

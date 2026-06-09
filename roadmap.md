@@ -1366,6 +1366,118 @@ still pass (case-only renames proceed).
 
 ---
 
+## Feature — library-wide artifact sweep (post-organize media-server junk) ✅ Shipped
+
+User found a `Bleach/Season 17/` folder full of `<episode>-thumb.jpg` files Jellyfin/Plex
+generated AFTER Kira organized the library, with no way to clear them. Root cause: the
+existing folder cleanup (`_cleanup_empty_source_parents`) only fires after a **Move** and
+only removes folders that become **entirely artifacts/empty** — it never strips artifacts
+OUT of a folder that still holds videos, and media servers keep dropping new ones in long
+after the rename. So there was no mechanism to clean a populated, already-organized folder.
+
+New `operations.sweep_artifacts(roots, *, dry_run, trash_root)` — walks the managed roots
+and removes media-server artifacts (`<stem>-thumb.jpg`, `poster.jpg`, `.tbn`, `.actors/`,
+season art, …) from folders that still contain media, leaving the videos. **Allow-list
+ONLY** (reuses `_is_artifact_file`/`_is_artifact_dir`): videos, subtitles, and anything
+Kira doesn't positively classify as a server artifact are never touched; artifact dirs are
+removed whole and not descended into; honors the recoverable-trash setting.
+
+Surfaced two ways (user picked "both" + full allow-list):
+- **On-demand**: `POST /api/v1/cleanup/artifacts` (`api/cleanup.py`) — `dry_run` defaults
+  TRUE (preview). Settings → Folder cleanup gains a "Find leftover artifacts" button that
+  previews the count + a sample, then a destructive "Delete/Move N" confirm.
+- **On-scan (opt-in)**: `cleanup.sweep_artifacts_on_scan` (default OFF) — `_scan_worker_locked`
+  runs the sweep after each scan + auto-rename settles, best-effort, with a notification.
+
+Safety: preview-before-delete, allow-list only, recoverable-trash option, scoped to managed
+roots (`_managed_roots`), blocking walk offloaded to a thread. Tests `tests/test_sweep_artifacts.py`
+(5): removes artifacts / keeps media+subs+user files; dry-run deletes nothing; trash mode
+moves not deletes; only walks given roots; endpoint preview-then-delete via dependency override.
+`tsc` + `vite build` clean.
+
+---
+
+## Fix — undo cleans up the folders it created + anime cours unify into one show ✅ Shipped (backend)
+
+Two coupled real-library reports after undoing/renaming Bleach TYBW.
+
+**A. Undo left empty Show/Season folders + show-level files.** Undo reverted the video
+(+ tracked artwork/NFO) but never removed the destination folders Kira created, leaving
+`Bleach - Thousand-Year Blood War/…` shells with `tvshow.nfo`/`poster.jpg` inside. New
+`_cleanup_undo_vacated_folders` (history.py) walks UP from the vacated `new_path` and
+removes folders that are empty or ENTIRELY media-server artifacts (reusing the move-time
+`_cleanup_empty_source_parents` walker), bounded by the managed root, honoring trash. A
+folder that still holds media stops the walk. Wired into `undo_entry` + `undo_bulk`. Tests
+`tests/test_undo_folder_cleanup.py` (3): removes empty show+season; keeps a show whose
+sibling season still has media; never touches outside a managed root.
+
+**B. AniDB cours fragmented into separate shows on disk.** AniDB gives each cour its own
+AID + title, so renaming Bleach TYBW produced THREE folders (`…`, `… - The Separation`,
+`… - The Conflict`) — even though the Review page groups them via `series_group_id`. Root
+cause: the rename's collapse called `AniDBProvider._pick_display_title(group_root)`, which
+needs the in-memory AniDB title dump loaded — at rename time it isn't, so it returned None
+and the collapse silently no-opped, leaving each cour its own title. (Confirmed None for all
+the user's AIDs.)
+
+Fix (`_rename_one_file` + new `_anime_group_members`): unify the show folder to the title of
+the EARLIEST member PRESENT in the library (lowest AID), read from the Match rows already in
+the DB — reliable, no dump. For TYBW → "Bleach: Thousand-Year Blood War"; for AoT → "Attack
+on Titan". Layout inside follows the user's `naming.anime_numbering`:
+- **seasonal** (default): each cour → its own sequential season (by AID/air order), so the
+  cours' overlapping per-cour episode numbers don't collide once unified (TYBW = S01/S02/S03);
+- **absolute**: the existing franchise-absolute machinery flattens to continuous episode
+  numbers under the one show; season left alone.
+
+Only for genuine multi-cour anidb groups (>1 member present); manual pins still win verbatim
+(and the new title source preserves a manual pick rather than overriding it to the franchise
+root, fixing the old "Bleach: TYBW → Bleach" footgun by construction). Test
+`test_anime_cours_unify_under_one_show_with_per_cour_seasons` (3 cours → one folder, S01/02/03,
+no per-cour suffix). Forward-looking: existing fragmented folders are cleaned by undoing then
+re-renaming (A cleans the shells, B unifies).
+
+---
+
+## Fix — folder-cleanup default: backend now matches the UI ✅ Shipped (backend)
+
+User renamed Bleach (cours relocated `Bleach/Season 17/` → `Bleach - Thousand-Year Blood War/
+Season 0X/`) and Euphoria (old season folders → `Euphoria (US)/Season N/`), but the emptied
+SOURCE folders were left behind and there was no prompt. Root cause: a UI↔backend default
+mismatch. The Settings toggle "Remove empty folders after Move" renders **ON** by default
+(`SettingsPage` `masterOn` → `return true`), but `_resolve_cleanup_empty_dirs` defaulted
+**FALSE** — so a user who never touched the setting SAW cleanup enabled yet the backend
+silently skipped it. Flipped the backend default to TRUE to match the UI.
+
+Safe to default on now (the reasons it was turned off are fixed): the walk is depth-capped
+per media type (movie 1 / tv+anime 2, not the old 6-level over-walk) and computes removability
+FIRST (#62), so it only ever removes a folder that is empty or entirely media-server artifacts
+and is about to go — any real content stops the walk. With the artifact sub-toggle also
+defaulting on, this clears both cases: Euphoria's empty old season folders and Bleach's
+Season 17 (left holding only Jellyfin `-thumb.jpg` after the cours relocated). Users can still
+opt out. Full suite green.
+
+---
+
+## Fix — empty optional-token residue + rename progress feedback ✅ Shipped
+
+**Empty "()" / "[_]" in names.** With the unified anime title above, the Jellyfin profile
+(whose template is `{{n}} ({{y}})`) rendered "Bleach - Thousand-Year Blood War ()" because
+AniDB gives the cour no year — and empty release-group brackets render "[_]" (the blank-token
+placeholder). Fix in `_safe` (templates.py): strip any bracket/paren/brace group containing
+only whitespace and/or `_` placeholders (plus the preceding space), then re-collapse spaces.
+General — fixes every profile/template (year, rg, quality, …) where an optional token is
+missing. Test `test_safe_strips_empty_optional_token_residue` (strips `()`/`[]`/`[_]`/`{}`,
+preserves `(2022)`/`[1080p]`/`[EMBER]`).
+
+**Rename progress.** A season's worth of files (+ artwork/subtitle fetches) takes real time
+with no feedback. `perform_rename` now drives the existing activity surface — `activity.begin/
+progress/end("rename", …)` around the dispatcher loop (real runs only; dry-run is instant) —
+so the bottom-left pill shows "Renaming N files" with a live count. The two frontend rename
+call sites fire `kira:activity-refresh` on start so the pill appears immediately rather than
+waiting out the poll interval. Best-effort; never affects the rename outcome. `tsc` + `vite
+build` clean.
+
+---
+
 ## Where we are now + what's next
 
 **Done:** Passes 5, M, the FileBot stretch, 6, 7, the Pass-S hardening arc,
