@@ -1478,6 +1478,228 @@ build` clean.
 
 ---
 
+## Fix — anime cour numbering (TVDB seasons + episode offset), drop the global sweep ✅ Shipped
+
+Three coupled corrections after the cour-unification, on user direction.
+
+**1. Cour episode offset, not fake seasons.** The previous unification renumbered each cour
+to its own sequential season (AID rank) → AoT showed **7 seasons** instead of 4. Root mismatch:
+AniDB = 1 AID per *production cour*; TVDB/Jellyfin = 1 ID per *broadcast season* (AoT S3 = 2
+cours, S4 = 3). Kira's `season_number` already carries the correct TVDB season — so we KEEP it
+and instead offset each cour's AniDB-local episode by the cumulative OFFICIAL episode count of
+the prior cours in that season (continuous numbering). The offset comes from the existing
+`build_cour_routing_table` (Fribb + AniDB official per-AID counts — STATIC, never disk-state, so
+a partial/out-of-order download can't corrupt it). Result: AoT = 4 seasons (S3 E1-22, S4 E1-30),
+Bleach = Season 17 continuous. Render-only mutation of `parsed.episode`. Tests: TVDB season kept
+(no rank renumber) + offset applied (mocked routing table).
+
+**2. Dropped the library-wide artifact sweep → time-of-vacancy GC.** The global sweep was the
+wrong tool: it deleted artwork for CURRENT correctly-named files (Jellyfin just regenerates →
+churn) and walked into its own `.kira-trash`, re-trashing already-trashed files (the 1427-item
+preview). Removed it entirely — the endpoint (`api/cleanup.py` slimmed to just the trash-target
+helper), the per-scan auto-sweep hook, `operations.sweep_artifacts`, the Settings UI + API call,
+and the tests. Cleanup now happens ONLY at the moment a folder becomes useless: the move-time
+`_cleanup_empty_source_parents` (default on) + undo cleanup remove a folder + its leftover
+artifacts exactly when the last media file leaves it.
+
+**3. Unmapped-cour season inheritance (the Calamity anomaly).** Bleach: TYBW "The Calamity"
+(AID 19079) matched to Season 1 — Fribb mapping rot (new AID not yet linked, fell back to the
+base franchise). `resolve_canonical_season` now, when `tvdb_season(aid)` is None, inherits the
+season of the nearest PREQUEL cour of the same TVDB series (`aids_by_tvdb` → highest AID below
+with a known season → S17) instead of defaulting to parsed/1. Only activates on the rot case;
+mapped AIDs unchanged. (Takes effect on re-scan/re-match.) Tests: prequel inheritance, unknown
+series → parsed fallback, non-AniDB untouched.
+
+---
+
+## Fix — unified-rename round-trip: synthetic seasons no longer kill matching ✅ Shipped
+
+After renaming Bleach to the unified show + DB reset + rescan, ALL 40 files went
+`no_match` at 0% ("can't match them properly") while AoT round-tripped fine. Traced with
+the live matcher + cascade traces, layer by layer:
+
+1. `search_tv("Bleach - Thousand-Year Blood War")` was PERFECT — all four cours returned,
+   the right one (15449) ranked first. Not a search problem.
+2. The cascade's **`fribb_authority` metric vetoed every correct cour**:
+   `fribb season 17 != parsed 1 (veto)` → final 0.000. The renamed folders say
+   "Season 01/02/03" (synthetic), Fribb says the cours are S17. The only cour with NO
+   Fribb entry (The Calamity, mapping rot) escaped the veto, won at 0.99 on title, then
+   failed downstream → the whole franchise no_match. AoT survived only because its parsed
+   title equals the AniDB main title and its folder seasons happen to be real TVDB seasons.
+
+Principle fixed: **a parsed season Fribb doesn't know for that series is a hint, not
+truth.** Two surgical changes:
+- `fribb_authority`: veto only when the parsed season is a REAL Fribb season of the
+  candidate's series (some sibling AID maps to it — the genuine "MHA S01 file vs S06
+  candidate" case). Otherwise abstain and let the exact-title metrics decide.
+- `build_cour_routing_table`: same test — when the parsed season is synthetic, build the
+  table against the candidate's own Fribb season instead of refusing, so continuous
+  episode numbers still route (synthetic "Season 02" E14 → cour 17765 local E1).
+
+Verified live against the real library: `S01E01` → 15449 @ 1.000; `S02E14` → 15449 @
+1.000 + routing table `[(1,13,15449,0),(14,26,17765,13),(27,40,18220,26)]`, E14 →
+(17765, 1). Tests `tests/test_synthetic_season_matching.py` (5): abstain-on-synthetic,
+veto-on-real-mismatch preserved, promotion unchanged, routing-from-synthetic, routing
+still refuses real mismatch. Existing cour-routing suites untouched.
+
+---
+
+## Feature — franchise rescue: episode-title + franchise-absolute pairing ✅ Shipped
+
+Follow-up report: AoT files an old build renamed as "Attack on Titan - S05E61 -
+Midnight Train" (synthetic season 5 + franchise-continuous E61) matched the SHOW but
+every episode paired as "orphaned · no matching episode". User: "there is name of
+episodes why do we not use that as well?" — right instinct. The bipartite title pass
+(Pass 5) already title-matches, but ONLY within the matched AID's own episode list;
+"Midnight Train" is a Final Season title, not in the S1 list the cluster matched.
+
+New `_franchise_rescue_unpaired` (scans.py), run in `_match_cluster` for AniDB-matched
+anime files every number pass left unpaired. Two static-metadata passes:
+- **Numeric** — `get_franchise_offsets` (official AniDB counts, cached, never disk
+  state) places a franchise-continuous number on its owning cour: E61 → Final Season
+  AID 14977 local E2. Gated on `ep > matched AID's own episode count` so a normal
+  cour-LOCAL number (Frieren S2E03) is never reinterpreted.
+- **Title** — the filename's `episode_title_guess` is trigram-matched (same ≥0.6
+  floor as Pass 5) across the sibling cours' episode lists, fetched once per sibling
+  via the ban-safe TVDB cross-ref, capped at 12 siblings. Rescues files whose numbers
+  are pure garbage — the user's ask.
+
+Rescued files flow through the SAME per-file routed-AID plumbing as cour routing
+(provider_id → owning cour, episode_number → cour-local, canonical season via Fribb,
+episode title from the sibling's list). Cour routing keeps priority — the rescue is
+consulted only when the same-season table didn't claim the file. One (aid, episode)
+slot can't be claimed twice. Best-effort; any failure degrades to the old orphan
+behavior. Tests `tests/test_franchise_rescue.py` (5): numeric placement, local-range
+gate, cross-cour title rescue, no-double-claim, no-provider noop.
+
+---
+
+## Fix — franchise rescue index correctness + confidence honesty ✅ Shipped
+
+User re-scanned AoT after the rescue landed and reported "wrong matches / no matches &
+wrong duplicates — at 100%". DB rows decomposed into three distinct defects:
+
+**1. Lumped-vs-local index bug in the rescue (real).** The episode fetch goes through
+the TVDB cross-ref, which returns ONE LUMPED list per TVDB season — the SAME 30-entry
+S4 list for every AoT Final Season cour. The rescue stored cour-LOCAL numbers but read
+titles at the lumped index: "S06E81 - Thaw" (Part 2 local E6 = lumped E22) stored as
+E6/"The War Hammer Titan". Fixed: compute each cour's in-season offset (its abs start −
+the season block's start, from the franchise offsets + Fribb seasons) and store the
+LUMPED index — which is exactly what the popup pairs against. The title pass now claims
+only within the owning cour's stretch of the shared list (else every cour "finds" every
+title). Verified live: E71→(14977,12,'Guides'), E76→(16177,17,'Judgment'),
+E81→(16177,22,'Thaw'), E88→(17303,29,'Final Chapters Special 1') — all title-consistent
+with the filenames.
+
+**2. "No matches" rows were STALE, not a new bug.** The E71-79 rows (aid 9541, raw
+S1E71+, no title) were written by the PRE-fix scan; a plain re-scan skips files already
+`matched`, so they survived untouched next to freshly-rescued neighbors. Heal: Re-identify
+the card (re-matches everything) — now places them correctly (verified).
+
+**3. Confidence honesty (the "how is this 100%?" rage).** Per-file confidence was the
+SHOW-level cascade score, displayed as "100%" even on rows whose episode pairing entirely
+failed — and dangerous around auto-approve. The write loop now caps the selected row at
+0.49 when an episode list existed yet NO pairing avenue succeeded (no bipartite pair, no
+cour routing, no rescue, no episode title). The file still matches the show; the row no
+longer claims episode certainty it doesn't have.
+
+Also: the "wrong duplicate" (S04E22 'The Other Side of the Wall' vs S06E81 'Thaw') is
+numerically the SAME episode (S4E22 ≡ abs 81 ≡ 'Thaw') — a REAL duplicate whose labels
+were garbled by defect 1; with consistent lumped indexing the labels now agree.
+
+Tests `tests/test_franchise_rescue.py` (6): first-cour lumped==local, later-cour lumped
+regression (the Thaw case), local-range gate, owning-stretch title claim, no-double-claim,
+no-provider noop.
+
+---
+
+## Fix — title arbitration + the local/lumped episode-index convention ✅ Shipped
+
+Post-reset rescan surfaced the next layer: FALSE duplicates ("S04E13 - The Town Where
+Everything Began" flagged as a dupe of the real S4E13) and popup orphans on rows the DB
+had CORRECT. Diagnosed from the stored rows + /series source:
+
+**1. Title arbitration — numbers lie, titles don't.** The user's `Season 04` folder
+actually holds SEASON 3 Part 2 files (titles prove it: "The Town Where Everything
+Began" = S3E13, "Thunder Spears", … "The Other Side of the Wall" = S3E22) wearing
+rank-hack `S04E13-22` numbers. The number passes believed the numbers, placed them on
+Final Season episodes at 1.0, and the REAL S4 files showed up as phantom duplicates.
+New arbitration pass in `_match_cluster`: any number-placed file whose own
+`episode_title_guess` CONTRADICTS the placed episode's title (trigram < 0.2) is
+re-arbitrated by the franchise-wide TITLE search (`_franchise_rescue_unpaired`
+`title_only=True` — the numeric pass is what's on trial); a strong (≥0.6) hit elsewhere
+overrides the number placement (beats assignment, routing, and the resolved title).
+No strong hit anywhere (romaji-vs-English lists) → the number stands, nothing degrades.
+Verified live: "S04E13 - The Town Where Everything Began" → (14444 = S3 Part 2,
+local E1, correct title). The false dupes dissolve.
+
+**2. The episode-number convention, settled definitively.** Two list shapes coexist:
+the scan side fetches via the TVDB cross-ref (ONE LUMPED list per TVDB season, shared
+by all its cours), while the POPUP prefers the ANIDB-NATIVE per-cour list (locals 1..N
+— the One Piece fix in /series). The rescue initially stored lumped numbers → popup
+paired en=23-28 against a native 1..12 list → "orphaned" rows that were correct in the
+DB. Rule now enforced everywhere: **store the cour-LOCAL number (what the popup pairs
+against); convert local → lumped ONLY when reading titles from cross-ref lists** (via
+the cour's in-season offset, derived from the franchise offsets + Fribb seasons).
+Applies to the rescue, the arbitration, and the cour-routing title fallback. Verified
+live: E76 → (16177, local 1, 'Judgment'), E81 → (16177, local 6, 'Thaw'),
+E88 → (17303, local 1, 'Final Chapters Special 1').
+
+Tests `tests/test_franchise_rescue.py` (7): local-en regression for later cours (the
+Thaw case), owning-stretch title claim returning locals, title_only skips the numeric
+pass and lets the title decide, plus the prior numeric/gate/claim/noop cases.
+
+---
+
+## Fix — rename trusts the MATCH's episode, not the filename's lying number ✅ Shipped
+
+Closing the loop on the arbitration work: rescued/arbitrated files carry an
+authoritative cour-local `Match.episode_number` ("S06E81 - Thaw" → 16177 local E6), but
+the seasonal render computed the output episode from `parsed.episode` + cour offset —
+which for those files is the OLD mangled number (81+16 → S04E97, garbage). The seasonal
+cour-offset block in `_rename_one_file` now bases the season-continuous output on
+`selected.episode_number` + the cour's table offset (6+16 → S04E22), falling back to the
+parsed number only when the match carries no episode. Absolute mode already preferred
+`selected.episode_number` (`_resolve_franchise_absolute`), so `{{absx}}` was correct.
+Round-trip is now stable: "S04E22 - Thaw" parses (4,22) → cour-routes to (16177, local 6)
+→ renders S04E22 again. Test
+`test_rename_uses_match_episode_not_lying_filename_number` (E81/en=6 → S04E22, never E97).
+
+---
+
+## Fix — "HDR10Plus" token poisoned title+year → sequels matched part 1 ✅ Shipped
+
+"Nobody.2.2025.2160p.HDR10Plus.DV.WEBRip…-PSA" matched **Nobody (2021)** at 60% instead
+of Nobody 2 (2025). Root cause chain: the HDR list had `HDR10+`/`HDR10` but not the
+spelled-out **HDR10Plus** (PSA et al. use it), and boundary discipline means `HDR10`
+can't partial-match inside it → fully unknown token → the END-ANCHORED bare-year rule
+(the Blade-Runner-2049 guard: a bare year only counts at the cleaned string's end)
+couldn't fire → `title='Nobody 2 2025 HDR10Plus'`, `year=None` → fuzzy title slightly
+preferred "Nobody", and no year to disambiguate the sequel.
+
+Fix: `HDR10Plus` added to the HDR token list (format_stripper curated fallback +
+release_tokens.json), ordered before `HDR10`. Verified live: parse →
+`title='Nobody 2', year=2025, hdr=HDR10Plus, quality=2160p`; match → **tmdb 'Nobody 2'
+(2025) at 1.000**. Regression test in test_format_stripper.py.
+
+Design note: the year-end-anchor + stripper-vocabulary contract means any unknown tech
+token can re-create this shape — when it happens, the fix is always "add the token";
+the structural alternative (accepting mid-string bare years) would break numbered
+titles and is deliberately rejected.
+
+**Same shape, next two tokens (HTTYD 2025):** "How.to.Train.Your.Dragon.2025.1080p.
+BluRay.AV1.DDP.5.1.Multi3-dAV1nci" → the 2025 remake won over the 2010 original by a
+coin flip (0.680 vs 0.680) because BOTH `DDP.5.1` (dotted channel form — the glued
+`DDP5.1` was known, the dotted one left "5 1" in the title) and `Multi3` (language-count
+flag, mixed case) were unknown → year=None. Fixes: channel suffixes are now dot-tolerant
+(`DDP\.?5\.1`, `DD\.?5\.1`, `AAC\.?2\.0`, …) and the MULTI flag accepts a count —
+scene-cased `MULTI\d*`/`MULTi\d*` plus mixed-case `Multi\d+` (digit REQUIRED so a real
+title word "Multi"/"Multiplicity" is never touched; flags stay case-sensitive by
+design). Verified: HTTYD parses title+2025 clean; Multiplicity (1996) survives.
+Regression tests in test_format_stripper.py.
+
+---
+
 ## Where we are now + what's next
 
 **Done:** Passes 5, M, the FileBot stretch, 6, 7, the Pass-S hardening arc,

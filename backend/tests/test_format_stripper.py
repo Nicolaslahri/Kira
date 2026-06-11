@@ -182,3 +182,32 @@ def test_max_title_not_eaten_as_platform() -> None:
     cleaned, tok = fs.strip("Max.2015.1080p.WEB-DL.mkv")
     assert tok.source == "WEB-DL"
     assert "Max" in cleaned
+
+
+def test_hdr10plus_spelled_out_does_not_poison_title_or_year():
+    # "HDR10Plus" (PSA et al.) wasn't in the HDR list, and boundary discipline
+    # means HDR10 can't partial-match inside it — the unknown token blocked the
+    # end-anchored bare-year detection and dragged "2025 HDR10Plus" into the
+    # title, so "Nobody 2" fuzzy-matched part 1 ("Nobody" 2021) instead of the
+    # sequel. The spelled-out token must strip like its symbol form.
+    from kira.parser import parse_filename
+    p = parse_filename(
+        "Nobody.2.2025.2160p.HDR10Plus.DV.WEBRip.DDP5.1.Atmos.X265.HEVC-PSA.mkv"
+    )
+    assert p.title == "Nobody 2"
+    assert p.year == 2025
+    assert p.hdr == "HDR10Plus"
+    assert p.quality == "2160p"
+
+
+def test_dotted_channel_suffix_and_multi_count_do_not_poison_year():
+    # "DDP.5.1" (dotted channels) left a bare "5 1" in the title, and "Multi3"
+    # (language-count flag, mixed case) was unknown — both blocked the
+    # end-anchored year and the 2025 remake nearly lost to the 2010 original.
+    from kira.parser import parse_filename
+    p = parse_filename("How.to.Train.Your.Dragon.2025.1080p.BluRay.AV1.DDP.5.1.Multi3-dAV1nci.mkv")
+    assert p.title == "How to Train Your Dragon"
+    assert p.year == 2025
+    # Mixed-case "Multi" strips ONLY with a digit — a real title word survives.
+    p2 = parse_filename("Multiplicity.1996.1080p.BluRay.mkv")
+    assert p2.title == "Multiplicity" and p2.year == 1996

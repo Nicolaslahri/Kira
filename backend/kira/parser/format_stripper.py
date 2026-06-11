@@ -76,14 +76,19 @@ _WXH_TO_P: dict[str, str] = {
     "640x480":   "480p",
 }
 
+# Channel suffixes are DOT-TOLERANT ("DDP\.?5\.1"): releases write both
+# "DDP5.1" and "DDP.5.1" — without the optional dot the codec matched but the
+# bare "5.1" leaked into the title, blocking the end-anchored year detection
+# ("How to Train Your Dragon 2025 5 1" → year=None → near-tie with the 2010
+# original).
 AUDIO = [
     "DTS-HD\\.MA", "DTS-HD\\.HRA", "DTS-HD", "DTSHD", "DTS-X", "DTS-ES", "DTS",
     "TrueHD\\.?Atmos", "TrueHD", "Atmos",
-    "DDPA", "DDP5\\.1", "DDP7\\.1", "DDP2\\.0", "DDP", "DD\\+",
-    "DD5\\.1", "DD7\\.1", "DD2\\.0", "DD",
+    "DDPA", "DDP\\.?5\\.1", "DDP\\.?7\\.1", "DDP\\.?2\\.0", "DDP", "DD\\+",
+    "DD\\.?5\\.1", "DD\\.?7\\.1", "DD\\.?2\\.0", "DD",
     "Dolby\\.?Digital\\.?Plus", "Dolby\\.?Digital",
     "AC3", "EAC3", "E-AC-3", "AC4",
-    "AAC2\\.0", "AAC5\\.1", "AAC-LC", "AAC", "FLAC", "ALAC",
+    "AAC\\.?2\\.0", "AAC\\.?5\\.1", "AAC-LC", "AAC", "FLAC", "ALAC",
     "LPCM", "PCM", "MP3", "MP2", "WMA", "OGG",
 ]
 
@@ -105,7 +110,12 @@ EDITIONS = [
     "Remastered", "IMAX", "Anniversary", "Criterion", "LIMITED",
 ]
 
-HDR = ["HDR10\\+", "HDR10", "HDR", "DoVi", "DV", "Dolby\\.?Vision", "HLG"]
+# Spelled-out "HDR10Plus" (PSA et al.) must be its own entry: boundary
+# discipline means HDR10 can't partial-match inside it, so without the long
+# form the token goes UNKNOWN — which blocks the end-anchored bare-year
+# detection and drags "2025 HDR10Plus" into the title ("Nobody 2" matched
+# part 1 because of exactly this).
+HDR = ["HDR10\\+", "HDR10Plus", "HDR10", "HDR", "DoVi", "DV", "Dolby\\.?Vision", "HLG"]
 
 # Bit depth — 10-bit encodes (Hi10P / x265 10-bit) are the gold standard
 # for anime because they kill the color banding 8-bit can't avoid in
@@ -121,7 +131,12 @@ BIT_DEPTH = ["10[\\.\\-]?bit", "Hi10P", "Hi10", "8[\\.\\-]?bit"]
 # ranker (a PROPER/REPACK beats the original release).
 RELEASE_FLAGS = [
     "PROPER", "REPACK", "RERIP", "INTERNAL", "iNTERNAL",
-    "READNFO", "DIRFIX", "NFOFIX", "SUBFIX", "RETAIL", "FESTIVAL", "MULTI",
+    # Language-count multis: scene-cased forms strip with an optional digit
+    # ("MULTI", "MULTi3"); the mixed-case "Multi" only with a REQUIRED digit
+    # ("Multi3") so a real title word "Multi" is never touched. Unknown, the
+    # token leaked into the title and broke the end-anchored year detection.
+    "READNFO", "DIRFIX", "NFOFIX", "SUBFIX", "RETAIL", "FESTIVAL",
+    "MULTI\\d*", "MULTi\\d*", "Multi\\d+",
 ]
 
 # Known video/audio extensions — anything else after the last "." stays in

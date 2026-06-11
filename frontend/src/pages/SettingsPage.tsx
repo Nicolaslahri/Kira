@@ -118,37 +118,6 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
   // All backend settings as a flat dict — read-through for provider keys etc.
   const [rawSettings, setRawSettings] = useState<Record<string, unknown>>({});
   const [loaded, setLoaded] = useState(false);
-  // On-demand library artifact sweep (Settings → Folder cleanup). `preview` holds
-  // the dry-run result so the user confirms before any deletion happens.
-  const [artSweep, setArtSweep] = useState<{
-    busy: boolean;
-    preview: { removed: number; items: string[]; trashed: boolean } | null;
-  }>({ busy: false, preview: null });
-  const previewArtifacts = async () => {
-    setArtSweep(s => ({ ...s, busy: true }));
-    try {
-      const r = await api.cleanupArtifacts(true);
-      setArtSweep({ busy: false, preview: { removed: r.removed, items: r.items, trashed: r.trashed } });
-      if (r.removed === 0) pushToast({ title: 'No leftover artifacts found', kind: 'success' });
-    } catch (e) {
-      setArtSweep(s => ({ ...s, busy: false }));
-      pushToast({ title: 'Scan for artifacts failed', sub: (e as Error).message, kind: 'error' });
-    }
-  };
-  const runArtifactSweep = async () => {
-    setArtSweep(s => ({ ...s, busy: true }));
-    try {
-      const r = await api.cleanupArtifacts(false);
-      setArtSweep({ busy: false, preview: null });
-      pushToast({
-        title: `Removed ${r.removed} artifact${r.removed === 1 ? '' : 's'}`,
-        sub: r.trashed ? 'Moved to trash' : 'Deleted', kind: 'success',
-      });
-    } catch (e) {
-      setArtSweep(s => ({ ...s, busy: false }));
-      pushToast({ title: 'Cleanup failed', sub: (e as Error).message, kind: 'error' });
-    }
-  };
   // F-05 / F-06: live provider catalog from /providers, keyed by slug.
   // Drives Connected / Not configured / Coming soon labels per block.
   const [providers, setProviders] = useState<Record<string, ApiProvider>>({});
@@ -840,65 +809,6 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                         </div>
                       ) : null}
                     </NestedBox>
-                  </div>
-                </SectionCard>
-
-                {/* On-demand + on-scan library-wide artifact sweep. The source
-                    cleanup above only fires after a Move; this clears artifacts
-                    a media server drops into folders that still hold videos. */}
-                <SectionCard
-                  icon={<IcTrash />}
-                  title="Clean leftover artifacts library-wide"
-                  desc="Jellyfin / Plex / Kodi keep adding poster.jpg, per-episode -thumb.jpg and .tbn files to folders Kira already organized. Sweep them across your whole library — your videos, subtitles, and other files are never touched."
-                >
-                  <div className="flex flex-col gap-4">
-                    <SettingRow
-                      label="Also sweep after every scan"
-                      desc={<>Run this cleanup automatically at the end of each library scan. <strong className="text-ink">Off by default</strong> — it deletes, so opt in once you trust it. Honors the trash setting above.</>}
-                    >
-                      <Toggle
-                        isSelected={rawSettings['cleanup.sweep_artifacts_on_scan'] === true}
-                        onChange={() => saveKey('cleanup.sweep_artifacts_on_scan')(rawSettings['cleanup.sweep_artifacts_on_scan'] !== true)}
-                        className="mt-0.5"
-                        aria-label="Sweep artifacts after every scan"
-                      />
-                    </SettingRow>
-
-                    {artSweep.preview ? (
-                      <NestedBox>
-                        <div className="text-[13px] text-ink">
-                          Found <strong>{artSweep.preview.removed}</strong> leftover artifact{artSweep.preview.removed === 1 ? '' : 's'}
-                          {artSweep.preview.trashed ? ' — will move to trash (recoverable).' : ' — will be permanently deleted.'}
-                        </div>
-                        {artSweep.preview.items.length ? (
-                          <div className="mt-2 max-h-44 overflow-auto rounded-md bg-black/20 p-2 font-mono text-[11px] leading-relaxed text-ink-soft">
-                            {artSweep.preview.items.slice(0, 50).map((p, i) => <div key={i} className="truncate">{p}</div>)}
-                            {artSweep.preview.removed > 50 ? <div className="text-ink-faint">…and {artSweep.preview.removed - 50} more</div> : null}
-                          </div>
-                        ) : null}
-                        <div className="mt-3 flex gap-2">
-                          <Button
-                            color="primary-destructive" size="sm"
-                            isDisabled={artSweep.busy || artSweep.preview.removed === 0}
-                            onClick={runArtifactSweep}
-                          >
-                            {artSweep.preview.trashed ? `Move ${artSweep.preview.removed} to trash` : `Delete ${artSweep.preview.removed}`}
-                          </Button>
-                          <Button color="secondary" size="sm" isDisabled={artSweep.busy} onClick={() => setArtSweep({ busy: false, preview: null })}>
-                            Cancel
-                          </Button>
-                        </div>
-                      </NestedBox>
-                    ) : (
-                      <div>
-                        <Button color="secondary" size="sm" isDisabled={artSweep.busy} onClick={previewArtifacts}>
-                          {artSweep.busy ? 'Scanning…' : 'Find leftover artifacts'}
-                        </Button>
-                        <div className="mt-1.5 text-[11px] leading-relaxed text-ink-soft">
-                          Previews what would be removed first — nothing is deleted until you confirm.
-                        </div>
-                      </div>
-                    )}
                   </div>
                 </SectionCard>
 

@@ -131,51 +131,114 @@ async def test_re_submitting_same_rename_is_noop_no_duplicate_history(tmp_path, 
     assert len(parents) == 1, f"a re-submit must not add a history row, got {len(parents)}"
 
 
-@pytest.mark.asyncio
-async def test_anime_cours_unify_under_one_show_with_per_cour_seasons(tmp_path, monkeypatch):
-    # AniDB splits a franchise into per-cour AIDs with distinct titles; without
-    # unification each lands in its own folder (the Bleach TYBW report). With a
-    # shared series_group_id they collapse to the EARLIEST member's title, and in
-    # seasonal mode each cour becomes its own season so the (overlapping) episodes
-    # don't collide.
-    sm = await _fresh_db(tmp_path, monkeypatch)
+async def _seed_cours(sm, tmp_path, cours):
+    """Seed AniDB cour matches sharing a series_group_id. `cours` = [(aid, title, ep)]."""
     media = tmp_path / "anime" / "Bleach" / "Season 17"
-    media.mkdir(parents=True)
-    cours = [
-        (15449, "Bleach: Thousand-Year Blood War"),
-        (17765, "Bleach: Thousand-Year Blood War - The Separation"),
-        (18220, "Bleach: Thousand-Year Blood War - The Conflict"),
-    ]
+    media.mkdir(parents=True, exist_ok=True)
     ids = []
     async with sm() as s:
-        for aid, title in cours:
-            pd = {"original_filename": f"{title} - 01.mkv", "media_type": "anime",
-                  "title": "Bleach", "season": 17, "episode": 1}
-            src = media / f"bleach {aid} e01.mkv"
+        for aid, title, ep in cours:
+            pd = {"original_filename": f"{title} - {ep:02d}.mkv", "media_type": "anime",
+                  "title": "Bleach", "season": 17, "episode": ep}
+            src = media / f"bleach {aid} e{ep:02d}.mkv"
             src.write_bytes(b"v")
             mf = MediaFile(file_path=str(src), parsed_data=pd, media_type="anime", status="matched")
             s.add(mf)
             await s.flush()
             s.add(Match(media_file_id=mf.id, provider="anidb", provider_id=str(aid),
                         match_type="tv_episode", series_group_id="anidb:2369", confidence=0.95,
-                        title=title, season_number=17, episode_number=1,
+                        title=title, season_number=17, episode_number=ep,
                         is_selected=True, is_manual=False))
             ids.append(mf.id)
         await s.commit()
+    return ids
+
+
+@pytest.mark.asyncio
+async def test_anime_cours_unify_under_one_show_keeping_tvdb_season(tmp_path, monkeypatch):
+    # AniDB splits a franchise into per-cour AIDs with distinct titles; they collapse
+    # to the EARLIEST member's title (one show folder), and CRUCIALLY keep their real
+    # TVDB season — NOT renumbered to fake per-cour seasons (the AoT=7-seasons bug).
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    # Distinct episodes so there's no collision even without the cour offset (which
+    # needs Fribb data this fresh DB doesn't have).
+    ids = await _seed_cours(sm, tmp_path, [
+        (15449, "Bleach: Thousand-Year Blood War", 1),
+        (17765, "Bleach: Thousand-Year Blood War - The Separation", 2),
+        (18220, "Bleach: Thousand-Year Blood War - The Conflict", 3),
+    ])
 
     res = await _run(sm, RenameRequest(file_ids=ids, profile="Plex", op="move", dry_run=True))
-    paths = {i.file_id: i.new_path for i in res.items}
+    paths = [i.new_path for i in res.items]
 
-    # One unified show folder, the earliest cour's title (":" is filesystem-sanitized
-    # to " - ") — and crucially NEVER the per-cour suffixes (proves they collapsed
-    # to the base title rather than each keeping its own folder).
-    for p in paths.values():
+    for p in paths:
+        # One unified folder, earliest cour's title — never the per-cour suffixes.
         assert "Bleach - Thousand-Year Blood War" in p
         assert "The Separation" not in p and "The Conflict" not in p
-    # Each cour gets its own sequential season (by AID order) → no episode collision.
-    assert "Season 01" in paths[ids[0]]
-    assert "Season 02" in paths[ids[1]]
-    assert "Season 03" in paths[ids[2]]
+        # The TVDB season (17) is KEPT, not rank-renumbered to Season 01/02/03.
+        assert "Season 17" in p
+
+
+@pytest.mark.asyncio
+async def test_anime_cour_episode_offset_applied(tmp_path, monkeypatch):
+    # Two cours sharing TVDB season 17, both AniDB-local E01. The static cour-routing
+    # table (mocked here) offsets the 2nd cour by the 1st's official length so they
+    # run continuously (E01 vs E14) instead of colliding.
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    ids = await _seed_cours(sm, tmp_path, [
+        (15449, "Bleach: Thousand-Year Blood War", 1),               # cour 1, local E01
+        (17765, "Bleach: Thousand-Year Blood War - The Separation", 1),  # cour 2, local E01
+    ])
+
+    async def _fake_table(provider, top_id, season, registry=None):
+        # (start, end, cour_aid, offset) — cour 1 = 13 eps, cour 2 offset +13.
+        return [(1, 13, 15449, 0), (14, 26, 17765, 13)]
+    monkeypatch.setattr("kira.matcher.cour_routing.build_cour_routing_table", _fake_table)
+
+    res = await _run(sm, RenameRequest(file_ids=ids, profile="Plex", op="move", dry_run=True))
+    by_fid = {i.file_id: i.new_path for i in res.items}
+
+    assert "S17E01" in by_fid[ids[0]], by_fid[ids[0]]   # cour 1 unchanged
+    assert "S17E14" in by_fid[ids[1]], by_fid[ids[1]]   # cour 2 local E01 -> continuous E14
+    for p in by_fid.values():
+        assert "Bleach - Thousand-Year Blood War" in p
+
+
+@pytest.mark.asyncio
+async def test_rename_uses_match_episode_not_lying_filename_number(tmp_path, monkeypatch):
+    # A rescued/arbitrated file: the FILENAME says E81 (old franchise-continuous
+    # numbering) but the Match knows the truth — cour 16177 (AoT Final Season
+    # Part 2), cour-LOCAL episode 6 ("Thaw"). The seasonal render must output
+    # en + the cour's in-season offset (6+16 → S04E22) — NEVER parsed.episode +
+    # offset (81+16 → S04E97, garbage).
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    media = tmp_path / "anime" / "Attack on Titan" / "Season 06"
+    media.mkdir(parents=True)
+    src = media / "Attack on Titan - S06E81 - Thaw.mkv"
+    src.write_bytes(b"v")
+    pd = {"original_filename": src.name, "media_type": "anime",
+          "title": "Attack on Titan", "season": 6, "episode": 81}
+    async with sm() as s:
+        mf = MediaFile(file_path=str(src), parsed_data=pd, media_type="anime", status="matched")
+        s.add(mf)
+        await s.flush()
+        s.add(Match(media_file_id=mf.id, provider="anidb", provider_id="16177",
+                    match_type="tv_episode", series_group_id="anidb:9541", confidence=0.95,
+                    title="Attack on Titan The Final Season (2022)", season_number=4,
+                    episode_number=6, episode_title="Thaw", is_selected=True))
+        await s.commit()
+        fid = mf.id
+
+    async def _fake_table(provider, top_id, season, registry=None):
+        # AoT TVDB S4: Part 1 (16 eps, offset 0) + Part 2 (12 eps, offset 16).
+        return [(1, 16, 14977, 0), (17, 28, 16177, 16)]
+    monkeypatch.setattr("kira.matcher.cour_routing.build_cour_routing_table", _fake_table)
+
+    res = await _run(sm, RenameRequest(file_ids=[fid], profile="Plex", op="move", dry_run=True))
+    p = res.items[0].new_path
+    assert "S04E22" in p, p          # en 6 + offset 16 — the truth
+    assert "E97" not in p, p          # parsed 81 + 16 — the garbage
+    assert "Thaw" in p, p
 
 
 @pytest.mark.asyncio

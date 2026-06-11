@@ -1,41 +1,21 @@
-"""Standalone library-artifact cleanup endpoint.
+"""Cleanup helpers shared by the rename teardown + undo paths.
 
-The move-time folder cleanup only removes folders that become empty/artifact-only
-after a Move. Media servers (Jellyfin/Plex/Kodi) keep sprinkling artifacts
-(`<episode>-thumb.jpg`, `poster.jpg`, `.tbn`, `.actors/`, …) into folders that
-still hold your videos — AFTER Kira has organized them — so they accumulate with
-no way to clear them. This endpoint sweeps the configured library roots for those
-artifacts (allow-list only; videos/subtitles/user files are never touched),
-previewing with `dry_run` before deleting and respecting the recoverable-trash
-setting.
+NOTE: the standalone library-wide artifact *sweep* (the on-demand button + the
+per-scan auto-sweep) was removed. A global sweep is the wrong tool — it can't tell
+a CURRENT file's Jellyfin/Plex artwork (which the server just regenerates) from
+genuinely orphaned junk, so it churns endlessly and fights the media server, and
+it even re-processed its own trash folder. Artifact cleanup now happens only at
+"time of vacancy": when a rename moves the last media file OUT of a folder, the
+move-time cleanup (`operations._cleanup_empty_source_parents`, on by default) and
+the undo path remove the now-media-less folder + its leftover artifacts — exactly
+when, and only when, a folder becomes useless. This module keeps just the shared
+trash-target resolver those paths use.
 """
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from kira.api.files import _managed_roots
-from kira.database import get_session
-from kira.renamer.operations import sweep_artifacts
-
-router = APIRouter(prefix="/cleanup", tags=["cleanup"])
-
-
-class ArtifactSweepRequest(BaseModel):
-    # Default to a PREVIEW — a destructive library-wide delete must be opt-in per call.
-    dry_run: bool = True
-
-
-class ArtifactSweepResult(BaseModel):
-    removed: int
-    items: list[str]
-    dry_run: bool
-    trashed: bool
-    roots: list[str]
 
 
 async def _resolve_trash_root(session: AsyncSession, roots: list[str]) -> Path | None:
@@ -51,30 +31,3 @@ async def _resolve_trash_root(session: AsyncSession, roots: list[str]) -> Path |
     if roots:
         return Path(roots[0]) / ".kira-trash"
     return None
-
-
-@router.post("/artifacts", response_model=ArtifactSweepResult)
-async def sweep_library_artifacts(
-    payload: ArtifactSweepRequest,
-    session: AsyncSession = Depends(get_session),
-) -> ArtifactSweepResult:
-    """Sweep (or preview) media-server artifacts across the managed library roots."""
-    roots = await _managed_roots(session)
-    trash_root = await _resolve_trash_root(session, roots)
-    # The walk is blocking disk I/O over the whole library — offload it so the
-    # event loop stays responsive (same reasoning as the rename move offload).
-    removed, items = await asyncio.to_thread(
-        sweep_artifacts, roots, dry_run=payload.dry_run, trash_root=trash_root,
-    )
-    if not payload.dry_run and removed:
-        from kira.models import Notification
-        session.add(Notification(
-            kind="success",
-            title=f"Cleaned {removed} leftover artifact{'' if removed == 1 else 's'}",
-            body=("Moved to trash" if trash_root else "Deleted") + " from your library folders.",
-        ))
-        await session.commit()
-    return ArtifactSweepResult(
-        removed=removed, items=items, dry_run=payload.dry_run,
-        trashed=trash_root is not None, roots=roots,
-    )

@@ -141,10 +141,37 @@ class FribbAuthorityMetric:
             # set entirely. The correct sibling AID (which DOES match
             # parsed.season) wins by survivorship.
             if cand_season is not None and cand_season != parsed_season:
+                # The veto presumes parsed.season is TVDB truth. That holds when
+                # the season came from a real layout ("Bleach.S17E27"), but NOT
+                # when it's synthetic — e.g. a library renamed to a unified show
+                # folder with "Season 01/02/03" subfolders, where Bleach TYBW
+                # files parse as S1 even though every cour is TVDB S17. Vetoing
+                # on a season Fribb doesn't even know for this series zeroed ALL
+                # the correct cours and the whole franchise went no_match after
+                # a DB reset. So: veto ONLY when parsed_season is a REAL Fribb
+                # season of this series (some sibling AID maps to it — then this
+                # candidate is genuinely the wrong cour, the MHA S01-vs-S06 case).
+                # Otherwise the season hint is unreliable → abstain and let the
+                # title metrics decide.
+                try:
+                    season_is_real = bool(
+                        await AnimeMappings.aids_by_tvdb_season(cand_tvdb, parsed_season)
+                    )
+                except Exception:
+                    season_is_real = False
+                if season_is_real:
+                    return MetricResult(
+                        metric=self.name, tier=self.tier,
+                        raw=-1.0, score=0.0,
+                        reason=f"fribb season {cand_season} != parsed {parsed_season} (veto)",
+                    )
                 return MetricResult(
                     metric=self.name, tier=self.tier,
-                    raw=-1.0, score=0.0,
-                    reason=f"fribb season {cand_season} != parsed {parsed_season} (veto)",
+                    raw=0.0, score=0.0,
+                    reason=(
+                        f"parsed season {parsed_season} unknown to fribb for "
+                        f"tvdb {cand_tvdb} — season hint unreliable, abstain"
+                    ),
                 )
             return MetricResult(
                 metric=self.name, tier=self.tier,

@@ -1142,24 +1142,55 @@ async def perform_rename(
             and parsed.media_type == "anime"
         ):
             members = await _anime_group_members(session, selected.series_group_id)
-            if members:
-                if members[0][1]:
-                    library_title = members[0][1]
-                # Seasonal numbering: cours each restart at episode 1, so several
-                # sharing one TVDB season (Bleach TYBW = all season 17) would COLLIDE
-                # once unified into one folder. Give each cour its own sequential
-                # season (by AID/air order) so episodes don't clash. Absolute
-                # numbering instead flattens to franchise-absolute episode numbers
-                # (handled just below), so the season is left alone there. Only for
-                # genuine multi-cour groups (>1 member present).
-                if anime_numbering != "absolute" and len(members) > 1:
-                    try:
-                        aid = int(selected.provider_id)
-                        rank = next((i for i, (a, _t) in enumerate(members) if a == aid), None)
-                        if rank is not None:
-                            season_override_val = rank + 1
-                    except (TypeError, ValueError):
-                        pass
+            if members and members[0][1]:
+                # Unify the show folder to the earliest cour present (lowest AID).
+                library_title = members[0][1]
+
+        # Seasonal cour-episode offset. AniDB stores each cour's episodes LOCALLY
+        # (every cour restarts at 1), but TVDB/Jellyfin want one continuous run per
+        # season — so several cours sharing a TVDB season (AoT S3/S4 parts, Bleach
+        # TYBW = all S17) would collide at E01 once unified. We KEEP the real TVDB
+        # season (selected.season_number) and shift this cour's episode by the
+        # cumulative OFFICIAL episode count of the prior cours in that season. The
+        # offset comes from the static cour-routing table (Fribb mapping + AniDB's
+        # official per-AID episode counts — NEVER the user's on-disk file counts, so
+        # a partial/out-of-order download can't corrupt the numbering). Absolute
+        # numbering flattens via {{absx}} below instead, so skip there. Render-only:
+        # mutate the local `parsed`, never the stored row.
+        if (anime_numbering != "absolute"
+                and (selected.provider or "").lower() == "anidb"
+                and selected.provider_id
+                and selected.season_number is not None
+                and parsed.media_type == "anime"
+                and parsed.episode is not None):
+            try:
+                from kira.matcher.cour_routing import build_cour_routing_table
+                table = await build_cour_routing_table(
+                    "anidb", str(selected.provider_id), selected.season_number,
+                )
+                if table:
+                    aid = int(selected.provider_id)
+                    offset = next((off for (_s, _e, cid, off) in table if cid == aid), None)
+                    if offset is not None:
+                        # The MATCH is authoritative over the filename: after the
+                        # rescue/arbitration passes, Match.episode_number is the
+                        # cour-LOCAL episode regardless of what number the old
+                        # filename carried ("S06E81 - Thaw" → 16177 local E6). So
+                        # the season-continuous output is en + the cour's offset
+                        # (6+16 → S04E22), NOT parsed.episode + offset (81+16 →
+                        # S04E97, garbage). Fall back to the parsed number only
+                        # when the match carries no episode.
+                        base = (
+                            selected.episode_number
+                            if selected.episode_number is not None
+                            else parsed.episode
+                        )
+                        new_ep = base + offset
+                        if parsed.episode_end is not None:
+                            parsed.episode_end = new_ep + (parsed.episode_end - parsed.episode)
+                        parsed.episode = new_ep
+            except Exception as e:
+                print(f"rename: cour episode offset failed for {fid} (non-fatal): {e!r}")
 
         # Locally-named anime → franchise-absolute number for {{absx}}. The file
         # was named per-cour-local (e.g. "S4E01") so parsed.absolute_episode is

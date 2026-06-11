@@ -76,11 +76,26 @@ async def build_cour_routing_table(
     except Exception:
         return None
 
-    if top_tvdb is None or top_season is None or top_season != parsed_season:
+    if top_tvdb is None or top_season is None:
         return None
 
+    if top_season != parsed_season:
+        # Disagreement. If the parsed season is a REAL Fribb season of this
+        # series (some sibling AID maps to it), this is a stale-entry/umbrella
+        # mismatch — refuse to route, as before. But when Fribb has NO AID at
+        # the parsed season, the number is synthetic (e.g. a unified-show
+        # rename put TYBW cours under "Season 01/02/03" folders while every
+        # cour is really TVDB S17) — a hint, not truth. Trust the candidate's
+        # own Fribb season and route by episode against it, so continuous
+        # numbering (E14 → cour 2) still resolves.
+        try:
+            if await AnimeMappings.aids_by_tvdb_season(top_tvdb, parsed_season):
+                return None
+        except Exception:
+            return None
+
     try:
-        sibling_aids = await AnimeMappings.aids_by_tvdb_season(top_tvdb, parsed_season)
+        sibling_aids = await AnimeMappings.aids_by_tvdb_season(top_tvdb, top_season)
     except Exception:
         return None
 
@@ -122,16 +137,16 @@ async def build_cour_routing_table(
                 if not eps:
                     return None
                 # get_episodes write-through populates _ep_count_cache
-                # as a side effect (see AniDBProvider.get_episodes).
-                # Defensive: stamp count_cache directly in case the
-                # provider's write was suppressed (e.g. test stubs).
+                # (the same singleton dict `count_cache` points at) as a
+                # side effect (see AniDBProvider.get_episodes). Stamping
+                # here too keeps the count even if the provider's write
+                # was suppressed (e.g. test stubs). `_load_ep_count_cache`
+                # is memoized, so re-reading would just return this same
+                # object — no on-disk re-read needed.
                 count_cache[sib_aid] = len(eps)
             except Exception as e:
                 print(f"cour_routing: dynamic fetch for AID {sib_aid} failed: {e!r}")
                 return None
-        # Re-read the on-disk cache in case the provider's write-through
-        # produced canonical values (e.g. specials-stripped count).
-        count_cache = AniDBProvider._load_ep_count_cache()
 
     table: list[tuple[int, int, int, int]] = []
     current_start = 1

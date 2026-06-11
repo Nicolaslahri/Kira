@@ -1288,9 +1288,31 @@ async def resolve_canonical_season(
     if provider_key == "anidb":
         try:
             from kira.providers.anime_mappings import AnimeMappings
-            mapped = await AnimeMappings.tvdb_season(int(provider_id))
+            aid = int(provider_id)
+            mapped = await AnimeMappings.tvdb_season(aid)
             if mapped is not None:
                 return mapped
+            # Fribb has NO season for this AID — classic mapping-database rot for a
+            # brand-new cour (e.g. Bleach: TYBW "The Calamity", AID 19079, which the
+            # mapping hasn't linked to TVDB S17 yet). Falling back to parsed_season
+            # then defaults it to the franchise base — Season 1 — fracturing the
+            # show. Instead inherit from the nearest PREQUEL cour of the SAME TVDB
+            # series: the immediately-preceding mapped AID (The Conflict = S17), so
+            # the new cour lands beside its siblings, not in Season 1.
+            tvdb = await AnimeMappings.tvdb_id(aid)
+            if tvdb is not None:
+                seasoned: list[tuple[int, int]] = []
+                for sib in await AnimeMappings.aids_by_tvdb(tvdb):
+                    if sib == aid:
+                        continue
+                    s = await AnimeMappings.tvdb_season(sib)
+                    if s is not None:
+                        seasoned.append((sib, s))
+                if seasoned:
+                    below = [(a, s) for (a, s) in seasoned if a < aid]
+                    # nearest prequel (highest AID below this one); else nearest sibling
+                    pick = max(below or seasoned, key=lambda t: t[0])
+                    return pick[1]
         except Exception:
             pass
     return parsed_season

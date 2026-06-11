@@ -754,6 +754,72 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
                 except Exception as e:
                     print(f"_match_cluster: DVD-order retry failed: {e!r}")
 
+    # ── Franchise rescue (episode-title + franchise-absolute) ─────────
+    # Files every number pass left unpaired may belong to a DIFFERENT cour
+    # of the same franchise — a prior rename can leave synthetic seasons +
+    # franchise-continuous numbers ("AoT S05E61 - Midnight Train") whose
+    # episode isn't in the matched AID's own list at all. Rescue via static
+    # franchise metadata: the offsets table places the number (E61 → Final
+    # Season local 2), and the filename's episode-title guess is matched
+    # across the sibling cours' lists. Results flow through the same
+    # per-file routed-AID plumbing as the cour table below.
+    franchise_rescued: dict[int, tuple[int, int, str | None]] = {}
+    if rep_parsed.media_type == "anime" and top.provider == "anidb":
+        unpaired_files = [
+            (fid, p) for fid, p in files
+            if (fid not in bipartite_assignments
+                or bipartite_assignments[fid].matched_via == "unpaired")
+        ]
+        if unpaired_files:
+            try:
+                franchise_rescued = await _franchise_rescue_unpaired(
+                    unpaired_files, top.provider_id, engine.registry,
+                )
+                if franchise_rescued:
+                    print(f"_match_cluster: franchise rescue placed {len(franchise_rescued)} file(s)")
+            except Exception as e:
+                print(f"_match_cluster: franchise rescue failed (non-fatal): {e!r}")
+
+    # ── Title arbitration: the file's own episode title outranks a lying
+    # number. Old renames can stamp wrong SxE numbers ("S04E13 - The Town
+    # Where Everything Began" is really S3E13) — the number passes then place
+    # the file on the wrong episode at full confidence, and the REAL owner of
+    # that slot shows up as a phantom duplicate. For every number-placed file
+    # whose title guess CONTRADICTS the placed episode's title (trigram < 0.2),
+    # search the franchise BY TITLE; a strong (≥0.6) hit elsewhere overrides
+    # the number placement. No strong hit anywhere (e.g. romaji-vs-English
+    # list) → the number stands, nothing degrades.
+    title_overrides: dict[int, tuple[int, int, str | None]] = {}
+    if rep_parsed.media_type == "anime" and top.provider == "anidb" and episodes_by_key:
+        from kira.matcher.similarity import trigram_similarity
+        challenged: list[tuple[int, object]] = []
+        for fid, p in files:
+            guess = getattr(p, "episode_title_guess", None)
+            if not guess or fid in franchise_rescued:
+                continue
+            a = bipartite_assignments.get(fid)
+            if a is not None and getattr(a, "matched_via", "") == "title":
+                continue  # paired BY title — already in agreement
+            placed_title = None
+            if a is not None and getattr(a, "matched_via", "") != "unpaired":
+                placed_title = a.episode_title
+            elif p.episode is not None:
+                placed_title = (
+                    episodes_by_key.get((1, p.episode))
+                    or episodes_by_key.get((p.season or 1, p.episode))
+                )
+            if placed_title and trigram_similarity(guess, placed_title) < 0.2:
+                challenged.append((fid, p))
+        if challenged:
+            try:
+                title_overrides = await _franchise_rescue_unpaired(
+                    challenged, top.provider_id, engine.registry, title_only=True,
+                )
+                if title_overrides:
+                    print(f"_match_cluster: title arbitration overrode {len(title_overrides)} number placement(s)")
+            except Exception as e:
+                print(f"_match_cluster: title arbitration failed (non-fatal): {e!r}")
+
     # Absolute→season-local map for cour routing. Lets pure-absolute-numbered
     # files (AoT Final Season "- 60".."- 89") reach the season-local cour table:
     # 60→S4E1 … 89→S4E30 → routed to AID 14977 / 16177 / 17303. Built from the
@@ -841,6 +907,19 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
             if routed is not None:
                 routed_aid, routed_local_ep = routed
 
+        # Title arbitration outranks number routing — a lying number must not
+        # beat the file's own episode title. Franchise rescue fills in when
+        # nothing claimed the file. Both carry the cour-LOCAL episode number +
+        # the (lumped-list-resolved) title.
+        rescued_local_ep: int | None = None
+        rescued_title: str | None = None
+        _arb = title_overrides.get(fid)
+        if _arb is None and routed_aid is None:
+            _arb = franchise_rescued.get(fid)
+        if _arb is not None:
+            routed_aid, rescued_local_ep, rescued_title = _arb
+            routed_local_ep = None
+
         # Prefer bipartite assignment when it found a real pair —
         # otherwise fall back to per-file parsed data.
         assignment = bipartite_assignments.get(fid)
@@ -884,22 +963,36 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
                     routed_eb_key: dict[tuple[int, int], str | None] = {
                         (ep.season, ep.episode): ep.title for ep in routed_eps
                     }
-                    ep_title = _lookup_episode_title(
-                        routed_eb_key, "anidb", parsed, routed_local_ep,
+                    # The fetched list is the LUMPED season list (cross-ref) —
+                    # look up by the lumped index, same convention as ep_num.
+                    _r_off = next(
+                        (off for (_s, _e, cid, off) in (cour_routing or []) if cid == routed_aid), 0,
                     )
+                    ep_title = _lookup_episode_title(
+                        routed_eb_key, "anidb", parsed, routed_local_ep + _r_off,
+                    )
+            # Franchise-rescued files carry the title resolved from the
+            # sibling cour's own episode list during the rescue.
+            if ep_title is None and rescued_title is not None:
+                ep_title = rescued_title
 
         # ── Episode number MUST match the matched AID's own numbering ──
-        # When cour routing fires, the Match identity is the cour AID, whose
-        # episode list is LOCAL (cour 17303 = AoT Final Chapters has eps 1-2).
-        # So Match.episode_number has to be the cour-local number — otherwise
-        # the popup, which fetches that AID's own 1..N list, can't pair the
-        # file (AoT's "- 88" → cour 17303 needs episode_number=1, not the
-        # season-absolute 88 or a TVDB-lumped bipartite index of 29). The
-        # rename FILENAME is unaffected: it renders from parsed.episode /
-        # {{absx}} (the absolute), wholly independent of episode_number, so
-        # "Absolute" output still yields "Attack on Titan - 088".
+        # When cour routing / rescue / arbitration fires, the Match identity is
+        # the cour AID, and the POPUP pairs against that AID's ANIDB-NATIVE
+        # list (locals 1..N — native is preferred since the One Piece fix in
+        # /series). So the stored number is the cour-LOCAL one. Titles are a
+        # different story: the scan-side lists come from the TVDB cross-ref
+        # (LUMPED per TVDB season), so title LOOKUPS convert local → lumped via
+        # the cour's in-season offset — but the stored NUMBER never does. The
+        # rename FILENAME is unaffected (renders from parsed.episode / {{absx}}).
         if routed_aid is not None and routed_local_ep is not None:
             ep_num = routed_local_ep
+        elif rescued_local_ep is not None:
+            ep_num = rescued_local_ep
+            if fid in title_overrides:
+                # Arbitration beats whatever the number-based lookups resolved:
+                # the file's own title decided BOTH the number and the title.
+                ep_title = rescued_title
 
         # ── Flat-umbrella absolute remap (the One Piece "S23E04" → 1159 fix) ──
         # A TVDB-season-LOCAL file ("One Piece 1999 S23E04" → bipartite pairs it
@@ -965,10 +1058,27 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
                     row_metadata["cascade_trace"] = cascade_trace
             elif cascade_trace:
                 row_metadata = {"cascade_trace": cascade_trace}
+            # Confidence honesty: the cascade score is the SHOW-level identity.
+            # When we HAD an episode list yet every pairing avenue failed for
+            # this file (no bipartite pair, no cour routing, no franchise
+            # rescue, no episode title), displaying the show's 1.0 as "100%"
+            # on an orphaned row is a lie — and dangerous around auto-approve.
+            # Cap it visibly below every approval threshold; the file still
+            # matches the show, but the row now SAYS the episode is unresolved.
+            row_confidence = m.confidence
+            if (
+                rank == 0
+                and top.match_type == "tv_episode"
+                and episodes_by_key
+                and ep_title is None
+                and routed_aid is None
+                and (assignment is None or assignment.matched_via == "unpaired")
+            ):
+                row_confidence = min(row_confidence, 0.49)
             session.add(Match(
                 media_file_id=fid,
                 provider=m.provider, provider_id=row_provider_id,
-                match_type=m.match_type, confidence=m.confidence,
+                match_type=m.match_type, confidence=row_confidence,
                 title=row_title, year=m.year,
                 series_name=row_title if m.match_type == "tv_episode" else None,
                 season_number=canonical_season, episode_number=ep_num,
@@ -1006,6 +1116,165 @@ async def _try_cross_ref(provider, provider_id: str, season: int) -> tuple[bool,
     except Exception as e:
         print(f"_fetch_episodes cross-ref failed for {provider_id}/s{season}: {e!r}")
         return False, []
+
+
+async def _franchise_rescue_unpaired(
+    unpaired: list[tuple[int, object]],
+    top_provider_id: str,
+    registry,
+    title_only: bool = False,
+) -> dict[int, tuple[int, int, str | None]]:
+    """Rescue number/title-mangled anime files by searching the WHOLE franchise.
+
+    The bipartite passes pair files only against the matched AID's own episode
+    list. But a previously-renamed library can carry synthetic seasons +
+    franchise-continuous numbers ("Attack on Titan - S05E61 - Midnight Train":
+    season 5 doesn't exist, E61 is franchise-continuous) — the episode simply
+    isn't in that list, so every file orphans. Two static-metadata fallbacks:
+
+      1. NUMERIC — `get_franchise_offsets` (official AniDB counts, cached,
+         ban-safe; never disk-state) maps a franchise-continuous number to its
+         owning sibling AID + local episode: E61 → Final Season AID, local 2.
+      2. TITLE — the filename's episode-title guess is trigram-matched across
+         the sibling cours' episode lists ("Midnight Train" → Final Season E2),
+         rescuing files whose numbers are pure garbage. Same ≥0.6 floor as the
+         bipartite title pass; episode lists fetched once per sibling via the
+         ban-safe TVDB cross-ref, capped to 12 siblings.
+
+    Returns {file_id: (aid, local_episode, episode_title|None)} for the files
+    it could place; the write loop feeds these through the same per-file
+    routing plumbing the cour table uses. Best-effort: any failure → {}.
+    """
+    if not unpaired:
+        return {}
+    try:
+        from kira.providers.anidb import AniDBProvider
+        if not registry.has("anidb"):
+            return {}
+        anidb = registry.build("anidb")
+        offsets = await anidb.get_franchise_offsets(top_provider_id)
+    except Exception as e:
+        print(f"_franchise_rescue: offsets unavailable (non-fatal): {e!r}")
+        return {}
+    if not offsets or len(offsets) > 12:
+        return {}
+
+    # Each cour's offset WITHIN its TVDB season. The episode fetch below goes
+    # through the TVDB cross-ref, which returns ONE LUMPED list for the whole
+    # TVDB season (AoT S4 = 28+ entries) — the SAME list for every cour in it.
+    # So the number we store (and look titles up by) must be the LUMPED index,
+    # not the cour-local one: Part 2's local E6 is lumped E22 ("Thaw"), and
+    # storing 6 made the popup display Part 1's E6 ("The War Hammer Titan").
+    # in_season_off[aid] = sum of the official lengths of the PRIOR cours in
+    # the same TVDB season (0 for the season's first cour; flat umbrellas too).
+    from kira.providers.anime_mappings import AnimeMappings
+    in_season_off: dict[int, int] = {}
+    _season_of: dict[int, int | None] = {}
+    for aid, lo, _hi in offsets:
+        try:
+            _season_of[aid] = await AnimeMappings.tvdb_season(aid)
+        except Exception:
+            _season_of[aid] = None
+    _season_base: dict[int, int] = {}
+    for aid, lo, _hi in offsets:
+        s = _season_of.get(aid)
+        if s is not None:
+            _season_base[s] = min(_season_base.get(s, lo), lo)
+    for aid, lo, _hi in offsets:
+        s = _season_of.get(aid)
+        in_season_off[aid] = (lo - _season_base[s]) if s is not None else 0
+
+    # Lazily-fetched per-sibling episode lists, shared by both passes.
+    ep_lists: dict[int, list] = {}
+
+    async def _eps_for(aid: int) -> list:
+        if aid not in ep_lists:
+            try:
+                ep_lists[aid] = list(await _fetch_episodes_for_match(
+                    "anidb", str(aid), None, registry,
+                ))
+            except Exception:
+                ep_lists[aid] = []
+        return ep_lists[aid]
+
+    rescued: dict[int, tuple[int, int, str | None]] = {}
+    claimed: set[tuple[int, int]] = set()
+
+    # The matched AID's own official length — the disambiguation gate for the
+    # numeric pass. A number ≤ this could be a perfectly normal cour-LOCAL
+    # episode (Frieren S2 E03), so reinterpreting it as franchise-continuous
+    # would mis-route it; only numbers BEYOND the matched AID's own range are
+    # provably not local and safe to place via the franchise offsets.
+    try:
+        _top_aid = int(top_provider_id)
+    except (ValueError, TypeError):
+        _top_aid = None
+    top_count = next(
+        (hi - lo + 1 for aid, lo, hi in offsets if aid == _top_aid), None,
+    )
+
+    # Pass 1 — numeric: episode falls inside a sibling's official absolute range.
+    # Stored number = the cour-LOCAL episode (the popup pairs against the AID's
+    # ANIDB-NATIVE 1..N list); the TITLE is read from the cross-ref list, which
+    # is LUMPED per TVDB season, so the lookup converts local → lumped via the
+    # cour's in-season offset. Skipped in title_only mode (arbitration: the
+    # NUMBER is what's on trial).
+    for fid, parsed in unpaired if not title_only else []:
+        ep = parsed.episode if parsed.episode is not None else parsed.absolute_episode
+        if ep is None:
+            continue
+        if top_count is not None and ep <= top_count:
+            continue  # could be cour-local — leave it to the title pass
+        for aid, lo, hi in offsets:
+            if lo <= ep <= hi:
+                local = ep - lo + 1
+                if (aid, local) in claimed:
+                    break
+                lumped = local + in_season_off.get(aid, 0)
+                title = None
+                for e in await _eps_for(aid):
+                    if getattr(e, "episode", None) == lumped:
+                        title = getattr(e, "title", None)
+                        break
+                rescued[fid] = (aid, local, title)
+                claimed.add((aid, local))
+                break
+
+    # Pass 2 — title: trigram the filename's episode-title guess across every
+    # sibling's list. Only for files the numeric pass couldn't place. Because
+    # cours of one TVDB season share the SAME lumped cross-ref list, an entry
+    # only counts for the cour whose own stretch contains it — otherwise every
+    # cour would "find" every title and claim the wrong AID. The stored number
+    # is converted back to the cour-LOCAL one (lumped − in-season offset).
+    from kira.matcher.similarity import trigram_similarity
+    for fid, parsed in unpaired:
+        if fid in rescued:
+            continue
+        guess = getattr(parsed, "episode_title_guess", None)
+        if not guess:
+            continue
+        best: tuple[float, int, int, str | None] | None = None
+        for aid, lo, hi in offsets:
+            off = in_season_off.get(aid, 0)
+            stretch_lo = off + 1
+            stretch_hi = off + (hi - lo + 1)
+            for e in await _eps_for(aid):
+                t = getattr(e, "title", None)
+                num = getattr(e, "episode", None)
+                if not t or num is None:
+                    continue
+                if not (stretch_lo <= num <= stretch_hi):
+                    continue  # entry belongs to a sibling cour's stretch
+                local = num - off
+                if (aid, local) in claimed:
+                    continue
+                sim = trigram_similarity(guess, t)
+                if best is None or sim > best[0]:
+                    best = (sim, aid, local, t)
+        if best is not None and best[0] >= 0.6:
+            rescued[fid] = (best[1], best[2], best[3])
+            claimed.add((best[1], best[2]))
+    return rescued
 
 
 async def _fetch_episodes_for_match(
@@ -2069,33 +2338,6 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
             await maybe_auto_rename(scan_id, auto_rename_ids)
         except Exception as e:
             print(f"_scan_worker_locked: auto_rename hook failed (non-fatal): {e!r}")
-
-    # Opt-in: sweep leftover media-server artifacts (poster.jpg / <ep>-thumb.jpg /
-    # .tbn / .actors/ …) the server keeps dropping into already-organized folders.
-    # Default OFF since it deletes; runs over the managed roots after the scan +
-    # auto-rename settle, respects the recoverable-trash setting, best-effort.
-    try:
-        async with SessionLocal() as s:
-            from kira.api.rename import _resolve_bool_setting
-            if await _resolve_bool_setting(s, "cleanup.sweep_artifacts_on_scan", False):
-                from kira.api.cleanup import _resolve_trash_root
-                from kira.api.files import _managed_roots
-                from kira.models import Notification
-                from kira.renamer.operations import sweep_artifacts
-                roots = await _managed_roots(s)
-                trash_root = await _resolve_trash_root(s, roots)
-                removed, _items = await asyncio.to_thread(
-                    sweep_artifacts, roots, dry_run=False, trash_root=trash_root,
-                )
-                if removed:
-                    s.add(Notification(
-                        kind="info",
-                        title=f"Swept {removed} leftover artifact{'' if removed == 1 else 's'} after scan",
-                        body=("Moved to trash" if trash_root else "Deleted") + " from your library folders.",
-                    ))
-                    await s.commit()
-    except Exception as e:
-        print(f"_scan_worker_locked: artifact sweep hook failed (non-fatal): {e!r}")
 
 
 async def _reparse_worker(scan_id: int) -> None:
