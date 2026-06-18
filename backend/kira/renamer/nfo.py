@@ -53,7 +53,7 @@ def _esc(value: Any) -> str:
 # NFO_FIELDS and the `naming.nfo_fields` setting dict.
 NFO_TOGGLEABLE = (
     "plot", "genres", "cast", "director", "studio", "runtime",
-    "country", "originaltitle", "artwork", "collection", "status", "showtitle",
+    "country", "originaltitle", "artwork", "seasonposters", "collection", "status", "showtitle",
     "streamdetails",
 )
 
@@ -126,6 +126,23 @@ def _art_lines(meta: dict[str, Any]) -> list[str]:
     if fanart:
         out.append(f"  <fanart>\n    <thumb>{_esc(fanart)}</thumb>\n  </fanart>")
     return out
+
+
+def _season_thumb_lines(season_posters: dict[int, str] | None) -> list[str]:
+    """Per-season poster `<thumb>`s for a `tvshow.nfo` — Kodi's mechanism for
+    distinct season art (`<thumb aspect="poster" type="season" season="N">URL`).
+    Each AniDB cour carries its OWN poster + ScudLee season, so a franchise
+    unified into one show ships every season's real cover. Plex/Jellyfin/Emby
+    read season art from the `Season NN/poster.jpg` FILE instead (also written);
+    this covers the NFO-driven (Kodi) path. Gated under the `artwork` field with
+    the rest of the NFO art."""
+    if not season_posters:
+        return []
+    return [
+        f'  <thumb aspect="poster" type="season" season="{s}">{_esc(url)}</thumb>'
+        for s, url in sorted(season_posters.items())
+        if url
+    ]
 
 
 # ── Kodi <fileinfo><streamdetails> from the file's tech data (MediaInfo /
@@ -238,20 +255,26 @@ def build_movie_nfo(title: str, year: int | None, meta: dict[str, Any],
 
 def build_episode_nfo(episode_title: str | None, season: int | None, episode: int | None,
                       meta: dict[str, Any], series_name: str | None = None,
-                      fields: set[str] | None = None, tech: dict[str, Any] | None = None) -> str:
+                      fields: set[str] | None = None, tech: dict[str, Any] | None = None,
+                      plot: str | None = None, aired: str | None = None) -> str:
     meta = meta or {}
-    # NOTE: `plot`/`runtime` come from the SERIES-level metadata_blob — Kira
-    # doesn't store per-episode synopsis/airdate today, so we deliberately do
-    # NOT emit a per-episode <aired> or episode <uniqueid> we can't back with
-    # real data (a wrong airdate is worse than none). <showtitle> is the clean
-    # win: unambiguous and useful to every scraper.
+    # `plot` / `aired` are the REAL per-episode synopsis + air date the rename
+    # resolves from the provider's episode list (via the Fribb cross-ref for
+    # AniDB anime, which carries no per-episode titles of its own). We used to
+    # omit them deliberately because the only plot on hand was the SERIES
+    # overview — stamping that on every episode was wrong and blocked the media
+    # server from scraping the real one. With GENUINE per-episode data that
+    # concern is gone, so we write them; both stay empty (→ the media server
+    # scrapes) when the cross-ref can't resolve the episode. `plot` still honors
+    # the field toggle; `<showtitle>` remains the unambiguous scraper anchor.
     lines = [
         _HEADER, "<episodedetails>",
         _el("title", episode_title),
         _el("showtitle", series_name) if _enabled(fields, "showtitle") else "",
         _el("season", season),
         _el("episode", episode),
-        _el("plot", meta.get("overview")) if _enabled(fields, "plot") else "",
+        _el("plot", plot) if (plot and _enabled(fields, "plot")) else "",
+        _el("aired", aired) if aired else "",
         _el("runtime", meta.get("runtime")) if _enabled(fields, "runtime") else "",
         *(_streamdetails_lines(tech) if _enabled(fields, "streamdetails") else []),
         "</episodedetails>",
@@ -261,7 +284,8 @@ def build_episode_nfo(episode_title: str | None, season: int | None, episode: in
 
 def build_tvshow_nfo(series_title: str, year: int | None, meta: dict[str, Any],
                      provider: str | None = None, provider_id: str | None = None,
-                     fields: set[str] | None = None) -> str:
+                     fields: set[str] | None = None,
+                     season_posters: dict[int, str] | None = None) -> str:
     meta = meta or {}
     lines = [
         _HEADER, "<tvshow>",
@@ -275,6 +299,10 @@ def build_tvshow_nfo(series_title: str, year: int | None, meta: dict[str, Any],
         _status_line(meta) if _enabled(fields, "status") else "",
         *(_actor_lines(meta) if _enabled(fields, "cast") else []),
         *(_art_lines(meta) if _enabled(fields, "artwork") else []),
+        # Per-season posters (Kodi reads these from tvshow.nfo; file-based servers
+        # use the Season NN/poster.jpg written by the artwork pass instead). Own
+        # toggle so it's independent of the show poster/fanart `artwork` field.
+        *(_season_thumb_lines(season_posters) if _enabled(fields, "seasonposters") else []),
         _uniqueid(provider, provider_id),
         "</tvshow>",
     ]

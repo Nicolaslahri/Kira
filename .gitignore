@@ -48,6 +48,15 @@ backend/kira.db
 backend/.cache/
 .cache/
 
+# ── Bundled runtime binaries (ffmpeg ~195MB; provisioned at runtime by
+#    ffmpeg_setup.py — never source, and over GitHub's 100MB limit) ─────
+backend/tools/
+
+# ── Portable embedded-ID index (per-machine user data; regenerable;
+#    contains local/NAS file paths — see xattr_store.py) ───────────────
+kira-id-index.json
+backend/kira-id-index.json
+
 # ── Editor / IDE / OS ─────────────────────────────────────────────────
 .vscode/*
 !.vscode/extensions.json

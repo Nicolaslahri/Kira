@@ -14,8 +14,12 @@ keeps the title, while `Movie.2015.MAX.WEB-DL` correctly strips it.
 
 from __future__ import annotations
 
+import logging
+
 import re
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 # Token tables — curated defaults. Order matters where prefixes overlap
 # (e.g. "WEB-DL" must match before "WEB" alone), though `_alt()` also sorts
@@ -210,7 +214,7 @@ def _load_base_tables() -> dict:
             if isinstance(data, dict):
                 return data
     except Exception as e:  # pragma: no cover - defensive
-        print(f"format_stripper: base token file unreadable ({e!r}); using in-code defaults")
+        logger.info(f"format_stripper: base token file unreadable ({e!r}); using in-code defaults")
     return {}
 
 
@@ -253,7 +257,7 @@ def _load_extras() -> dict[str, set[str]]:
             "release_flags": scene_rules.extra_release_flags(),
         }
     except Exception as e:  # pragma: no cover - defensive
-        print(f"format_stripper: scene_rules unavailable ({e!r}); curated tables only")
+        logger.info(f"format_stripper: scene_rules unavailable ({e!r}); curated tables only")
         return {}
 
 
@@ -327,6 +331,10 @@ _build()
 # Release group: trailing -GROUP_NAME after the last dash, or [GROUP] at start.
 # Must start with a letter so plain "-38" (absolute episode) doesn't match.
 _TRAILING_GROUP_RE = re.compile(r"-([A-Za-z][A-Za-z0-9]*)$")
+# ...but a trailing EPISODE marker ("-E03" in "S01E01-E03", or "-EP03") is NOT
+# a group — eating it silently drops the second half of a two-parter. SxE
+# extraction runs on this stripped string, so the range must survive here.
+_TRAILING_EP_TOKEN_RE = re.compile(r"^E(?:P|PISODE)?\d{1,4}$", re.IGNORECASE)
 _LEADING_GROUP_RE  = re.compile(r"^\[([^\]]+)\]\s*")
 
 # Bracketed noise we always remove (CRC checksums, fansub flags).
@@ -484,7 +492,7 @@ def strip(name: str) -> tuple[str, FormatTokens]:
     m = _TRAILING_GROUP_RE.search(name)
     if m and tokens.release_group is None:
         candidate = m.group(1)
-        if not _is_known_token(candidate):
+        if not _is_known_token(candidate) and not _TRAILING_EP_TOKEN_RE.match(candidate):
             tokens.release_group = candidate
             name = _TRAILING_GROUP_RE.sub("", name, count=1)
 

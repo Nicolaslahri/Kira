@@ -2,9 +2,17 @@
 
 We deliberately do NOT spin up real filesystem watching here — those paths
 are exercised by the live smoke test. These lock the pure, deterministic
-bits: the ignore filter, config merging, per-folder mode resolution, and
-the idle status shape.
+bits: the ignore filter, config merging, per-folder mode resolution, the
+idle status shape, and the trigger-loop retry semantics (with `_fire`
+stubbed out).
 """
+
+import asyncio
+import time
+
+_REAL_SLEEP = asyncio.sleep  # the fakes below shadow the module-global
+
+import pytest
 
 from kira.watcher import (
     DEFAULT_FOLDER_MODE,
@@ -99,6 +107,97 @@ def test_folder_mode_prefix_match():
     # a file deep inside the watched root inherits the root's mode
     mode, thr = folder_mode(cfg, "Z:/tv/Show/S01/ep.mkv")
     assert mode == "auto_rename"
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_fires_once(monkeypatch):
+    """Files that arrive while Kira is down are invisible to awatch AND get
+    absorbed into the poll baseline — the catch-up scan on arm is the only
+    thing that finds them. Lock that it fires."""
+    svc = WatcherService()
+    svc._stop_event = asyncio.Event()
+    fired: list[str] = []
+
+    async def fake_fire(reason):
+        fired.append(reason)
+        return True
+
+    monkeypatch.setattr(svc, "_fire", fake_fire)
+    monkeypatch.setattr("kira.watcher.asyncio.sleep", lambda _s: _REAL_SLEEP(0))
+    await svc._startup_catchup()
+    assert fired == ["startup"]
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_skips_when_stopped(monkeypatch):
+    svc = WatcherService()
+    svc._stop_event = asyncio.Event()
+    svc._stop_event.set()  # stop() raced the catch-up delay
+    fired: list[str] = []
+
+    async def fake_fire(reason):
+        fired.append(reason)
+        return True
+
+    monkeypatch.setattr(svc, "_fire", fake_fire)
+    monkeypatch.setattr("kira.watcher.asyncio.sleep", lambda _s: _REAL_SLEEP(0))
+    await svc._startup_catchup()
+    assert fired == []
+
+
+@pytest.mark.asyncio
+async def test_debounce_retries_when_fire_skipped(monkeypatch):
+    """A skipped fire (another scan already running) must NOT consume the
+    dirty flag — the change retries until a scan actually starts."""
+    svc = WatcherService()
+    svc._stop_event = asyncio.Event()
+    svc._debounce_seconds = 0
+    svc._dirty = True
+    svc._last_event = time.monotonic() - 60
+    results = iter([False, False, True])  # busy, busy, started
+    fired: list[str] = []
+
+    async def fake_fire(reason):
+        ok = next(results)
+        fired.append(f"{reason}:{ok}")
+        if ok:
+            svc._stop_event.set()
+        return ok
+
+    monkeypatch.setattr(svc, "_fire", fake_fire)
+    monkeypatch.setattr("kira.watcher.asyncio.sleep", lambda _s: _REAL_SLEEP(0))
+    await asyncio.wait_for(svc._debounce_loop(), timeout=5)
+    assert fired == ["event:False", "event:False", "event:True"]
+    assert svc._dirty is False  # consumed only by the successful fire
+
+
+@pytest.mark.asyncio
+async def test_poll_keeps_signature_when_fire_skipped(monkeypatch):
+    """A signature change whose fire was skipped must re-trigger on the next
+    tick — advancing the baseline on a skipped fire would lose it forever."""
+    svc = WatcherService()
+    svc._stop_event = asyncio.Event()
+    svc._poll_interval_seconds = 0
+    svc._last_signature = (1, 1)
+    monkeypatch.setattr(svc, "_compute_signature", lambda: (2, 2))
+    results = iter([False, True])  # busy once, then started
+    fired: list[str] = []
+    sigs_at_fire: list[tuple] = []
+
+    async def fake_fire(reason):
+        ok = next(results)
+        fired.append(f"{reason}:{ok}")
+        sigs_at_fire.append(svc._last_signature)
+        if ok:
+            svc._stop_event.set()
+        return ok
+
+    monkeypatch.setattr(svc, "_fire", fake_fire)
+    monkeypatch.setattr("kira.watcher.asyncio.sleep", lambda _s: _REAL_SLEEP(0))
+    await asyncio.wait_for(svc._poll_loop(), timeout=5)
+    assert fired == ["poll:False", "poll:True"]
+    assert sigs_at_fire[0] == (1, 1)      # skipped fire left the baseline alone
+    assert svc._last_signature == (2, 2)  # successful fire advanced it
 
 
 def test_status_shape_when_idle():

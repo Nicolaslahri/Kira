@@ -15,6 +15,7 @@
 // matched episode) get appended at the bottom with a blank right side.
 
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import type { LibraryItem, LibEpisode, LibFile } from '../lib/types';
 import {
   IcCheck, IcX, IcSearch, IcRefresh, IcAlertTri, IcDownload,
@@ -434,13 +435,19 @@ export function CoverPopup({
       : null
   );
   useEffect(() => {
-    if (providerEpisodes || !providerKey || !providerId || item.kind === 'movie') return;
+    // Always revalidate on open — do NOT gate on `providerEpisodes` already
+    // being set, or the stale-cache instant-paint would suppress the refetch
+    // forever (a just-titled episode keeps showing "Episode N"). The initial
+    // paint still comes from getCachedEpisodes (useState above);
+    // fetchSeriesEpisodes serves last-known under the hood and only flips state
+    // when the backend returns real data.
+    if (!providerKey || !providerId || item.kind === 'movie') return;
     let cancelled = false;
     fetchSeriesEpisodes(providerKey, providerId, seasonForFetch).then(eps => {
       if (!cancelled && eps.length) setProviderEpisodes(eps);
     });
     return () => { cancelled = true; };
-  }, [providerKey, providerId, seasonForFetch, providerEpisodes, item.kind]);
+  }, [providerKey, providerId, seasonForFetch, item.kind]);
 
   // Suppress unused-var hint from the placeholder line above (kept for
   // clarity that this useEffect intentionally only runs for series/albums).
@@ -811,6 +818,57 @@ export function CoverPopup({
   // resolve. Opened from the "+N more" pill; the user picks a keeper and bulk-
   // deletes the rest in one confirm (no more click-delete-confirm per file).
   const [dupeModal, setDupeModal] = useState<{ episode: LibEpisode; files: LibFile[] } | null>(null);
+
+  // ── Ghost-row guard for duplicate detection ──────────────────────────
+  // A file renamed/deleted OUTSIDE Kira leaves a stale DB row at the old path.
+  // If that row still matches an episode it poses as a second copy, and the
+  // dupe resolver would offer to delete your only REAL file. So for the files
+  // that actually collide on an episode, ask the backend which no longer exist
+  // on disk and drop those from pairing (same treatment as `deletedIds`). Scoped
+  // to collision candidates only — we never stat a 1000-file series wholesale.
+  const [missingIds, setMissingIds] = useState<Set<string>>(new Set());
+  const verifiedExistRef = useRef<Set<number>>(new Set());
+
+  const collidingFileIds = useMemo<number[]>(() => {
+    if (item.kind === 'movie') return [];
+    const byKey = new Map<string, Set<string>>();
+    const push = (k: string, id: string) => {
+      const s = byKey.get(k);
+      if (s) s.add(id); else byKey.set(k, new Set([id]));
+    };
+    item.files.forEach(f => {
+      const ep = f.matchedToEpisode != null ? item.episodes[f.matchedToEpisode] : null;
+      if (!ep) return;
+      push(`${ep.season}-${ep.episode}`, f.id);
+      if (ep.absolute != null) push(`abs-${ep.absolute}`, f.id);
+      if (item.mediaType === 'anime') {
+        push(`ep-${ep.episode}`, f.id);
+        if (ep.season !== 1) { push(`1-${ep.episode}`, f.id); push(`abs-${ep.episode}`, f.id); }
+      }
+    });
+    const ids = new Set<string>();
+    for (const s of byKey.values()) if (s.size >= 2) for (const id of s) ids.add(id);
+    return [...ids].map(Number);
+  }, [item]);
+
+  useEffect(() => {
+    const toCheck = collidingFileIds.filter(id => !verifiedExistRef.current.has(id));
+    if (toCheck.length === 0) return;
+    toCheck.forEach(id => verifiedExistRef.current.add(id));
+    let cancelled = false;
+    api.verifyFilesExist(toCheck)
+      .then(res => {
+        if (cancelled || !res.missing?.length) return;
+        setMissingIds(prev => {
+          const next = new Set(prev);
+          res.missing.forEach(id => next.add(String(id)));
+          return next;
+        });
+      })
+      .catch(() => { /* best-effort: a failed check just leaves the row as-is */ });
+    return () => { cancelled = true; };
+  }, [collidingFileIds]);
+
   const rows: PairedRow[] = useMemo(() => {
     if (item.kind === 'movie') return [];
     const out: PairedRow[] = [];
@@ -898,6 +956,7 @@ export function CoverPopup({
         if (!list) return;
         for (const f of list) {
           if (deletedIds.has(f.id)) continue;
+          if (missingIds.has(f.id)) continue;   // ghost (file gone on disk) — never a dupe candidate
           if (!seen.has(f.id)) { seen.add(f.id); candidates.push(f); }
         }
       };
@@ -1006,7 +1065,7 @@ export function CoverPopup({
     // is built into V8 and correctly handles embedded integers in
     // filenames — no regex parsing needed.
     const orphanFiles = item.files
-      .filter(f => !matchedFileIds.has(f.id) && !deletedIds.has(f.id))
+      .filter(f => !matchedFileIds.has(f.id) && !deletedIds.has(f.id) && !missingIds.has(f.id))
       .slice()
       .sort((a, b) => a.filename.localeCompare(
         b.filename, undefined, { numeric: true, sensitivity: 'base' },
@@ -1015,7 +1074,7 @@ export function CoverPopup({
       out.push({ key: 'orphan-' + i, kind: 'orphan', episode: null, episodeIdx: null, file }),
     );
     return out;
-  }, [item, providerEpisodes, deletedIds]);
+  }, [item, providerEpisodes, deletedIds, missingIds]);
 
   // ── Bulk actions
   const handleApproveAll = useCallback(() => {
@@ -1035,6 +1094,32 @@ export function CoverPopup({
     onUpdateItem(next);
     pushToast?.({ title: 'All files rejected', sub: item.title, kind: 'error' });
   }, [item, onUpdateItem, pushToast]);
+
+  // ── Get missing subtitles for this cluster ──────────────────────────
+  // Files the backend flagged as missing a preferred subtitle language.
+  // One click queues a backfill (embedded → OpenSubtitles → YIFY); the
+  // activity pill appears immediately (the kick), narrates each file, and
+  // ends green/red with the outcome — it IS the feedback, no toast needed.
+  const subMissingIds = item.files
+    .filter(f => f.missingSubs && f.missingSubs.length > 0)
+    .map(f => Number(f.id))
+    .filter(Number.isFinite);
+  const [subBusy, setSubBusy] = useState(false);
+  const handleGetSubtitles = useCallback(async () => {
+    if (subBusy || subMissingIds.length === 0) return;
+    setSubBusy(true);
+    try {
+      const res = await api.backfillSubtitles({ file_ids: subMissingIds });
+      window.dispatchEvent(new Event('kira:activity-refresh'));
+      if (!res.started) {
+        pushToast?.({ title: 'Nothing to fetch', sub: res.detail ?? 'Already covered.', kind: 'success' });
+      }
+    } catch (e) {
+      pushToast?.({ title: 'Subtitle fetch failed', sub: (e as Error).message, kind: 'error' });
+    } finally {
+      setSubBusy(false);
+    }
+  }, [subBusy, subMissingIds, pushToast]);
 
   // Debounced batch for per-row approves. Previously every per-row
   // approve fired its own `renameFilesDirectly([file.id])` + its own
@@ -1093,7 +1178,28 @@ export function CoverPopup({
     }
   }, [item, applyFilePatch, renameFilesDirectly, flushPendingRename]);
 
-  return (
+  // Portal the entire overlay to <body>. CRITICAL z-index fix: the popup
+  // is rendered deep inside ReviewPage → motion.div.page-stage (App.tsx),
+  // and .page-stage animates `opacity` on every page change. An element
+  // with opacity < 1 (or a running opacity animation / will-change) creates
+  // a STACKING CONTEXT, which traps the popup's `z-index: 60` inside
+  // .page-stage's own level. .page-stage sits at z-auto within <main>,
+  // BELOW the sticky topbar (z-30), the brand sweep (z-40), and the mobile
+  // drawer (z-40) — so those shell chrome elements painted OVER the popup
+  // even though 60 > 40. No z-index value on .cx-overlay can win while it
+  // lives inside that descendant context. Portaling to <body> lifts the
+  // overlay OUT of .page-stage entirely, so its z-index is finally measured
+  // against the shell at the top level (see the z-scale comment in
+  // index.css). The dupe/delete/force-import sub-modals render INSIDE the
+  // shell at z 9000 (local to the overlay's stacking context) so they stay
+  // above the popup; toasts (z 100, also on <body>) stay above everything.
+  //
+  // Focus-trap / ESC / scroll-lock are unaffected: they bind to `document`
+  // / `window` and `shellRef`, none of which care where in the DOM tree the
+  // nodes live. The flying-cover is `position: fixed` and measures slot
+  // rects via refs — also DOM-location-independent. So this is a pure
+  // positioning fix, exactly as the constraint preferred.
+  return createPortal(
     <div
       className={`cx-overlay ${opening ? 'opening' : ''} ${closing ? 'closing' : ''}`}
       onClick={handleClose}
@@ -1225,7 +1331,7 @@ export function CoverPopup({
           />
 
           {item.kind === 'movie'
-            ? <MovieBody item={item} />
+            ? <div className="cx-movie-scroll"><MovieBody item={item} /></div>
             : <SeriesBody
                 item={item}
                 rows={rows}
@@ -1366,6 +1472,24 @@ export function CoverPopup({
                 </Button>
               );
             })()}
+
+            {/* ── Get missing subtitles ───────────────────────────────
+                Shows only when the backend flagged ≥1 file in this cluster
+                as missing a preferred language. Fire-and-forget: the live
+                story plays in the activity pill, not here. */}
+            {!clusterIsDead && subMissingIds.length > 0 ? (
+              <Button
+                color="secondary"
+                size="sm"
+                iconLeading={IcDownload}
+                isLoading={subBusy}
+                showTextWhileLoading
+                onClick={handleGetSubtitles}
+                title={`Fetch missing subtitles for ${subMissingIds.length} file(s) in this title.`}
+              >
+                Get subtitles ({subMissingIds.length})
+              </Button>
+            ) : null}
 
             {/* ── Sync from Sonarr (no-match clusters) ────────────────
                 Visible specifically on no-match clusters where the
@@ -1769,10 +1893,21 @@ export function CoverPopup({
                     // one and only rename — going through `updateFile` here
                     // would also queue id 0 and flush a duplicate rename on
                     // close/unmount.
-                    if (item.kind === 'movie') {
-                      if (item.files[0]?.status !== 'approved') applyFilePatch(0, { status: 'approved' });
-                    } else {
-                      handleApproveAll();
+                    // When we can rename, the rename endpoint flips status
+                    // server-side AND the parent refetches the file list — so
+                    // SKIP the per-file status PATCH storm (handleApproveAll /
+                    // applyFilePatch route through onUpdateItem → N concurrent
+                    // setFileStatus PATCHes in the parent), which raced the
+                    // rename's refetch and could momentarily revert 'renamed'
+                    // rows. Optimistically flip status ONLY when there's no
+                    // rename path (status-only fallback).
+                    const willRename = !!(renameFilesDirectly && eligible.length);
+                    if (!willRename) {
+                      if (item.kind === 'movie') {
+                        if (item.files[0]?.status !== 'approved') applyFilePatch(0, { status: 'approved' });
+                      } else {
+                        handleApproveAll();
+                      }
                     }
                     if (renameFilesDirectly && eligible.length) {
                       await renameFilesDirectly(eligible.map(f => f.id));
@@ -1787,7 +1922,8 @@ export function CoverPopup({
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

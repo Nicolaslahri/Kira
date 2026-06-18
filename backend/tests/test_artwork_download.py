@@ -210,9 +210,12 @@ async def test_batch_caches_fanart_call_and_image_bytes(tmp_path, monkeypatch):
     # fanart.tv hit ONCE despite two files; the logo image fetched ONCE.
     assert calls["n"] == 1
     assert _FakeHttp.gets == ["https://fanart/logo.png"]
-    # …but BOTH episodes got their own sidecar written.
-    assert (tmp_path / "Show - S01E01-clearlogo.png").exists()
-    assert (tmp_path / "Show - S01E02-clearlogo.png").exists()
+    # …and show-level art is written ONCE into the series root (here tmp_path —
+    # these episodes have no Season folder), NOT duplicated as a per-episode
+    # sidecar. (Episode files want a -thumb still, not the show poster/logo.)
+    assert (tmp_path / "clearlogo.png").exists()
+    assert not (tmp_path / "Show - S01E01-clearlogo.png").exists()
+    assert not (tmp_path / "Show - S01E02-clearlogo.png").exists()
 
 
 @pytest.mark.asyncio
@@ -238,3 +241,57 @@ async def test_no_fanart_key_still_writes_provider_poster(tmp_path, monkeypatch)
     assert (tmp_path / "Movie (2021)-poster.jpg").exists()
     assert (tmp_path / "Movie (2021)-fanart.jpg").exists()
     assert not (tmp_path / "Movie (2021)-clearlogo.png").exists()
+
+
+# ── per-cour SEASON poster (anime) ────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_anime_writes_per_cour_season_poster(tmp_path, monkeypatch):
+    """An AniDB cour carries its OWN poster; cours are unified into one show with
+    seasons, so the cour poster must land as `Season NN/poster.jpg` (not only the
+    single show-root poster, which is first-cour-wins)."""
+    _FakeHttp.gets = []
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeHttp)
+    monkeypatch.setattr("kira.download_guard.sniff_image", lambda b: "jpg")
+
+    async def _boom(**kw):
+        raise AssertionError("no fanart key configured")
+
+    monkeypatch.setattr("kira.providers.fanarttv.fetch_artwork", _boom)
+
+    season = tmp_path / "Attack on Titan" / "Season 02"
+    season.mkdir(parents=True)
+    target = season / "Attack on Titan - S02E06 - Warrior.mkv"
+    sel = _Sel("anidb", "17", poster_url="https://anidb/aot-s2.jpg")
+    await R._download_artwork_files(
+        target, _Parsed("anime"), sel, {},
+        kinds={"poster"}, fanart_key="", fanart_cache={}, img_cache={},
+    )
+    # The cour's poster lands as the SEASON poster (where Plex/Jellyfin read it)…
+    assert (season / "poster.jpg").exists()
+    # …plus the show-root poster (existing behaviour).
+    assert (tmp_path / "Attack on Titan" / "poster.jpg").exists()
+
+
+@pytest.mark.asyncio
+async def test_regular_tv_has_no_per_season_poster(tmp_path, monkeypatch):
+    """Regular-TV seasons share the one show poster, so we DON'T duplicate it into
+    each Season folder — only anime cours (distinct per-cour art) get one."""
+    _FakeHttp.gets = []
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeHttp)
+    monkeypatch.setattr("kira.download_guard.sniff_image", lambda b: "jpg")
+
+    async def _boom(**kw):
+        raise AssertionError("no fanart key configured")
+
+    monkeypatch.setattr("kira.providers.fanarttv.fetch_artwork", _boom)
+
+    season = tmp_path / "Breaking Bad" / "Season 01"
+    season.mkdir(parents=True)
+    target = season / "Breaking Bad - S01E01.mkv"
+    sel = _Sel("tvdb", "81189", poster_url="https://tvdb/bb.jpg")
+    await R._download_artwork_files(
+        target, _Parsed("tv"), sel, {},
+        kinds={"poster"}, fanart_key="", fanart_cache={}, img_cache={},
+    )
+    assert (tmp_path / "Breaking Bad" / "poster.jpg").exists()   # show poster
+    assert not (season / "poster.jpg").exists()                  # NOT per-season

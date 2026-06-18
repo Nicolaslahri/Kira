@@ -38,9 +38,13 @@ export const SegmentedControl = ({ options, value, onChange, fullWidth, classNam
                         aria-selected={active}
                         onClick={() => onChange(o.value)}
                         className={cx(
-                            "rounded-md px-3 py-1.5 text-[13px] font-medium transition-colors",
+                            "rounded-md px-3 py-1.5 text-[13px] font-medium outline-none transition-[color,background,box-shadow,transform]",
+                            "duration-[var(--dur-2)] ease-[var(--ease-out)]",
+                            // Springy toggle feel + visible keyboard focus, matching the
+                            // app-wide button system (see "BUTTON SYSTEM" in index.css).
+                            "active:scale-[0.96] focus-visible:ring-2 focus-visible:ring-[#6ea8fe] focus-visible:ring-offset-0",
                             fullWidth && "flex-1",
-                            active ? "bg-white/[0.1] text-ink shadow-[0_1px_2px_rgba(0,0,0,0.3)]" : "text-ink-muted hover:text-ink",
+                            active ? "bg-white/[0.1] text-ink shadow-[0_1px_2px_rgba(0,0,0,0.3)]" : "text-ink-muted hover:bg-white/[0.04] hover:text-ink",
                         )}
                     >
                         {o.label}

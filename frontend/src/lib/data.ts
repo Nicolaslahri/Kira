@@ -67,6 +67,12 @@ export const PROVIDERS: Record<ProviderKey, ProviderMeta> = {
                  desc: 'Audio fingerprint matching for music files with missing or wrong tags' },
   'fanart.tv': { name: 'fanart.tv',   for: ['movie', 'tv', 'anime'], color: '#ff7575', icon: 'film',
                  desc: 'Artwork only — clear logos, clear art, banners, disc & character art (used by Download artwork)' },
+  OpenSubtitles: { name: 'OpenSubtitles', for: ['movie', 'tv', 'anime'], color: '#ff9a4d', icon: 'caption',
+                 desc: 'Subtitles only — community subtitle downloads. Key enables search; the account login is what downloads need.' },
+  SubDL:       { name: 'SubDL',        for: ['movie', 'tv', 'anime'], color: '#5ac8d7', icon: 'caption',
+                 desc: 'Subtitles only — modern REST catalogue. Free key at subdl.com → panel → API.' },
+  SubSource:   { name: 'SubSource',    for: ['movie', 'tv', 'anime'], color: '#b48cff', icon: 'caption',
+                 desc: "Subtitles only — Subscene's successor. Free key from your subsource.net profile." },
 };
 
 export const TYPE_COLOR: Record<MediaType, string> = {

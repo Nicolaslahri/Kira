@@ -1,12 +1,12 @@
-import { useState } from 'react';
-import { IcSettings, IcFilm, IcAlertTri, IcTrash } from '../../lib/icons';
+import { useRef, useState } from 'react';
+import { IcSettings, IcFilm, IcAlertTri, IcDownload, IcRefresh } from '../../lib/icons';
 import { Select } from '../../components/ui';
-import { SettingsLayout, SectionCard, SettingRow, NumberField, NestedBox } from '../../components/settings-blocks';
+import { SettingsLayout, SectionCard, SettingRow, NumberField, NestedBox, SectionHeader, StatusPill, ProviderField } from '../../components/settings-blocks';
 import { Button } from '../../components/base/buttons/button';
 import { Input } from '../../components/base/input/input';
 import { Toggle } from '../../components/base/toggle/toggle';
 import { api } from '../../lib/api';
-import { type SaveKeyFn, type PushToast } from './helpers';
+import { strSetting, type SaveKeyFn, type PushToast } from './helpers';
 
 export function AdvancedSection({
   rawSettings,
@@ -39,23 +39,80 @@ export function AdvancedSection({
     ? rawSettings['parsing.read_mediainfo'] as boolean : false;
   const mediainfoAuthoritative = typeof rawSettings['parsing.mediainfo_authoritative'] === 'boolean'
     ? rawSettings['parsing.mediainfo_authoritative'] as boolean : false;
-  const [confirming, setConfirming] = useState(false);
-  const [confirmText, setConfirmText] = useState('');
+  // Stamp resolved provider IDs onto renamed files (xattr / ADS / Kira's
+  // portable index) so a wiped database can re-identify the library instantly.
+  // Default ON — some users object to ANY metadata being attached to their
+  // files, so it's switchable.
+  const stampIds = rawSettings['rename.stamp_ids'] !== false;
+  // Relative symlink targets (Symlink op only) — portable across remounts /
+  // different bind-mount paths. Default OFF (absolute, unchanged behavior).
+  const symlinkRelative = rawSettings['rename.symlink_relative'] === true;
+  // Post-rename ownership/mode (Docker/NAS). Master toggle reveals the octal
+  // mode + uid/gid fields; all best-effort + Unix-only (chown), no-op elsewhere.
+  const setPerms = rawSettings['rename.set_permissions'] === true;
+  // Compare /health's version against the latest GitHub release and show a
+  // small "vX.Y.Z out" link in the sidebar. The check is a single anonymous
+  // GitHub API call from the BROWSER on app load — off = zero outbound calls.
+  const updateCheck = rawSettings['advanced.update_check'] !== false;
+  // Hidden file input for the settings-import flow — clicked via the Button.
+  const importInputRef = useRef<HTMLInputElement>(null);
 
-  const doReset = async () => {
+  // Settings backup: download everything except secrets (API keys leave the
+  // server masked, and a backup that embeds them would undo that protection).
+  const doExport = async () => {
     try {
-      await api.resetDatabase();
-      pushToast({ title: 'Database reset', sub: 'All files, matches, and history removed.', kind: 'success' });
-      setConfirming(false);
-      // Force a reload so the rest of the UI resets too.
+      const all = await api.getSettings();
+      // Drop secrets: plaintext bullet placeholders AND the server-masked
+      // `{ masked: true, tail, set }` objects GET /settings now returns for
+      // every secret. Keeps the "API keys are never included" promise literal.
+      const clean = Object.fromEntries(
+        Object.entries(all).filter(([, v]) =>
+          !(typeof v === 'string' && v.startsWith('••••'))
+          && !(!!v && typeof v === 'object' && 'masked' in (v as object)),
+        ),
+      );
+      const blob = new Blob([JSON.stringify(clean, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'kira-settings.json';
+      a.click();
+      URL.revokeObjectURL(url);
+      pushToast({ title: 'Settings exported', sub: 'API keys are not included — re-enter them after an import.', kind: 'success' });
+    } catch (e) {
+      pushToast({ title: 'Export failed', sub: (e as Error).message, kind: 'error' });
+    }
+  };
+
+  const doImport = async (file: File) => {
+    try {
+      const parsed = JSON.parse(await file.text()) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('Not a Kira settings export (expected a JSON object of settings keys).');
+      }
+      // Never import masked placeholders — they'd overwrite real saved keys.
+      const clean = Object.fromEntries(
+        Object.entries(parsed).filter(([, v]) => !(typeof v === 'string' && v.startsWith('••••'))),
+      );
+      await api.putSettings(clean);
+      pushToast({ title: `Imported ${Object.keys(clean).length} settings`, sub: 'Reloading…', kind: 'success' });
       setTimeout(() => window.location.reload(), 600);
     } catch (e) {
-      pushToast({ title: 'Reset failed', sub: (e as Error).message, kind: 'error' });
+      pushToast({ title: 'Import failed', sub: (e as Error).message, kind: 'error' });
     }
   };
 
   return (
-    <SettingsLayout intro="Power-user settings — retention, performance, file metadata, and maintenance.">
+    <SettingsLayout
+      header={(
+        <SectionHeader
+          icon={<IcSettings />}
+          title="Advanced"
+          purpose="Power-user settings — history retention, performance, file metadata, and maintenance. The danger zone lives at the bottom, deliberately set apart."
+          status={<StatusPill tone={readMediainfo ? 'accent' : 'neutral'}>{readMediainfo ? 'MediaInfo on' : 'Defaults'}</StatusPill>}
+        />
+      )}
+    >
       <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
       {/* Library & performance */}
       <SectionCard
@@ -71,6 +128,7 @@ export function AdvancedSection({
             <div className="w-[160px]">
               <Select<string>
                 value={retention}
+                aria-label="History retention period"
                 onChange={v => saveKey('history.retention_days')(v === 'forever' ? '0' : v)}
                 options={[
                   { value: '30', label: '30 days' },
@@ -82,8 +140,8 @@ export function AdvancedSection({
             </div>
           </SettingRow>
           <SettingRow
-            label="Concurrent file operations"
-            desc="More is faster but heavier on disk I/O."
+            label="Concurrent file reads"
+            desc="How many parallel per-file operations run at once — post-rename subtitle downloads and the background media-info reads. The file moves themselves are deliberately one-at-a-time; that ordering is what makes a half-failed batch safely resumable."
           >
             <NumberField
               min={1}
@@ -91,6 +149,69 @@ export function AdvancedSection({
               value={concurrency}
               onChange={v => saveKey('rename.concurrency')(String(v))}
             />
+          </SettingRow>
+          <SettingRow
+            label="Remember matches on files"
+            desc={<>After a rename, stamp the file with its resolved provider IDs (extended attributes where the volume supports them, Kira's local index otherwise) so a re-scan — even after a database reset — re-identifies it instantly with zero searches. Turn off if you don't want Kira attaching any metadata to your files.</>}
+          >
+            <Toggle isSelected={stampIds} onChange={() => saveKey('rename.stamp_ids')(!stampIds)} className="mt-0.5" aria-label="Remember matches on files" />
+          </SettingRow>
+          <SettingRow
+            label="When a file already exists at the target"
+            desc={<>How Kira handles a rename whose destination is already occupied by a <em>different</em> file. (A re-run where the same file is already in place is always a safe no-op, regardless of this.)</>}
+          >
+            <div className="w-full max-w-[14rem]">
+              <Select<string>
+                value={strSetting(rawSettings, 'rename.on_conflict') || 'error'}
+                aria-label="When a file already exists at the target"
+                onChange={v => saveKey('rename.on_conflict')(v)}
+                options={[
+                  { value: 'error', label: 'Show an error (default)' },
+                  { value: 'skip', label: 'Skip — keep the existing file' },
+                  { value: 'overwrite', label: 'Overwrite the existing file' },
+                ]}
+              />
+            </div>
+          </SettingRow>
+          <SettingRow
+            label="Relative symlink targets"
+            desc={<>Only applies when the rename op is <strong className="text-ink">Symlink</strong>. Point each link at a path <em>relative</em> to its own folder instead of an absolute one, so links survive the library being remounted or bind-mounted at a different path (common in Docker). Off = absolute targets.</>}
+          >
+            <Toggle isSelected={symlinkRelative} onChange={() => saveKey('rename.symlink_relative')(!symlinkRelative)} className="mt-0.5" aria-label="Relative symlink targets" />
+          </SettingRow>
+          <SettingRow
+            label="Set file ownership & permissions"
+            desc={<>After each rename, apply a fixed mode and/or owner to the file and any folders Kira creates — so a media server running as a different user (common on Docker / NAS) can always read them. Best-effort: chown is Unix-only; on Windows this no-ops.</>}
+          >
+            <Toggle isSelected={setPerms} onChange={() => saveKey('rename.set_permissions')(!setPerms)} className="mt-0.5" aria-label="Set file ownership and permissions" />
+          </SettingRow>
+          {setPerms ? (
+            <NestedBox>
+              <div className="flex flex-col gap-3.5">
+                <ProviderField kind="text" label="File mode (octal)" mono
+                  value={strSetting(rawSettings, 'rename.file_mode')}
+                  placeholder="e.g. 644 — blank to leave unchanged"
+                  onSave={v => saveKey('rename.file_mode')(v as string)} />
+                <ProviderField kind="text" label="Folder mode (octal)" mono
+                  value={strSetting(rawSettings, 'rename.dir_mode')}
+                  placeholder="e.g. 755 — blank to leave unchanged"
+                  onSave={v => saveKey('rename.dir_mode')(v as string)} />
+                <ProviderField kind="text" label="Owner UID" mono
+                  value={strSetting(rawSettings, 'rename.owner_uid')}
+                  placeholder="numeric uid — blank to leave unchanged"
+                  onSave={v => saveKey('rename.owner_uid')(v as string)} />
+                <ProviderField kind="text" label="Owner GID" mono
+                  value={strSetting(rawSettings, 'rename.owner_gid')}
+                  placeholder="numeric gid — blank to leave unchanged"
+                  onSave={v => saveKey('rename.owner_gid')(v as string)} />
+              </div>
+            </NestedBox>
+          ) : null}
+          <SettingRow
+            label="Check for updates"
+            desc={<>On app load, compare this install against the latest GitHub release and show a small note in the sidebar when a newer version exists. One anonymous API call to github.com — off means zero outbound calls.</>}
+          >
+            <Toggle isSelected={updateCheck} onChange={() => saveKey('advanced.update_check')(!updateCheck)} className="mt-0.5" aria-label="Check for updates" />
           </SettingRow>
         </div>
       </SectionCard>
@@ -118,38 +239,200 @@ export function AdvancedSection({
           </NestedBox>
         </div>
       </SectionCard>
+
+      {/* Backup & restore — settings only (the database holds matches/history
+          and has its own lifecycle; this covers configuration). */}
+      <SectionCard
+        icon={<IcDownload />}
+        title="Backup &amp; restore"
+        desc={<>Export every setting as a JSON file, or import one to restore a configuration. <strong className="text-ink">API keys are never included</strong> — they leave the server masked — so re-enter those after a restore.</>}
+      >
+        <div className="flex flex-wrap items-center gap-2.5">
+          <Button color="secondary" size="sm" iconLeading={IcDownload} onClick={() => void doExport()}>
+            Export settings
+          </Button>
+          <input
+            ref={importInputRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={e => {
+              const f = e.target.files?.[0];
+              if (f) void doImport(f);
+              e.target.value = '';
+            }}
+          />
+          <Button color="secondary" size="sm" iconLeading={IcRefresh} onClick={() => importInputRef.current?.click()}>
+            Import settings…
+          </Button>
+        </div>
+      </SectionCard>
       </div>
 
-      {/* Danger zone */}
+      {/* Danger zone — visually quarantined: its own labelled group + the
+          red-tinted SectionCard tone. */}
+      <div className="settings-danger-zone flex flex-col gap-2.5 pt-2">
+      <div className="flex items-center gap-3">
+        <span className="text-[11px] font-semibold uppercase tracking-[0.1em] text-conf-low">Danger zone</span>
+        <span className="h-px flex-1 bg-[rgba(255,91,110,0.25)]" />
+      </div>
       <SectionCard
         tone="danger"
         icon={<IcAlertTri />}
-        title="Danger zone"
-        desc="Reset Kira's database. Renames already on disk are NOT undone."
+        title="Reset"
+        desc="Four levels, lightest first — each says exactly what it destroys. Files already on disk are never touched by any of them."
       >
-        <div>
-          {!confirming ? (
-            <Button color="secondary-destructive" size="sm" iconLeading={IcTrash} onClick={() => setConfirming(true)}>
-              Reset database…
-            </Button>
-          ) : (
-            <div className="flex flex-col gap-2.5">
-              <div className="text-[12.5px] text-conf-low">
-                Type <span className="font-mono font-semibold text-ink">DELETE</span> to confirm. This cannot be undone.
-              </div>
-              <div className="flex items-center gap-2">
-                <Input wrapperClassName="flex-1" mono value={confirmText} onChange={e => setConfirmText(e.target.value)} placeholder="DELETE" autoFocus />
-                <Button color="primary-destructive" size="sm" isDisabled={confirmText !== 'DELETE'} onClick={() => void doReset()}>
-                  Reset now
-                </Button>
-                <Button color="tertiary" size="sm" onClick={() => { setConfirming(false); setConfirmText(''); }}>
-                  Cancel
-                </Button>
-              </div>
-            </div>
-          )}
+        <div className="flex flex-col gap-2.5">
+          <DangerRow
+            level={1}
+            badge="history"
+            name="Clear rename history"
+            lost="The rename log and undo. Files, matches, and settings survive."
+            confirmWord={null}
+            onRun={async () => {
+              const r = await api.resetHistory();
+              pushToast({ title: 'History cleared', sub: `${r.history_deleted} entries removed.`, kind: 'success' });
+            }}
+          />
+          <DangerRow
+            level={2}
+            badge="matches"
+            name="Forget all matches"
+            lost="Every identification — files flip back to pending for a fresh re-match. Files, history, and settings survive."
+            confirmWord={null}
+            onRun={async () => {
+              const r = await api.resetMatches();
+              pushToast({ title: 'Matches reset', sub: `${r.matches_deleted} matches forgotten — run a scan to re-identify.`, kind: 'success' });
+              setTimeout(() => window.location.reload(), 700);
+            }}
+          />
+          <DangerRow
+            level={3}
+            badge="library data"
+            name="Reset database"
+            lost="All files, matches, history, and notifications. Settings and your account survive. Renames on disk are NOT undone."
+            confirmWord="DELETE"
+            onRun={async () => {
+              await api.resetDatabase();
+              pushToast({ title: 'Database reset', sub: 'All scan data removed.', kind: 'success' });
+              setTimeout(() => window.location.reload(), 700);
+            }}
+          />
+          <DangerRow
+            level={4}
+            badge="everything"
+            name="Factory reset"
+            lost="Everything above PLUS every setting, API key, and the account itself — back to the first-run sign-up and onboarding."
+            confirmWord="FACTORY"
+            onRun={async () => {
+              await api.factoryReset();
+              try { localStorage.clear(); sessionStorage.clear(); } catch { /* ignore */ }
+              window.location.reload();
+            }}
+          />
         </div>
       </SectionCard>
+      </div>
     </SettingsLayout>
+  );
+}
+
+
+// ── Danger-zone row — one reset tier ──
+// Severity escalates 1→4 (amber → deep red). Light tiers confirm with a
+// second click; heavy tiers demand the confirm word typed out. Every row
+// states exactly what is destroyed.
+
+const DANGER_COLORS = ['var(--conf-mid)', '#ff9a4d', 'var(--conf-low)', '#ff2d44'];
+
+function DangerRow({ level, badge, name, lost, confirmWord, onRun }: {
+  level: 1 | 2 | 3 | 4;
+  badge: string;
+  name: string;
+  lost: string;
+  /** null = two-click arm; string = must be typed to enable the button. */
+  confirmWord: string | null;
+  onRun: () => Promise<void>;
+}) {
+  const [armed, setArmed] = useState(false);
+  const [typed, setTyped] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const color = DANGER_COLORS[level - 1];
+
+  const run = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await onRun();
+      setArmed(false);
+      setTyped('');
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div
+      className="flex flex-col gap-2 rounded-xl border px-3.5 py-3"
+      style={{
+        borderColor: `color-mix(in srgb, ${color} 30%, transparent)`,
+        background: `color-mix(in srgb, ${color} 5%, transparent)`,
+      }}
+    >
+      <div className="flex items-center gap-3">
+        <span className="size-2 shrink-0 rounded-full" style={{ background: color, boxShadow: `0 0 8px ${color}` }} />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="text-[13px] font-semibold text-ink">{name}</span>
+            <span
+              className="rounded-full px-2 py-px text-[9.5px] font-semibold uppercase tracking-[0.07em]"
+              style={{
+                color,
+                background: `color-mix(in srgb, ${color} 12%, transparent)`,
+                border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`,
+              }}
+            >
+              {badge}
+            </span>
+          </div>
+          <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-muted">{lost}</div>
+        </div>
+        {!armed ? (
+          <Button color="secondary-destructive" size="sm" className="shrink-0" onClick={() => setArmed(true)}>
+            {name}…
+          </Button>
+        ) : null}
+      </div>
+      {armed ? (
+        <div className="flex flex-wrap items-center gap-2 pl-5">
+          {confirmWord ? (
+            <>
+              <span className="shrink-0 text-[11.5px] text-conf-low">
+                Type <span className="font-mono font-semibold text-ink">{confirmWord}</span>:
+              </span>
+              <Input wrapperClassName="w-40" mono value={typed} onChange={e => setTyped(e.target.value)} placeholder={confirmWord} autoFocus />
+            </>
+          ) : (
+            <span className="flex-1 text-[11.5px] text-conf-low">Sure? This can't be undone.</span>
+          )}
+          <Button
+            color="primary-destructive"
+            size="sm"
+            isDisabled={busy || (confirmWord !== null && typed !== confirmWord)}
+            isLoading={busy}
+            showTextWhileLoading
+            onClick={() => void run()}
+          >
+            {busy ? 'Working…' : 'Confirm'}
+          </Button>
+          <Button color="tertiary" size="sm" isDisabled={busy} onClick={() => { setArmed(false); setTyped(''); setErr(null); }}>
+            Cancel
+          </Button>
+          {err ? <span className="w-full text-[11.5px] text-conf-low">{err}</span> : null}
+        </div>
+      ) : null}
+    </div>
   );
 }

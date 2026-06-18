@@ -81,3 +81,58 @@ async def test_reconcile_skips_completed_with_status_left(monkeypatch) -> None:
         s.add(Scan(root_path="/x", status="failed: earlier", completed_at=datetime(2020, 1, 1)))
         await s.commit()
     assert await scans_mod.reconcile_orphaned_scans() == (0, 0)
+
+
+async def test_match_singleton_movie_does_not_crash(monkeypatch) -> None:
+    # Regression: _match_singleton must bind `ep_num` for NON-tv matches too.
+    # A movie top-match skips the tv_episode episode-title branch, so `ep_num`
+    # was left unbound and `resolve_canonical_season(..., episode=ep_num)` raised
+    # "cannot access local variable 'ep_num'..." on EVERY movie scan.
+    from kira.models import Match
+    from sqlalchemy import select
+
+    Session = await _mem_sessionmaker()
+    monkeypatch.setattr(scans_mod, "SessionLocal", Session)
+
+    async with Session() as s:
+        mf = MediaFile(
+            file_path="/m/Inception (2010).mkv",
+            parsed_data={"original_filename": "Inception (2010).mkv",
+                         "media_type": "movie", "title": "Inception", "year": 2010},
+            media_type="movie", status="discovered",
+        )
+        s.add(mf)
+        await s.flush()
+        fid = mf.id
+        await s.commit()
+
+    class _Scored:
+        provider = "tmdb"; provider_id = "27205"; match_type = "movie"
+        confidence = 1.0; title = "Inception"; year = 2010
+        poster_url = None; overview = None; raw = None
+
+    class _Engine:
+        registry = object()
+        async def match(self, parsed, limit=5):
+            return [_Scored()]
+
+    async def _meta(*a, **k):
+        return {}
+
+    async def _gid(*a, **k):
+        return None
+
+    monkeypatch.setattr(scans_mod, "fetch_match_metadata", _meta)
+    monkeypatch.setattr(scans_mod, "compute_series_group_id", _gid)
+
+    async with Session() as s:
+        # Must NOT raise (the bug raised UnboundLocalError on ep_num here).
+        await scans_mod._match_singleton(s, _Engine(), fid)
+        await s.commit()
+
+    async with Session() as s:
+        rows = list(await s.scalars(select(Match).where(Match.media_file_id == fid)))
+    assert len(rows) == 1
+    assert rows[0].match_type == "movie"
+    assert rows[0].season_number is None        # movie → no season, no ScudLee
+    assert rows[0].episode_number is None

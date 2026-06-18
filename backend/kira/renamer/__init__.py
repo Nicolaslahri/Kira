@@ -6,6 +6,7 @@ from kira.renamer.templates import (
 )
 from kira.renamer.operations import (
     FileOp,
+    RenameSkipped,
     compute_sidecar_target,
     discover_sidecars,
     execute_op,
@@ -14,6 +15,7 @@ from kira.renamer.operations import (
 __all__ = [
     "DEFAULT_PROFILES",
     "FileOp",
+    "RenameSkipped",
     "NamingProfile",
     "apply_template",
     "compute_sidecar_target",

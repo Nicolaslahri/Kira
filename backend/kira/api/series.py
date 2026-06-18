@@ -11,6 +11,8 @@ E13 — Frieren the Slayer" instead of disappearing.
 
 from __future__ import annotations
 
+import logging
+
 import asyncio
 from typing import Any
 
@@ -20,6 +22,8 @@ from fastapi import APIRouter, HTTPException
 
 from kira.matcher.engine import registry_from_settings
 from kira.providers.base import ProviderKey
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/series", tags=["series"])
 
@@ -126,7 +130,7 @@ async def list_series_episodes(
                     include_specials=want_specials,
                 )
             except Exception as e:
-                print(f"series anidb/{provider_id} native ep lookup failed: {e!r}")
+                logger.warning(f"series anidb/{provider_id} native ep lookup failed: {e!r}")
                 results = []
             # Cross-ref fallback covers AniDB ban + transient errors.
             if not results:
@@ -137,7 +141,7 @@ async def list_series_episodes(
             try:
                 results = await p.get_episodes(provider_id, season if season is not None else 1)
             except Exception as e:
-                print(f"series {provider}/{provider_id} ep lookup failed: {e!r}")
+                logger.warning(f"series {provider}/{provider_id} ep lookup failed: {e!r}")
                 results = []
 
     out = [
@@ -226,7 +230,8 @@ async def _anidb_episodes_via_cross_ref(
     except (ValueError, TypeError):
         return []
 
-    # Prefer TVDB (richer titles + English by default). TMDB as backup.
+    # Cross-ref order honors `matching.anime_crossref_order` (default TVDB-first
+    # — richer titles + English by default; TMDB as backup).
     #
     # Earlier-bug-history note: this helper used to .model_copy() each
     # returned episode to force season=1 (matching AniDB's native
@@ -240,24 +245,87 @@ async def _anidb_episodes_via_cross_ref(
     # the provider's real season number; the frontend pairing logic
     # falls back to absolute-episode matching when (season, episode)
     # misses, so the AniDB-native case (no real season) still works.
-    tvdb_id = await AnimeMappings.tvdb_id(aid_i)
-    if tvdb_id and registry.has("tvdb"):
-        try:
-            tvdb = registry.build("tvdb")
-            # Fribb usually carries the season number; if not, fall back
-            # to the season arg the caller passed (popup's seasonForFetch).
-            cross_season = await AnimeMappings.tvdb_season(aid_i) or season or 1
-            return await tvdb.get_episodes(str(tvdb_id), cross_season)
-        except Exception as e:
-            print(f"series cross-ref TVDB failed for AID {aid}: {e!r}")
+    from kira.matcher.engine import resolve_anime_crossref_order, _load_db_settings
+    order = resolve_anime_crossref_order(await _load_db_settings())
+    # Fribb usually carries the season number; if not, fall back to the
+    # season arg the caller passed (popup's seasonForFetch).
+    cross_season = await AnimeMappings.tvdb_season(aid_i) or season or 1
 
-    tmdb_id = await AnimeMappings.tmdb_tv_id(aid_i)
-    if tmdb_id and registry.has("tmdb"):
+    for key in order:
         try:
-            tmdb = registry.build("tmdb")
-            cross_season = await AnimeMappings.tvdb_season(aid_i) or season or 1
-            return await tmdb.get_episodes(str(tmdb_id), cross_season)
+            if key == "tvdb":
+                tvdb_id = await AnimeMappings.tvdb_id(aid_i)
+                if tvdb_id and registry.has("tvdb"):
+                    return await registry.build("tvdb").get_episodes(str(tvdb_id), cross_season)
+            elif key == "tmdb":
+                tmdb_id = await AnimeMappings.tmdb_tv_id(aid_i)
+                if tmdb_id and registry.has("tmdb"):
+                    return await registry.build("tmdb").get_episodes(str(tmdb_id), cross_season)
         except Exception as e:
-            print(f"series cross-ref TMDB failed for AID {aid}: {e!r}")
+            logger.warning(f"series cross-ref {key.upper()} failed for AID {aid}: {e!r}")
 
     return []
+
+
+_episode_meta_cache: dict[tuple, list] = {}
+
+
+async def resolve_episode_meta(selected, season, episode, registry, client):
+    """Best-effort cross-ref `EpisodeResult` (title / overview / air_date) for a
+    matched episode. AniDB anime carries no per-episode titles of its own, so we
+    resolve through the Fribb TVDB/TMDB cross-ref (the same path the popup uses);
+    a direct TVDB/TMDB match queries that provider. Cached per (provider, id,
+    season) so a batch of one series' episodes shares a single provider fetch.
+    Returns the matching EpisodeResult, or None on any miss."""
+    if episode is None or selected is None or not selected.provider_id:
+        return None
+    prov = (selected.provider or "").lower()
+    key = (prov, str(selected.provider_id), season)
+    eps = _episode_meta_cache.get(key)
+    if eps is None:
+        try:
+            if prov == "anidb":
+                # AniDB's native episode list carries per-episode titles — use it
+                # FIRST (exactly like the popup endpoint), so the rename/NFO get
+                # the SAME title the popup shows. The TVDB/TMDB cross-ref is the
+                # fallback for an AniDB ban / error.
+                try:
+                    if registry is not None and registry.has("anidb"):
+                        eps = await registry.build("anidb").get_episodes(
+                            str(selected.provider_id), season if season is not None else 1)
+                except Exception:
+                    eps = None
+                if not eps:
+                    eps = await _anidb_episodes_via_cross_ref(
+                        selected.provider_id, season, registry, client)
+            elif prov in ("tvdb", "tmdb") and registry is not None and registry.has(prov):
+                eps = await registry.build(prov).get_episodes(
+                    str(selected.provider_id), season if season is not None else 1)
+            else:
+                eps = []
+        except Exception:
+            eps = []
+        if len(_episode_meta_cache) > 256:   # bounded — long sessions don't leak
+            _episode_meta_cache.clear()
+        _episode_meta_cache[key] = list(eps or [])
+        eps = _episode_meta_cache[key]
+    # `episode_number` is the matcher's AUTHORITATIVE number (absolute for anime,
+    # season-local for ordinary TV). Match THAT — AniDB stores it as `episode`
+    # (season always 1), TVDB/TMDB carry it as `absolute_number`. We must NEVER
+    # match the cour-LOCAL number (e.g. 11) against `episode`: against AniDB's
+    # absolute list that collides with absolute episode 11 (a 2000-era One Piece
+    # episode) instead of absolute 1166 — which is exactly the "Captain Kuro"
+    # title that landed in a 2026 episode's NFO.
+    abs_no = getattr(selected, "episode_number", None)
+    match = None
+    if abs_no is not None:
+        match = (next((e for e in eps if getattr(e, "episode", None) == abs_no), None)
+                 or next((e for e in eps if getattr(e, "absolute_number", None) == abs_no), None))
+    # Only when the match carries NO authoritative number do we fall back to the
+    # (season, episode) tuple — season-guarded so AniDB's season-1 absolute list
+    # can't masquerade as a season-relative hit.
+    if match is None and abs_no is None and episode is not None and season is not None:
+        match = next((e for e in eps
+                      if getattr(e, "episode", None) == episode
+                      and getattr(e, "season", None) == season), None)
+    return match

@@ -85,6 +85,63 @@ async def test_prune_is_noop_when_nothing_missing(tmp_path, monkeypatch):
         assert len((await s.scalars(select(MediaFile.id))).all()) == 2
 
 
+def _alias_norm(drive_root: str, real_root: str):
+    """Mirror the worker's alias-aware `_norm`: swap between a mapped-drive root
+    spelling and its resolved form (what `Path('Z:/').resolve()` returns), and
+    emit both slash styles. This is exactly the One Piece S00E04/S23E04 case."""
+    dl, rl = drive_root.lower(), real_root.lower()
+
+    def _n(p) -> set[str]:
+        pl = str(p).lower()
+        bases = {pl}
+        if pl.startswith(dl):
+            bases.add(rl + pl[len(dl):])
+        elif pl.startswith(rl):
+            bases.add(dl + pl[len(rl):])
+        forms: set[str] = set()
+        for b in bases:
+            forms.add(b)
+            forms.add(b.replace("/", "\\"))
+            forms.add(b.replace("\\", "/"))
+        return forms
+
+    return _n
+
+
+@pytest.mark.asyncio
+async def test_prune_is_drive_letter_unc_alias_aware(tmp_path, monkeypatch):
+    """Phantom-duplicate fix: a row stored under one spelling of a share (the
+    UNC/resolved form an earlier rename wrote) must still be pruned when the scan
+    runs under the OTHER spelling (the mapped drive). Before the fix the raw-string
+    scope check judged it out-of-scope and the stale ghost row lived forever,
+    surfacing as a false "duplicate" of the re-scanned file."""
+    sm = await _session(tmp_path, monkeypatch)
+    real_root = tmp_path / "media"; real_root.mkdir()
+    present = real_root / "present.S01E01.mkv"; present.write_text("x")
+    gone = real_root / "gone.S01E02.mkv"          # never created → gone on disk
+
+    # Rows stored under the REAL (resolved) spelling, like Kira's renamed rows.
+    async with sm() as s:
+        for p in (present, gone):
+            s.add(MediaFile(file_path=str(p), media_type="tv", status="renamed",
+                            parsed_data={"title": "X"}))
+        await s.commit()
+
+    # ...but the scan runs under a DIFFERENT spelling: a mapped-drive root that
+    # `norm_fn` aliases to the real path (what Path("Z:/").resolve() yields).
+    drive_root = "R:\\media"
+    norm = _alias_norm(drive_root, str(real_root))
+
+    async with sm() as s:
+        removed = await scans._prune_missing_files(s, [drive_root], norm(present), norm)
+    assert removed == 1   # `gone` pruned ACROSS the spelling alias
+
+    async with sm() as s:
+        paths = set((await s.scalars(select(MediaFile.file_path))).all())
+    assert str(present) in paths   # present (aliased) → NOT over-pruned
+    assert str(gone) not in paths  # confirmed gone → pruned despite spelling
+
+
 @pytest.mark.asyncio
 async def test_prune_posts_notification(tmp_path, monkeypatch):
     sm = await _session(tmp_path, monkeypatch)

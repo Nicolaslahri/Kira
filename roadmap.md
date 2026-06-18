@@ -1700,6 +1700,29 @@ Regression tests in test_format_stripper.py.
 
 ---
 
+## Feature — post-rename Sonarr rescan hook + franchise year unification ✅ Shipped
+
+**Sonarr "thinks the files are deleted" (user report).** When Kira renames/moves an
+episode, Sonarr's next disk scan sees the OLD path gone → marks the episode file
+deleted → may RE-DOWNLOAD monitored episodes. New post-rename hook: the batch collects
+each successfully-renamed episode's series identity (`(provider, provider_id)`), and the
+existing post-hook block (beside the Plex/Jellyfin `refresh_all`) resolves them to TVDB
+ids (tvdb direct; anidb via the Fribb cross-ref) and fires Sonarr's `RescanSeries`
+command per series (`sonarr.rescan_series_by_tvdb` — finds the series by TVDB id, POSTs
+`/api/v3/command`). Sonarr immediately re-parses the renamed files and re-links them —
+the deleted→re-grab window never opens. Best-effort everywhere: silent when Sonarr isn't
+configured, a series isn't in Sonarr, or the call fails. Tests: hook fires once per
+series with the right TVDB id; silent for movies/unconfigured.
+
+**Franchise year unification.** Found while answering "how will AoT arrange under every
+setting": year-bearing templates (Jellyfin anime = `{{n}} ({{y}})/…`) still fragmented a
+unified franchise into "Show (2013)" / "Show (2017)" folders, because the unification
+overrode only the TITLE and each cour keeps its own premiere year. `_anime_group_members`
+now returns `(aid, title, year)` and the earliest cour supplies BOTH. Test: two cours
+(2022/2023) under the Jellyfin profile land in one "(2022)" folder.
+
+---
+
 ## Where we are now + what's next
 
 **Done:** Passes 5, M, the FileBot stretch, 6, 7, the Pass-S hardening arc,

@@ -100,6 +100,11 @@ class MediaFileOut(BaseModel):
     # chip on the file row + prevents rename collisions between same-episode
     # variants. See MediaFile.variant_key in models.py for the schema notes.
     variant_key: str | None = None
+    # Wanted subtitle languages this file is missing (2-letter codes), computed
+    # against the user's `subtitles.languages` preference. ``None`` = unknown
+    # (no preference set, or the file's container was never inspected); ``[]`` =
+    # fully covered; non-empty drives the "No EN subs" chip + fetch action.
+    missing_subs: list[str] | None = None
     created_at: UtcDateTime
     updated_at: UtcDateTime
     matches: list[MatchOut] = []  # ranked by confidence desc

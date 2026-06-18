@@ -1,5 +1,16 @@
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://127.0.0.1:8000/api/v1';
 
+/** Route slow poster CDNs through Kira's image proxy/cache so they load from
+ *  localhost (instant after first fetch). Fast CDNs (TMDB/TheTVDB) load fine
+ *  direct, so they're left untouched — only AniDB's slow CDN is proxied. */
+export function posterSrc(url: string | null | undefined): string | null {
+  if (!url) return null;
+  if (url.includes('cdn.anidb.net')) {
+    return `${API_BASE}/img?u=${encodeURIComponent(url)}`;
+  }
+  return url;
+}
+
 export interface ApiMatch {
   id: number;
   provider: string;
@@ -76,6 +87,10 @@ export interface ApiMediaFile {
    *  prevents same-episode rename collisions. Backend computes via
    *  _compute_variant_key from parsed.subtitles / edition / bit_depth. */
   variant_key: string | null;
+  /** Wanted subtitle languages this file is missing (2-letter codes). null =
+   *  unknown (no preference, or container never inspected); [] = fully covered;
+   *  non-empty drives the "No EN subs" chip + the fetch action. */
+  missing_subs: string[] | null;
   created_at: string;
   updated_at: string;
   matches: ApiMatch[];
@@ -109,15 +124,49 @@ const getStoredAuth = (): string | null => {
 const setStoredAuth = (v: string | null): void => {
   try { v ? sessionStorage.setItem(AUTH_KEY, v) : sessionStorage.removeItem(AUTH_KEY); } catch { /* ignore */ }
 };
-// Minimal credential capture. window.prompt is intentionally simple (single-user
-// self-host); it can be upgraded to a styled login modal later. Returns the
-// base64 user:pass or null if the user cancels.
-const promptForAuth = (): string | null => {
-  const user = window.prompt('Kira requires sign-in.\nUsername:');
-  if (user === null) return null;
-  const pass = window.prompt('Password:') ?? '';
-  return btoa(`${user}:${pass}`);
-};
+/** True when credentials are held for this tab (auth may still be off). */
+export function hasStoredAuth(): boolean {
+  return getStoredAuth() !== null;
+}
+
+/** Sign out: drop the held credentials and let the login gate take over. */
+export function clearStoredAuth(): void {
+  setStoredAuth(null);
+  try { window.dispatchEvent(new Event('kira:auth-required')); } catch { /* SSR */ }
+}
+
+/** First-run sign-up: create the server account, then hold the credentials
+ *  for this tab (the middleware starts enforcing them immediately). */
+export async function setupAccount(user: string, pass: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/auth/setup`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: user, password: pass }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    let message = `${res.status} ${res.statusText}`;
+    try {
+      const detail = JSON.parse(text)?.detail;
+      if (typeof detail === 'string') message = detail;
+    } catch { /* keep status line */ }
+    throw new Error(message);
+  }
+  setStoredAuth(btoa(`${user}:${pass}`));
+}
+
+/** Verify candidate credentials against /auth/check (which sits BEHIND the
+ *  Basic middleware) and store them on success. The login page's submit. */
+export async function loginBasic(user: string, pass: string): Promise<boolean> {
+  const header = btoa(`${user}:${pass}`);
+  const res = await fetch(`${API_BASE}/auth/check`, {
+    headers: { Authorization: `Basic ${header}` },
+  });
+  if (res.status === 401) return false;
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  setStoredAuth(header);
+  return true;
+}
 
 // ── Backend connectivity signal ────────────────────────────────────────────
 // Derived from the ACTUAL HTTP layer rather than a single probe: any response
@@ -151,7 +200,7 @@ function markBackend(online: boolean): void {
   for (const fn of _connListeners) fn(online);
 }
 
-async function request<T>(path: string, init?: RequestInit, _retried = false): Promise<T> {
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const auth = getStoredAuth();
   let res: Response;
   try {
@@ -172,18 +221,14 @@ async function request<T>(path: string, init?: RequestInit, _retried = false): P
   // We got a response. The backend is reachable even if it answered non-2xx
   // (a 500 on one endpoint is "connected but erroring", NOT "disconnected").
   markBackend(true);
-  // 401 → credentials missing/rejected. Prompt once and retry; on a second 401
-  // (wrong creds) clear them and surface the error.
-  if (res.status === 401 && !_retried) {
-    const creds = promptForAuth();
-    if (creds !== null) {
-      setStoredAuth(creds);
-      return request<T>(path, init, true);
-    }
+  // 401 → credentials missing/rejected. Drop whatever we held and raise the
+  // login gate (App listens for the event and renders the sign-in screen).
+  // The old window.prompt() flow lived here; the styled gate replaced it.
+  if (res.status === 401) {
     setStoredAuth(null);
+    try { window.dispatchEvent(new Event('kira:auth-required')); } catch { /* SSR */ }
   }
   if (!res.ok) {
-    if (res.status === 401) setStoredAuth(null);   // bad creds — don't keep them
     const text = await res.text().catch(() => '');
     // FastAPI wraps errors as {"detail": ...} — pull the inner message for clean
     // toasts. HTTPException uses a STRING detail; 422 validation errors use a
@@ -234,6 +279,13 @@ export interface ApiActivityJob {
   name: string;
   label: string;
   active: boolean;
+  /** Lifecycle state. Finished jobs ride along in the snapshot for a grace
+   *  window (errors linger much longer) so even a sub-second failure reaches
+   *  the pill — 'done' renders a green beat, 'error' a sticky red card. */
+  state: 'running' | 'done' | 'error';
+  /** One-line outcome/explanation for the finished states. */
+  detail: string | null;
+  ended_at: number | null;
   done: number;
   total: number | null;
 }
@@ -242,6 +294,92 @@ export interface ApiActivity {
   active: boolean;
   /** One-shot summary of what a restart cleaned up, or null if none. */
   boot: { scans_reset: number; files_reset: number; at: number } | null;
+}
+
+export interface ApiFfmpegStatus {
+  available: boolean;
+  path: string | null;
+  source: 'system' | 'managed' | null;
+  installable: boolean;
+  installing: boolean;
+}
+
+export interface ApiSubtitleAsset {
+  id: number;
+  media_file_id: number | null;
+  language: string;
+  provider: string;
+  release_name: string | null;
+  score: number;
+  sync: 'guaranteed' | 'likely' | 'unknown';
+  reasons: string[] | null;
+  hearing_impaired: boolean;
+  forced: boolean;
+  title: string | null;
+  active: boolean;
+  blacklisted: boolean;
+  created_at: string;
+}
+
+export interface ApiSubtitleCandidate {
+  provider: string;
+  language: string;
+  release_name: string;
+  downloads: number;
+  rating: number | null;
+  hash_match: boolean;
+  hearing_impaired: boolean;
+  forced: boolean;
+  is_pack: boolean;
+  from_embedded: boolean;
+  score: number;
+  reasons: string[];
+  sync: 'guaranteed' | 'likely' | 'unknown';
+  ref: string;
+}
+
+/** One subtitle file inside a season pack, scored as a candidate for THIS
+ *  episode (S/E, absolute number, episode title, runtime, release group). */
+export interface ApiPackEntry {
+  name: string;
+  score: number;
+  reasons: string[];
+  guessed_episode: number | null;
+}
+
+/** Result of picking a candidate: either it was saved, OR (for an ambiguous
+ *  season pack) Kira returns the ranked entries for the user to choose from. */
+export interface ApiPickResult {
+  ok: boolean;
+  /** Set when the pick is a pack we couldn't resolve confidently. */
+  needs_choice?: boolean;
+  /** The language was already on disk — coverage was re-asserted, nothing
+   *  re-downloaded. */
+  already_present?: boolean;
+  /** Extra sibling episodes whose subtitle was harvested from the same season
+   *  pack (returned by the explicit /pack/harvest opt-in). */
+  harvested?: number;
+  /** This pick came from a season pack that could ALSO fill this many other
+   *  episodes in the series — an opt-in offer, nothing saved yet. */
+  pack_more?: number;
+  language: string;
+  provider: string;
+  ref?: string;
+  episode?: number | null;
+  entries?: ApiPackEntry[];
+  // present when ok === true
+  score?: number;
+  sync?: string;
+  reasons?: string[];
+}
+
+export interface ApiSubtitleCoverage {
+  wanted: string[];                    // the user's preferred languages (2-letter)
+  enabled: boolean;                    // at least one source usable
+  inspected: number;                   // files whose container we've read
+  covered: number;                     // inspected files with no missing language
+  missing_files: number;               // inspected files missing ≥1 wanted language
+  by_language: Record<string, number>; // language → files missing it
 }
 
 export class ApiError extends Error {
@@ -257,6 +395,14 @@ export class ApiError extends Error {
 
 export const api = {
   health: () => request<{ status: string; version: string }>('/health'),
+  /** Poster URLs for the login page's animated rails. Auth-exempt, randomly
+   *  sampled server-side per request — every visit looks different. */
+  getAuthBackdrop: () =>
+    request<{ movies: string[]; anime: string[]; tv: string[] }>('/auth/backdrop'),
+  /** Auth state: `setup` = first run, no account yet (show sign-up);
+   *  `required` = an account (or env creds) exists, sign-in needed.
+   *  Auth-exempt — callable before credentials exist. */
+  getAuthStatus: () => request<{ required: boolean; setup: boolean; onboarded: boolean }>('/auth/status'),
   listFiles: (params?: { media_type?: string; status?: string; limit?: number }) => {
     const q = new URLSearchParams();
     if (params?.media_type) q.set('media_type', params.media_type);
@@ -264,6 +410,13 @@ export const api = {
     if (params?.limit) q.set('limit', String(params.limit));
     const qs = q.toString();
     return request<ApiMediaFile[]>(`/files${qs ? `?${qs}` : ''}`);
+  },
+  /** The whole library in one call. Every consumer of the file list (grid,
+   *  dedupe, bulk ops) works on the full set — the old hardcoded
+   *  `limit: 1000` silently TRUNCATED libraries past a thousand files, which
+   *  read as "scan lost my files" at scale. Backend caps at 100k. */
+  listAllFiles: () => {
+    return request<ApiMediaFile[]>('/files?limit=100000');
   },
   listScans: () => request<ApiScan[]>('/scans'),
   getScan: (id: number) => request<ApiScan>(`/scans/${id}`),
@@ -296,6 +449,52 @@ export const api = {
   fetchSubtitles: (fileId: number) =>
     request<{ saved: string[]; count: number; languages: string[] }>(
       `/files/${fileId}/fetch-subtitles`, { method: 'POST' }),
+
+  /** Queue a subtitle backfill (embedded → OpenSubtitles → YIFY) for specific
+   *  files, or the whole library's missing-sub set with scope:'library'.
+   *  Returns immediately; progress narrates through GET /activity. */
+  backfillSubtitles: (body: { file_ids?: number[]; scope?: 'library'; languages?: string[] }) =>
+    request<{ started: boolean; queued: number; detail: string | null }>(
+      '/subtitles/backfill', { method: 'POST', body: JSON.stringify(body) }),
+
+  /** Library-wide subtitle coverage against the wanted languages (dashboard tile). */
+  subtitleCoverage: () =>
+    request<ApiSubtitleCoverage>('/subtitles/coverage'),
+
+  /** Subtitle history — every sub Kira fetched, with provider/score/sync. */
+  subtitleHistory: () =>
+    request<ApiSubtitleAsset[]>('/subtitles/history'),
+  /** Delete a subtitle sidecar; blacklist=true also bars that candidate from
+   *  future auto-picks for the file. */
+  deleteSubtitleAsset: (id: number, blacklist = false) =>
+    request<{ ok: boolean; deleted_file?: boolean }>(
+      `/subtitles/asset/${id}?blacklist=${blacklist}`, { method: 'DELETE' }),
+  /** Scored candidates across all providers for one file (the browse menu). */
+  subtitleCandidates: (fileId: number, language?: string) =>
+    request<ApiSubtitleCandidate[]>(
+      `/subtitles/candidates?file_id=${fileId}${language ? `&language=${language}` : ''}`),
+  /** Download a SPECIFIC candidate the user picked from the browse modal. May
+   *  return needs_choice + ranked entries when it's an ambiguous season pack. */
+  pickSubtitle: (body: { file_id: number; provider: string; language: string; ref: string }) =>
+    request<ApiPickResult>('/subtitles/pick', { method: 'POST', body: JSON.stringify(body) }),
+  /** Save the exact entry the user chose from an ambiguous season pack. */
+  extractPackEntry: (body: { file_id: number; provider: string; language: string; ref: string; entry: string }) =>
+    request<ApiPickResult>('/subtitles/pack/extract', { method: 'POST', body: JSON.stringify(body) }),
+  /** Opt-in: fill the rest of the season from the pack just downloaded. */
+  harvestPack: (body: { file_id: number; provider: string; ref: string; language: string }) =>
+    request<{ harvested: number }>('/subtitles/pack/harvest', { method: 'POST', body: JSON.stringify(body) }),
+
+  /** Kick off an upgrade-over-time sweep (re-check low-scoring subs for better). */
+  upgradeSubtitles: () =>
+    request<{ started: boolean }>('/subtitles/upgrade', { method: 'POST' }),
+
+  /** Is ffmpeg usable (system or Kira-managed), and can we one-click install it? */
+  ffmpegStatus: () =>
+    request<ApiFfmpegStatus>('/ffmpeg'),
+  /** One-click managed ffmpeg install into Kira's own tools dir. Fire-and-forget;
+   *  progress + final state narrate through the activity pill. */
+  installFfmpeg: () =>
+    request<ApiFfmpegStatus>('/ffmpeg/install', { method: 'POST' }),
   /** Re-parse the EXISTING library in place and re-match it. A normal scan
    *  skips already-indexed files, so parser + folder-lock improvements only
    *  reach NEW files; this re-runs the parser on every stored file so they
@@ -322,6 +521,15 @@ export const api = {
     request<{ deleted: number[]; failed: { id: number; error: string }[]; count: number }>(
       '/files/bulk-delete',
       { method: 'POST', body: JSON.stringify({ file_ids: fileIds, keep_on_disk: !!opts?.keepOnDisk }) },
+    ),
+  /** Report which of the given tracked files no longer exist on disk (a file
+   *  renamed/deleted outside Kira leaves a stale row). The duplicate UI calls
+   *  this for collision candidates so a ghost row never poses as a deletable
+   *  "second copy". Report-only — the row is pruned by the next scan. */
+  verifyFilesExist: (fileIds: number[]) =>
+    request<{ missing: number[] }>(
+      '/files/verify-exist',
+      { method: 'POST', body: JSON.stringify({ ids: fileIds }) },
     ),
   rematchAll: (params?: { media_type?: string; limit?: number }) => {
     const q = new URLSearchParams();
@@ -429,6 +637,28 @@ export const api = {
 
   getSettings: () => request<Record<string, unknown>>('/settings'),
 
+  /** Trash bin — items the folder-cleanup sweep recycled instead of deleting. */
+  listTrash: () =>
+    request<{ root: string | null; total_bytes: number; items: Array<{
+      name: string; is_dir: boolean; size_bytes: number;
+      trashed_at: string | null; mtime: number; original: string | null;
+    }> }>('/trash'),
+  restoreTrashItem: (name: string) =>
+    request<{ restored: string; to: string }>('/trash/restore', {
+      method: 'POST', body: JSON.stringify({ name }),
+    }),
+  deleteTrashItem: (name: string) =>
+    request<{ deleted: string }>('/trash/delete', {
+      method: 'POST', body: JSON.stringify({ name }),
+    }),
+  emptyTrash: () =>
+    request<{ deleted: number }>('/trash/empty', { method: 'POST' }),
+
+  /** Can match-identity stamps live ON the media files (xattr / NTFS ADS), or
+   *  does this volume force Kira's portable index fallback? */
+  getPersistence: () =>
+    request<{ root: string | null; native: boolean; mode: 'native' | 'index' }>('/settings/persistence'),
+
   putSettings: (values: Record<string, unknown>) =>
     request<{ updated: number }>('/settings', {
       method: 'PUT',
@@ -468,6 +698,16 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body ?? {}),
     }),
+
+  /** Background connection-health snapshot for the configured integrations.
+   *  Driven by the backend's HealthMonitor loop (probes every ~5 min); this
+   *  endpoint just serves the latest results and does NO outbound HTTP, so the
+   *  Settings page polls it cheaply (~60s) to drive the per-integration status
+   *  dots. Keys present = integrations probed since boot; an absent key (or one
+   *  never seen) is "unknown" and renders grey. */
+  integrationsHealth: () =>
+    request<Record<string, { ok: boolean; detail: string; checked_at: string }>>(
+      '/integrations/health'),
 
   /** Send Kira's missing-episode list to Sonarr in one round-trip.
    *  The backend resolves the TVDB id from the Match row (cross-refs
@@ -662,6 +902,22 @@ export const api = {
       body: JSON.stringify({ ids }),
     }),
   exportHistoryUrl: () => `${API_BASE}/history/export.csv`,
+  /** Sweep leftover sidecar files (NFO / poster / subtitle sidecars) that an
+   *  undone rename couldn't clean up — the media file went back to its original
+   *  location but the artifacts Kira wrote alongside the renamed copy stayed
+   *  behind. Returns how many stray files were removed. */
+  cleanupOrphans: () =>
+    request<{ removed: number }>('/history/cleanup-orphans', { method: 'POST' }),
+  /** Per-row undo viability check (mirrors /files/verify-exist's shape): given
+   *  history ids, report whether each can still be safely undone. `undoable`
+   *  false carries a short human `reason` ("File changed on disk" / "Original
+   *  location occupied" / "Target missing") the UI surfaces on the disabled
+   *  Undo button. Report-only — calling it never mutates anything. */
+  verifyUndoable: (ids: number[]) =>
+    request<Record<string, { undoable: boolean; reason: string }>>(
+      '/history/verify-undoable',
+      { method: 'POST', body: JSON.stringify({ ids }) },
+    ),
 
   listFolders: (path: string) => {
     const q = new URLSearchParams({ path });
@@ -672,6 +928,17 @@ export const api = {
     }>(`/folders?${q.toString()}`);
   },
 
+  /** Tier-1: clear the rename log (undo goes with it). Files untouched.
+   *  NB: the system router carries no /system prefix — these live at the
+   *  API root, same as /database/reset below. */
+  resetHistory: () =>
+    request<{ history_deleted: number }>('/history/reset?confirm=RESET', { method: 'POST' }),
+  /** Tier-2: forget every match; files flip to pending for re-identification. */
+  resetMatches: () =>
+    request<{ matches_deleted: number }>('/matches/reset?confirm=RESET', { method: 'POST' }),
+  /** Tier-4: database AND settings AND the account — true factory state. */
+  factoryReset: () =>
+    request<Record<string, number>>('/database/reset?confirm=RESET&wipe_settings=true', { method: 'POST' }),
   resetDatabase: () =>
     request<{ ok: number }>('/database/reset?confirm=RESET', { method: 'POST' }),
 
@@ -699,6 +966,11 @@ export interface ApiHistoryEntry {
   title: string | null;
   episode_title: string | null;
   poster_url: string | null;
+  /** Provider identity of the linked match — AniDB entries have no
+   *  poster_url, so the History page resolves their covers lazily via
+   *  the shared AniDB picture cache (same as the library grid). */
+  provider: string | null;
+  provider_id: string | null;
   created_at: string;
   undone_at: string | null;
 }

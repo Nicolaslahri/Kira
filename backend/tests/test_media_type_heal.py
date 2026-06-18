@@ -109,3 +109,32 @@ def test_manual_pick_noop_when_unchanged() -> None:
     _apply_media_type_for_manual_pick(mf, "tvdb", "tv")  # already tv
     assert mf.media_type == "tv"
     assert mf.series_key == before  # unchanged → no key churn
+
+
+# ── anime detection independent of folder (scan phase, Fribb cross-ref) ──────
+# The scan now treats a TVDB/TMDB *series* whose id cross-references to an AniDB
+# id in Fribb as anime — so an anime sitting in a generic /tv/ folder (matched
+# via TVDB because it never queried AniDB) is still classified anime.
+async def test_selected_match_is_anime_folder_independent(monkeypatch) -> None:
+    from kira.api.scans import _selected_match_is_anime
+    from kira.providers.anime_mappings import AnimeMappings
+
+    # Direct AniDB match → anime (the original signal).
+    assert await _selected_match_is_anime("anidb", "18303", "tv_episode") is True
+
+    # TVDB SERIES with a Fribb AID → anime, even matched via a TV provider.
+    # The Adam's Sweet Agony case: tvdb 442084 → aid 18303.
+    async def _aid_tvdb(tvdb):
+        return 18303 if int(tvdb) == 442084 else None
+    monkeypatch.setattr(AnimeMappings, "aid_by_tvdb", _aid_tvdb)
+    assert await _selected_match_is_anime("tvdb", "442084", "tv_episode") is True
+
+    # Genuine live-action TVDB series (no Fribb AID) → NOT anime.
+    assert await _selected_match_is_anime("tvdb", "999999", "tv_episode") is False
+
+    # A MOVIE match is never flipped (anime films stay movies, not series).
+    assert await _selected_match_is_anime("tvdb", "442084", "movie") is False
+
+    # Missing / non-numeric id → safe False (no crash, no lookup).
+    assert await _selected_match_is_anime("tmdb", None, "tv_episode") is False
+    assert await _selected_match_is_anime("tmdb", "abc", "tv_episode") is False

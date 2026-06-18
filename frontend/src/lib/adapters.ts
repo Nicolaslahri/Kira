@@ -4,6 +4,7 @@
  * ways — this adapter is the only place we paper over them.
  */
 import type { ApiMediaFile } from './api';
+import { posterSrc } from './api';
 import { poster } from './data';
 import type {
   CandidateData, MatchData, MediaFile, MediaType,
@@ -116,7 +117,7 @@ export function apiToMediaFile(api: ApiMediaFile): MediaFile {
         collectionName: strOrU('collection_name') ?? null,  // #14
         tmdbId: topMatch && topMatch.provider === 'tmdb' ? Number(topMatch.provider_id) || null : null,
         poster: poster(displayTitle, displayYear),
-        posterUrl: topMatch?.poster_url ?? null,
+        posterUrl: posterSrc(topMatch?.poster_url),
         // Overview fallback chain: Match.overview column → metadata.overview
         // (populated by TVDB/TMDB extended payload, including via the
         // AniDB cross-ref). AniDB's search doesn't return descriptions,
@@ -169,7 +170,7 @@ export function apiToMediaFile(api: ApiMediaFile): MediaFile {
     year: m.year,
     confidence: Math.round(m.confidence * 100),
     poster: poster(m.title ?? '', m.year),
-    posterUrl: m.poster_url ?? null,
+    posterUrl: posterSrc(m.poster_url),
     season: m.season_number ?? undefined,
     episode: m.episode_number ?? undefined,
   }));
@@ -213,6 +214,10 @@ export function apiToMediaFile(api: ApiMediaFile): MediaFile {
     audio: Array.isArray(parsed.audio) ? parsed.audio : undefined,
     audio_langs: Array.isArray(parsed.audio_langs) ? parsed.audio_langs : undefined,
     sub_langs: Array.isArray(parsed.sub_langs) ? parsed.sub_langs : undefined,
+    // Backend-computed coverage gap (top-level, not in parsed_data). Keep only
+    // a non-empty array → the chip/button render exactly when there's a gap.
+    missingSubs: Array.isArray(api.missing_subs) && api.missing_subs.length > 0
+      ? api.missing_subs : undefined,
     size: humanSize(api.file_size),
     sizeBytes: api.file_size ?? undefined,
     parsedTitle: parsed.title ?? undefined,
@@ -331,6 +336,7 @@ function buildItem(group: MediaFile[]): LibraryItem {
       audio: f.audio,
       audio_langs: f.audio_langs,
       sub_langs: f.sub_langs,
+      missingSubs: f.missingSubs,
       releaseGroup: f.releaseGroup ?? null,
       matchedToEpisode,
       matchedWrong: false, // future: detect filename-says-X but matched-to-Y

@@ -1,7 +1,11 @@
 """HTTP-200 error-body guard for subtitle/artwork downloads (R6)."""
 from __future__ import annotations
 
-from kira.download_guard import looks_like_error_page, sniff_image
+import httpx
+import pytest
+
+from kira import download_guard
+from kira.download_guard import fetch_capped, looks_like_error_page, sniff_image
 
 
 def test_sniff_image_detects_real_formats():
@@ -49,3 +53,45 @@ def test_real_subtitles_are_not_rejected():
     assert looks_like_error_page(microdvd, "") is False
 
     assert looks_like_error_page(b"", "") is False
+
+
+# ── SSRF-via-redirect on the auth-exempt /img proxy (audit fix) ───────────────
+# fetch_capped(..., revalidate_redirects=True) must re-run the SSRF guard on
+# EVERY hop, so a public URL that 302s to an internal/metadata host is refused
+# instead of blindly fetched.
+_JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIFreal-image-bytes"
+
+
+@pytest.mark.asyncio
+async def test_revalidated_redirect_to_internal_host_is_blocked(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "evil.example":
+            # bounce to the cloud-metadata endpoint
+            return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data/"})
+        return httpx.Response(200, content=_JPEG)   # must never be reached
+
+    def fake_guard(url: str):
+        host = httpx.URL(url).host
+        return (not host.startswith("169.254"), host)
+    monkeypatch.setattr("kira.url_guard.is_safe_outbound_url", fake_guard)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        out = await fetch_capped(client, "http://evil.example/poster.jpg",
+                                 max_bytes=10_000_000, timeout=5.0,
+                                 revalidate_redirects=True)
+    assert out is None   # internal redirect target refused by the per-hop guard
+
+
+@pytest.mark.asyncio
+async def test_revalidated_redirect_to_safe_host_is_followed(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "cdn.example":
+            return httpx.Response(302, headers={"location": "http://cdn2.example/real.jpg"})
+        return httpx.Response(200, content=_JPEG)
+    monkeypatch.setattr("kira.url_guard.is_safe_outbound_url", lambda url: (True, ""))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        out = await fetch_capped(client, "http://cdn.example/poster.jpg",
+                                 max_bytes=10_000_000, timeout=5.0,
+                                 revalidate_redirects=True)
+    assert out is not None and out[0] == _JPEG   # safe hop chain followed

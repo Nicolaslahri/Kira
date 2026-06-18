@@ -51,6 +51,8 @@ from kira.providers.base import (
     TVResult,
 )
 
+logger = logging.getLogger(__name__)
+
 # Local alias preserves existing `_USER_AGENT` call sites unchanged.
 # See KI-13 in the plan's Known Issues for the hoist rationale: AniDB
 # rejected the default `python-httpx` UA with a 403, and so does the
@@ -89,6 +91,45 @@ _API_DELAY_SEC = 5.0
 _ERROR_WINDOW_SEC = 60.0
 _ERROR_THRESHOLD = 3
 _CIRCUIT_OPEN_SEC = 300.0  # 5 min cool-down after circuit trips
+
+# AniDB auto-fills an episode's ENGLISH title with the literal "Episode <num>"
+# (the absolute number) until someone adds a real localized one — a zero-info
+# placeholder. For a freshly-aired episode that means the English title is just
+# "Episode 1166" while the real romaji/Japanese title already exists. So when the
+# English title is exactly this episode's placeholder, prefer romaji/native.
+_XML_LANG_NS = "{http://www.w3.org/XML/1998/namespace}lang"
+_EP_TITLE_PLACEHOLDER = re.compile(r"(?i)\s*episode\s+0*(\d+)\s*$")
+
+
+def _select_episode_title(ep, num: int) -> str | None:
+    """Best title from an AniDB ``<episode>`` for episode number ``num``.
+
+    Prefer a REAL English title; fall back to romaji (x-jat) → native (ja) when
+    English is missing OR is just AniDB's auto-filled "Episode <num>" placeholder
+    — so a brand-new episode AniDB only carries in Japanese still shows its actual
+    title instead of "Episode 1166". The placeholder (or the first title present)
+    is used only as a last resort, so the episode is never left untitled (which
+    would drop it from the popup). Older episodes WITH a real English title are
+    unaffected — they take the English branch as before."""
+    en = jat = ja = first = None
+    for cand in ep.findall("title"):
+        t = (cand.text or "").strip() or None
+        if not t:
+            continue
+        if first is None:
+            first = t
+        lang = (cand.get(_XML_LANG_NS) or "").lower()
+        if lang == "en" and en is None:
+            en = t
+        elif lang == "x-jat" and jat is None:
+            jat = t
+        elif lang == "ja" and ja is None:
+            ja = t
+    m = _EP_TITLE_PLACEHOLDER.fullmatch(en) if en else None
+    en_is_placeholder = m is not None and int(m.group(1)) == num
+    if en and not en_is_placeholder:
+        return en
+    return jat or ja or en or first
 
 
 class AniDBProvider(MetadataProvider):
@@ -159,7 +200,7 @@ class AniDBProvider(MetadataProvider):
             # for this one request. Better than blowing up the whole scan.
             # Log it though: a RECURRING failure here means the 4s rate guard
             # is silently off, which is exactly what precedes a 12h AniDB ban.
-            print(f"anidb: rate-guard timestamp write failed (rate guarantee lost this call): {e!r}")
+            logger.warning(f"anidb: rate-guard timestamp write failed (rate guarantee lost this call): {e!r}")
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
@@ -489,8 +530,6 @@ class AniDBProvider(MetadataProvider):
         data = await self._http_api(series_id)
         if not data:
             return []
-        # ElementTree's xml:lang requires Clark notation, not 'xml:lang'.
-        XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
         out: list[EpisodeResult] = []
         regular_count = 0
         for ep in data.findall(".//episode"):
@@ -521,22 +560,9 @@ class AniDBProvider(MetadataProvider):
             else:
                 continue
 
-            # Prefer English title, then x-jat (romaji), then anything.
-            title: str | None = None
-            for cand in ep.findall("title"):
-                if cand.get(XML_LANG) == "en":
-                    title = (cand.text or "").strip() or None
-                    break
-            if title is None:
-                for cand in ep.findall("title"):
-                    if cand.get(XML_LANG) in ("x-jat", "ja"):
-                        title = (cand.text or "").strip() or None
-                        if title:
-                            break
-            if title is None:
-                first = ep.find("title")
-                if first is not None and first.text:
-                    title = first.text.strip() or None
+            # Best title — prefers a real one over AniDB's "Episode <num>"
+            # English placeholder (see _select_episode_title).
+            title = _select_episode_title(ep, num)
 
             air_el = ep.find("airdate")
             # AniDB stores per-episode runtime as <length>NN</length> in minutes.
@@ -613,11 +639,16 @@ class AniDBProvider(MetadataProvider):
     @classmethod
     async def _record_episode_count(cls, aid: int, count: int) -> None:
         """Update the cache for one AID and flush to disk."""
-        cache = cls._load_ep_count_cache()
-        if cache.get(aid) == count:
-            return  # no change, skip the write
-        cache[aid] = count
+        # Hold the lock across the read-check-mutate-AND-save. Concurrent cour
+        # fetches call this in parallel; mutating the shared dict outside the
+        # lock (as before) raced the `_save_ep_count_cache` snapshot iteration
+        # ("dict changed size during iteration") and could drop a just-fetched
+        # count when two writers serialized partial views.
         async with cls._ep_count_cache_lock:
+            cache = cls._load_ep_count_cache()
+            if cache.get(aid) == count:
+                return  # no change, skip the write
+            cache[aid] = count
             await asyncio.to_thread(cls._save_ep_count_cache)
 
     async def get_episode_count(self, aid: int | str) -> int | None:
@@ -1018,7 +1049,7 @@ class AniDBProvider(MetadataProvider):
         async with cls._picture_cache_lock:
             await asyncio.to_thread(cls._save_picture_cache)
         if evicted:
-            print(f"anidb pictures: evicted {evicted} stale franchise-member URLs (now season-aware).")
+            logger.warning(f"anidb pictures: evicted {evicted} stale franchise-member URLs (now season-aware).")
 
     async def _anidb_cdn_picture(self, aid: str) -> tuple[str | None, bool]:
         """Fetch the AID's OWN picture from the AniDB HTTP API.
@@ -1241,7 +1272,7 @@ class AniDBProvider(MetadataProvider):
                 f"{_ERROR_WINDOW_SEC:.0f}s; pausing for "
                 f"{_CIRCUIT_OPEN_SEC / 60:.0f} min."
             )
-            print(f"anidb: {cls._last_error}")
+            logger.warning(f"anidb: {cls._last_error}")
             # Reset window so we don't immediately re-trip after cool-down.
             cls._recent_errors = []
     # Set when AniDB returns a "banned" error (5xx or text with "banned").

@@ -11,19 +11,29 @@ from fastapi.responses import JSONResponse, Response
 # provider client (or the settings test endpoint) can resolve a hostname, so we
 # never attempt a dead IPv6 path. The lifespan still reads the user's saved
 # override below.
+from kira import __version__ as _kira_version
+from kira.log import setup_logging
+
+# Configure logging FIRST — before any module-level logger fires (net.py's
+# install side-effect below logs, and so does the alembic startup path).
+setup_logging()
 from kira import net as _net  # noqa: F401  (import side-effect: net.install())
 
 from kira.api import files as files_api
 from kira.api import health as health_api
 from kira.api import history as history_api
+from kira.api import images as images_api
 from kira.api import integrations as integrations_api
 from kira.api import matches as matches_api
 from kira.api import providers as providers_api
+from kira.api import trash as trash_api
+from kira.api import auth as auth_api
 from kira.api import rename as rename_api
 from kira.api import scans as scans_api
 from kira.api import search as search_api
 from kira.api import series as series_api
 from kira.api import settings as settings_api
+from kira.api import subtitles as subtitles_api
 from kira.api import system as system_api
 from kira.api import webhooks as webhooks_api
 from kira.config import settings
@@ -165,6 +175,31 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("startup: history prune failed: %r", e)
 
+        # Self-purge the trash folder to its retention window (Settings ->
+        # Cleanup). 0 / unset = keep forever. Mirrors the history prune.
+        try:
+            import asyncio as _aio
+
+            from kira.api.trash import _resolve_trash_root, purge_old_trash
+            from kira.database import SessionLocal
+            from kira.models import Setting as _Setting
+            async with SessionLocal() as _ts:
+                _root = await _resolve_trash_root(_ts)
+                _row = await _ts.get(_Setting, "rename.trash_retention_days")
+                _days = _row.value if _row else 0
+                if isinstance(_days, dict):
+                    _days = _days.get("value", 0)
+                try:
+                    _days = int(_days)
+                except (TypeError, ValueError):
+                    _days = 0
+            if _root is not None and _days > 0:
+                _n = await _aio.to_thread(purge_old_trash, _root, _days)
+                if _n:
+                    logger.info("startup: purged %d expired trash item(s)", _n)
+        except Exception as e:
+            logger.warning("startup: trash purge failed: %r", e)
+
     # Keep a strong reference — asyncio holds only a weakref to bare tasks,
     # so without this binding the GC can collect the warmup mid-fetch and
     # leave the cross-reference table un-refreshed without any error log.
@@ -179,16 +214,59 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("startup: watcher start failed: %r", e)
 
+    # Integration health monitor: arm the background connection checker. It
+    # probes each CONFIGURED integration (Sonarr / Plex / Jellyfin) every ~5
+    # min with a short timeout and notifies on ok→failed transitions, so a
+    # broken connection surfaces without the user clicking "Test connection".
+    # Same discipline as the watcher: never raises out of start(), so a
+    # monitor problem can't block boot.
+    try:
+        from kira.integrations.health_monitor import monitor as health_monitor
+        await health_monitor.start()
+    except Exception as e:
+        logger.warning("startup: health monitor start failed: %r", e)
+
+    # Persist anime poster URLs onto matches (covers render from a stored URL,
+    # not a throttled per-card AniDB lookup). Already-cached AIDs cost zero
+    # network; strong-ref'd so the GC can't collect it mid-run.
+    try:
+        from kira.posters import warm_anime_posters
+        poster_task = asyncio.create_task(warm_anime_posters(narrate=False))
+    except Exception as e:
+        logger.warning("startup: poster warmup spawn failed: %r", e)
+        poster_task = None
+
     try:
         yield
     finally:
         if not warmup_task.done():
             warmup_task.cancel()
+        if poster_task is not None and not poster_task.done():
+            poster_task.cancel()
         try:
             from kira.watcher import watcher
             await watcher.stop()
         except Exception as e:
             logger.warning("shutdown: watcher stop failed: %r", e)
+        try:
+            from kira.integrations.health_monitor import monitor as health_monitor
+            await health_monitor.stop()
+        except Exception as e:
+            logger.warning("shutdown: health monitor stop failed: %r", e)
+        # Let in-flight fire-and-forget work finish BEFORE we close the shared
+        # HTTP client / tear down the loop under it — the post-rename tail
+        # (subtitle fetch → media-server refresh → Sonarr rescan), MediaInfo
+        # enrich, ffmpeg install, etc. all live in the spawn_tracked registry.
+        # Bounded so a long subtitle batch can't wedge shutdown: a task still
+        # running after the grace window is cancelled as before, but the common
+        # short hooks complete instead of dying mid-write with the client closed.
+        try:
+            from kira.tasks import drain_background_tasks
+            await asyncio.wait_for(drain_background_tasks(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("shutdown: background tasks still running after 10s — proceeding")
+        except Exception as e:
+            logger.warning("shutdown: background-task drain failed: %r", e)
         try:
             from kira import net
             await net.aclose_shared()
@@ -222,16 +300,31 @@ def _auth_exempt(method: str, path: str) -> bool:
     Anchored to the exact mounted paths so an unauthenticated request can't slip
     past by embedding `/webhooks/` or `/health` elsewhere in the URL (e.g.
     `/api/v1/files/x/webhooks/y` or `/api/v1/evil/health`)."""
+    # Everything OUTSIDE /api/ is the SPA shell + static assets — they MUST
+    # load without credentials or the login page itself could never render
+    # in the same-origin Docker deployment (FastAPI serves the frontend).
+    # All data lives behind /api/, which stays guarded.
+    if not path.startswith("/api/"):
+        return True
     return (
         method == "OPTIONS"
         or path == "/api/v1/health"
+        # The login gate must be able to ask "is auth even on?" BEFORE it has
+        # credentials. /auth/check is deliberately NOT here — it exists to
+        # verify credentials, so it must go through the middleware.
+        or path == "/api/v1/auth/status"
+        # Login-page poster rails — cosmetic, pre-auth by necessity.
+        or path == "/api/v1/auth/backdrop"
+        # Image proxy/cache for poster art — <img> tags can't send Basic-auth
+        # headers; the bytes are SSRF-guarded, size-capped, and image-only.
+        or path == "/api/v1/img"
         or path.startswith("/api/v1/webhooks/")
     )
 
 
 app = FastAPI(
     title="Kira API",
-    version="0.1.0",
+    version=_kira_version,
     lifespan=lifespan,
 )
 
@@ -242,9 +335,25 @@ app = FastAPI(
 # error. No creds configured → fully open (today's localhost behavior).
 @app.middleware("http")
 async def _basic_auth_mw(request: Request, call_next):
+    """Credential resolution, strongest first:
+      1. Env override (KIRA_AUTH_USER/PASS) — plaintext compare, ops-managed.
+      2. DB account created via the first-run sign-up (/auth/setup) —
+         username constant-time + PBKDF2 password verify; cached per-process
+         so this is a tuple check per request, not a DB hit.
+      3. Neither configured → open. That's the pre-setup window: the SPA
+         forces the sign-up screen before the app is usable, and /auth/setup
+         itself is only valid inside this window."""
+    if _auth_exempt(request.method, request.url.path):
+        return await call_next(request)
     user, pw = settings.auth_user, settings.auth_pass
-    if user and pw and not _auth_exempt(request.method, request.url.path):
+    if user and pw:
         if not _basic_auth_ok(request.headers.get("Authorization"), user, pw):
+            return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Kira"'})
+        return await call_next(request)
+    from kira.api.auth import db_auth_ok, get_db_account
+    acct = await get_db_account()
+    if acct is not None:
+        if not db_auth_ok(request.headers.get("Authorization"), acct[0], acct[1]):
             return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Kira"'})
     return await call_next(request)
 
@@ -313,8 +422,12 @@ app.include_router(history_api.router, prefix="/api/v1")
 app.include_router(system_api.router, prefix="/api/v1")
 app.include_router(system_api.notif_router, prefix="/api/v1")
 app.include_router(providers_api.router, prefix="/api/v1")
+app.include_router(trash_api.router, prefix="/api/v1")
+app.include_router(auth_api.router, prefix="/api/v1")
 app.include_router(integrations_api.router, prefix="/api/v1")
 app.include_router(webhooks_api.router, prefix="/api/v1")
+app.include_router(subtitles_api.router, prefix="/api/v1")
+app.include_router(images_api.router, prefix="/api/v1")
 
 
 # ─────────────────────────────────────────────────────────────────────

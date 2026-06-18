@@ -66,59 +66,43 @@ def find_slug(html: str, lang_name: str) -> str | None:
     return m.group(1) if m else None
 
 
-async def fetch(
-    video_path: str, languages: list[str], *, imdb_id, client: httpx.AsyncClient,
-) -> list[str]:
-    """Fetch movie subs for the wanted languages from YIFY → sidecars. Skips a
-    language already on disk (any sidecar ext). Best-effort; never raises."""
-    ttid = _norm_imdb(imdb_id)
-    if not ttid or not languages:
+async def search(client: httpx.AsyncClient, ctx) -> list:
+    """Structured search → SubtitleCandidate list (movies, IMDb-indexed)."""
+    from kira.subtitles.model import SubtitleCandidate
+    ttid = _norm_imdb(ctx.imdb_id)
+    if not ttid:
         return []
-    wanted = [
-        lang for lang in languages
-        if lang.lower() in _LANG_NAME and not any(
-            Path(video_path).with_name(subtitle_sidecar_name(video_path, lang, ext=e)).exists()
-            for e in ("srt", "ass", "vtt")
-        )
-    ]
+    wanted = [l for l in ctx.languages if l.lower() in _LANG_NAME]
     if not wanted:
         return []
-
     try:
-        resp = await client.get(
-            f"{_BASE}/movie-imdb/{ttid}", timeout=20.0, headers={"User-Agent": _UA},
-        )
+        resp = await client.get(f"{_BASE}/movie-imdb/{ttid}", timeout=20.0,
+                                headers={"User-Agent": _UA})
         if resp.status_code != 200 or not resp.text:
             return []
         html = resp.text
     except Exception as e:
-        _log.warning("listing fetch failed for %s: %r", ttid, e)
+        _log.warning("yify listing fetch failed for %s: %r", ttid, e)
         return []
-
-    saved: list[str] = []
+    out: list = []
     for lang in wanted:
         slug = find_slug(html, _LANG_NAME[lang.lower()])
-        if not slug:
-            continue
-        srt = await _download_srt(client, slug)
-        if not srt:
-            continue
-        dest = Path(video_path).with_name(subtitle_sidecar_name(video_path, lang, ext="srt"))
-        # Confine the write to the video's own directory and never follow a
-        # symlink planted at the sidecar path (a local symlink could otherwise
-        # redirect the write outside the library).
-        if dest.exists() or dest.is_symlink():
-            continue
-        try:
-            tmp = dest.with_name(dest.name + ".part")
-            if tmp.is_symlink():
-                tmp.unlink()
-            tmp.write_bytes(srt)
-            os.replace(tmp, dest)
-            saved.append(str(dest))
-        except Exception as e:
-            _log.warning("save %s failed: %r", lang, e)
-    return saved
+        if slug:
+            out.append(SubtitleCandidate(provider="yifysubtitles", language=lang.lower(),
+                                         release_name=slug, download_ref=slug))
+    return out
+
+
+async def download(client: httpx.AsyncClient, cand, ctx) -> bytes | None:
+    """Download one YIFY candidate → raw ZIP bytes (aggregator extracts)."""
+    fetched = await fetch_capped(
+        client, f"{_BASE}/subtitle/{cand.download_ref}.zip",
+        max_bytes=_MAX_ZIP_BYTES, timeout=30.0, headers={"User-Agent": _UA},
+    )
+    if not fetched:
+        return None
+    content, ct = fetched
+    return None if looks_like_error_page(content, ct) else content
 
 
 async def _download_srt(client: httpx.AsyncClient, slug: str) -> bytes | None:

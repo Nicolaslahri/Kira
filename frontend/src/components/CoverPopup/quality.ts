@@ -61,6 +61,12 @@ export function subLangChip(file: { sub_langs?: string[] }): string | null {
   const langs = file.sub_langs?.filter(Boolean) ?? [];
   return langs.length >= 1 ? 'SUB ' + _fmtLangs(langs) : null;
 }
+// Wanted languages this file is MISSING (backend-computed coverage gap).
+// "No EN" / "No EN+ES" — drives the amber warning chip + the bulk fetch count.
+export function missingSubChip(file: { missingSubs?: string[] }): string | null {
+  const langs = file.missingSubs?.filter(Boolean) ?? [];
+  return langs.length >= 1 ? 'No ' + langs.map(l => l.toUpperCase()).join('+') : null;
+}
 
 // MediaInfo dupe signals (lower = better). HDR flavor: DV > HDR10+ > HDR10 > HLG;
 // a file with ANY HDR beats SDR (no tag → 9). Channels: more speakers win.

@@ -71,6 +71,55 @@ def test_unstamped_file_reads_none(tmp_path) -> None:
     assert xattr_store.read_ids(str(f)) is None
 
 
+# ── Tier 3: portable index fallback (NAS shares with no xattr / ADS) ──────
+
+
+@pytest.fixture
+def _no_native(monkeypatch, tmp_path):
+    """Simulate a volume that supports neither xattr nor ADS (the Samba-NAS
+    case that silently no-op'ed every stamp), and point the index at a temp
+    dir so tests never touch the real one."""
+    monkeypatch.setattr(xattr_store, "_HAS_XATTR", False)
+    monkeypatch.setattr(xattr_store, "_IS_WINDOWS", False)
+    monkeypatch.setattr(xattr_store, "_index_path", lambda: str(tmp_path / "kira-id-index.json"))
+    monkeypatch.setattr(xattr_store, "_index_cache", None)
+    return tmp_path
+
+
+def test_index_fallback_round_trip(_no_native, tmp_path) -> None:
+    f = tmp_path / "movie.mkv"
+    f.write_bytes(b"data")
+    assert xattr_store.write_ids(str(f), {"anidb": "13759"}) is True
+    assert xattr_store.read_ids(str(f)) == {"anidb": "13759"}
+    # The stamp went to the portable index, not the file.
+    assert (tmp_path / "kira-id-index.json").exists()
+
+
+def test_index_fallback_survives_cache_invalidation(_no_native, tmp_path) -> None:
+    a = tmp_path / "a.mkv"; a.write_bytes(b"a")
+    b = tmp_path / "b.mkv"; b.write_bytes(b"b")
+    assert xattr_store.write_ids(str(a), {"tmdb": "1"}) is True
+    assert xattr_store.write_ids(str(b), {"tvdb": "2"}) is True
+    # Second write must not clobber the first (read-modify-replace).
+    assert xattr_store.read_ids(str(a)) == {"tmdb": "1"}
+    assert xattr_store.read_ids(str(b)) == {"tvdb": "2"}
+
+
+def test_index_fallback_missing_file_still_false(_no_native, tmp_path) -> None:
+    # The index refuses to stamp a file that doesn't exist — same contract
+    # the native tiers enforce for free.
+    assert xattr_store.write_ids(str(tmp_path / "ghost.mkv"), {"tmdb": "1"}) is False
+
+
+def test_index_key_is_case_and_separator_insensitive(_no_native, tmp_path) -> None:
+    f = tmp_path / "Show.mkv"
+    f.write_bytes(b"x")
+    assert xattr_store.write_ids(str(f), {"tvdb": "81797"}) is True
+    # Windows: same path with different case/separators must hit the same key.
+    alt = str(f).replace("\\", "/")
+    assert xattr_store.read_ids(alt) == {"tvdb": "81797"}
+
+
 # ── _apply_xattr_ids (match-time read; NOT in the discovery walk) ─────────
 
 async def test_apply_xattr_ids_fills_when_stamped(monkeypatch) -> None:

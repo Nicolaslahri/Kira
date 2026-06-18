@@ -5,9 +5,11 @@ import { api, type ApiHistoryEntry, type ApiNotification, type ApiScan } from '.
 import {
   IcScan, IcCheck, IcX, IcHistory, IcArrowRight,
   IcFilm, IcTv, IcAnime, IcMusic, IcFolder, IcReview,
-  IcShieldCheck, IcLink, IcAlertTri,
+  IcShieldCheck, IcLink, IcAlertTri, IcSparkles, IcRefresh,
+  IcTag, IcDownload,
 } from '../lib/icons';
 import { cn } from '../lib/utils';
+import { getConfBands } from '../lib/confBands';
 import { Button } from '../components/base/buttons/button';
 import { FeaturedIcon } from '../components/base/featured-icons/featured-icon';
 import { ProgressBar } from '../components/base/progress-indicators/progress-bar';
@@ -68,7 +70,7 @@ function Card({ title, icon, action, glow, divider, className, bodyClassName, ch
   const hasHeader = title != null || action != null;
   return (
     <section className={cn(
-      'group relative flex flex-col overflow-hidden rounded-2xl border border-line bg-[rgba(255,255,255,0.025)] transition-colors duration-300 hover:border-line-strong',
+      'dash-card group relative flex flex-col overflow-hidden rounded-2xl border border-line bg-[rgba(255,255,255,0.025)] transition-colors duration-300 hover:border-line-strong',
       className,
     )}>
       {glow ? (
@@ -115,7 +117,7 @@ function CardLink({ label, onClick }: { label: string; onClick: () => void }) {
 // node's text directly via motion's `animate` (no React state) so the
 // per-frame updates don't re-render the card — and so toLocaleString
 // thousands separators match the static render.
-function CountUp({ value, duration = 0.55 }: { value: number; duration?: number }) {
+function CountUp({ value, duration = 0.7, suffix }: { value: number; duration?: number; suffix?: string }) {
   const ref = useRef<HTMLSpanElement>(null);
   const fromRef = useRef(0);
   useEffect(() => {
@@ -124,28 +126,30 @@ function CountUp({ value, duration = 0.55 }: { value: number; duration?: number 
     const from = fromRef.current;
     fromRef.current = value;
     const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    const fmt = (v: number) => `${Math.round(v).toLocaleString()}${suffix ?? ''}`;
     if (reduce || from === value) {
-      node.textContent = value.toLocaleString();
+      node.textContent = fmt(value);
       return;
     }
     const controls = animate(from, value, {
       duration,
       ease: [0.2, 0.9, 0.3, 1],
-      onUpdate: (v) => { node.textContent = Math.round(v).toLocaleString(); },
+      onUpdate: (v) => { node.textContent = fmt(v); },
     });
     return () => controls.stop();
-  }, [value, duration]);
-  return <span ref={ref}>{(0).toLocaleString()}</span>;
+  }, [value, duration, suffix]);
+  return <span ref={ref}>{`${(0).toLocaleString()}${suffix ?? ''}`}</span>;
 }
 
 // ── KPI metric card ─────────────────────────────────────────────────
-function Metric({ icon, color, label, value, sub, onClick }: {
+function Metric({ icon, color, label, value, sub, onClick, index = 0 }: {
   icon: ReactNode;
   color: 'brand' | 'success' | 'warning' | 'error' | 'gray';
   label: string;
   value: ReactNode;
   sub?: ReactNode;
   onClick?: () => void;
+  index?: number;
 }) {
   const inner = (
     <>
@@ -161,22 +165,181 @@ function Metric({ icon, color, label, value, sub, onClick }: {
       {sub ? <div className="relative mt-2 text-xs text-ink-soft">{sub}</div> : null}
     </>
   );
-  const base = 'group relative flex flex-col overflow-hidden rounded-2xl border border-line bg-[rgba(255,255,255,0.025)] p-5 text-left transition-colors duration-300 hover:border-line-strong';
+  const base = 'dash-metric anim-rise-sm group relative flex flex-col overflow-hidden rounded-2xl border border-line bg-[rgba(255,255,255,0.025)] p-5 text-left transition-colors duration-300 hover:border-line-strong';
+  const style = { '--i': index } as React.CSSProperties;
   // A clickable metric navigates — render a real <button> so it's keyboard-
   // and screen-reader-operable; a static metric stays a plain <div>.
   if (onClick) {
     return (
-      <button type="button" onClick={onClick} className={cn(base, 'cursor-pointer hover:bg-[rgba(255,255,255,0.045)]')}>
+      <button type="button" onClick={onClick} style={style} className={cn(base, 'cursor-pointer hover:bg-[rgba(255,255,255,0.045)]')}>
         {inner}
       </button>
     );
   }
-  return <div className={base}>{inner}</div>;
+  return <div style={style} className={base}>{inner}</div>;
+}
+
+// ── Confidence ring ─────────────────────────────────────────────────
+// An animated SVG donut that springs each confidence segment to its share of
+// the library on mount. Pure stroke-dashoffset tweens (no transform), each
+// driven by motion's `animate`; the global prefers-reduced-motion `*` net
+// (transition/animation-duration → 0.001ms) makes the CSS transitions snap,
+// and we additionally short-circuit the JS tween to land instantly.
+function ConfidenceRing({ segments, total, centerValue, centerLabel }: {
+  segments: { k: string; color: string; value: number }[];
+  total: number;
+  centerValue: ReactNode;
+  centerLabel: string;
+}) {
+  const R = 52;
+  const C = 2 * Math.PI * R;
+  const safeTotal = Math.max(1, total);
+
+  // Pre-compute each arc's length + rotation offset so segments sit end to end.
+  let acc = 0;
+  const arcs = segments.map((s) => {
+    const frac = total > 0 ? s.value / safeTotal : 0;
+    const len = frac * C;
+    const startFrac = acc;
+    acc += frac;
+    return { ...s, len, startFrac };
+  });
+
+  return (
+    <div className="relative grid size-[148px] shrink-0 place-items-center">
+      <svg viewBox="0 0 140 140" className="size-full -rotate-90">
+        <circle cx="70" cy="70" r={R} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="12" />
+        {arcs.map((a, i) => (
+          <circle
+            key={a.k}
+            className="dash-ring-arc"
+            cx="70" cy="70" r={R}
+            fill="none"
+            stroke={a.color}
+            strokeWidth="12"
+            strokeLinecap="round"
+            strokeDasharray={`${Math.max(0, a.len - (a.len > 4 ? 3 : 0))} ${C}`}
+            strokeDashoffset={-a.startFrac * C}
+            style={{ '--ring-len': `${Math.max(0, a.len - (a.len > 4 ? 3 : 0))}`, '--ring-circ': `${C}`, '--ring-delay': `${i * 90}ms` } as React.CSSProperties}
+          />
+        ))}
+      </svg>
+      <div className="pointer-events-none absolute inset-0 grid place-items-center text-center">
+        <div>
+          <div className="text-[34px] font-bold leading-none tracking-tight tabular-nums text-ink">{centerValue}</div>
+          <div className="mt-1 text-[10px] uppercase tracking-[0.1em] text-ink-soft">{centerLabel}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Hero poster ambiance ────────────────────────────────────────────
+// A fanned cluster of recent poster thumbnails behind the hero, lazy-loaded
+// and heavily blurred/dimmed so the headline stays readable. Posters that
+// fail to load simply hide themselves. Decorative only.
+function PosterFan({ urls }: { urls: string[] }) {
+  if (urls.length === 0) return null;
+  return (
+    <div aria-hidden className="dash-poster-fan pointer-events-none absolute inset-y-0 right-0 hidden w-[440px] overflow-hidden lg:block">
+      <div className="dash-poster-fan-inner absolute right-6 top-1/2 flex -translate-y-1/2">
+        {urls.slice(0, 6).map((u, i) => (
+          <img
+            key={u + i}
+            src={u}
+            alt=""
+            loading="lazy"
+            decoding="async"
+            className="dash-poster-card"
+            style={{ '--i': i } as React.CSSProperties}
+            onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Subtitle coverage tile ──────────────────────────────────────────
+// Library-wide "% of inspected files that have every wanted subtitle
+// language", with a one-click backfill of the whole missing set. Fetches
+// its own coverage snapshot (cheap, pure-read endpoint) and narrates the
+// fetch through the activity pill. Hidden entirely when no source is
+// configured or nothing's been inspected yet (nothing useful to say).
+function SubtitleCoverageCard({ setActive }: { setActive: (p: 'dashboard' | 'review' | 'history' | 'settings') => void }) {
+  const [cov, setCov] = useState<Awaited<ReturnType<typeof api.subtitleCoverage>> | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+
+  const load = () => { void api.subtitleCoverage().then(setCov).catch(() => {}); };
+  useEffect(() => { load(); }, []);
+
+  if (!cov || cov.inspected === 0) return null;
+
+  const pct = cov.inspected > 0 ? Math.round((cov.covered / cov.inspected) * 100) : 100;
+  const topLangs = Object.entries(cov.by_language).sort((a, b) => b[1] - a[1]).slice(0, 4);
+
+  const getAll = async () => {
+    if (busy) return;
+    setBusy(true);
+    setNote(null);
+    try {
+      const res = await api.backfillSubtitles({ scope: 'library' });
+      window.dispatchEvent(new Event('kira:activity-refresh'));
+      setNote(res.started ? `Fetching for ${res.queued} file${res.queued === 1 ? '' : 's'}…` : (res.detail ?? 'Nothing to fetch.'));
+    } catch (e) {
+      setNote((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card
+      title="Subtitle coverage"
+      icon={<FeaturedIcon size="sm" color={cov.missing_files > 0 ? 'warning' : 'success'} icon={<IcTag />} />}
+      action={<CardLink label="Settings" onClick={() => setActive('settings')} />}
+    >
+      <div className="flex flex-col gap-3.5">
+        <div className="flex items-end justify-between gap-3">
+          <div className="flex items-end gap-2">
+            <span className="text-2xl font-bold leading-none tracking-tight text-ink tabular-nums">{pct}%</span>
+            <span className="mb-0.5 text-xs text-ink-soft">covered · {cov.wanted.map(l => l.toUpperCase()).join(', ') || 'EN'}</span>
+          </div>
+          {cov.missing_files > 0 && cov.enabled ? (
+            <Button color="secondary" size="sm" iconLeading={IcDownload} isLoading={busy} showTextWhileLoading onClick={getAll}>
+              Get all ({cov.missing_files})
+            </Button>
+          ) : null}
+        </div>
+        <ProgressBar value={cov.covered} max={Math.max(1, cov.inspected)} color="var(--accent)" className="w-full" />
+        {topLangs.length > 0 ? (
+          <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+            {topLangs.map(([lang, n]) => (
+              <span key={lang} className="text-[12px] text-ink-muted">
+                <span className="font-mono uppercase text-ink-soft">{lang}</span> · {n} missing
+              </span>
+            ))}
+          </div>
+        ) : (
+          <div className="text-[12px] text-ink-soft">Every inspected file has your preferred languages.</div>
+        )}
+        {!cov.enabled ? (
+          <div className="text-[11px] text-ink-soft">No subtitle source configured — add one in Settings → Subtitles.</div>
+        ) : null}
+        {note ? <div className="text-[11px] text-ink-muted">{note}</div> : null}
+      </div>
+    </Card>
+  );
 }
 
 export function DashboardPage({ state, openModal, runScan, runReparse, setActive, scanRoot: SCAN_ROOT }: Props) {
-  void openModal; void runScan; void SCAN_ROOT;
+  void openModal; void SCAN_ROOT;
   const [history, setHistory] = useState<ApiHistoryEntry[]>([]);
+  // Authoritative all-time rename count for the "Organized" KPI. `history` is
+  // backend-capped (period:'all' returns at most N rows), so its length
+  // under-reports on a large library; /counts is the true total.
+  const [totalRenames, setTotalRenames] = useState<number | null>(null);
   const [notifications, setNotifications] = useState<ApiNotification[]>([]);
   const [lastScan, setLastScan] = useState<ApiScan | null>(null);
   const [scans, setScans] = useState<ApiScan[]>([]);
@@ -193,6 +356,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
     let cancelled = false;
     const load = async () => {
       try { const h = await api.listHistory({ period: 'all' }); if (!cancelled) setHistory(h); } catch { /* */ }
+      try { const c = await api.historyCounts(); if (!cancelled) setTotalRenames(c.all); } catch { /* */ }
       try { const n = await api.listNotifications(); if (!cancelled) setNotifications(n); } catch { /* */ }
       try {
         const allScans = await api.listScans();
@@ -220,11 +384,18 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
 
   const stats = useMemo(() => {
     const files = state.files;
+    // "matched" = has a REAL provider match, regardless of confidence band — a
+    // library fully matched at mid confidence is still matched. The old
+    // `confidence >= high` gate made the donut read a scary-low "% matched" for
+    // a fully-matched library and disagreed with Review's pending/matched split.
+    // The band breakdown lives in `buckets` + `lowConf` below (those honor the
+    // user's Confidence sliders, Settings → Confidence).
+    const { mid } = getConfBands();
     const total = files.length;
-    const matched = files.filter(f => f.match && f.confidence >= 85).length;
+    const matched = files.filter(f => !!f.match?.provider && !!f.match?.providerId).length;
     const pending = files.filter(f => f.status === 'pending').length;
     const approved = files.filter(f => f.status === 'approved').length;
-    const lowConf = files.filter(f => f.confidence < 50).length;
+    const lowConf = files.filter(f => f.confidence < mid).length;
     const totalSize = files.reduce((sum, f) => sum + (f.sizeBytes ?? 0), 0);
     const byType = {
       movie: files.filter(f => f.mediaType === 'movie').length,
@@ -249,7 +420,24 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
 
   const matchedPct = stats.total > 0 ? Math.round((stats.matched / stats.total) * 100) : 0;
   const maxType = Math.max(1, ...TYPE_META.map(t => stats.byType[t.k]));
-  const typesPresent = TYPE_META.filter(t => stats.byType[t.k] > 0).length;
+  // Composition only lists types the library actually has — a permanent
+  // "Music · 0" row is noise. Empty library falls back to showing all four.
+  const typesWithFiles = TYPE_META.filter(t => stats.byType[t.k] > 0);
+  const compositionTypes = typesWithFiles.length > 0 ? typesWithFiles : TYPE_META;
+  const typesPresent = typesWithFiles.length;
+
+  // Recent poster URLs for the hero ambiance — de-duplicated, capped. Derived
+  // from the existing file list (no extra fetch); empty when no real covers.
+  const posterUrls = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const f of state.files) {
+      const u = f.match?.posterUrl;
+      if (u && !seen.has(u)) { seen.add(u); out.push(u); }
+      if (out.length >= 6) break;
+    }
+    return out;
+  }, [state.files]);
 
   const activity = useMemo(() => {
     const items: { id: string; kind: 'success' | 'error' | 'info'; when: string; text: React.ReactNode }[] = [];
@@ -298,43 +486,90 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
   const providers = [
     { slug: 'tmdb', name: 'TMDB', note: 'Movies & TV metadata' },
     { slug: 'tvdb', name: 'TVDB', note: 'TV & anime episode data' },
+    { slug: 'anidb', name: 'AniDB', note: 'Anime episodes & franchises' },
   ];
+
+  const scanning = state.scanRunning;
+  const scanPct = Math.round(state.scanProgress);
 
   return (
     <div className="page relative">
-      {/* ── Header ─────────────────────────────────────────────── */}
-      <div className="relative z-10 mb-6 flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <BadgeWithDot color={state.scanRunning ? 'warning' : 'brand'} pulse className="mb-3">
-            {state.scanRunning ? 'Scanning…' : 'Live'}
-          </BadgeWithDot>
-          <h1 className="bg-gradient-to-br from-white via-white to-white/45 bg-clip-text text-[40px] font-bold leading-[1.04] tracking-[-0.03em] text-transparent">
-            Welcome back
-          </h1>
-          <p className="mt-2.5 text-[13.5px] text-ink-soft">
-            {stats.total === 0
-              ? 'No library scanned yet — hit Scan now to get started.'
-              : <><b className="text-ink-muted">{stats.pending}</b> pending review · <b className="text-ink-muted">{stats.matched}</b> matched{lastScan?.completed_at ? <> · last scan {relativeTime(lastScan.completed_at)}</> : null}</>}
-          </p>
-        </div>
+      {/* ── Hero band ───────────────────────────────────────────── */}
+      <section className={cn('dash-hero anim-rise relative z-10 mb-5 overflow-hidden rounded-3xl border border-line p-7 sm:p-8', scanning && 'dash-hero-live')}>
+        <PosterFan urls={posterUrls} />
+        {/* readability scrim over the poster fan */}
+        <div className="dash-hero-scrim pointer-events-none absolute inset-0" />
 
-        <Button
-          size="md"
-          color="secondary"
-          iconLeading={IcScan}
-          isLoading={state.scanRunning}
-          isDisabled={state.scanRunning}
-          showTextWhileLoading
-          onClick={runReparse}
-          title="Re-run the parser + re-match the existing library in place — applies parsing/grouping improvements without losing manual picks."
-        >
-          Re-parse &amp; re-match
-        </Button>
-      </div>
+        <div className="relative z-10 flex flex-wrap items-end justify-between gap-x-6 gap-y-5">
+          <div className="min-w-0 max-w-xl">
+            <BadgeWithDot color={scanning ? 'warning' : 'brand'} pulse className="mb-3">
+              {scanning ? (state.scanPhase === 'matching' ? 'Matching…' : 'Scanning…') : 'Live'}
+            </BadgeWithDot>
+            <h1 className="dash-hero-title bg-gradient-to-br from-white via-white to-white/45 bg-clip-text text-[40px] font-bold leading-[1.04] tracking-[-0.03em] text-transparent sm:text-[46px]">
+              Welcome back
+            </h1>
+
+            {scanning ? (
+              <div className="mt-4 max-w-md">
+                <div className="mb-2 flex items-center justify-between gap-3 text-[13px]">
+                  <span className="truncate text-ink-muted">
+                    {state.scanMessage || (state.scanPhase === 'matching' ? 'Matching against providers…' : 'Discovering files…')}
+                  </span>
+                  <span className="shrink-0 font-mono tabular-nums text-ink-soft">
+                    {state.scanPhase === 'matching' ? `${scanPct}%` : `${state.scanFound} found`}
+                  </span>
+                </div>
+                <ProgressBar
+                  value={scanPct}
+                  max={100}
+                  color="var(--accent)"
+                  height={8}
+                  indeterminate={state.scanPhase !== 'matching'}
+                  className="w-full"
+                />
+              </div>
+            ) : (
+              <p className="mt-3 text-[13.5px] text-ink-soft">
+                {stats.total === 0
+                  ? 'No library scanned yet — hit Scan now to get started.'
+                  : <><b className="text-ink-muted">{stats.pending}</b> pending review · <b className="text-ink-muted">{stats.matched}</b> matched{lastScan?.completed_at ? <> · last scan {relativeTime(lastScan.completed_at)}</> : null}</>}
+              </p>
+            )}
+          </div>
+
+          <div className="flex shrink-0 items-center gap-2.5">
+            <Button
+              size="md"
+              color="secondary"
+              iconLeading={IcRefresh}
+              isDisabled={scanning}
+              onClick={runReparse}
+              className="dash-hero-btn-secondary"
+              title="Re-run the parser + re-match the existing library in place — applies parsing/grouping improvements without losing manual picks."
+            >
+              Re-parse
+            </Button>
+            <Button
+              size="md"
+              color="primary"
+              iconLeading={scanning ? undefined : IcScan}
+              isLoading={scanning}
+              isDisabled={scanning}
+              showTextWhileLoading
+              onClick={runScan}
+              className="dash-hero-cta"
+              title="Scan the configured library root for new files and match them."
+            >
+              {scanning ? 'Scanning…' : 'Scan now'}
+            </Button>
+          </div>
+        </div>
+      </section>
 
       {/* ── KPI strip ──────────────────────────────────────────── */}
-      <div className="relative z-10 grid grid-cols-2 gap-4 lg:grid-cols-4">
+      <div className="anim-stagger relative z-10 grid grid-cols-2 gap-4 lg:grid-cols-4">
         <Metric
+          index={0}
           icon={<IcFolder />}
           color="brand"
           label="Library"
@@ -342,6 +577,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
           sub={typesPresent > 0 ? `${typesPresent} media type${typesPresent === 1 ? '' : 's'}` : 'No files yet'}
         />
         <Metric
+          index={1}
           icon={<IcCheck />}
           color="success"
           label="Matched"
@@ -350,6 +586,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
           onClick={() => setActive('review')}
         />
         <Metric
+          index={2}
           icon={<IcReview />}
           color="warning"
           label="Pending review"
@@ -359,19 +596,24 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
             : 'All reviewed'}
           onClick={() => setActive('review')}
         />
+        {/* All-time renames from the history feed — "approved" was a dead
+            metric (it's a transient state: approved files are renamed moments
+            later, so the count read 0 forever). */}
         <Metric
-          icon={<IcShieldCheck />}
+          index={3}
+          icon={<IcSparkles />}
           color="brand"
-          label="Approved"
-          value={<CountUp value={stats.approved} />}
-          sub="Confirmed & ready"
+          label="Organized"
+          value={<CountUp value={totalRenames ?? history.length} />}
+          sub={(totalRenames ?? history.length) > 0 ? 'renames in history' : 'No renames yet'}
+          onClick={() => setActive('history')}
         />
       </div>
 
       {/* ── Main region: left stack + full-height activity ─────── */}
       <div className="relative z-10 mt-4 grid grid-cols-1 gap-4 xl:grid-cols-3">
         <div className="flex flex-col gap-4 xl:col-span-2">
-          {/* Match quality — donut + confidence buckets */}
+          {/* Match quality — ring + confidence buckets */}
           <Card
             title="Match quality"
             icon={<FeaturedIcon size="sm" color="success" icon={<IcShieldCheck />} />}
@@ -379,10 +621,17 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
             glow
           >
             <div className="flex flex-col items-center gap-7 sm:flex-row sm:gap-8">
-              <div className="shrink-0 text-center sm:px-4">
-                <div className="text-[44px] font-bold leading-none tracking-tight text-ink tabular-nums">{matchedPct}<span className="text-2xl text-ink-soft">%</span></div>
-                <div className="mt-1.5 text-[11px] uppercase tracking-[0.08em] text-ink-soft">matched</div>
-              </div>
+              <ConfidenceRing
+                total={stats.total}
+                segments={[
+                  { k: 'strong', color: '#28d9a0', value: stats.buckets.strong },
+                  { k: 'likely', color: '#49b8fe', value: stats.buckets.likely },
+                  { k: 'review', color: '#ffc94a', value: stats.buckets.review },
+                  { k: 'low',    color: '#ff5b6e', value: stats.buckets.low },
+                ]}
+                centerValue={<><CountUp value={matchedPct} suffix="" /><span className="text-xl text-ink-soft">%</span></>}
+                centerLabel="matched"
+              />
 
               <div className="flex w-full flex-col gap-3.5">
                 {BUCKET_META.map(b => {
@@ -408,7 +657,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
             icon={<FeaturedIcon size="sm" color="gray" icon={<IcFilm />} />}
           >
             <div className="flex flex-col gap-3">
-              {TYPE_META.map(t => {
+              {compositionTypes.map(t => {
                 const n = stats.byType[t.k];
                 return (
                   <div key={t.k} className="flex items-center gap-3">
@@ -486,22 +735,25 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
               )}
             </Card>
           </div>
+
+          {/* Subtitle coverage — hidden until there's something to report */}
+          <SubtitleCoverageCard setActive={setActive} />
         </div>
 
-        {/* Recent activity — full-height right rail */}
+        {/* Recent activity — full-height right rail, as a timeline */}
         <Card
           title="Recent activity"
           icon={<FeaturedIcon size="sm" color="gray" icon={<IcHistory />} />}
           action={<CardLink label="History" onClick={() => setActive('history')} />}
           divider
           className="min-h-[460px] xl:col-span-1 xl:h-full"
-          bodyClassName="flex-1 min-h-0 overflow-y-auto p-3 [scrollbar-width:thin]"
+          bodyClassName="flex-1 min-h-0 overflow-y-auto p-4 [scrollbar-width:thin]"
         >
           {!activityHydrated ? (
             <div className="flex flex-col gap-1">
               {Array.from({ length: 7 }).map((_, i) => (
-                <div key={i} className="flex items-center gap-3 px-2.5 py-2">
-                  <Skeleton w={36} h={36} radius={8} />
+                <div key={i} className="flex items-center gap-3 px-1.5 py-2">
+                  <Skeleton w={32} h={32} radius={8} />
                   <div className="min-w-0 flex-1"><Skeleton h={13} w={`${74 - i * 6}%`} /></div>
                   <Skeleton w={26} h={11} radius={4} />
                 </div>
@@ -516,19 +768,39 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
               />
             </div>
           ) : (
-            <div className="flex flex-col gap-0.5">
-              {activity.map(a => (
-                <div key={a.id} className="flex items-center gap-3 rounded-xl px-2.5 py-2 transition-colors hover:bg-glass-2">
-                  <FeaturedIcon
-                    size="md"
-                    color={a.kind === 'success' ? 'success' : a.kind === 'error' ? 'error' : 'gray'}
-                    icon={a.kind === 'success' ? <IcCheck /> : a.kind === 'error' ? <IcX /> : <IcHistory />}
-                  />
-                  <div className="min-w-0 flex-1 truncate text-[13px] text-ink-muted" title={typeof a.text === 'string' ? a.text : undefined}>{a.text}</div>
-                  <div className="shrink-0 text-[11px] text-ink-faint">{relativeTime(a.when)}</div>
-                </div>
+            <ol className="dash-timeline anim-stagger relative">
+              {activity.map((a, i) => (
+                <li
+                  key={a.id}
+                  className={cn('dash-timeline-item', `dash-timeline-${a.kind}`)}
+                  style={{ '--i': Math.min(i, 11) } as React.CSSProperties}
+                >
+                  <span className="dash-timeline-node" aria-hidden>
+                    {a.kind === 'success' ? <IcCheck /> : a.kind === 'error' ? <IcX /> : <IcSparkles />}
+                  </span>
+                  <div className="dash-timeline-body">
+                    <div className="min-w-0 truncate text-[13px] text-ink-muted" title={typeof a.text === 'string' ? a.text : undefined}>{a.text}</div>
+                    <div className="mt-0.5 text-[11px] text-ink-faint">{relativeTime(a.when)}</div>
+                  </div>
+                </li>
               ))}
-            </div>
+              {/* Sparse feed → fade the timeline out through ghost rows
+                  instead of stopping dead with a half-empty rail. */}
+              {activity.length < 6 && Array.from({ length: 6 - activity.length }).map((_, g) => (
+                <li
+                  key={`ghost-${g}`}
+                  aria-hidden
+                  className="dash-timeline-item dash-timeline-ghost"
+                  style={{ '--i': Math.min(activity.length + g, 11), '--g': g } as React.CSSProperties}
+                >
+                  <span className="dash-timeline-node" />
+                  <div className="dash-timeline-body">
+                    <div className="dash-ghost-line" style={{ width: `${64 - g * 9}%` }} />
+                    <div className="dash-ghost-line dash-ghost-line-sub" />
+                  </div>
+                </li>
+              ))}
+            </ol>
           )}
         </Card>
       </div>

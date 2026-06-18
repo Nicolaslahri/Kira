@@ -206,3 +206,31 @@ class Notification(Base):
     body: Mapped[str | None] = mapped_column(String, nullable=True)
     read: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class SubtitleAsset(Base):
+    """A subtitle Kira fetched + the metric/provenance behind it — the
+    subtitle history. One row per (file, language) download; `active` flips
+    false when the sidecar is deleted, `blacklisted` excludes that exact
+    candidate from future auto-picks for this file."""
+
+    __tablename__ = "subtitle_assets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # SET NULL (not CASCADE) so the history survives a file row being wiped.
+    media_file_id: Mapped[int | None] = mapped_column(
+        ForeignKey("media_files.id", ondelete="SET NULL"), nullable=True, index=True)
+    language: Mapped[str] = mapped_column(String)          # 2-letter
+    provider: Mapped[str] = mapped_column(String)          # embedded|opensubtitles|…
+    release_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    ref: Mapped[str | None] = mapped_column(String, nullable=True)  # provider download handle (for blacklist match)
+    score: Mapped[int] = mapped_column(Integer, default=0)
+    sync: Mapped[str] = mapped_column(String, default="unknown")    # guaranteed|likely|unknown
+    reasons: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    hearing_impaired: Mapped[bool] = mapped_column(default=False)
+    forced: Mapped[bool] = mapped_column(default=False)
+    path: Mapped[str | None] = mapped_column(String, nullable=True)  # sidecar on disk; null once deleted
+    title: Mapped[str | None] = mapped_column(String, nullable=True)  # frozen video title for the history list
+    active: Mapped[bool] = mapped_column(default=True, index=True)
+    blacklisted: Mapped[bool] = mapped_column(default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

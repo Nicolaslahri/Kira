@@ -22,16 +22,23 @@ ScudLee `<anime>` shapes handled:
 """
 from __future__ import annotations
 
+import logging
+
 import asyncio
 import re
 import time
-import xml.etree.ElementTree as ET
+# defusedxml (not stdlib xml): this XML comes from a remote CDN
+# (raw.githubusercontent.com), so a MITM / compromised cache could inject XXE
+# or billion-laughs entities. Same hardening as providers/anidb.py; drop-in API.
+import defusedxml.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
 
 from kira.providers.base import KIRA_USER_AGENT
+
+logger = logging.getLogger(__name__)
 
 _MAPPING_URL = (
     "https://raw.githubusercontent.com/Anime-Lists/anime-lists/master/anime-list-master.xml"
@@ -165,9 +172,71 @@ def resolve_tvdb_episode(
     return None
 
 
+def resolve_anidb_episode(
+    index: dict[int, list[AnimeListEntry]],
+    anidb_id: int,
+    anidb_episode: int,
+    anidb_season: int = 1,
+) -> tuple[int, int] | None:
+    """Reverse of `resolve_tvdb_episode`: an AniDB ``(id, episode)`` → its TVDB
+    ``(season, episode)``.
+
+    This is how a seasonless AniDB umbrella gets a real per-arc TVDB season:
+    ScudLee splits the flat absolute run into ``<mapping>`` season ranges, e.g.
+    One Piece (AID 69) ``…tvdbseason=22 start=1086 end=1155; tvdbseason=23
+    start=1156 …`` → anidb ep 1156 → TVDB **S23E01**. A cour AID with no
+    mapping-list uses ``defaulttvdbseason + episodeoffset`` (Bleach TYBW cour 2 =
+    AID 17765, season 17 + offset 13 → S17E14). One mechanism fits both shapes.
+
+    Precedence mirrors `resolve_tvdb_episode`: explicit pairs → ranges → flat
+    default. Returns None when nothing covers the episode (caller keeps its own
+    season). Pure / filesystem-free.
+    """
+    if anidb_episode is None or anidb_episode < 1:
+        return None
+    entry: AnimeListEntry | None = None
+    for entries in index.values():
+        for e in entries:
+            if e.anidb_id == anidb_id:
+                entry = e
+                break
+        if entry is not None:
+            break
+    if entry is None:
+        return None
+
+    # 1: explicit anidb→tvdb pairs (specials interleaving) win.
+    for m in entry.mappings:
+        if m.anidb_season == anidb_season:
+            t_ep = m.explicit.get(anidb_episode)
+            if t_ep is not None:
+                return (m.tvdb_season, t_ep)
+    # 2: range mappings — tvdb_ep = anidb_ep + offset, within [start, end].
+    for m in entry.mappings:
+        if m.anidb_season != anidb_season:
+            continue
+        if (m.start is None or anidb_episode >= m.start) and \
+           (m.end is None or anidb_episode <= m.end):
+            t_ep = anidb_episode + m.offset
+            if t_ep >= 1:
+                return (m.tvdb_season, t_ep)
+    # 3: flat default season + offset — ONLY for entries WITHOUT a mapping-list
+    # (an explicit list is authoritative; an out-of-range ep must not fall
+    # through to flat math). This is the cour-AID case (Bleach TYBW cours).
+    if not entry.mappings and entry.default_tvdb_season is not None:
+        t_ep = anidb_episode + entry.episode_offset
+        if t_ep >= 1:
+            return (entry.default_tvdb_season, t_ep)
+    return None
+
+
 # ── Lazy download + cache + parse (mirrors the AniDB title-dump pattern) ────
 _index: dict[int, list[AnimeListEntry]] | None = None
 _load_lock = asyncio.Lock()
+# AID → entry reverse index, built lazily from `_index` for resolve_anidb_to_tvdb
+# (the forward index is TVDB-keyed; scanning all entries per file would be O(n)).
+_aid_index: dict[int, AnimeListEntry] | None = None
+_aid_index_src: dict | None = None
 
 
 def _fresh() -> bool:
@@ -197,7 +266,7 @@ async def _ensure_index(client: httpx.AsyncClient | None = None) -> dict[int, li
                 _XML_PATH.write_bytes(r.content)
             except Exception as e:
                 # Stale cache is better than nothing — fall through to parse it.
-                print(f"anime_lists: download failed ({e!r}); using cache if present")
+                logger.warning(f"anime_lists: download failed ({e!r}); using cache if present")
             finally:
                 if own:
                     await c.aclose()
@@ -208,7 +277,7 @@ async def _ensure_index(client: httpx.AsyncClient | None = None) -> dict[int, li
                 if parsed:  # corruption-safety: only adopt a non-empty parse
                     _index = parsed
             except Exception as e:
-                print(f"anime_lists: parse failed: {e!r}")
+                logger.warning(f"anime_lists: parse failed: {e!r}")
         if _index is None:
             _index = {}
         return _index
@@ -226,5 +295,43 @@ async def resolve_tvdb_to_anidb(
     except (TypeError, ValueError):
         return None
     except Exception as e:
-        print(f"anime_lists.resolve_tvdb_to_anidb failed: {e!r}")
+        logger.warning(f"anime_lists.resolve_tvdb_to_anidb failed: {e!r}")
+        return None
+
+
+async def resolve_anidb_to_tvdb(
+    anidb_id: int | str, anidb_episode: int | str,
+    anidb_season: int | str = 1,
+    client: httpx.AsyncClient | None = None,
+) -> tuple[int, int] | None:
+    """Async front door: ensure the index is loaded, then resolve an AniDB
+    ``(id, episode)`` to its TVDB ``(season, episode)``. None on any failure.
+
+    Uses a cached AID→entry reverse index so a large batch rename doesn't rescan
+    the whole (TVDB-keyed) table per file."""
+    global _aid_index, _aid_index_src
+    try:
+        idx = await _ensure_index(client)
+        if not idx:
+            return None
+        if _aid_index is None or _aid_index_src is not idx:
+            built: dict[int, AnimeListEntry] = {}
+            for entries in idx.values():
+                for e in entries:
+                    built.setdefault(e.anidb_id, e)
+            _aid_index = built
+            _aid_index_src = idx
+        entry = _aid_index.get(int(anidb_id))
+        if entry is None:
+            return None
+        # Reuse the pure resolver (single code path / precedence) against a
+        # one-entry index keyed by this entry's tvdb id.
+        return resolve_anidb_episode(
+            {entry.tvdb_id or 0: [entry]},
+            int(anidb_id), int(anidb_episode), int(anidb_season),
+        )
+    except (TypeError, ValueError):
+        return None
+    except Exception as e:
+        logger.warning(f"anime_lists.resolve_anidb_to_tvdb failed: {e!r}")
         return None

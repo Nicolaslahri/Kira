@@ -148,6 +148,77 @@ async def get_activity() -> dict:
     return activity.snapshot()
 
 
+@router.get("/ffmpeg")
+async def get_ffmpeg_status() -> dict:
+    """Is ffmpeg usable (system or Kira-managed), and can this platform
+    one-click install it? Drives the Settings + Onboarding status rows."""
+    from kira.ffmpeg_setup import ffmpeg_status
+    return ffmpeg_status()
+
+
+@router.post("/ffmpeg/install")
+async def install_ffmpeg_endpoint() -> dict:
+    """One-click managed ffmpeg: download a static build into Kira's own
+    ./tools/ dir — no PATH edits, nothing system-wide. Fire-and-forget;
+    progress + the final state narrate through /activity."""
+    from kira.ffmpeg_setup import FFMPEG_INSTALL_JOB, ffmpeg_status, install_ffmpeg
+    from kira.tasks import spawn_tracked
+    status = ffmpeg_status()
+    if status["available"]:
+        return status
+    if not status["installable"]:
+        raise HTTPException(400, "No one-click ffmpeg build for this platform — install from ffmpeg.org.")
+    if not status["installing"]:
+        spawn_tracked(install_ffmpeg(), label=FFMPEG_INSTALL_JOB)
+        status["installing"] = True
+    return status
+
+
+@router.post("/matches/reset")
+async def reset_matches(
+    confirm: str = Query(..., description="Must equal 'RESET' to proceed"),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, int]:
+    """Tier-2 reset: forget every identification. Deletes Match rows and
+    flips files back to pending so the next scan / Re-identify re-matches
+    from scratch. Files on disk, rename history, and settings all survive."""
+    if confirm != "RESET":
+        raise HTTPException(400, "Pass ?confirm=RESET to actually reset matches.")
+    from sqlalchemy import update
+    from kira.models import RenameHistory
+    # Detach every rename-history back-reference BEFORE deleting matches. On a
+    # legacy DB whose `rename_history.match_id` FK is still RESTRICT (created by
+    # the old create_all path — SQLite can't ALTER a FK's ON DELETE in place),
+    # deleting a Match a past rename points at raises "FOREIGN KEY constraint
+    # failed" with foreign_keys=ON, 500ing the whole reset. Same discipline as
+    # match_cleanup.detach_and_delete_matches, applied wholesale.
+    await session.execute(
+        update(RenameHistory).where(RenameHistory.match_id.isnot(None)).values(match_id=None)
+    )
+    res = await session.execute(delete(Match))
+    await session.execute(
+        update(MediaFile)
+        .where(MediaFile.status.in_(("matched", "no_match", "approved")))
+        .values(status="pending")
+    )
+    await session.commit()
+    return {"matches_deleted": res.rowcount or 0}
+
+
+@router.post("/history/reset")
+async def reset_history(
+    confirm: str = Query(..., description="Must equal 'RESET' to proceed"),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, int]:
+    """Tier-1 reset: clear the rename log (and with it, undo). Nothing else
+    is touched — files, matches, and settings all survive."""
+    if confirm != "RESET":
+        raise HTTPException(400, "Pass ?confirm=RESET to actually clear history.")
+    res = await session.execute(delete(RenameHistory))
+    await session.commit()
+    return {"history_deleted": res.rowcount or 0}
+
+
 @router.post("/database/reset")
 async def reset_database(
     confirm: str = Query(..., description="Must equal 'RESET' to proceed"),
@@ -175,10 +246,13 @@ async def reset_database(
     if wipe_settings:
         # Preserve the heal-version row so the heal pass doesn't re-run
         # its (now-irrelevant) one-shot migrations on the empty DB.
-        # Everything else goes.
+        # Everything else goes — including the auth account, so a factory
+        # reset returns the server to the first-run sign-up screen.
         await session.execute(
             delete(Setting).where(Setting.key != "system.heal_version")
         )
+        from kira.api.auth import set_account_cache
+        set_account_cache(None)
     await session.commit()
     return {"ok": 1, "wiped_settings": 1 if wipe_settings else 0}
 

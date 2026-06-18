@@ -204,6 +204,20 @@ def normalize_language(raw) -> str | None:
     return None
 
 
+def _parse_fast_then_full(path: str):
+    """Parse with MediaInfo's minimum ParseSpeed when the installed pymediainfo
+    supports it. Everything Kira reads (track formats, height, HDR transfer,
+    channel counts, languages, container duration) lives in the container
+    HEADERS — ParseSpeed 0 skips the deep bitstream scan (interlacement /
+    bitrate sampling) that the default 0.5 pays for, which over a network share
+    is most of the wall-clock per file. Falls back to a default-speed parse for
+    older pymediainfo without the kwarg."""
+    try:
+        return _MediaInfo.parse(path, parse_speed=0)  # type: ignore[union-attr]
+    except TypeError:
+        return _MediaInfo.parse(path)  # type: ignore[union-attr]
+
+
 def read_media_info(path: str) -> dict[str, Any] | None:
     """Read {quality, codec, hdr, channels, audio, duration} from the file.
     None when the lib is unavailable, the file can't be read, or it has no
@@ -211,13 +225,30 @@ def read_media_info(path: str) -> dict[str, Any] | None:
 
     Video fields come from the first Video track; audio fields from the first
     Audio track (the default/primary track in practice). Duration prefers the
-    General track (whole-container length) and falls back to the Video track."""
+    General track (whole-container length) and falls back to the Video track.
+
+    Uses a header-only fast parse first; if that yields nothing usable (or no
+    duration — possible on odd containers), retries once at default speed so
+    the fast path can never REDUCE coverage, only cost."""
     if not _AVAILABLE:
         return None
     try:
-        info = _MediaInfo.parse(path)  # type: ignore[union-attr]
+        info = _parse_fast_then_full(path)
     except Exception:
         return None
+    out = _extract_tracks(info)
+    if out is None or "duration" not in out:
+        try:
+            full = _MediaInfo.parse(path)  # type: ignore[union-attr]
+        except Exception:
+            return out
+        out2 = _extract_tracks(full)
+        if out2 is not None:
+            return out2
+    return out
+
+
+def _extract_tracks(info) -> dict[str, Any] | None:
     out: dict[str, Any] = {}
     audio_langs: list[str] = []
     sub_langs: list[str] = []

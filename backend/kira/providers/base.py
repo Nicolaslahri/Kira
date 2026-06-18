@@ -25,7 +25,9 @@ ProviderKey = Literal["tmdb", "tvdb", "anidb", "musicbrainz", "acoustid"]
 # rate-limit / 403 the default Python UA when aggregate traffic spikes.
 # Hoisted here so every external HTTP client in providers/ can adopt the
 # same defensive identifier without duplicating the string.
-KIRA_USER_AGENT = "kira/0.5.0 (+https://github.com/Nicolaslahri/Kira)"
+from kira import __version__ as _kira_version
+
+KIRA_USER_AGENT = f"kira/{_kira_version} (+https://github.com/Nicolaslahri/Kira)"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -79,6 +81,8 @@ class ProviderConfig(BaseModel):
     # overviews and genre names in the popup. None → the provider's "en-US"
     # default. Other providers ignore it.
     tmdb_language: str | None = None
+    # TVDB /search `language` param (ISO 639-2, e.g. "eng"). None → "eng".
+    tvdb_language: str | None = None
 
 
 @dataclass(frozen=True)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import time
 from typing import Any, Literal
 
@@ -15,6 +17,8 @@ from kira.database import get_session
 from kira.matcher.engine import registry_from_settings
 from kira.models import Setting
 from kira.schemas import ProviderTestResponse, SettingsBody
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -37,12 +41,17 @@ def _is_secret_key(key: str) -> bool:
     return any(marker in k for marker in _SECRET_MARKERS)
 
 
-def _masked(raw: Any) -> dict[str, Any]:
-    """A masked stand-in that proves a secret is configured (and exposes only
-    the last 4 chars as a fingerprint) without ever returning the plaintext.
-    Shape matches what the frontend already renders for env-bootstrapped keys."""
+def _masked(raw: Any, *, fingerprint: bool = True) -> dict[str, Any]:
+    """A masked stand-in that proves a secret is configured (and, by default,
+    exposes only the last 4 chars as a fingerprint so the UI can show '…abcd' for
+    an API key) without ever returning the plaintext. Shape matches what the
+    frontend already renders for env-bootstrapped keys.
+
+    Pass ``fingerprint=False`` for values where even a 4-char tail is too much —
+    e.g. a password HASH, whose trailing base64 chars are a needless credential-
+    adjacent leak (and let two installs be compared for a shared password)."""
     val = raw.get("value") if isinstance(raw, dict) else raw
-    tail = val[-4:] if isinstance(val, str) and len(val) >= 4 else ""
+    tail = val[-4:] if (fingerprint and isinstance(val, str) and len(val) >= 4) else ""
     return {"masked": True, "tail": tail, "set": bool(val)}
 
 
@@ -65,7 +74,10 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     rows directly, so masking the API response changes nothing functionally."""
     rows = list(await session.scalars(select(Setting)))
     out: dict[str, Any] = {
-        row.key: (_masked(row.value) if _is_secret_key(row.key) else row.value)
+        row.key: (
+            _masked(row.value, fingerprint="password_hash" not in row.key.lower())
+            if _is_secret_key(row.key) else row.value
+        )
         for row in rows
     }
     # Surface env-bootstrapped keys too (masked), so the UI can tell a provider
@@ -75,6 +87,46 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     if app_settings.tvdb_api_key and "providers.tvdb.api_key" not in out:
         out["providers.tvdb.api_key"] = _masked(app_settings.tvdb_api_key)
     return out
+
+
+@router.get("/persistence", response_model=dict[str, Any])
+async def get_persistence(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """Whether match-identity stamps can live ON the media files themselves
+    (xattr / NTFS ADS) or fall back to Kira's portable index. Probes the
+    configured library root with a throwaway temp file — cheap, no lasting
+    effect. The UI surfaces this on Settings → Paths so 'stamping silently
+    no-ops on this volume' is visible instead of a mystery."""
+    import asyncio as _asyncio
+    import tempfile
+
+    from kira import xattr_store
+
+    root_row = await session.get(Setting, "paths.library_root")
+    root = root_row.value if root_row else None
+    if isinstance(root, dict) and "value" in root:
+        root = root["value"]
+    if not isinstance(root, str) or not root.strip():
+        return {"root": None, "native": False, "mode": "index"}
+
+    def _probe() -> bool:
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=root, prefix=".kira-probe-", delete=False
+            ) as fh:
+                probe_path = fh.name
+            try:
+                return xattr_store.supported(probe_path)
+            finally:
+                try:
+                    import os as _os
+                    _os.remove(probe_path)
+                except OSError:
+                    pass
+        except OSError:
+            return False
+
+    native = await _asyncio.to_thread(_probe)
+    return {"root": root, "native": native, "mode": "native" if native else "index"}
 
 
 @router.put("", response_model=dict[str, int])
@@ -125,13 +177,16 @@ async def put_settings(
     if "network.force_ipv4" in payload.values:
         try:
             from kira import net
-            v = payload.values["network.force_ipv4"]
-            if isinstance(v, dict):
-                v = v.get("value")
-            if isinstance(v, bool):
-                net.set_force_ipv4(v)
+            from kira.settings_store import unwrap
+            v = unwrap(payload.values["network.force_ipv4"])
+            # Coerce the common string-toggle shape ("true"/"false"/"1"/"0") too,
+            # not just a literal bool — otherwise a string value committed the row
+            # but silently skipped the live apply, breaking the "no restart" promise.
+            if isinstance(v, str):
+                v = v.strip().lower() in ("1", "true", "yes", "on")
+            net.set_force_ipv4(bool(v))
         except Exception as e:
-            print(f"settings: force_ipv4 apply failed: {e!r}")
+            logger.warning(f"settings: force_ipv4 apply failed: {e!r}")
 
     # Watched-folders: if the watch config or the scanned paths changed,
     # re-arm the daemon so the new settings take effect without a restart.
@@ -143,7 +198,7 @@ async def put_settings(
             from kira.watcher import watcher
             await watcher.reconfigure()
         except Exception as e:
-            print(f"settings: watcher reconfigure failed: {e!r}")
+            logger.warning(f"settings: watcher reconfigure failed: {e!r}")
 
     # MediaInfo: turning the read on — or turning on authoritative while read is
     # already on — should enrich the EXISTING library, not just files found by
@@ -160,29 +215,32 @@ async def put_settings(
                 _spawn_mediainfo_enrich,
             )
             from kira.models import MediaFile
+            from kira.settings_store import unwrap
 
             read_now = await _read_mediainfo_setting(session)
             auth_now = await _read_mediainfo_authoritative_setting(session)
+            # unwrap the prior value the same way the readers now do, so the
+            # OFF→ON detection can't misfire on a wrapped {"value": …} shape.
             read_on = (
                 "parsing.read_mediainfo" in _mi_old
-                and read_now and not bool(_mi_old["parsing.read_mediainfo"])
+                and read_now and not bool(unwrap(_mi_old["parsing.read_mediainfo"]))
             )
             auth_on = (
                 "parsing.mediainfo_authoritative" in _mi_old
-                and auth_now and not bool(_mi_old["parsing.mediainfo_authoritative"])
+                and auth_now and not bool(unwrap(_mi_old["parsing.mediainfo_authoritative"]))
             )
             if read_now and (read_on or auth_on):
                 all_ids = list((await session.scalars(select(MediaFile.id))).all())
                 _spawn_mediainfo_enrich(all_ids, reason="settings")
         except Exception as e:
-            print(f"settings: mediainfo backfill kick-off failed (non-fatal): {e!r}")
+            logger.warning(f"settings: mediainfo backfill kick-off failed (non-fatal): {e!r}")
 
     return {"updated": n}
 
 
 @router.post("/providers/{provider}/test", response_model=ProviderTestResponse)
 async def test_provider(
-    provider: Literal["tmdb", "tvdb", "anidb", "fanarttv"],
+    provider: Literal["tmdb", "tvdb", "anidb", "fanarttv", "opensubtitles", "subdl", "subsource"],
     session: AsyncSession = Depends(get_session),
 ) -> ProviderTestResponse:
     """Actually call the provider with the configured credentials and report ok/error.
@@ -192,6 +250,98 @@ async def test_provider(
     pinging its API with the saved key. (`provider` is a free string rather than
     the matcher `ProviderKey` enum precisely so artwork-only sources fit here.)
     """
+    # OpenSubtitles — subtitle provider. Search validates the API key (a dead
+    # key 403s → typed AuthRejected); when download creds are saved, login is
+    # exercised too, since downloads are the part that actually needs them.
+    if provider == "opensubtitles":
+        from kira.providers.opensubtitles import OpenSubtitlesClient
+        from kira.subtitles.errors import AuthRejected
+        from kira.subtitles.prefs import load_subtitle_prefs
+        prefs = await load_subtitle_prefs(session)
+        if not prefs.api_key:
+            return ProviderTestResponse(ok=False, detail="No API key configured")
+        t0 = time.monotonic()
+        async with httpx.AsyncClient() as client:
+            osc = OpenSubtitlesClient(prefs.api_key, client)
+            try:
+                cands = await osc.search(query="inception", languages=["en"])
+            except AuthRejected:
+                return ProviderTestResponse(
+                    ok=False,
+                    detail="API key rejected — use the 32-character key from opensubtitles.com → API consumers",
+                )
+            if not cands:
+                return ProviderTestResponse(ok=False, detail="Search returned nothing — check the API key")
+            detail = "key OK"
+            if prefs.has_download_creds:
+                token = await osc.login(prefs.username, prefs.password)
+                detail = "key OK · login OK" if token else "key OK · login FAILED — check username/password"
+                if not token:
+                    return ProviderTestResponse(ok=False, detail=detail)
+            else:
+                detail += " · no login saved (needed for downloads)"
+        return ProviderTestResponse(
+            ok=True, detail=detail, latency_ms=int((time.monotonic() - t0) * 1000),
+        )
+
+    # SubDL — subtitle provider, key-gated. A search validates the key.
+    if provider == "subdl":
+        from kira.subtitles import subdl
+        from kira.subtitles.prefs import load_subtitle_prefs
+        prefs = await load_subtitle_prefs(session)
+        if not prefs.subdl_api_key:
+            return ProviderTestResponse(ok=False, detail="No API key configured")
+        t0 = time.monotonic()
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                "https://api.subdl.com/api/v1/subtitles",
+                params={"api_key": prefs.subdl_api_key, "film_name": "inception", "languages": "EN"},
+                headers={"Accept": "application/json"}, timeout=20.0, follow_redirects=True,
+            )
+        if r.status_code in (401, 403):
+            return ProviderTestResponse(ok=False, detail="API key rejected")
+        try:
+            ok = bool(isinstance(r.json(), dict))
+        except Exception:
+            ok = False
+        return ProviderTestResponse(
+            ok=ok, detail="key OK" if ok else f"unexpected response (HTTP {r.status_code})",
+            latency_ms=int((time.monotonic() - t0) * 1000) if ok else None,
+        )
+
+    # SubSource — subtitle provider, key-gated. A movie search validates the key
+    # (the API is Cloudflare-fronted, so it needs the module's browser UA).
+    if provider == "subsource":
+        from kira.subtitles import subsource
+        from kira.subtitles.prefs import load_subtitle_prefs
+        prefs = await load_subtitle_prefs(session)
+        if not prefs.subsource_api_key:
+            return ProviderTestResponse(ok=False, detail="No API key configured")
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    f"{subsource._BASE}/movies/search",
+                    params={"searchType": "text", "q": "inception"},
+                    headers={"X-API-Key": prefs.subsource_api_key,
+                             "User-Agent": subsource._UA, "Accept": "application/json"},
+                    timeout=20.0, follow_redirects=True,
+                )
+            if r.status_code in (401, 403):
+                # 403 here is usually Cloudflare, not the key; say so.
+                detail = ("API key rejected" if r.status_code == 401
+                          else "blocked by Cloudflare (403) — try again shortly")
+                return ProviderTestResponse(ok=False, detail=detail)
+            if r.status_code >= 400:
+                return ProviderTestResponse(ok=False, detail=f"HTTP {r.status_code}")
+            ok = bool(isinstance(r.json(), dict) and r.json().get("success"))
+            return ProviderTestResponse(
+                ok=ok, detail="key OK" if ok else "unexpected response",
+                latency_ms=int((time.monotonic() - t0) * 1000) if ok else None,
+            )
+        except Exception as e:
+            return ProviderTestResponse(ok=False, detail=str(e))
+
     # fanart.tv — artwork provider, tested against its own API.
     if provider == "fanarttv":
         from kira.providers import fanarttv

@@ -69,9 +69,17 @@ async def _setup(tmp_path, monkeypatch, *, write_nfo=True):
 
 async def _run(sm, req):
     """Drive perform_rename on a session that's properly closed afterward (the
-    post-rename hooks open their own SessionLocal, so this one is just the batch)."""
+    post-rename hooks open their own SessionLocal, so this one is just the batch).
+
+    The post-rename network tail (subtitle fetch → media-server refresh → Sonarr)
+    now runs as a tracked background task, so drain it before returning — that's
+    what makes hook effects (e.g. the Sonarr rescan spy) observable synchronously
+    in tests, mirroring how shutdown awaits the same tasks."""
+    from kira.tasks import drain_background_tasks
     async with sm() as s:
-        return await perform_rename(req, s)
+        res = await perform_rename(req, s)
+    await drain_background_tasks()
+    return res
 
 
 async def _history(sm):
@@ -180,6 +188,147 @@ async def test_anime_cours_unify_under_one_show_keeping_tvdb_season(tmp_path, mo
 
 
 @pytest.mark.asyncio
+async def test_unified_franchise_uses_one_year_for_year_bearing_templates(tmp_path, monkeypatch):
+    # Jellyfin's anime template is "{{n}} ({{y}})/..." — each cour carries its own
+    # premiere year, so a unified TITLE alone still fragments the franchise into
+    # "Show (2022)" / "Show (2023)" folders. The earliest cour supplies BOTH.
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    media = tmp_path / "anime" / "Bleach" / "Season 17"
+    media.mkdir(parents=True)
+    ids = []
+    async with sm() as s:
+        for aid, title, year, ep in [
+            (15449, "Bleach: Thousand-Year Blood War", 2022, 1),
+            (17765, "Bleach: Thousand-Year Blood War - The Separation", 2023, 2),
+        ]:
+            pd = {"original_filename": f"x{ep}.mkv", "media_type": "anime",
+                  "title": "Bleach", "season": 17, "episode": ep}
+            src = media / f"b{aid}e{ep}.mkv"
+            src.write_bytes(b"v")
+            mf = MediaFile(file_path=str(src), parsed_data=pd, media_type="anime", status="matched")
+            s.add(mf)
+            await s.flush()
+            s.add(Match(media_file_id=mf.id, provider="anidb", provider_id=str(aid),
+                        match_type="tv_episode", series_group_id="anidb:2369", confidence=0.95,
+                        title=title, year=year, season_number=17, episode_number=ep,
+                        is_selected=True, is_manual=False))
+            ids.append(mf.id)
+        await s.commit()
+
+    res = await _run(sm, RenameRequest(file_ids=ids, profile="Jellyfin", op="move", dry_run=True))
+    for i in res.items:
+        assert "(2022)" in i.new_path, i.new_path     # earliest cour's year everywhere
+        assert "(2023)" not in i.new_path, i.new_path
+
+
+@pytest.mark.asyncio
+async def test_yearless_franchise_never_splits_on_per_file_filename_year(tmp_path, monkeypatch):
+    # Regression (Gachiakuta): every file matched the SAME AniDB entry with
+    # year=None, but some FILENAMES carried "2025" and others didn't. The folder
+    # year fell back to each file's own parsed year, so a year-bearing template
+    # split ONE show into "Gachiakuta (2025)" + "Gachiakuta". The group year must
+    # unify to a SINGLE value (None here) so the show can never fragment on a
+    # per-file filename year.
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    media = tmp_path / "anime" / "Gachiakuta" / "Season 1"
+    media.mkdir(parents=True)
+    ids = []
+    async with sm() as s:
+        for ep, pyear, fname in [
+            (1, 2025, "Gachiakuta.S01E01.2025.1080p.WEB-DL.mp4"),   # filename has a year
+            (2, None, "[Erai-raws] Gachiakuta-02 [1080p].mkv"),     # filename has none
+        ]:
+            pd = {"original_filename": fname, "media_type": "anime",
+                  "title": "Gachiakuta", "season": 1, "episode": ep, "year": pyear}
+            src = media / fname
+            src.write_bytes(b"v")
+            mf = MediaFile(file_path=str(src), parsed_data=pd, media_type="anime", status="matched")
+            s.add(mf)
+            await s.flush()
+            # Same group, SAME entry, year=None — exactly the live Gachiakuta rows.
+            s.add(Match(media_file_id=mf.id, provider="anidb", provider_id="18686",
+                        match_type="tv_episode", series_group_id="anidb:18686", confidence=1.0,
+                        title="Gachiakuta", year=None, season_number=1, episode_number=ep,
+                        is_selected=True, is_manual=False))
+            ids.append(mf.id)
+        await s.commit()
+
+    res = await _run(sm, RenameRequest(file_ids=ids, profile="Jellyfin", op="move", dry_run=True))
+    assert len(res.items) == 2 and all(i.ok for i in res.items), res
+    # ONE show folder for both files, and the per-file "2025" must not leak in.
+    show_folders = {Path(i.new_path).parent.parent.name for i in res.items}
+    assert len(show_folders) == 1, f"show split across folders: {show_folders}"
+    for i in res.items:
+        assert "(2025)" not in i.new_path, i.new_path
+
+
+@pytest.mark.asyncio
+async def test_anime_show_folder_uses_franchise_root_not_present_cour(tmp_path, monkeypatch):
+    # Regression (Haikyu): only a LATER season is in the library — Haikyu S2
+    # (AID 10981, AniDB title "Haikyu!! 2nd Season"), whose franchise root is
+    # AID 10145 ("Haikyu!!"). The show folder + file prefix must be the ROOT
+    # title "Haikyu!!" (+ Season 2), NOT the cour's own qualified title — else
+    # you get "Haikyu!! 2nd Season/Season 2/Haikyu!! 2nd Season - S02E24…".
+    # This case = the real production failure: the title dump is NOT loaded
+    # (restart → re-rename runs no AniDB op), so the root lookup misses and the
+    # offline season-qualifier STRIP must still fold it to "Haikyu!!".
+    from kira.providers.anidb import AniDBProvider
+    monkeypatch.setattr(AniDBProvider, "_titles", {})
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    media = tmp_path / "anime" / "Haikyu" / "Season 2"
+    media.mkdir(parents=True)
+    src = media / "Haikyuu!! S02E24.mkv"
+    src.write_bytes(b"v")
+    pd = {"original_filename": src.name, "media_type": "anime",
+          "title": "Haikyuu!!", "season": 2, "episode": 24}
+    async with sm() as s:
+        mf = MediaFile(file_path=str(src), parsed_data=pd, media_type="anime", status="matched")
+        s.add(mf)
+        await s.flush()
+        s.add(Match(media_file_id=mf.id, provider="anidb", provider_id="10981",
+                    match_type="tv_episode", series_group_id="anidb:10145", confidence=1.0,
+                    title="Haikyu!! 2nd Season", season_number=2, episode_number=24,
+                    is_selected=True, is_manual=False))
+        await s.commit()
+        fid = mf.id
+    res = await _run(sm, RenameRequest(file_ids=[fid], profile="Plex", op="move", dry_run=True))
+    p = res.items[0].new_path
+    assert "2nd Season" not in p, p                 # the per-cour qualifier must be gone
+    assert "Haikyu!!" in p, p                        # root franchise title used
+    assert ("Season 2" in p or "Season 02" in p), p  # season still correct
+
+
+@pytest.mark.asyncio
+async def test_anime_show_folder_resolves_root_title_from_loaded_dump(tmp_path, monkeypatch):
+    # Same as above but the title dump IS loaded → the franchise ROOT aid's title
+    # is used directly (handles subtitle sequels too, which the strip can't).
+    from kira.providers.anidb import AniDBProvider
+    monkeypatch.setattr(AniDBProvider, "_titles", {9999: [("official", "en", "Mushishi")]})
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    media = tmp_path / "anime" / "Mushishi" / "S2"
+    media.mkdir(parents=True)
+    src = media / "Mushishi Zoku Shou E01.mkv"
+    src.write_bytes(b"v")
+    pd = {"original_filename": src.name, "media_type": "anime", "title": "Mushishi Zoku Shou", "season": 2, "episode": 1}
+    async with sm() as s:
+        mf = MediaFile(file_path=str(src), parsed_data=pd, media_type="anime", status="matched")
+        s.add(mf)
+        await s.flush()
+        # AniDB names this sequel "Mushishi Zoku Shou" (a SUBTITLE, not an ordinal)
+        # — only the root-aid dump lookup can fold it to "Mushishi".
+        s.add(Match(media_file_id=mf.id, provider="anidb", provider_id="10000",
+                    match_type="tv_episode", series_group_id="anidb:9999", confidence=1.0,
+                    title="Mushishi Zoku Shou", season_number=2, episode_number=1,
+                    is_selected=True, is_manual=False))
+        await s.commit()
+        fid = mf.id
+    res = await _run(sm, RenameRequest(file_ids=[fid], profile="Plex", op="move", dry_run=True))
+    p = res.items[0].new_path
+    assert "Zoku Shou" not in p, p   # the subtitle sequel name must be gone
+    assert "Mushishi" in p, p        # folded to the root title from the dump
+
+
+@pytest.mark.asyncio
 async def test_anime_cour_episode_offset_applied(tmp_path, monkeypatch):
     # Two cours sharing TVDB season 17, both AniDB-local E01. The static cour-routing
     # table (mocked here) offsets the 2nd cour by the 1st's official length so they
@@ -239,6 +388,126 @@ async def test_rename_uses_match_episode_not_lying_filename_number(tmp_path, mon
     assert "S04E22" in p, p          # en 6 + offset 16 — the truth
     assert "E97" not in p, p          # parsed 81 + 16 — the garbage
     assert "Thaw" in p, p
+
+
+@pytest.mark.asyncio
+async def test_season_zero_match_does_not_dump_to_specials(tmp_path, monkeypatch):
+    # One Piece blunder: AniDB AID 69 has no season concept and the match comes
+    # back season 0. The file parsed a real positive season (23) + episode 1160.
+    # A season-0 match must NOT collapse a numbered episode into Specials/S00 —
+    # trust the parsed season instead.
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    # Isolate the season-0 GUARD: ScudLee mapping OFF so this asserts purely that
+    # a season-0 match trusts the file's parsed positive season (23) instead of
+    # collapsing into Specials. (The ScudLee seasonal mapping is covered by
+    # test_seasonal_anime_maps_to_real_tvdb_season below.)
+    async def _no_scud(*a, **k):
+        return None
+    monkeypatch.setattr("kira.providers.anime_lists.resolve_anidb_to_tvdb", _no_scud)
+    media = tmp_path / "anime" / "One Piece" / "Season 23"
+    media.mkdir(parents=True)
+    src = media / "One Piece - S23E1160 - Episode 1160.mkv"
+    src.write_bytes(b"v")
+    pd = {"original_filename": src.name, "media_type": "anime",
+          "title": "One Piece", "season": 23, "episode": 1160}
+    async with sm() as s:
+        mf = MediaFile(file_path=str(src), parsed_data=pd, media_type="anime", status="matched")
+        s.add(mf)
+        await s.flush()
+        s.add(Match(media_file_id=mf.id, provider="anidb", provider_id="69",
+                    match_type="tv_episode", confidence=1.0, title="One Piece",
+                    season_number=0, episode_number=1160,
+                    episode_title="An Encounter on a Snowfield", is_selected=True))
+        await s.commit()
+        fid = mf.id
+
+    res = await _run(sm, RenameRequest(file_ids=[fid], profile="Plex", op="move", dry_run=True))
+    p = res.items[0].new_path
+    assert "Specials" not in p, p
+    assert "S00" not in p, p
+    assert "S23E1160" in p, p
+
+
+@pytest.mark.asyncio
+async def test_seasonal_anime_maps_to_real_tvdb_season(tmp_path, monkeypatch):
+    # Seasonal mode: an AniDB absolute episode is placed in its REAL TVDB
+    # (season, episode) via ScudLee — One Piece anidb 1160 → S23E05 — so the
+    # whole flat umbrella unifies in one season instead of scattering across
+    # Season 01 / Season 23. The folder + filename use the SAME resolver that
+    # stamps Match.season_number, so what's shown is what's written.
+    sm = await _fresh_db(tmp_path, monkeypatch)
+
+    async def _scud(aid, ep, *a, **k):
+        return (23, 5) if int(aid) == 69 and int(ep) == 1160 else None
+    monkeypatch.setattr("kira.providers.anime_lists.resolve_anidb_to_tvdb", _scud)
+
+    media = tmp_path / "anime" / "One Piece" / "Season 01"
+    media.mkdir(parents=True)
+    src = media / "One Piece - S01E1160 - Episode 1160.mkv"
+    src.write_bytes(b"v")
+    pd = {"original_filename": src.name, "media_type": "anime",
+          "title": "One Piece", "season": 1, "episode": 1160}
+    async with sm() as s:
+        mf = MediaFile(file_path=str(src), parsed_data=pd, media_type="anime", status="matched")
+        s.add(mf)
+        await s.flush()
+        s.add(Match(media_file_id=mf.id, provider="anidb", provider_id="69",
+                    match_type="tv_episode", confidence=1.0, title="One Piece",
+                    season_number=23, episode_number=1160,
+                    episode_title="An Encounter on a Snowfield", is_selected=True))
+        await s.commit()
+        fid = mf.id
+
+    res = await _run(sm, RenameRequest(file_ids=[fid], profile="Plex", op="move", dry_run=True))
+    p = res.items[0].new_path
+    assert "Season 23" in p, p
+    assert "S23E05" in p, p          # TVDB season-local episode, NOT absolute 1160
+    assert "S01E1160" not in p, p     # the scattered "Season 01" placement is gone
+
+
+@pytest.mark.asyncio
+async def test_episode_nfo_carries_cour_offset_number(tmp_path, monkeypatch):
+    # The Jellyfin "two episode 1s" bug: the FILENAME got the cour offset
+    # (Part 2 local E01 → S03E13) but the episode NFO was written from the raw
+    # Match.episode_number — <episode>1</episode>. Jellyfin trusts the NFO over
+    # the filename, so every multi-cour season displayed duplicate numbering.
+    # The NFO must mirror the rendered filename exactly.
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    media = tmp_path / "anime" / "Attack on Titan" / "Season 03"
+    media.mkdir(parents=True)
+    src = media / "Attack on Titan - S03E01 - The Town Where Everything Began.mkv"
+    src.write_bytes(b"v")
+    pd = {"original_filename": src.name, "media_type": "anime",
+          "title": "Attack on Titan", "season": 3, "episode": 1}
+    async with sm() as s:
+        s.add(Setting(key="naming.write_nfo", value=True))
+        mf = MediaFile(file_path=str(src), parsed_data=pd, media_type="anime", status="matched")
+        s.add(mf)
+        await s.flush()
+        s.add(Match(media_file_id=mf.id, provider="anidb", provider_id="13759",
+                    match_type="tv_episode", series_group_id="anidb:9541", confidence=0.95,
+                    title="Attack on Titan Season 3 Part 2", season_number=3,
+                    episode_number=1, episode_title="The Town Where Everything Began",
+                    is_selected=True))
+        await s.commit()
+        fid = mf.id
+
+    async def _fake_table(provider, top_id, season, registry=None):
+        # AoT TVDB S3: Part 1 (12 eps, offset 0) + Part 2 (10 eps, offset 12).
+        return [(1, 12, 13700, 0), (13, 22, 13759, 12)]
+    monkeypatch.setattr("kira.matcher.cour_routing.build_cour_routing_table", _fake_table)
+
+    res = await _run(sm, RenameRequest(file_ids=[fid], profile="Plex", op="move"))
+    assert res.items[0].ok, res.items[0].error
+    target = Path(res.items[0].new_path)
+    assert "S03E13" in target.name, target.name
+
+    nfo = target.with_suffix(".nfo")
+    assert nfo.exists(), "episode NFO should be written"
+    content = nfo.read_text(encoding="utf-8")
+    assert "<episode>13</episode>" in content, content
+    assert "<episode>1</episode>" not in content, content
+    assert "<season>3</season>" in content, content
 
 
 @pytest.mark.asyncio
@@ -380,6 +649,10 @@ async def test_untrackable_sidecar_is_not_moved(tmp_path, monkeypatch):
     async with sm() as s:
         monkeypatch.setattr(s, "flush", _boom)
         res = await perform_rename(RenameRequest(file_ids=[fid], profile="Plex", op="move"), s)
+    # Let the (harmless, unconfigured) background hook finish so it doesn't leak
+    # a pending task into the next test — this path calls perform_rename directly.
+    from kira.tasks import drain_background_tasks
+    await drain_background_tasks()
 
     new = Path(res.items[0].new_path)
     assert new.exists() and not src.exists(), "the video itself still moves"
@@ -504,3 +777,115 @@ async def test_reconcile_does_not_duplicate_existing_history(tmp_path, monkeypat
     async with sm() as s:
         hist = list(await s.scalars(select(RenameHistory).where(RenameHistory.new_path == str(dst))))
         assert len(hist) == 1, "must not duplicate the already-recorded history row"
+
+
+@pytest.mark.asyncio
+async def test_sonarr_rescan_hook_fires_for_renamed_episodes(tmp_path, monkeypatch):
+    # After renaming episode files, Kira must tell Sonarr to rescan the series —
+    # otherwise Sonarr's next disk scan sees the old paths gone, marks the files
+    # deleted, and may re-download monitored episodes.
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    media = tmp_path / "tv" / "Some Show" / "Season 01"
+    media.mkdir(parents=True)
+    src = media / "Some.Show.S01E01.720p.mkv"
+    src.write_bytes(b"v")
+    pd = {"original_filename": src.name, "media_type": "tv",
+          "title": "Some Show", "season": 1, "episode": 1}
+    async with sm() as s:
+        s.add(Setting(key="integrations.sonarr.url", value="http://localhost:8989"))
+        s.add(Setting(key="integrations.sonarr.api_key", value="k"))
+        mf = MediaFile(file_path=str(src), parsed_data=pd, media_type="tv", status="matched")
+        s.add(mf)
+        await s.flush()
+        s.add(Match(media_file_id=mf.id, provider="tvdb", provider_id="123456",
+                    match_type="tv_episode", confidence=0.95, title="Some Show",
+                    year=2020, season_number=1, episode_number=1, is_selected=True))
+        await s.commit()
+        fid = mf.id
+
+    calls: list[int] = []
+
+    async def spy(cfg, tvdb_id):
+        calls.append(int(tvdb_id))
+        return True
+    monkeypatch.setattr("kira.integrations.sonarr.rescan_series_by_tvdb", spy)
+
+    res = await _run(sm, RenameRequest(file_ids=[fid], profile="Plex", op="move"))
+    assert res.succeeded == 1, res
+    assert calls == [123456], f"sonarr rescan should fire once for the series, got {calls}"
+
+
+@pytest.mark.asyncio
+async def test_sonarr_rescan_hook_silent_when_unconfigured(tmp_path, monkeypatch):
+    # No Sonarr settings → the hook must skip without erroring the rename.
+    sm, fid, src, srt = await _setup(tmp_path, monkeypatch, write_nfo=False)
+    calls: list[int] = []
+
+    async def spy(cfg, tvdb_id):
+        calls.append(int(tvdb_id))
+        return True
+    monkeypatch.setattr("kira.integrations.sonarr.rescan_series_by_tvdb", spy)
+
+    res = await _run(sm, RenameRequest(file_ids=[fid], profile="Plex", op="move"))
+    assert res.succeeded == 1
+    assert calls == [], "movie + unconfigured Sonarr must not trigger a rescan"
+
+
+@pytest.mark.asyncio
+async def test_post_rename_network_tail_is_backgrounded(tmp_path, monkeypatch):
+    # The whole point of the speed fix: /rename returns the moment the files are
+    # moved, and the network tail (notify → subtitle fetch → media-server refresh
+    # → Sonarr) runs as a tracked BACKGROUND task. We prove it's deferred — not
+    # run inline — by gating the hook's FIRST step (notify.fan_out) on an event:
+    # while the gate is closed the hook can't reach the Sonarr call, yet
+    # perform_rename has already returned a successful result. Releasing the gate
+    # and draining then lets the tail finish (proving ordering still holds too).
+    import asyncio
+    from kira.tasks import drain_background_tasks
+
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    media = tmp_path / "tv" / "Some Show" / "Season 01"
+    media.mkdir(parents=True)
+    src = media / "Some.Show.S01E01.720p.mkv"
+    src.write_bytes(b"v")
+    pd = {"original_filename": src.name, "media_type": "tv",
+          "title": "Some Show", "season": 1, "episode": 1}
+    async with sm() as s:
+        s.add(Setting(key="integrations.sonarr.url", value="http://localhost:8989"))
+        s.add(Setting(key="integrations.sonarr.api_key", value="k"))
+        mf = MediaFile(file_path=str(src), parsed_data=pd, media_type="tv", status="matched")
+        s.add(mf)
+        await s.flush()
+        s.add(Match(media_file_id=mf.id, provider="tvdb", provider_id="123456",
+                    match_type="tv_episode", confidence=0.95, title="Some Show",
+                    year=2020, season_number=1, episode_number=1, is_selected=True))
+        await s.commit()
+        fid = mf.id
+
+    gate = asyncio.Event()
+
+    async def gated_fanout(*a, **k):
+        await gate.wait()
+
+    calls: list[int] = []
+
+    async def spy(cfg, tvdb_id):
+        calls.append(int(tvdb_id))
+        return True
+
+    monkeypatch.setattr("kira.notify.fan_out", gated_fanout)
+    monkeypatch.setattr("kira.integrations.sonarr.rescan_series_by_tvdb", spy)
+
+    async with sm() as s:
+        res = await perform_rename(RenameRequest(file_ids=[fid], profile="Plex", op="move"), s)
+    assert res.succeeded == 1, res
+    # The file is moved already, but the network tail is parked at the gate — the
+    # Sonarr rescan (which runs LAST) cannot have fired. This is what makes the
+    # rename feel instant: the response doesn't wait on the tail.
+    await asyncio.sleep(0)  # let the bg task advance up to the gate
+    assert calls == [], "network tail must be deferred, not run inline with /rename"
+    assert src.exists() is False and Path(res.items[0].new_path).exists(), "file already moved"
+
+    gate.set()
+    await drain_background_tasks()
+    assert calls == [123456], "backgrounded Sonarr rescan should run once the tail drains"

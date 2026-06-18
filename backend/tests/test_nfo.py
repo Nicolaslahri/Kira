@@ -44,7 +44,11 @@ def test_episode_nfo_structure() -> None:
     assert "<title>The Rains of Castamere</title>" in out
     assert "<season>3</season>" in out
     assert "<episode>9</episode>" in out
-    assert "<plot>Red wedding.</plot>" in out
+    # The only plot Kira has is the SERIES overview - writing it as the episode
+    # plot made every episode in Jellyfin show the identical blurb AND blocked
+    # the server from scraping the real synopsis. Episode NFOs carry no <plot>.
+    assert "<plot>" not in out
+    assert "<runtime>51</runtime>" in out
 
 
 def test_tvshow_nfo_uses_network_when_no_studio() -> None:

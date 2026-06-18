@@ -18,7 +18,7 @@ def test_connection_pragmas_applied(tmp_path):
         _apply_connection_pragmas(conn)
         cur = conn.cursor()
         assert cur.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
-        assert cur.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        assert cur.execute("PRAGMA busy_timeout").fetchone()[0] == 15000
         assert cur.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert cur.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
     finally:
@@ -40,6 +40,6 @@ def test_pragmas_are_idempotent(tmp_path):
         _apply_connection_pragmas(second)
         cur = second.cursor()
         assert cur.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
-        assert cur.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        assert cur.execute("PRAGMA busy_timeout").fetchone()[0] == 15000
     finally:
         second.close()

@@ -53,3 +53,49 @@ async def test_unknown_series_falls_back_to_parsed(monkeypatch):
 @pytest.mark.asyncio
 async def test_non_anidb_keeps_parsed_season():
     assert await resolve_canonical_season("tvdb", "12345", 4) == 4
+
+
+@pytest.mark.asyncio
+async def test_flat_umbrella_pins_season_1(monkeypatch):
+    """A seasonless absolute series (One Piece AID 69) whose only mapped siblings
+    are movies/specials (all season 0) pins Season 1 uniformly — NOT 0 (→ Specials)
+    and NOT each file's parsed Sxx (→ the 1165-in-Season-23 / rest-in-Season-1
+    scatter). Absolute episode number still rides in the filename."""
+    seasons = {69: None, 411: 0, 16983: 0, 18325: 0}  # 69 = One Piece; rest = movies/specials
+
+    async def _season(aid):
+        return seasons.get(int(aid))
+
+    async def _tvdb(aid):
+        return 81797  # One Piece
+
+    async def _aids(tvdb_id):
+        return [69, 411, 16983, 18325]
+
+    monkeypatch.setattr(AnimeMappings, "tvdb_season", _season)
+    monkeypatch.setattr(AnimeMappings, "tvdb_id", _tvdb)
+    monkeypatch.setattr(AnimeMappings, "aids_by_tvdb", _aids)
+
+    assert await resolve_canonical_season("anidb", "69", None) == 1
+    assert await resolve_canonical_season("anidb", "69", 1) == 1
+    assert await resolve_canonical_season("anidb", "69", 23) == 1   # the "S23E1165" file unifies
+
+
+@pytest.mark.asyncio
+async def test_genuine_special_keeps_season_0(monkeypatch):
+    """A real special's OWN aid maps to season 0 in Fribb → returns 0 directly
+    (it really IS a special), unaffected by the flat-umbrella rule above."""
+    async def _season(aid):
+        return 0 if int(aid) == 411 else None
+
+    async def _tvdb(aid):
+        return 81797
+
+    async def _aids(tvdb_id):
+        return [69, 411]
+
+    monkeypatch.setattr(AnimeMappings, "tvdb_season", _season)
+    monkeypatch.setattr(AnimeMappings, "tvdb_id", _tvdb)
+    monkeypatch.setattr(AnimeMappings, "aids_by_tvdb", _aids)
+
+    assert await resolve_canonical_season("anidb", "411", None) == 0

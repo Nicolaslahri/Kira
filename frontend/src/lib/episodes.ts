@@ -3,22 +3,23 @@
  * refreshes) + in-memory (avoids repeated localStorage parse cost
  * within a single tab session).
  *
- * The CoverPopup fires `seriesEpisodes()` on mount to get the authoritative
- * episode count + titles + air dates. Previously the cache was Map-only,
- * which meant every page refresh started cold — the popup's right column
- * would show synthesized-from-files data for ~1s, then snap to real
- * provider data when the fetch resolved. That snap is the "data changes
- * after 1 second of opening the popup" the user called out.
+ * Stale-while-revalidate. `getCachedEpisodes` paints last-known data
+ * (in-memory Map → localStorage) synchronously so the popup never flickers;
+ * `fetchSeriesEpisodes` ALWAYS revalidates against the backend once per tab
+ * session and updates both tiers.
  *
- * Fix: persist successful fetches to localStorage keyed by
- * `kira:cache:episodes:<provider>|<providerId>|<season>`. On popup open:
- *   1. Synchronously check the in-memory Map → if hit, instant data.
- *   2. Synchronously check localStorage → if hit, hydrate the Map + return.
- *   3. Otherwise issue a network fetch, store both places on success.
+ * IMPORTANT — the bug this comment used to describe wrongly: the persisted
+ * entry has NO TTL, so `fetchSeriesEpisodes` must NOT short-circuit to it.
+ * It used to `return stored` on a localStorage hit, so an episode list cached
+ * before a provider added a brand-new episode's title (e.g. a just-aired One
+ * Piece episode showing "Episode 1166" forever) was never refreshed — the
+ * backend had the real title but the frontend never asked. Revalidation is now
+ * gated by `revalidated` (keys successfully fetched THIS session), NOT by Map
+ * presence — `getCachedEpisodes` fills the Map with the (possibly stale)
+ * localStorage copy for instant paint, so trusting the Map would re-freeze it.
  *
- * Backend still caches process-side, so the worst case is one provider
- * call the first time anyone in this household requests a particular
- * (provider, providerId, season) tuple.
+ * Backend still caches process-side (6h), so a session's first request for a
+ * given (provider, providerId, season) tuple is at worst one provider call.
  */
 import { api } from './api';
 import { cacheGet, cacheSet } from './cache';
@@ -43,6 +44,10 @@ export interface ProviderEpisode {
 
 const cache = new Map<string, ProviderEpisode[]>();
 const inflight = new Map<string, Promise<ProviderEpisode[]>>();
+// Keys successfully revalidated against the backend THIS tab session. Gates
+// refetch — NOT Map presence, which getCachedEpisodes fills with the (possibly
+// stale) localStorage copy for instant paint.
+const revalidated = new Set<string>();
 
 function key(provider: string, providerId: string, season?: number): string {
   return `${provider}|${providerId}|${season ?? '_'}`;
@@ -76,31 +81,30 @@ export function getCachedEpisodes(provider: string, providerId: string, season?:
 
 export function fetchSeriesEpisodes(provider: string, providerId: string, season?: number): Promise<ProviderEpisode[]> {
   const k = key(provider, providerId, season);
-  if (cache.has(k)) return Promise.resolve(cache.get(k)!);
-  // Synchronous localStorage check — same logic as getCachedEpisodes
-  // but inline to avoid the extra Map.get in the hot path.
-  const stored = cacheGet<ProviderEpisode[]>(storageKey(k));
-  if (stored) {
-    cache.set(k, stored);
-    return Promise.resolve(stored);
-  }
+  // Reuse ONLY a result already revalidated against the backend this session.
+  // Map presence alone is NOT enough — getCachedEpisodes promotes the (maybe
+  // stale) localStorage copy into the Map for instant paint, and trusting that
+  // is exactly what kept a just-titled episode showing "Episode N" forever.
+  if (revalidated.has(k) && cache.has(k)) return Promise.resolve(cache.get(k)!);
   const existing = inflight.get(k);
   if (existing) return existing;
+  const lastKnown = () => cache.get(k) ?? cacheGet<ProviderEpisode[]>(storageKey(k)) ?? [];
   const p = api.seriesEpisodes(provider, providerId, season)
     .then(({ episodes }) => {
-      cache.set(k, episodes);
-      // Persist for the next page refresh. Skip empty arrays — those
-      // are usually transient (banned AniDB, network blip) and we
-      // don't want to lock in "no episodes" as the persisted answer.
-      if (episodes.length > 0) {
-        cacheSet(storageKey(k), episodes);
-      }
       inflight.delete(k);
-      return episodes;
+      if (episodes.length > 0) {
+        revalidated.add(k);
+        cache.set(k, episodes);
+        cacheSet(storageKey(k), episodes);  // persist for next page's instant paint
+        return episodes;
+      }
+      // Empty is usually transient (AniDB blip / ban) — keep last-known rather
+      // than lock in "no episodes", and DON'T mark revalidated so we retry.
+      return lastKnown();
     })
     .catch(() => {
       inflight.delete(k);
-      return [] as ProviderEpisode[];
+      return lastKnown();
     });
   inflight.set(k, p);
   return p;

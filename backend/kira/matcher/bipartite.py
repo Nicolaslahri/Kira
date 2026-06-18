@@ -74,7 +74,10 @@ def assign_files_to_episodes(
         if s is None and isinstance(ep, dict):
             s = ep.get("season")
             e = ep.get("episode")
-        return (int(s or 1), int(e or 0))
+        # Preserve season 0 (Specials). `int(s or 1)` would coerce 0 → 1
+        # (0 is falsy), mis-keying every Season-0 entry into the main season's
+        # key space — so the exact (0, e) pass could never pair a real special.
+        return (int(s) if s is not None else 1, int(e) if e is not None else 0)
 
     def _ep_title(ep) -> str | None:
         if hasattr(ep, "title"):
@@ -155,7 +158,12 @@ def assign_files_to_episodes(
         for fid, parsed in files:
             if fid in claimed_fids:
                 continue
-            if parsed.episode is None:
+            # Season-0 isolation: a Special/OVA ("S00E05") must NOT be matched
+            # season-agnostically against a MAIN-run episode (its episode 5).
+            # Specials only legitimately pair via Pass 1's exact (0, e) lookup
+            # against a real Season-0 entry; if that missed, leave it unpaired
+            # rather than overwriting canonical episode 5 in the grid.
+            if parsed.episode is None or parsed.season == 0:
                 continue
             for ep in remaining_eps:
                 s, e = _ep_key(ep)
@@ -196,6 +204,8 @@ def assign_files_to_episodes(
             if fid in claimed_fids:
                 continue
             if parsed.episode is None or parsed.absolute_episode is not None:
+                continue
+            if parsed.season == 0:        # Season-0 isolation (see Pass 3)
                 continue
             if parsed.episode <= max_local:
                 continue

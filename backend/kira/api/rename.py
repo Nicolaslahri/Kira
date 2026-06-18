@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import asyncio
 import os
 from datetime import datetime, timezone
@@ -26,7 +28,10 @@ from kira.renamer import (
     discover_sidecars,
     execute_op,
     format_target_path,
+    RenameSkipped,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/rename", tags=["rename"])
 
@@ -362,16 +367,16 @@ async def _resolve_rename_mode(session: AsyncSession) -> str:
     must opt in.
     """
     from kira.models import Setting
+    from kira.settings_store import unwrap
     row = await session.get(Setting, "rename.mode")
     if not row:
         return "in-place"
-    val = row.value
-    if isinstance(val, str) and val.strip():
-        return val.strip()
-    if isinstance(val, dict):
-        v = val.get("value")
-        if isinstance(v, str) and v.strip():
-            return v.strip()
+    v = unwrap(row.value)
+    # Clamp to the known enum. An unrecognized/garbage value must NOT slip into
+    # the mode selector that feeds the (data-loss-historied) rename pipeline —
+    # fall back to the conservative default, same as _resolve_cleanup_nonvideo.
+    if isinstance(v, str) and v.strip() in ("in-place", "move-to-library"):
+        return v.strip()
     return "in-place"
 
 
@@ -435,6 +440,54 @@ async def _resolve_cleanup_artifacts(session: AsyncSession) -> bool:
     return True
 
 
+async def _resolve_cleanup_extra_names(session: AsyncSession) -> frozenset[str]:
+    """User-added filenames to ALSO treat as deletable during folder cleanup
+    (`rename.cleanup_extra_filenames`, a list). Lowercased; empty when unset.
+    Merged into the built-in artifact set — "delete these too"."""
+    from kira.models import Setting
+    row = await session.get(Setting, "rename.cleanup_extra_filenames")
+    val = row.value if row else None
+    if isinstance(val, dict):
+        val = val.get("value")
+    if isinstance(val, list):
+        return frozenset(s.strip().lower() for s in val if isinstance(s, str) and s.strip())
+    return frozenset()
+
+
+async def _resolve_cleanup_extra_exts(session: AsyncSession) -> frozenset[str]:
+    """User-added file EXTENSIONS to ALSO sweep (`rename.cleanup_extra_extensions`,
+    a list). Normalized to lowercase, dot-led (`txt`/`*.txt` → `.txt`)."""
+    from kira.models import Setting
+    row = await session.get(Setting, "rename.cleanup_extra_extensions")
+    val = row.value if row else None
+    if isinstance(val, dict):
+        val = val.get("value")
+    if not isinstance(val, list):
+        return frozenset()
+    out: set[str] = set()
+    for s in val:
+        if isinstance(s, str) and s.strip():
+            e = s.strip().lower().lstrip("*")
+            out.add(e if e.startswith(".") else "." + e)
+    return frozenset(out)
+
+
+async def _resolve_cleanup_nonvideo(session: AsyncSession) -> str:
+    """Aggressive cleanup mode (`rename.cleanup_nonvideo`): when emptying a
+    moved-from source folder, how much NON-video content to delete —
+      'off'       → recognized artifacts only (default, safest);
+      'keep_subs' → all non-video files except subtitle sidecars;
+      'all'       → every non-video file.
+    Only ever acts on a folder with no videos left; deletions honor the Trash
+    setting (`rename.cleanup_trash`). Invalid/missing → 'off'."""
+    from kira.models import Setting
+    row = await session.get(Setting, "rename.cleanup_nonvideo")
+    val = row.value if row else None
+    if isinstance(val, dict):
+        val = val.get("value")
+    return val if val in ("off", "keep_subs", "all") else "off"
+
+
 async def _resolve_bool_setting(session: AsyncSession, key: str, default: bool) -> bool:
     """Read a boolean setting that may be stored bare or wrapped in {"value": …}.
     Used by the Pass 7 output toggles (write_nfo, download_artwork)."""
@@ -450,6 +503,47 @@ async def _resolve_bool_setting(session: AsyncSession, key: str, default: bool) 
         if isinstance(v, bool):
             return v
     return default
+
+
+async def _resolve_permissions(session: AsyncSession) -> dict | None:
+    """Post-rename chmod/chown spec, or None when disabled. The
+    `rename.set_permissions` master toggle gates `rename.file_mode` /
+    `rename.dir_mode` (octal strings, e.g. "644"/"755") + `rename.owner_uid` /
+    `rename.owner_gid` (ints). Applied best-effort by execute_op — chown is
+    Unix-only, so on Windows the mode/uid simply no-op."""
+    if not await _resolve_bool_setting(session, "rename.set_permissions", False):
+        return None
+    from kira.models import Setting
+
+    async def _raw(key: str):
+        row = await session.get(Setting, key)
+        if not row:
+            return None
+        v = row.value
+        return v.get("value") if isinstance(v, dict) else v
+
+    def _mode(v: object) -> str | None:
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if isinstance(v, int) and not isinstance(v, bool):
+            return str(v)
+        return None
+
+    def _id(v: object) -> int | None:
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.strip().lstrip("-").isdigit():
+            return int(v.strip())
+        return None
+
+    return {
+        "file_mode": _mode(await _raw("rename.file_mode")),
+        "dir_mode": _mode(await _raw("rename.dir_mode")),
+        "uid": _id(await _raw("rename.owner_uid")),
+        "gid": _id(await _raw("rename.owner_gid")),
+    }
 
 
 async def _resolve_str_setting(session: AsyncSession, key: str, default: str) -> str:
@@ -507,7 +601,9 @@ async def _resolve_nfo_fields(session: AsyncSession) -> set[str] | None:
 
 
 async def _write_nfo_files(target: Path, parsed: ParsedFile, selected: Match, meta: dict | None,
-                           fields: set[str] | None = None) -> list[str]:
+                           fields: set[str] | None = None, season_override: int | None = None,
+                           series_name_override: str | None = None,
+                           season_posters: dict[int, str] | None = None) -> list[str]:
     """#12: write Kodi/Emby .nfo sidecars beside the renamed video. Best-effort
     output from data already on the Match — no API calls. `fields` selects which
     optional tags to include (None = all).
@@ -518,6 +614,22 @@ async def _write_nfo_files(target: Path, parsed: ParsedFile, selected: Match, me
     single episode must never delete it."""
     from kira.renamer import nfo
     written: list[str] = []
+    def _atomic_write_text(p: Path, text: str) -> None:
+        # Atomic: temp sibling + os.replace, so a crash / disk-full / NAS drop
+        # mid-write never leaves a TRUNCATED NFO on disk. Media servers trust the
+        # NFO over the filename, so a torn write is permanent wrong/empty metadata
+        # until the next rename. Mirrors the artwork path's _atomic_write.
+        _tmp = p.with_name(p.name + ".kira-nfo-tmp")
+        try:
+            _tmp.write_text(text, encoding="utf-8")
+            os.replace(_tmp, p)
+        except Exception:
+            try:
+                if _tmp.exists():
+                    _tmp.unlink()
+            except OSError:
+                pass
+            raise
     plan = nfo.plan_nfo_writes(target, parsed.media_type)
     if not plan:
         return written
@@ -528,6 +640,14 @@ async def _write_nfo_files(target: Path, parsed: ParsedFile, selected: Match, me
         meta = {**meta, "poster_url": selected.poster_url}
     prov, pid = selected.provider, selected.provider_id
     title = selected.title or parsed.title
+    # The SHOW name for <showtitle> and the tvshow <title>. Prefer the unified
+    # folder title the rename rendered into the PATH (`series_name_override` =
+    # the loop's `library_title`). AniDB gives every cour its own title
+    # ("Attack on Titan Season 2"), so `selected.series_name` would stamp the
+    # cour qualifier into <showtitle> — splitting the show in Plex/Jellyfin from
+    # the franchise-unified folder ("Attack on Titan"). The NFO must name the
+    # SAME show the folder does, so the override (when present) always wins.
+    show_name = series_name_override or selected.series_name or title
     year = selected.year if selected.year is not None else parsed.year
     # The file's own container/tech data → Kodi <fileinfo><streamdetails>. From
     # the filename strip (codec/quality) + MediaInfo when `parsing.read_mediainfo`
@@ -542,14 +662,51 @@ async def _write_nfo_files(target: Path, parsed: ParsedFile, selected: Match, me
     }
     if "movie" in plan:
         content = nfo.build_movie_nfo(title, year, meta, prov, pid, fields=fields, tech=tech)
-        await asyncio.to_thread(plan["movie"].write_text, content, encoding="utf-8")
+        await asyncio.to_thread(_atomic_write_text, plan["movie"], content)
         written.append(str(plan["movie"]))
     if "episode" in plan:
-        season = selected.season_number
-        episode = selected.episode_number if selected.episode_number is not None else parsed.episode
-        content = nfo.build_episode_nfo(selected.episode_title, season, episode, meta,
-                                        series_name=selected.series_name, fields=fields, tech=tech)
-        await asyncio.to_thread(plan["episode"].write_text, content, encoding="utf-8")
+        # Mirror the FILENAME's season EXACTLY. `season_override` is the value the
+        # rename loop rendered into the path — the cour-mapped season for anime
+        # (ScudLee), else Match.season_number / parsed. Without it the NFO copied
+        # the raw Match.season_number, which can be a stale AniDB-degenerate "1"
+        # from a scan done while AniDB was banned: the file landed in S23 but its
+        # NFO said <season>1</season>, and Jellyfin trusts the NFO.
+        season = season_override if season_override is not None else selected.season_number
+        # Season-0 guard: a season-0 tv_episode match over a real parsed positive
+        # season is an AniDB-no-season artifact, not a special — mirror parsed.
+        if (season in (0, None) and selected.match_type == "tv_episode"
+                and isinstance(parsed.season, int) and parsed.season > 0):
+            season = parsed.season
+        # MUST mirror the rendered FILENAME, not the raw Match row. By the time
+        # we run, the caller has already baked the final season-continuous
+        # number into the local `parsed` (the cour-offset block rewrites
+        # parsed.episode = Match.episode_number + cour offset). Preferring
+        # Match.episode_number here re-introduced the cour-LOCAL number: the
+        # file said "S03E13 - The Town Where Everything Began" while its NFO
+        # said <episode>1</episode> — and Jellyfin trusts the NFO, so every
+        # multi-cour season showed two "episode 1"s, two "episode 2"s, etc.
+        episode = parsed.episode if parsed.episode is not None else selected.episode_number
+        # Resolve the per-episode entry (title / plot / aired) from the provider's
+        # episode list. AniDB anime carries no per-episode titles, so without this
+        # the NFO had no <title> (and the filename fell back to "Episode NN").
+        # Best-effort + cached per series/season; a miss just leaves the lean NFO.
+        ep_title, ep_plot, ep_aired = selected.episode_title, None, None
+        try:
+            from kira.api.series import resolve_episode_meta
+            from kira.matcher.engine import registry_from_settings
+            from kira import net
+            _client = net.shared_client()
+            _ep = await resolve_episode_meta(
+                selected, season, episode, await registry_from_settings(_client), _client)
+            if _ep:
+                ep_title = ep_title or _ep.title
+                ep_plot, ep_aired = _ep.overview, _ep.air_date
+        except Exception:
+            pass
+        content = nfo.build_episode_nfo(ep_title, season, episode, meta,
+                                        series_name=show_name, fields=fields, tech=tech,
+                                        plot=ep_plot, aired=ep_aired)
+        await asyncio.to_thread(_atomic_write_text, plan["episode"], content)
         written.append(str(plan["episode"]))
     if "tvshow" in plan:
         tv_path = plan["tvshow"]
@@ -557,8 +714,9 @@ async def _write_nfo_files(target: Path, parsed: ParsedFile, selected: Match, me
         # tracked in `written`: it's shared across the series, so undoing one
         # episode must not delete it.
         if not tv_path.exists():
-            content = nfo.build_tvshow_nfo(selected.series_name or title, year, meta, prov, pid, fields=fields)
-            await asyncio.to_thread(tv_path.write_text, content, encoding="utf-8")
+            content = nfo.build_tvshow_nfo(show_name, year, meta, prov, pid, fields=fields,
+                                           season_posters=season_posters)
+            await asyncio.to_thread(_atomic_write_text, tv_path, content)
     return written
 
 
@@ -713,7 +871,31 @@ async def _download_artwork_with_client(
     # background (so the toggle still produces art with no fanart.tv key).
     provider_poster = selected.poster_url or meta.get("poster_url")
     provider_fanart = meta.get("fanart_url") or meta.get("backdrop_url")
-    jobs: list[tuple[str, Path]] = []
+    # Episode artwork is SHOW-level (poster/fanart/clearlogo describe the series,
+    # not a single episode), so write it ONCE into the series root under the
+    # canonical media-server name (poster.jpg, fanart.jpg, …) where Plex/Jellyfin/
+    # Kodi actually read it — instead of duplicating the show poster as
+    # `<episode-stem>-poster.jpg` beside EVERY episode (wasteful, and episode files
+    # want a -thumb still, not the show poster). Movies keep the per-file
+    # `<stem>-<kind>` local-asset convention.
+    from kira.renamer.nfo import series_root_for
+    _is_episode = media_type in ("tv", "anime")
+    _show_root = series_root_for(target) if _is_episode else None
+    # Per-cour SEASON poster. AniDB gives every cour its OWN cover, and the
+    # rename unifies cours into one show with seasons — so the single show-root
+    # `poster.jpg` (write-if-absent) only ever captures whichever cour renamed
+    # first. Write each cour's own poster as `Season NN/poster.jpg` (where
+    # Plex/Jellyfin/Kodi read the season poster) so every season shows its real
+    # art. ANIME only (regular-TV seasons share the one show poster — a per-
+    # season copy would just duplicate it), and only in seasonal layout
+    # (absolute/flat numbering has no Season folder → `target.parent` IS the
+    # show root).
+    _season_dir = (
+        target.parent
+        if (media_type == "anime" and _show_root is not None and target.parent != _show_root)
+        else None
+    )
+    jobs: list[tuple[str, Path, bool]] = []   # (url, dest, shared_show_art)
     for kind in kinds:
         url = fanart_urls.get(kind)
         if not url and kind == "poster":
@@ -723,7 +905,17 @@ async def _download_artwork_with_client(
         if not url:
             continue
         ext = EXT_FOR_KIND.get(kind, "jpg")
-        jobs.append((url, target.with_name(f"{target.stem}-{kind}.{ext}")))
+        if _is_episode:
+            jobs.append((url, _show_root / f"{kind}.{ext}", True))
+        else:
+            jobs.append((url, target.with_name(f"{target.stem}-{kind}.{ext}"), False))
+    # The cour's OWN poster → the season folder. Uses the provider poster
+    # (`Match.poster_url`, the cour-specific cover) — NOT the fanart.tv show
+    # poster. Shared across the season's episodes (write-if-absent; the empty-
+    # folder sweep reclaims it when the whole season is undone), so it's never
+    # in this file's created_assets.
+    if _season_dir is not None and provider_poster and "poster" in kinds:
+        jobs.append((provider_poster, _season_dir / "poster.jpg", True))
     written: list[str] = []
     if not jobs:
         return written
@@ -733,7 +925,7 @@ async def _download_artwork_with_client(
         tmp.write_bytes(data)
         os.replace(tmp, final)
 
-    for url, dest in jobs:
+    for url, dest, _shared in jobs:
         try:
             if dest.exists():
                 continue
@@ -754,7 +946,7 @@ async def _download_artwork_with_client(
                 # otherwise be saved as a permanent corrupt file
                 # (write-if-absent → no retry).
                 if sniff_image(content) is None:
-                    print(f"artwork: {url} returned a non-image payload, skipping")
+                    logger.warning(f"artwork: {url} returned a non-image payload, skipping")
                     continue
                 data = content
                 if img_cache is not None:
@@ -766,9 +958,14 @@ async def _download_artwork_with_client(
                     img_cache[url] = data
             tmp = dest.with_name(dest.name + ".part")
             await asyncio.to_thread(_atomic_write, tmp, dest, data)
-            written.append(str(dest))
+            # Per-series art (poster.jpg/fanart.jpg) is shared by every episode —
+            # like tvshow.nfo — so exclude it from THIS file's created_assets:
+            # undoing one episode must not delete the show's poster, and the
+            # empty-folder sweep removes it when the whole show is undone.
+            if not _shared:
+                written.append(str(dest))
         except Exception as e:
-            print(f"artwork: failed {url} -> {dest} (non-fatal): {e!r}")
+            logger.warning(f"artwork: failed {url} -> {dest} (non-fatal): {e!r}")
     return written
 
 
@@ -866,7 +1063,7 @@ async def _resolve_franchise_absolute(anidb, selected, parsed) -> int | None:
     try:
         offsets = await anidb.get_franchise_offsets(aid)
     except Exception as e:
-        print(f"_resolve_franchise_absolute: get_franchise_offsets failed (non-fatal): {e!r}")
+        logger.warning(f"_resolve_franchise_absolute: get_franchise_offsets failed (non-fatal): {e!r}")
         return None
     return franchise_absolute(offsets, aid, local_ep)
 
@@ -884,15 +1081,17 @@ async def rename(
     return await perform_rename(payload, session)
 
 
-async def _anime_group_members(session: AsyncSession, group_id: str) -> list[tuple[int, str]]:
+async def _anime_group_members(session: AsyncSession, group_id: str) -> list[tuple[int, str, int | None]]:
     """All AniDB cours of a franchise group that are present (selected) in the
-    library, as ``(aid, title)`` sorted by AID ascending (≈ air order).
+    library, as ``(aid, title, year)`` sorted by AID ascending (≈ air order).
 
     Read straight from the Match rows — reliable, unlike the in-memory AniDB title
     dump the old collapse relied on (it's often unloaded at rename time, silently
-    no-opping and leaving every cour in its own folder). Drives BOTH the show-folder
-    unification (use the earliest-present cour's title) and seasonal cour-numbering
-    (each cour → its rank as a season)."""
+    no-opping and leaving every cour in its own folder). Drives the show-folder
+    unification: the earliest-present cour supplies BOTH the title AND the year —
+    year-bearing templates (Jellyfin anime = "{{n}} ({{y}})/…") would otherwise
+    still fragment one franchise into "Show (2013)" / "Show (2017)" folders even
+    with a unified title, because each cour carries its own premiere year."""
     rows = list(await session.scalars(
         select(Match).where(
             Match.series_group_id == group_id,
@@ -900,15 +1099,39 @@ async def _anime_group_members(session: AsyncSession, group_id: str) -> list[tup
             Match.is_selected.is_(True),
         )
     ))
-    seen: dict[int, str] = {}
+    seen: dict[int, tuple[str, int | None]] = {}
     for m in rows:
         try:
             aid = int(m.provider_id)
         except (TypeError, ValueError):
             continue
         if aid not in seen and (m.title or "").strip():
-            seen[aid] = m.title
-    return sorted(seen.items())
+            seen[aid] = (m.title, m.year)
+    return [(aid, t, y) for aid, (t, y) in sorted(seen.items())]
+
+
+async def _anime_group_season_posters(session: AsyncSession, group_id: str) -> dict[int, str]:
+    """`{season_number: poster_url}` across a franchise's present cours.
+
+    Each AniDB cour carries its OWN poster and its ScudLee-stamped `season_number`
+    (the same season the rename renders into the path), so a franchise unified
+    into one show can ship every season's real cover as a per-season `<thumb>` in
+    the `tvshow.nfo` (Kodi's mechanism). First poster seen per season wins; rows
+    without a positive season or a poster are skipped. Best-effort — only as
+    complete as the per-cour poster warm-up that populated `Match.poster_url`."""
+    rows = list(await session.scalars(
+        select(Match).where(
+            Match.series_group_id == group_id,
+            Match.provider == "anidb",
+            Match.is_selected.is_(True),
+        )
+    ))
+    out: dict[int, str] = {}
+    for m in rows:
+        s, p = m.season_number, (m.poster_url or "").strip()
+        if isinstance(s, int) and s > 0 and p and s not in out:
+            out[s] = p
+    return out
 
 
 async def _discard_intent(session: AsyncSession, intent: RenameIntent | None) -> None:
@@ -920,7 +1143,7 @@ async def _discard_intent(session: AsyncSession, intent: RenameIntent | None) ->
         await session.delete(intent)
         await session.commit()
     except Exception as e:
-        print(f"rename: discard intent failed (non-fatal): {e!r}")
+        logger.warning(f"rename: discard intent failed (non-fatal): {e!r}")
         try:
             await session.rollback()
         except Exception:
@@ -970,11 +1193,11 @@ async def reconcile_pending_renames() -> tuple[int, int]:
                     discarded += 1
                 await session.delete(it)
             except Exception as e:
-                print(f"reconcile_pending_renames: intent {getattr(it, 'id', None)} failed (non-fatal): {e!r}")
+                logger.warning(f"reconcile_pending_renames: intent {getattr(it, 'id', None)} failed (non-fatal): {e!r}")
         try:
             await session.commit()
         except Exception as e:
-            print(f"reconcile_pending_renames: commit failed (non-fatal): {e!r}")
+            logger.warning(f"reconcile_pending_renames: commit failed (non-fatal): {e!r}")
     return finalized, discarded
 
 
@@ -995,8 +1218,11 @@ async def perform_rename(
     # Managed library roots — the allowlist that bounds asset cleanup (#1): the
     # forward-orphan sweep below (and undo) only ever delete satellite files that
     # live under one of these, never anywhere else on disk.
-    from kira.api.files import _managed_roots
-    managed_roots = await _managed_roots(session)
+    from kira.api.files import _managed_roots_aliased
+    # Alias-aware (mapped-drive `Z:\` ↔ UNC): the forward-orphan sweep below
+    # deletes created_assets persisted under the RESOLVED spelling, so a
+    # drive-letter-only root set would skip them all — the same alias gap undo hit.
+    managed_roots = await _managed_roots_aliased(session)
     cleanup_empty_source = await _resolve_cleanup_empty_dirs(session)
     # Sub-toggle: when cleanup_empty_source is on, ALSO sweep Plex/
     # Jellyfin/Kodi metadata artifacts (poster.jpg, *-thumb.jpg, etc.)
@@ -1004,6 +1230,25 @@ async def perform_rename(
     # Settings → Folder cleanup if they want strict "only touch what's
     # already empty" semantics.
     cleanup_artifacts = await _resolve_cleanup_artifacts(session)
+    # User-extendable cleanup lists + the aggressive "delete non-video" mode.
+    # The aggressive mode is a SUB-option of the artifact sweep: with the sweep
+    # off, force 'off' so nothing extra is ever deleted.
+    cleanup_extra_names = await _resolve_cleanup_extra_names(session)
+    cleanup_extra_exts = await _resolve_cleanup_extra_exts(session)
+    cleanup_nonvideo = await _resolve_cleanup_nonvideo(session) if cleanup_artifacts else "off"
+    # Symlink op only: write a RELATIVE link target (portable across remounts /
+    # changed bind-mount paths) when the user opts in. Absolute by default.
+    symlink_relative = await _resolve_bool_setting(session, "rename.symlink_relative", False)
+    # Post-rename ownership/mode for Docker / NAS — chmod/chown the renamed file
+    # + dirs we create so the media server (often a different uid) can read them.
+    permissions = await _resolve_permissions(session)
+    # Conflict policy when a DIFFERENT file already occupies the target:
+    # "error" (default, surfaces as a failed item) / "skip" (RenameSkipped →
+    # no-op) / "overwrite" (replace). Idempotent re-runs are always a safe
+    # no-op regardless of this. "overwrite" folds into the overwrite flag so
+    # execute_op's existing replace path handles it.
+    on_conflict = await _resolve_str_setting(session, "rename.on_conflict", "error")
+    effective_overwrite = payload.overwrite or on_conflict == "overwrite"
     # Recoverable cleanup (Settings → Folder cleanup): when on, swept artifacts
     # are MOVED into a managed trash folder instead of deleted, so a mistaken
     # sweep can be recovered from the user's file browser. Defaults to
@@ -1019,6 +1264,10 @@ async def perform_rename(
     rename_mode = await _resolve_rename_mode(session)
     # Pass 7 output toggles (both default OFF — opt-in metadata sidecars).
     write_nfo = await _resolve_bool_setting(session, "naming.write_nfo", False)
+    # Stamp resolved provider IDs onto renamed files (xattr / ADS / portable
+    # index) for instant re-identification. Default ON; switchable for users
+    # who don't want Kira attaching ANY metadata to their files.
+    stamp_ids = await _resolve_bool_setting(session, "rename.stamp_ids", True)
     nfo_fields = await _resolve_nfo_fields(session) if write_nfo else None
     download_artwork = await _resolve_bool_setting(session, "naming.download_artwork", False)
     # Artwork sources: provider poster/background always; fanart.tv (when a key
@@ -1068,7 +1317,7 @@ async def perform_rename(
             if _abs_reg.has("anidb"):
                 anidb_for_abs = _abs_reg.build("anidb")
         except Exception as e:
-            print(f"perform_rename: anidb build for absolute numbering failed (non-fatal): {e!r}")
+            logger.warning(f"perform_rename: anidb build for absolute numbering failed (non-fatal): {e!r}")
 
     files = list(await session.scalars(
         select(MediaFile)
@@ -1085,6 +1334,17 @@ async def perform_rename(
     # (case-fold + separator-fold) so casing/slash differences still collide.
     from kira.api.webhooks import _norm as _norm_path
     claimed_targets: dict[str, int] = {}
+    # Series whose files were RENAMED this batch — feeds the post-rename Sonarr
+    # rescan hook. Without it, Sonarr's next disk scan sees the old paths gone,
+    # marks the episode files deleted, and may re-download monitored episodes.
+    # (provider, provider_id) pairs; resolved to TVDB ids in the hook.
+    renamed_episode_series: set[tuple[str, str]] = set()
+    # Every path Kira WROTE this batch (renamed videos + their NFO / artwork /
+    # co-renamed sidecars), so the post-loop in-place junk sweep can protect our
+    # own fresh output when it strips leftovers from a destination folder that
+    # keeps its media (the same-folder rename case). Raw abs strings; normalized
+    # at compare time in sweep_destination_junk.
+    inplace_protected: set[str] = set()
     async def _rename_one_file(f, fid):
         """Run the full pipeline for ONE file: resolve match+target, guard
         against duplicates/phantoms, journal intent, move, then write history /
@@ -1121,7 +1381,20 @@ async def perform_rename(
             return
         library_title = selected.title or parsed.title
         library_year = selected.year if selected.year is not None else parsed.year
+        # Per-season posters for the unified tvshow.nfo (anime franchises only —
+        # gathered alongside the title unification below).
+        season_posters: dict[int, str] | None = None
         season_override_val = selected.season_number
+        # Season-0 guard: a tv_episode match that reports season 0 must NOT dump
+        # a regular numbered episode into "Specials". AniDB has no season concept
+        # and several entries (One Piece AID 69, other long-runners) come back as
+        # season 0 — that collapsed One Piece 1156+ into Specials/S00E1156. A
+        # GENUINE special parses as season 0/None too, so only override when the
+        # FILE itself parsed a real positive season; then trust the filename.
+        if (season_override_val in (0, None)
+                and selected.match_type == "tv_episode"
+                and isinstance(parsed.season, int) and parsed.season > 0):
+            season_override_val = parsed.season
 
         # AniDB franchise grouping. AniDB gives every cour/season its own AID +
         # title, so without unification each lands in its OWN show folder — the user
@@ -1143,8 +1416,65 @@ async def perform_rename(
         ):
             members = await _anime_group_members(session, selected.series_group_id)
             if members and members[0][1]:
-                # Unify the show folder to the earliest cour present (lowest AID).
-                library_title = members[0][1]
+                # Unify the show folder to the FRANCHISE ROOT title — not each
+                # cour's own AniDB title. The group_id encodes the canonical root
+                # aid (`anidb:<root>`), whose title is the base franchise name
+                # ("Haikyu!!") with NO per-cour season qualifier. The earliest cour
+                # PRESENT in the library is only a safe fallback when the root
+                # season itself is present; if the user has ONLY "Haikyu!! 2nd
+                # Season" (AID 10981) and not S1, members[0]'s title carries the
+                # "2nd Season" qualifier → "Haikyu!! 2nd Season/Season 2/Haikyu!!
+                # 2nd Season - S02E24…". Resolve the root title from the offline
+                # AniDB title dump; fall back to the earliest present member when
+                # it's not loaded / the AID is absent (no regression). Year is
+                # still unified across the present members below.
+                _root_title = None
+                try:
+                    _canon = selected.series_group_id.split(":", 1)[-1]
+                    if _canon.isdigit():
+                        from kira.providers.anidb import AniDBProvider
+                        _root_title = AniDBProvider._pick_display_title(int(_canon))
+                except Exception:
+                    _root_title = None
+                if _root_title:
+                    library_title = _root_title
+                else:
+                    # The title dump isn't in memory this process — and the common
+                    # "restart → re-rename" path runs NO AniDB op, so nothing lazy-
+                    # loads it (parsing the 30 MB dump on the rename path is too
+                    # heavy to force). Fall back to stripping AniDB's trailing per-
+                    # cour season qualifier so a later cour still folds to the base
+                    # franchise name ("Haikyu!! 2nd Season" → "Haikyu!!"). Ordinal /
+                    # "Part N" forms only; a SUBTITLE sequel ("… To the Top") needs
+                    # the dump, which any scan/match loads.
+                    import re as _re
+                    _stripped = _re.sub(
+                        r"\s+(?:\d+(?:st|nd|rd|th)\s+Season|Season\s+\d+|Part\s+\d+)\s*$",
+                        "", members[0][1], flags=_re.IGNORECASE,
+                    ).strip()
+                    library_title = _stripped or members[0][1]
+                # Unify the YEAR across the group UNCONDITIONALLY. The old code only
+                # overrode the year when the canonical member HAD one — so when the
+                # AniDB match carries no year (common), each file fell back to its
+                # OWN filename-parsed year (line above), and a release group that
+                # stamps "2025" into some filenames but not others split ONE show
+                # into "Gachiakuta (2025)" + "Gachiakuta". Take the first member
+                # that has a year (AID order), else None — but the SAME value for
+                # EVERY file in the group, so a franchise can never again fragment
+                # on a per-file year. (None → the show folder simply carries no
+                # year, which is correct + consistent for a yearless AniDB entry.)
+                library_year = next((y for _aid, _t, y in members if y is not None), None)
+                # The template's {{y}} token falls back to parsed.year when
+                # library_year is None (templates._build_ctx), so a YEARLESS group
+                # would STILL leak each file's own filename year → "Gachiakuta
+                # (2025)" beside "Gachiakuta". Pin the file's parsed year to the
+                # unified group value too (render-only — mirrors how the cour block
+                # below already mutates `parsed`), so every file in the franchise
+                # renders the SAME year, or none, no matter what its filename had.
+                parsed.year = library_year
+            # Each cour's own poster → a per-season <thumb> in the unified
+            # tvshow.nfo (Kodi). File-based servers use Season NN/poster.jpg.
+            season_posters = await _anime_group_season_posters(session, selected.series_group_id)
 
         # Seasonal cour-episode offset. AniDB stores each cour's episodes LOCALLY
         # (every cour restarts at 1), but TVDB/Jellyfin want one continuous run per
@@ -1160,37 +1490,58 @@ async def perform_rename(
         if (anime_numbering != "absolute"
                 and (selected.provider or "").lower() == "anidb"
                 and selected.provider_id
-                and selected.season_number is not None
-                and parsed.media_type == "anime"
-                and parsed.episode is not None):
-            try:
-                from kira.matcher.cour_routing import build_cour_routing_table
-                table = await build_cour_routing_table(
-                    "anidb", str(selected.provider_id), selected.season_number,
-                )
-                if table:
-                    aid = int(selected.provider_id)
-                    offset = next((off for (_s, _e, cid, off) in table if cid == aid), None)
-                    if offset is not None:
-                        # The MATCH is authoritative over the filename: after the
-                        # rescue/arbitration passes, Match.episode_number is the
-                        # cour-LOCAL episode regardless of what number the old
-                        # filename carried ("S06E81 - Thaw" → 16177 local E6). So
-                        # the season-continuous output is en + the cour's offset
-                        # (6+16 → S04E22), NOT parsed.episode + offset (81+16 →
-                        # S04E97, garbage). Fall back to the parsed number only
-                        # when the match carries no episode.
-                        base = (
-                            selected.episode_number
-                            if selected.episode_number is not None
-                            else parsed.episode
-                        )
-                        new_ep = base + offset
-                        if parsed.episode_end is not None:
-                            parsed.episode_end = new_ep + (parsed.episode_end - parsed.episode)
-                        parsed.episode = new_ep
-            except Exception as e:
-                print(f"rename: cour episode offset failed for {fid} (non-fatal): {e!r}")
+                and parsed.media_type == "anime"):
+            # ── Seasonal (TVDB) placement — THE single source of truth ────────
+            # AniDB is absolute/seasonless; in "seasonal" mode map the matched
+            # AniDB (id, episode) to its real TVDB (season, episode) via the
+            # ScudLee anime-lists table. ONE resolver handles every shape:
+            #   • flat umbrella  — One Piece AID 69 ep 1156 → S23E01 (… 1165→S23E10)
+            #   • cour-split     — Bleach TYBW cour 2 (AID 17765) → S17E14
+            # `resolve_canonical_season` stamps Match.season_number with the SAME
+            # ScudLee season at scan time, so what the popup SHOWS equals what we
+            # WRITE here. Render-only: mutate the local `parsed`, never the row.
+            anidb_ep = (
+                selected.episode_number
+                if selected.episode_number is not None else parsed.episode
+            )
+            resolved = None
+            if anidb_ep is not None:
+                try:
+                    from kira.providers.anime_lists import resolve_anidb_to_tvdb
+                    resolved = await resolve_anidb_to_tvdb(int(selected.provider_id), anidb_ep)
+                except Exception as e:
+                    logger.warning(f"rename: ScudLee season resolve failed for {fid} (non-fatal): {e!r}")
+            if resolved is not None:
+                scud_season, scud_episode = resolved
+                season_override_val = scud_season
+                if parsed.episode_end is not None and parsed.episode is not None:
+                    parsed.episode_end = scud_episode + (parsed.episode_end - parsed.episode)
+                parsed.episode = scud_episode
+            elif (selected.season_number is not None and parsed.episode is not None):
+                # Fallback (no ScudLee mapping): keep the prior cour-routing offset
+                # — Fribb season (selected.season_number) + cumulative cour offset.
+                try:
+                    from kira.matcher.cour_routing import build_cour_routing_table
+                    table = await build_cour_routing_table(
+                        "anidb", str(selected.provider_id), selected.season_number,
+                    )
+                    if table:
+                        aid = int(selected.provider_id)
+                        offset = next((off for (_s, _e, cid, off) in table if cid == aid), None)
+                        if offset is not None:
+                            # Match.episode_number is the cour-LOCAL episode after
+                            # arbitration; season-continuous output = local + offset.
+                            base = (
+                                selected.episode_number
+                                if selected.episode_number is not None
+                                else parsed.episode
+                            )
+                            new_ep = base + offset
+                            if parsed.episode_end is not None:
+                                parsed.episode_end = new_ep + (parsed.episode_end - parsed.episode)
+                            parsed.episode = new_ep
+                except Exception as e:
+                    logger.warning(f"rename: cour episode offset failed for {fid} (non-fatal): {e!r}")
 
         # Locally-named anime → franchise-absolute number for {{absx}}. The file
         # was named per-cour-local (e.g. "S4E01") so parsed.absolute_episode is
@@ -1221,6 +1572,25 @@ async def perform_rename(
         #      all RENAME, but no relocation to a different library.
         #   2. Per-type destination override (admin-configured in Settings).
         #   3. Fallback: library_root + SUBFOLDER[type] (legacy).
+        # Resolve the real per-episode title up front so BOTH the in-place root
+        # and the final filename render "{t}" with it. AniDB anime carry no
+        # per-episode title on the Match, so without this the filename fell back
+        # to "Episode NN". Cached per series/season; best-effort — on a miss we
+        # keep selected.episode_title (the prior behavior).
+        _ep_title = selected.episode_title
+        if not _ep_title and parsed.episode is not None and selected.provider_id:
+            try:
+                from kira.api.series import resolve_episode_meta
+                from kira.matcher.engine import registry_from_settings
+                from kira import net
+                _epc = net.shared_client()
+                _epr = await resolve_episode_meta(
+                    selected, selected.season_number, parsed.episode,
+                    await registry_from_settings(_epc), _epc)
+                if _epr and _epr.title:
+                    _ep_title = _epr.title
+            except Exception:
+                pass
         type_target_root: str | None = None
         if rename_mode == "in-place":
             try:
@@ -1228,7 +1598,7 @@ async def perform_rename(
                     Path(f.file_path), parsed, profile,
                     library_title=library_title,
                     library_year=library_year,
-                    episode_title=selected.episode_title,
+                    episode_title=_ep_title,
                     season_override=season_override_val,
                 )
             except Exception as e:
@@ -1260,7 +1630,7 @@ async def perform_rename(
                 parsed, library_root, profile,
                 library_title=library_title,
                 library_year=library_year,
-                episode_title=selected.episode_title,
+                episode_title=_ep_title,
                 season_override=season_override_val,
                 type_target_root=type_target_root,
                 metadata=_meta,
@@ -1397,7 +1767,7 @@ async def perform_rename(
             session.add(intent)
             await session.commit()
         except Exception as e:
-            print(f"rename: intent journal write failed for {fid} (non-fatal): {e!r}")
+            logger.warning(f"rename: intent journal write failed for {fid} (non-fatal): {e!r}")
             try:
                 await session.rollback()
             except Exception:
@@ -1435,13 +1805,28 @@ async def perform_rename(
             video_artifacts_cleaned = await asyncio.to_thread(
                 execute_op,
                 op, src, target,
-                overwrite=payload.overwrite,
+                overwrite=effective_overwrite,
+                on_conflict=on_conflict,
                 cleanup_empty_source=cleanup_empty_source,
                 cleanup_stop_at=Path(library_root) if library_root else None,
                 cleanup_max_levels=cleanup_max_levels,
                 cleanup_artifacts=cleanup_artifacts,
                 cleanup_trash_dir=cleanup_trash_dir,
+                cleanup_nonvideo=cleanup_nonvideo,
+                cleanup_extra_names=cleanup_extra_names,
+                cleanup_extra_exts=cleanup_extra_exts,
+                symlink_relative=symlink_relative,
+                permissions=permissions,
             ) or 0
+        except RenameSkipped:
+            # on_conflict=skip: a DIFFERENT file already occupies the target.
+            # Deliberate no-op — leave both untouched, drop the write-ahead
+            # intent, and report the file as unchanged (old == new), not failed.
+            await _discard_intent(session, intent)
+            results.append(RenameItemResult(
+                file_id=fid, ok=True, old_path=str(src), new_path=str(src),
+            ))
+            return
         except Exception as e:
             # The move never happened → discard the write-ahead intent so reconcile
             # doesn't later inspect a rename that didn't occur.
@@ -1470,16 +1855,16 @@ async def perform_rename(
         session.add(video_history)
 
         # Stamp the renamed file with its resolved provider ID (xattr / NTFS
-        # ADS) so a future re-scan re-identifies it instantly via the Phase 14
-        # embedded-ID bypass — even if the filename is later changed. Pure
-        # optimisation: a no-op on filesystems that don't support it, never
-        # fails the rename.
-        if selected and selected.provider and selected.provider_id:
+        # ADS / the portable index) so a future re-scan re-identifies it
+        # instantly via the Phase 14 embedded-ID bypass — even if the filename
+        # is later changed. Pure optimisation, gated by `rename.stamp_ids`
+        # (Settings → Advanced), never fails the rename.
+        if stamp_ids and selected and selected.provider and selected.provider_id:
             try:
                 from kira import xattr_store
                 xattr_store.write_ids(str(target), {selected.provider: str(selected.provider_id)})
             except Exception as e:
-                print(f"rename: xattr stamp failed for {fid} (non-fatal): {e!r}")
+                logger.warning(f"rename: xattr stamp failed for {fid} (non-fatal): {e!r}")
 
         # Provenance of the satellite files THIS rename creates (#1). Recorded
         # on the video_history row so undo deletes exactly these — no deriving
@@ -1492,9 +1877,12 @@ async def perform_rename(
         # already on the Match. Pure output — never fails the rename.
         if write_nfo and selected:
             try:
-                created_assets += await _write_nfo_files(target, parsed, selected, _meta, fields=nfo_fields)
+                created_assets += await _write_nfo_files(target, parsed, selected, _meta,
+                                                          fields=nfo_fields, season_override=season_override_val,
+                                                          series_name_override=library_title,
+                                                          season_posters=season_posters)
             except Exception as e:
-                print(f"rename: NFO write failed for {fid} (non-fatal): {e!r}")
+                logger.warning(f"rename: NFO write failed for {fid} (non-fatal): {e!r}")
 
         # ── #13: artwork download (opt-in, best-effort) ───────────────
         if download_artwork and selected and artwork_client is not None:
@@ -1507,10 +1895,14 @@ async def perform_rename(
                     fanart_cache=artwork_cache, img_cache=artwork_img_cache,
                 )
             except Exception as e:
-                print(f"rename: artwork download failed for {fid} (non-fatal): {e!r}")
+                logger.warning(f"rename: artwork download failed for {fid} (non-fatal): {e!r}")
 
         if created_assets:
             video_history.created_assets = created_assets
+        # Protect the renamed video + everything we just wrote beside it from the
+        # post-loop in-place junk sweep (it must never delete our own output).
+        inplace_protected.add(str(target))
+        inplace_protected.update(created_assets)
 
         # ── #1 forward-orphan sweep ───────────────────────────────────
         # Re-renaming this file to a DIFFERENT target (without an undo in
@@ -1522,7 +1914,7 @@ async def perform_rename(
             from kira.api.history import sweep_superseded_assets
             await sweep_superseded_assets(session, fid, str(target), managed_roots)
         except Exception as e:
-            print(f"rename: superseded-asset sweep failed for {fid} (non-fatal): {e!r}")
+            logger.warning(f"rename: superseded-asset sweep failed for {fid} (non-fatal): {e!r}")
 
         # ── Tier 1.2: Subtitle / sidecar co-renaming ─────────────────
         # Now that the video has moved, hunt for sidecars (.srt, .ass,
@@ -1543,7 +1935,7 @@ async def perform_rename(
         try:
             sidecars = discover_sidecars(src)
         except Exception as e:
-            print(f"rename: sidecar discovery failed for {fid}: {e!r}")
+            logger.warning(f"rename: sidecar discovery failed for {fid}: {e!r}")
             sidecars = []
 
         if sidecars:
@@ -1556,7 +1948,7 @@ async def perform_rename(
                 await session.flush()
                 parent_history_id = video_history.id
             except Exception as e:
-                print(f"rename: flush before sidecars failed for {fid}: {e!r}")
+                logger.warning(f"rename: flush before sidecars failed for {fid}: {e!r}")
                 parent_history_id = None
 
             if parent_history_id is None:
@@ -1578,6 +1970,20 @@ async def perform_rename(
                 sub_target = compute_sidecar_target(sidecar, src, target)
                 if sub_target is None:
                     continue
+                # #7: sidecars are real files too — guard them against the same
+                # in-batch duplicate-target collision as the video (#3 above).
+                # Without this, two files whose sidecars render to the same path
+                # would silently overwrite each other under overwrite=True,
+                # entirely outside the video-target guard.
+                sub_key = _norm_path(str(sub_target))
+                if sub_key in claimed_targets:
+                    failed_subs.append(
+                        f"{sidecar.name}: duplicate target — file id "
+                        f"{claimed_targets[sub_key]} in this batch already maps to "
+                        f"“{sub_target.name}”"
+                    )
+                    continue
+                claimed_targets[sub_key] = fid
                 try:
                     # Same cleanup_empty_source policy as the video. Last
                     # operation in the parent folder triggers the cleanup
@@ -1586,12 +1992,18 @@ async def perform_rename(
                     sub_artifacts_cleaned = await asyncio.to_thread(
                         execute_op,
                         op, sidecar, sub_target,
-                        overwrite=payload.overwrite,
+                        overwrite=effective_overwrite,
+                        on_conflict=on_conflict,
                         cleanup_empty_source=cleanup_empty_source,
                         cleanup_stop_at=Path(library_root) if library_root else None,
                         cleanup_max_levels=cleanup_max_levels,
                         cleanup_artifacts=cleanup_artifacts,
                         cleanup_trash_dir=cleanup_trash_dir,
+                        cleanup_nonvideo=cleanup_nonvideo,
+                        cleanup_extra_names=cleanup_extra_names,
+                        cleanup_extra_exts=cleanup_extra_exts,
+                        symlink_relative=symlink_relative,
+                        permissions=permissions,
                     ) or 0
                     # Aggregate artifact count across all sidecar moves
                     # for this video. The LAST sidecar move triggers the
@@ -1600,6 +2012,9 @@ async def perform_rename(
                     # up there — but counting per-call is robust to any
                     # ordering.
                     video_artifacts_cleaned += sub_artifacts_cleaned
+                    # Co-renamed sidecar is our output too — shield it from the
+                    # in-place junk sweep (esp. 'all' mode, which deletes subs).
+                    inplace_protected.add(str(sub_target))
                 except Exception as e:
                     failed_subs.append(f"{sidecar.name}: {e}")
                     continue
@@ -1674,7 +2089,7 @@ async def perform_rename(
                 # persist. This is the most dangerous failure mode in
                 # the entire endpoint — surface it loudly in the
                 # result rather than swallowing.
-                print(f"rename: per-file commit failed for {fid}: {e!r}")
+                logger.warning(f"rename: per-file commit failed for {fid}: {e!r}")
                 results.append(RenameItemResult(
                     file_id=fid, ok=False, old_path=str(src), new_path=str(target),
                     error=(
@@ -1689,6 +2104,13 @@ async def perform_rename(
                 except Exception:
                     pass
                 return
+        # Successful episode rename → remember the series for the Sonarr
+        # rescan hook (movies don't apply; Sonarr keys series by TVDB id).
+        if (
+            selected.match_type == "tv_episode"
+            and selected.provider and selected.provider_id
+        ):
+            renamed_episode_series.add((selected.provider, str(selected.provider_id)))
         results.append(RenameItemResult(
             file_id=fid, ok=True, old_path=str(src), new_path=str(target),
             error=sidecar_msg,
@@ -1705,13 +2127,31 @@ async def perform_rename(
         activity.begin("rename", f"Renaming {n} file{'' if n == 1 else 's'}", total=n)
     try:
         for fid in payload.file_ids:
-            f = by_id.get(fid)
-            if f is None:
-                results.append(RenameItemResult(file_id=fid, ok=False, error="File not found"))
-            elif not f.parsed_data:
-                results.append(RenameItemResult(file_id=fid, ok=False, error="File not parsed"))
-            else:
-                await _rename_one_file(f, fid)
+            try:
+                f = by_id.get(fid)
+                if f is None:
+                    results.append(RenameItemResult(file_id=fid, ok=False, error="File not found"))
+                elif not f.parsed_data:
+                    results.append(RenameItemResult(file_id=fid, ok=False, error="File not parsed"))
+                else:
+                    await _rename_one_file(f, fid)
+            except Exception as e:
+                # One file's UNEXPECTED error must NEVER abort the whole batch.
+                # It used to escape `_rename_one_file` → out of `perform_rename`
+                # → 500, leaving the rest of the season unprocessed (stuck at
+                # "approved") while the activity pill's `finally` still flashed
+                # "done". Contain it here: roll back any half-applied per-file
+                # transaction so the next file + the summary commit don't inherit
+                # a poisoned session, then record a per-file failure so the user
+                # sees WHICH file broke and why (instead of a blank 500).
+                logger.exception(f"rename: unexpected error on file {fid}")
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
+                if not any(r.file_id == fid for r in results):
+                    results.append(RenameItemResult(
+                        file_id=fid, ok=False, error=f"Unexpected error: {e}"))
             if _track:
                 activity.progress("rename", len(results))
     finally:
@@ -1739,21 +2179,68 @@ async def perform_rename(
         # rows (annoying, not catastrophic).
         await session.commit()
 
-        # ── Pass 6 post-rename hooks (best-effort, never affect the result) ──
-        if succeeded:
-            # Run on a FRESH session: the rename loop above may have left
-            # `session` in a pending-rollback state after a caught per-file
-            # IntegrityError, which would make these follow-up reads raise
-            # PendingRollbackError and silently skip media-server refresh +
-            # subtitle fetch for an otherwise-successful batch.
+        # ── In-place junk sweep (same-folder rename case) ──────────────────
+        # The source-folder walk above only cleans VACATED folders, so a file
+        # renamed IN PLACE — or any destination folder that keeps its media —
+        # never gets its leftovers swept. Do that here: sweep each folder a file
+        # landed in, honoring the SAME cleanup mode + custom lists, while
+        # protecting media, everything Kira wrote this batch (inplace_protected),
+        # and Kira's own artwork/NFO output names. FS-only + best-effort; gated by
+        # the same master + artifact toggles as the source walk. Skipped on dry-run
+        # (we're inside `if not payload.dry_run`).
+        if cleanup_empty_source and cleanup_artifacts:
+            try:
+                from kira.renamer.operations import sweep_destination_junk
+                _prot = frozenset(inplace_protected)
+                _dest_folders = {Path(r.new_path).parent for r in results if r.ok and r.new_path}
+                _swept = 0
+                for _folder in _dest_folders:
+                    _swept += sweep_destination_junk(
+                        _folder, mode=cleanup_nonvideo,
+                        extra_names=cleanup_extra_names, extra_exts=cleanup_extra_exts,
+                        trash_root=cleanup_trash_dir, protected=_prot,
+                    )
+                if _swept:
+                    logger.info(
+                        f"rename: in-place junk sweep removed {_swept} file"
+                        f"{'' if _swept == 1 else 's'} across {len(_dest_folders)} folder"
+                        f"{'' if len(_dest_folders) == 1 else 's'}")
+            except Exception as e:
+                logger.warning(f"rename: in-place junk sweep failed (non-fatal): {e!r}")
+
+        # ── Pass 6 post-rename hooks (best-effort, run in the BACKGROUND) ──
+        # Defined here; SCHEDULED below. Everything in this hook is network-
+        # bound — for a full season the per-episode subtitle auto-fetch alone
+        # runs for minutes — so it must NOT block the /rename response. We hand
+        # it to a tracked background task and return the instant the files are
+        # on disk; the activity pill narrates the subtitle phase as it fills the
+        # sidecars in. The files are already moved + their history committed, so
+        # the rename is DONE and fully undoable before this even starts.
+        async def _post_rename_hooks():
+            # Run on a FRESH session: the original request session is already
+            # closed by the time this task runs (so its loaded MediaFiles are
+            # detached), and the rename loop may also have left it in a pending-
+            # rollback state after a caught per-file IntegrityError. A clean
+            # session keeps every read below bound to a live connection.
             from kira.database import SessionLocal
+            from kira import activity
             async with SessionLocal() as hook_session:
-                # #9: nudge Plex/Jellyfin to re-scan so the renames show up now.
-                try:
-                    from kira.integrations.media_server import refresh_all
-                    await refresh_all(hook_session)
-                except Exception as e:
-                    print(f"rename: media-server refresh failed (non-fatal): {e!r}")
+                # Re-load the renamed files + their matches on THIS session, so
+                # attribute access in the subtitle fetch (matches, parsed_data,
+                # metadata_blob) never touches the closed request session.
+                _ok_ids = [r.file_id for r in results if r.ok and r.new_path]
+                by_id = {
+                    f.id: f for f in await hook_session.scalars(
+                        select(MediaFile)
+                        .options(selectinload(MediaFile.matches))
+                        .where(MediaFile.id.in_(_ok_ids))
+                    )
+                }
+                # NOTE: media-server refresh (Plex/Jellyfin) + Sonarr rescan run
+                # AFTER the subtitle auto-fetch below — see the ORDERING block at
+                # the end. Firing them here would make the media server index the
+                # renamed file BEFORE its .srt sidecars exist, so Plex/Jellyfin
+                # would miss the subtitles until their next (much later) scan.
                 # #10: fan out the summary to external sinks (Discord / webhook).
                 try:
                     from kira import notify
@@ -1764,7 +2251,7 @@ async def perform_rename(
                         + (f" · {failed} failed" if failed else ""),
                     )
                 except Exception as e:
-                    print(f"rename: notification fan-out failed (non-fatal): {e!r}")
+                    logger.warning(f"rename: notification fan-out failed (non-fatal): {e!r}")
                 # #11: auto-fetch subtitles for the renamed files (opt-in). The
                 # aggregator runs the enabled sources cheapest/most-reliable first
                 # (embedded → OpenSubtitles → YIFY), each skipping a language already
@@ -1773,54 +2260,207 @@ async def perform_rename(
                 try:
                     if await _resolve_bool_setting(hook_session, "subtitles.auto_fetch", False):
                         from kira import net
-                        from kira.api.matches import load_opensubtitles_settings
                         from kira.subtitles.aggregate import fetch_subtitles
-                        api_key, sub_user, sub_pw, sub_langs = await load_opensubtitles_settings(hook_session)
-                        if sub_langs:
-                            # Per-source toggles: embedded on by default (free,
-                            # offline); OpenSubtitles whenever a key exists;
-                            # yifysubtitles a scraper → opt-in (default off).
-                            sub_enabled = {
-                                "embedded": await _resolve_bool_setting(hook_session, "subtitles.embedded", True),
-                                "opensubtitles": True,
-                                "yifysubtitles": await _resolve_bool_setting(hook_session, "subtitles.yifysubtitles", False),
-                            }
-                            # Each file's subtitle work (embedded MediaInfo parse +
-                            # the network sources) is INDEPENDENT, so run them with
-                            # bounded concurrency instead of strictly serial — a
-                            # whole-season batch no longer waits on each file in
-                            # turn. The shared client keeps the connection pool warm
-                            # across the batch.
+                        from kira.subtitles.model import SearchContext
+                        from kira.subtitles.prefs import load_subtitle_prefs
+                        # ONE loader for every subtitle setting — the same view
+                        # the backfill + per-file fetch use, so all sources
+                        # (embedded → OpenSubtitles → SubDL → Podnapisi →
+                        # SubSource → AnimeTosho → YIFY) run consistently here too.
+                        prefs = await load_subtitle_prefs(hook_session)
+                        sub_langs = prefs.languages
+                        if sub_langs and prefs.any_source_enabled:
+                            # Each file's subtitle work is INDEPENDENT, so run with
+                            # bounded concurrency; the shared client keeps the pool
+                            # warm across the batch.
                             _sc = net.shared_client()
-                            # Settings → Advanced → "Concurrent file operations":
-                            # how many sidecar fetches/writes run in parallel.
                             _conc = await _resolve_int_setting(
                                 hook_session, "rename.concurrency", 4, lo=1, hi=32)
                             _sem = asyncio.Semaphore(_conc)
 
+                            # Shared stop-flag: OpenSubtitles quota/auth failures hit
+                            # every remaining file the same way, so the first one stops
+                            # the batch (instead of hammering a dead / 429 API) and
+                            # surfaces ONE notification — mirroring the backfill path.
+                            from kira.subtitles.errors import AuthRejected, QuotaExceeded
+                            _stop = {"reason": None}
+                            # video new_path -> [.srt paths auto-fetch wrote]; recorded on
+                            # each rename's history row after the batch so undo deletes them.
+                            _sub_assets: dict[str, list[str]] = {}
+                            # file_id -> (title, results): recorded into the Subtitles
+                            # ledger after the batch (same as backfill / manual fetch) so an
+                            # auto-fetch is never invisible. `_done` drives live narration.
+                            _sub_results: dict[int, tuple] = {}
+                            _done = {"n": 0}
+
                             async def _fetch_one(r):
+                                if _stop["reason"]:
+                                    return
                                 f = by_id.get(r.file_id)
                                 sel = next((m for m in (f.matches if f else []) if m.is_selected), None) if f else None
                                 tmdb_id = (int(sel.provider_id) if sel and sel.provider == "tmdb"
                                            and (sel.provider_id or "").isdigit() else None)
-                                # YIFY is IMDb-indexed — pull the imdb id off the
-                                # match's metadata blob when present (movies).
+                                anidb_id = (int(sel.provider_id) if sel and sel.provider == "anidb"
+                                            and (sel.provider_id or "").isdigit() else None)
                                 imdb_id = None
                                 if sel and isinstance(getattr(sel, "metadata_blob", None), dict):
                                     imdb_id = sel.metadata_blob.get("imdbid") or sel.metadata_blob.get("imdb_id")
+                                # Parsed (rendered-filename) S/E beats cour-local
+                                # match numbers (see backfill for the AoT case).
+                                _pd = f.parsed_data if f and isinstance(f.parsed_data, dict) else {}
+                                _season = _pd.get("season")
+                                _episode = _pd.get("episode")
+                                if _season is None and sel is not None:
+                                    _season = sel.season_number
+                                if _episode is None and sel is not None:
+                                    _episode = sel.episode_number
+                                _query = sel.title if sel and sel.title else None
+                                _ctx = SearchContext(
+                                    video_path=r.new_path, languages=sub_langs,
+                                    media_type=f.media_type if f else None, query=_query,
+                                    tmdb_id=tmdb_id, imdb_id=imdb_id, anidb_id=anidb_id,
+                                    season=_season, episode=_episode, parsed=_pd,
+                                    os_api_key=prefs.api_key, os_user=prefs.username, os_pw=prefs.password,
+                                    subdl_api_key=prefs.subdl_api_key, subsource_api_key=prefs.subsource_api_key,
+                                    hearing_impaired=prefs.hearing_impaired or "", forced=prefs.forced or "",
+                                    # Per-type (and global) score floor — same as backfill /
+                                    # manual; without this the auto path saved ANY-scoring sub.
+                                    min_score=prefs.min_score_for(f.media_type if f else None),
+                                )
                                 async with _sem:
-                                    await fetch_subtitles(
-                                        r.new_path, sub_langs, client=_sc, enabled=sub_enabled,
-                                        os_api_key=api_key, os_user=sub_user, os_pw=sub_pw,
-                                        tmdb_id=tmdb_id, imdb_id=imdb_id,
-                                        season=sel.season_number if sel else None,
-                                        episode=sel.episode_number if sel else None,
-                                    )
+                                    if _stop["reason"]:
+                                        return
+                                    try:
+                                        _res = await fetch_subtitles(_sc, _ctx, enabled=prefs.sources_for(_ctx.media_type))
+                                        if _res:
+                                            _sub_assets[r.new_path] = [x.path for x in _res if x.path]
+                                            _sub_results[r.file_id] = (
+                                                (sel.series_name or sel.title) if sel else None, _res)
+                                    except QuotaExceeded:
+                                        _stop["reason"] = "quota"
+                                    except AuthRejected:
+                                        _stop["reason"] = "auth"
+                                    finally:
+                                        # Narrate progress so the pill shows the work — a
+                                        # silent background download is what felt "stuck".
+                                        _done["n"] += 1
+                                        activity.progress("subtitles", _done["n"], _total)
 
                             targets = [r for r in results if r.ok and r.new_path]
+                            _total = len(targets)
+                            if _total:
+                                activity.progress("subtitles", 0, _total)  # begin the visible phase
                             await asyncio.gather(*(_fetch_one(r) for r in targets), return_exceptions=True)
+                            # Surface every fetch in History → Subtitles, exactly like the
+                            # backfill / manual paths. Sequential because record_results
+                            # commits and the shared hook_session isn't concurrency-safe.
+                            if _sub_results:
+                                try:
+                                    from kira.subtitles import store as _substore
+                                    for _fid, (_title, _res) in _sub_results.items():
+                                        await _substore.record_results(hook_session, _fid, _title, _res)
+                                except Exception as e:
+                                    logger.warning(f"rename: recording subtitle history failed (non-fatal): {e!r}")
+                            if _total:
+                                _n = sum(len(v[1]) for v in _sub_results.values())
+                                activity.end("subtitles", ok=not _stop["reason"],
+                                             detail=(f"Fetched {_n} subtitle{'' if _n == 1 else 's'} for "
+                                                     f"{len(_sub_results)} file{'' if len(_sub_results) == 1 else 's'}"))
+                            # Record what auto-fetch wrote on each rename's history row so
+                            # UNDO removes the .srt sidecars too — they're Kira-created,
+                            # exactly like the NFO/artwork, and were being orphaned before.
+                            if _sub_assets:
+                                try:
+                                    from sqlalchemy.orm.attributes import flag_modified
+                                    _hrows = list(await hook_session.scalars(
+                                        select(RenameHistory).where(
+                                            RenameHistory.new_path.in_(list(_sub_assets)),
+                                            RenameHistory.parent_id.is_(None),
+                                            RenameHistory.undone_at.is_(None),
+                                        )
+                                    ))
+                                    for _hr in _hrows:
+                                        _extra = _sub_assets.get(_hr.new_path) or []
+                                        if _extra:
+                                            _cur = list(_hr.created_assets or [])
+                                            _cur.extend(p for p in _extra if p not in _cur)
+                                            _hr.created_assets = _cur
+                                            flag_modified(_hr, "created_assets")
+                                    await hook_session.commit()
+                                except Exception as e:
+                                    logger.warning(f"rename: recording auto-fetched subs failed (non-fatal): {e!r}")
+                            if _stop["reason"]:
+                                # Don't leave a silently sub-less batch — tell the user
+                                # WHY and that a backfill will finish the rest once fixed.
+                                from kira.database import SessionLocal as _SL
+                                _body = ("OpenSubtitles' daily quota is exhausted — the rest of this batch was skipped. "
+                                         "They'll fill in on the next subtitle backfill once your quota resets."
+                                         if _stop["reason"] == "quota" else
+                                         "OpenSubtitles rejected your API key — replace it in Settings → Connections, "
+                                         "then run a subtitle backfill to fill the rest.")
+                                try:
+                                    async with _SL() as _ns:
+                                        _ns.add(Notification(kind="warning", title="Subtitle auto-fetch stopped", body=_body))
+                                        await _ns.commit()
+                                except Exception:
+                                    pass
                 except Exception as e:
-                    print(f"rename: subtitle auto-fetch failed (non-fatal): {e!r}")
+                    logger.warning(f"rename: subtitle auto-fetch failed (non-fatal): {e!r}")
+
+                # ── ORDERING: media-server / Sonarr rescan LAST ──────────────
+                # Now that the files are renamed AND their subtitle sidecars are
+                # written, tell the media servers to re-index — so Plex/Jellyfin
+                # pick up the file and its subtitles in a single scan instead of
+                # indexing a sub-less file and missing the .srt until next time.
+                # #9: nudge Plex/Jellyfin to re-scan so the renames show up now.
+                try:
+                    from kira.integrations.media_server import refresh_all
+                    await refresh_all(hook_session)
+                except Exception as e:
+                    logger.warning(f"rename: media-server refresh failed (non-fatal): {e!r}")
+                # Sonarr rescan: tell Sonarr to re-scan each renamed series NOW,
+                # so it re-links the files under their new names instead of its
+                # next disk scan seeing the old paths gone → "episode file
+                # deleted" → re-grabbing monitored episodes. Best-effort: skips
+                # silently when Sonarr isn't configured or a series isn't in it.
+                if renamed_episode_series:
+                    try:
+                        from kira.api.integrations import _load_sonarr_config
+                        from kira.integrations import sonarr as sonarr_mod
+                        from kira.providers.anime_mappings import AnimeMappings
+                        try:
+                            sonarr_cfg = await _load_sonarr_config(hook_session)
+                        except Exception:
+                            sonarr_cfg = None  # not configured — nothing to do
+                        if sonarr_cfg is not None:
+                            tvdb_ids: set[int] = set()
+                            for prov, pid in renamed_episode_series:
+                                try:
+                                    if prov == "tvdb":
+                                        tvdb_ids.add(int(pid))
+                                    elif prov == "anidb":
+                                        t = await AnimeMappings.tvdb_id(int(pid))
+                                        if t:
+                                            tvdb_ids.add(int(t))
+                                except (TypeError, ValueError):
+                                    continue
+                            for tid in tvdb_ids:
+                                ok = await sonarr_mod.rescan_series_by_tvdb(sonarr_cfg, tid)
+                                if ok:
+                                    logger.info(f"rename: sonarr rescan queued for tvdb {tid}")
+                    except Exception as e:
+                        logger.warning(f"rename: sonarr rescan hook failed (non-fatal): {e!r}")
+
+        # The files are moved and history is committed → the rename is DONE and
+        # undoable right now. Schedule the network tail (notify → subtitle auto-
+        # fetch → media-server refresh → Sonarr) as a tracked background task and
+        # return immediately, so a big season no longer blocks the request for
+        # minutes. The ordering invariant (subtitles BEFORE media-server refresh)
+        # holds because the task runs its steps sequentially. Tests/shutdown can
+        # await it via kira.tasks.drain_background_tasks().
+        if succeeded:
+            from kira.tasks import spawn_tracked
+            spawn_tracked(_post_rename_hooks(), "rename-post-hooks")
 
     succeeded = sum(1 for r in results if r.ok)
     return RenameResult(

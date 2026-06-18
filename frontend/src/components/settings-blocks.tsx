@@ -2,11 +2,11 @@ import { useState, useEffect, useRef, type ReactNode, type FC } from 'react';
 import type { ProviderKey, MediaType } from '../lib/types';
 import { PROVIDERS, TYPE_COLOR } from '../lib/data';
 import { api } from '../lib/api';
-import { IcChevDown, IcRefresh, IcAlertTri, IcFilm, IcTv, IcAnime, IcMusic, IcDisc, IcWaveform, IcEye, IcEyeOff } from '../lib/icons';
+import { IcChevDown, IcRefresh, IcAlertTri, IcFilm, IcTv, IcAnime, IcMusic, IcDisc, IcWaveform, IcEye, IcEyeOff, IcSearch, IcX, IcCaption } from '../lib/icons';
 import { cn } from '../lib/utils';
 import { Button } from './base/buttons/button';
 import { FeaturedIcon } from './base/featured-icons/featured-icon';
-import { BadgeWithDot, Badge } from './base/badges/badges';
+import { Badge } from './base/badges/badges';
 import { Input } from './base/input/input';
 import { Alert } from './base/alert/alert';
 import { Toggle } from './base/toggle/toggle';
@@ -14,10 +14,13 @@ import { Select } from './ui';
 
 // ── Shared settings surface styles ──────────────────────────────────
 // One source of truth so every Settings section (Connections, Paths,
-// Integrations, …) uses the exact same card + nested-box treatment.
-export const SETTINGS_CARD = 'rounded-2xl border border-white/[0.12] bg-white/[0.045] shadow-[0_1px_3px_rgba(0,0,0,0.35)]';
-export const SETTINGS_NESTED = 'rounded-xl border border-white/[0.1] bg-white/[0.07]';
-export const SETTINGS_DIVIDER = 'border-white/[0.1]';
+// Integrations, …) uses the exact same card + nested-box treatment. Built
+// on the shared elevation tokens (--surface-* / --border-* / --shadow-*) so
+// the cards read as clearly raised against the canvas, matching the rest of
+// the Phase 1–4 redesign. `.settings-card` adds the hover lift + entrance.
+export const SETTINGS_CARD = 'settings-card rounded-2xl border border-[var(--border-2)] bg-[var(--surface-2)] shadow-[var(--shadow-1)]';
+export const SETTINGS_NESTED = 'rounded-xl border border-[var(--border-1)] bg-[var(--surface-3)]';
+export const SETTINGS_DIVIDER = 'border-[var(--border-1)]';
 
 // ── Layout + section primitives ─────────────────────────────────────
 // One source of truth for the chrome every Settings sub-page repeats:
@@ -37,18 +40,29 @@ export const SETTINGS_DIVIDER = 'border-white/[0.1]';
  * `wide` is retained for call-site compatibility but no longer changes the
  * width — every section now uses the same full width.
  */
-export function SettingsLayout({ intro, children, wide: _wide = false, actions }: {
+export function SettingsLayout({ intro, children, wide: _wide = false, actions, header }: {
   intro?: ReactNode;
   children: ReactNode;
   wide?: boolean;
   /** Optional right-aligned header content (e.g. a status badge). */
   actions?: ReactNode;
+  /** Full section-identity banner (see {@link SectionHeader}). When set it
+   *  replaces the plain intro/actions row and sits OUTSIDE the staggered
+   *  stage so it lands first and the cards cascade beneath it. */
+  header?: ReactNode;
 }) {
   return (
     <div className="p-5">
-      {/* Full width — same as the original per-section wrappers. No mx-auto
-          and no max-w cap so the page width matches what it was before. */}
-      <div className="flex w-full flex-col gap-4">
+      {/* Full width by owner decree: no centered cap — wide viewports get
+          MULTI-COLUMN section layouts (provider grid, SettingsGrid pairs)
+          instead of empty margins. Individual cards keep their own internal
+          max-widths where line length matters. */}
+      {header ? <div className="settings-header-wrap mb-4">{header}</div> : null}
+      {/* `settings-stage` cascades the section cards in on each sub-nav
+          change (the parent re-keys on `section`, so this re-fires). Each
+          direct child gets its stagger delay from a CSS :nth-child rule, so
+          no per-child --i markup is needed. */}
+      <div className="settings-stage flex w-full flex-col gap-4">
         {intro || actions ? (
           <div className="flex flex-wrap items-start justify-between gap-3">
             {intro ? <p className="max-w-3xl text-[13px] leading-relaxed text-ink-muted">{intro}</p> : <span />}
@@ -73,6 +87,137 @@ export function SettingsGrid({ children, className }: { children: ReactNode; cla
   return (
     <div className={cn('grid grid-cols-1 items-start gap-4 lg:grid-cols-2', className)}>
       {children}
+    </div>
+  );
+}
+
+// ── Section identity ────────────────────────────────────────────────
+// Each of the 8 Settings sections gets a strong, consistent header: a
+// large featured icon, a title, a one-line purpose, and an optional live
+// status summary on the right (e.g. "3 of 5 providers connected"). This is
+// the "distinct room" treatment — purely presentational, no setting keys.
+
+export type StatusTone = 'connected' | 'warning' | 'error' | 'neutral' | 'accent';
+
+const STATUS_TONE: Record<StatusTone, { dot: string; text: string; ring: string }> = {
+  connected: { dot: 'var(--conf-high)', text: 'text-conf-high', ring: 'border-[var(--accent-line)]' },
+  warning:   { dot: 'var(--conf-mid)',  text: 'text-conf-mid',  ring: 'border-[rgba(255,201,74,0.32)]' },
+  error:     { dot: 'var(--conf-low)',  text: 'text-conf-low',  ring: 'border-[rgba(255,91,110,0.35)]' },
+  accent:    { dot: 'var(--accent)',    text: 'text-accent',    ring: 'border-[var(--accent-line)]' },
+  neutral:   { dot: 'var(--ink-3)',     text: 'text-ink-soft',  ring: 'border-[var(--border-2)]' },
+};
+
+/**
+ * A small status pill with a leading dot. When `tone` is `connected` /
+ * `accent` the dot breathes (folds under reduced-motion). Used as the live
+ * summary chip in {@link SectionHeader} and inline status badges.
+ */
+export function StatusPill({ tone, children, breathe = false }: {
+  tone: StatusTone;
+  children: ReactNode;
+  breathe?: boolean;
+}) {
+  const t = STATUS_TONE[tone];
+  const alive = breathe && (tone === 'connected' || tone === 'accent');
+  return (
+    <span className={cn(
+      'settings-status-pill inline-flex shrink-0 items-center gap-2 rounded-full border bg-[var(--surface-1)] px-3 py-1.5 text-[12px] font-semibold',
+      t.ring, t.text,
+    )}>
+      <span
+        className={cn('size-1.5 rounded-full', alive && 'settings-dot-live')}
+        style={{ background: t.dot, boxShadow: `0 0 8px ${t.dot}` }}
+      />
+      {children}
+    </span>
+  );
+}
+
+/**
+ * Strong, consistent section identity banner. Replaces the bare intro
+ * paragraph at the top of each section with a featured icon + title +
+ * one-line purpose, plus an optional live `status` summary and a `filter`
+ * affordance on the right. Sections feel like distinct rooms instead of one
+ * endless wall of cards.
+ */
+export function SectionHeader({ icon, title, purpose, status, filter, accent = false }: {
+  icon: ReactNode;
+  title: ReactNode;
+  purpose: ReactNode;
+  /** Live status summary chip (e.g. provider/path/integration state). */
+  status?: ReactNode;
+  /** Optional right-aligned filter input (see {@link SettingsFilter}). */
+  filter?: ReactNode;
+  /** Brand-tinted icon treatment for the section's flagship (Naming). */
+  accent?: boolean;
+}) {
+  return (
+    <div className="settings-section-header flex flex-wrap items-start gap-4 rounded-2xl border border-[var(--border-2)] bg-[var(--surface-1)] px-4 py-4 shadow-[var(--shadow-1)]">
+      <span className={cn('settings-section-icon grid size-11 shrink-0 place-items-center rounded-xl [&_svg]:size-[22px]', accent ? 'settings-section-icon-accent' : '')}>
+        {icon}
+      </span>
+      <div className="min-w-0 flex-1">
+        <h2 className="text-[17px] font-semibold tracking-[-0.01em] text-ink">{title}</h2>
+        <p className="mt-1 max-w-2xl text-[13px] leading-relaxed text-ink-muted">{purpose}</p>
+      </div>
+      {(status || filter) ? (
+        <div className="flex shrink-0 flex-wrap items-center gap-2.5 self-center">
+          {filter}
+          {status}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Local-state-only filter input. Highlights/hides SettingRows within the
+ * current section by matching `query` against their label/desc text — see
+ * the `[data-search]` attribute SettingRow stamps and the CSS filter rules.
+ * Purely cosmetic: never touches the save plumbing.
+ */
+export function SettingsFilter({ value, onChange, placeholder = 'Filter settings…' }: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+}) {
+  return (
+    <div className="settings-filter relative">
+      <IcSearch className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-ink-soft" aria-hidden="true" />
+      <input
+        type="text"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder={placeholder}
+        spellCheck={false}
+        aria-label="Filter settings in this section"
+        className="settings-filter-input h-9 w-[200px] max-w-full rounded-full border border-[var(--border-2)] bg-[var(--surface-1)] pl-8 pr-8 text-[12.5px] text-ink outline-none placeholder:text-ink-soft"
+      />
+      {value ? (
+        <button
+          type="button"
+          onClick={() => onChange('')}
+          aria-label="Clear filter"
+          className="absolute right-2.5 top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded-full text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink [&_svg]:size-3"
+        >
+          <IcX />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Optional muted group label that breaks a long section into labelled
+ * clusters ("Primary" / "Advanced" / "Per-type"). Gives dense pages a
+ * scannable rhythm without changing any control. Renders an uppercase
+ * eyebrow with a hairline rule.
+ */
+export function GroupLabel({ children }: { children: ReactNode }) {
+  return (
+    <div className="flex items-center gap-3 pt-1">
+      <span className="text-[11px] font-semibold uppercase tracking-[0.1em] text-ink-soft">{children}</span>
+      <span className="h-px flex-1 bg-[var(--border-1)]" />
     </div>
   );
 }
@@ -134,6 +279,19 @@ export function SectionCard({
  *   - `stacked`: label above, control below full width — for wide
  *     controls (segmented controls, path fields).
  */
+// Flatten a ReactNode label/desc to plain lowercase text so the per-section
+// filter can match against it. Best-effort: strings + nested children only
+// (good enough for the human-readable label/desc copy we pass).
+function nodeText(node: ReactNode): string {
+  if (node == null || node === false || node === true) return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(nodeText).join(' ');
+  if (typeof node === 'object' && 'props' in (node as { props?: { children?: ReactNode } })) {
+    return nodeText((node as { props?: { children?: ReactNode } }).props?.children);
+  }
+  return '';
+}
+
 export function SettingRow({ label, desc, children, layout = 'inline', disabled = false, control }: {
   label: ReactNode;
   desc?: ReactNode;
@@ -144,9 +302,12 @@ export function SettingRow({ label, desc, children, layout = 'inline', disabled 
   disabled?: boolean;
 }) {
   const node = control ?? children;
+  // Stamp searchable text so SettingsFilter can scope-highlight this row. The
+  // attribute is inert when no filter is active.
+  const search = `${nodeText(label)} ${nodeText(desc)}`.toLowerCase().trim();
   if (layout === 'stacked') {
     return (
-      <div className={cn(disabled && 'opacity-50')}>
+      <div className={cn('setting-row', disabled && 'opacity-50')} data-search={search}>
         <div className="text-[13.5px] font-medium text-ink">{label}</div>
         {desc ? <div className="mt-0.5 text-[12.5px] leading-relaxed text-ink-muted">{desc}</div> : null}
         <div className="mt-2.5">{node}</div>
@@ -154,7 +315,7 @@ export function SettingRow({ label, desc, children, layout = 'inline', disabled 
     );
   }
   return (
-    <div className={cn('flex items-start justify-between gap-4', disabled && 'opacity-50')}>
+    <div className={cn('setting-row flex items-start justify-between gap-4', disabled && 'opacity-50')} data-search={search}>
       <div className="min-w-0">
         <div className="text-[13.5px] font-medium text-ink">{label}</div>
         {desc ? <div className="mt-0.5 text-[12.5px] leading-relaxed text-ink-muted">{desc}</div> : null}
@@ -296,9 +457,14 @@ export interface ProviderFieldProps {
   mono?: boolean;
   desc?: string;
   onSave?: (next: string | boolean) => void;
+  /** Grey out + block the control when its prerequisite isn't met (e.g. a
+   *  toggle whose API key isn't configured). `disabledReason` is shown beneath
+   *  the label so the user knows WHY and how to fix it. */
+  disabled?: boolean;
+  disabledReason?: string;
 }
 
-export function ProviderField({ kind = 'text', label, value, placeholder, options, mono, desc, onSave }: ProviderFieldProps) {
+export function ProviderField({ kind = 'text', label, value, placeholder, options, mono, desc, onSave, disabled = false, disabledReason }: ProviderFieldProps) {
   const [text, setText] = useState(value ?? '');
   const [on, setOn] = useState(value !== 'false');
   const [show, setShow] = useState(false);
@@ -317,9 +483,12 @@ export function ProviderField({ kind = 'text', label, value, placeholder, option
   useEffect(() => { setOn(value !== 'false'); }, [value]);
 
   const labelBlock = (
-    <div>
+    <div className={disabled ? 'opacity-60' : undefined}>
       <div className="text-[13px] font-medium text-ink">{label}</div>
       {desc ? <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-soft">{desc}</div> : null}
+      {disabled && disabledReason ? (
+        <div className="mt-0.5 text-[11px] leading-relaxed text-conf-mid">{disabledReason}</div>
+      ) : null}
     </div>
   );
 
@@ -327,7 +496,9 @@ export function ProviderField({ kind = 'text', label, value, placeholder, option
     return (
       <div className="flex items-center justify-between gap-4">
         {labelBlock}
-        <Toggle isSelected={on} onChange={() => { const next = !on; setOn(next); onSave?.(next); }} aria-label={label} />
+        {/* A prerequisite-blocked toggle reads OFF (not its saved/default-on
+            state) — "on but greyed" looks active yet does nothing. */}
+        <Toggle isSelected={on && !disabled} isDisabled={disabled} onChange={() => { const next = !on; setOn(next); onSave?.(next); }} aria-label={label} />
       </div>
     );
   }
@@ -338,6 +509,7 @@ export function ProviderField({ kind = 'text', label, value, placeholder, option
         <div className="mb-1.5">{labelBlock}</div>
         <Select<string>
           value={value ?? null}
+          disabled={disabled}
           onChange={v => onSave?.(v)}
           options={(options ?? []).map(o => ({ value: o, label: o }))}
           placeholder={placeholder}
@@ -355,10 +527,13 @@ export function ProviderField({ kind = 'text', label, value, placeholder, option
         type={isPassword && !show ? 'password' : 'text'}
         value={text}
         aria-label={label}
+        disabled={disabled}
         onChange={e => setText(e.target.value)}
         onBlur={() => { if (text !== value) onSave?.(text); }}
         placeholder={placeholder}
-        autoComplete={isPassword ? 'off' : undefined}
+        // Off for ALL credential fields (not just passwords) — these API-key
+        // `text` inputs were the ones browser autofill silently overwrote.
+        autoComplete="off"
         trailing={isPassword ? (
           <button
             type="button"
@@ -382,7 +557,9 @@ interface ProviderBlockProps {
   status?: 'connected' | 'warning' | 'error' | 'disabled' | 'coming-soon' | 'not-configured';
   rateLimit?: string;
   warning?: string;
-  onTest?: () => void | Promise<void>;
+  /** Returns `true` on a verified connection (drives the success pulse).
+   *  A void / falsy result just means "no celebration". */
+  onTest?: () => void | boolean | Promise<void | boolean>;
   /** Unix timestamp (seconds) when the provider's ban expires. When set
    *  AND > now, the block renders a live countdown banner. AniDB only. */
   bannedUntil?: number | null;
@@ -444,7 +621,7 @@ function useCountdown(unixSec: number | null | undefined): string | null {
 
 // Map a provider's icon slug (from PROVIDERS metadata) to an icon component.
 const PROVIDER_ICON: Record<string, FC<{ className?: string }>> = {
-  film: IcFilm, tv: IcTv, anime: IcAnime, disc: IcDisc, waveform: IcWaveform,
+  film: IcFilm, tv: IcTv, anime: IcAnime, disc: IcDisc, waveform: IcWaveform, caption: IcCaption,
 };
 
 // Provider avatar: tries the official logo at /providers/<slug>.svg and falls
@@ -453,14 +630,17 @@ const PROVIDER_ICON: Record<string, FC<{ className?: string }>> = {
 function ProviderLogo({ slug, color, icon: Icon }: { slug: string; color: string; icon: FC<{ className?: string }> }) {
   const [failed, setFailed] = useState(false);
   if (failed) return <FeaturedIcon size="md" tint={color} icon={<Icon />} />;
+  // `flex` is LOAD-BEARING: a bare inline <span> ignores width/height/overflow,
+  // so the img escaped its 36px box and rendered the raw SVG at ~300px (the
+  // "one-foot icons" bug). A flex box honors size-9 and clips the image.
   return (
-    <span className="size-9 shrink-0 overflow-hidden rounded-lg bg-white/[0.06]">
+    <span className="flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white/[0.06]">
       <img
         src={`/providers/${slug}.svg`}
         alt=""
         draggable={false}
         onError={() => setFailed(true)}
-        className="size-full object-contain"
+        className="size-full rounded-lg object-cover"
       />
     </span>
   );
@@ -469,6 +649,15 @@ function ProviderLogo({ slug, color, icon: Icon }: { slug: string; color: string
 export function ProviderCard({ providerKey, fields = [], defaultOpen = false, status = 'connected', warning, onTest, bannedUntil, fallbackChain }: ProviderBlockProps) {
   const [open, setOpen] = useState(defaultOpen);
   const [testing, setTesting] = useState(false);
+  // One-shot success pulse after a verified test. Cleared on a timer so the
+  // celebration plays once and the card settles back to rest.
+  const [celebrate, setCelebrate] = useState(false);
+  // "Last tested" feel — remember the moment of a verified test so the tile
+  // reads as alive. Local + transient (resets on navigation), matching the
+  // Integrations section's own test-state lifetime.
+  const [testedAt, setTestedAt] = useState<number | null>(null);
+  const celebrateTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(celebrateTimer.current), []);
   const p = PROVIDERS[providerKey];
   if (!p) return null;
 
@@ -484,25 +673,48 @@ export function ProviderCard({ providerKey, fields = [], defaultOpen = false, st
     status === 'error' ? 'Error' :
     status === 'coming-soon' ? 'Coming soon' :
     status === 'not-configured' ? 'Not configured' : 'Disabled';
-  const statusColor: 'success' | 'warning' | 'error' | 'gray' =
-    status === 'connected' ? 'success' :
+  // Map the provider state onto the shared StatusPill tones (dot + glow).
+  const pillTone: StatusTone =
+    status === 'connected' ? 'connected' :
     status === 'warning' ? 'warning' :
-    status === 'error' ? 'error' : 'gray';
+    status === 'error' ? 'error' : 'neutral';
+  // A configured/connected tile reads visually distinct from an empty one —
+  // a faint accent wash + brighter border so "wired up" is obvious at a glance.
+  const live = status === 'connected';
 
   const handleTest = async () => {
     if (!onTest) return;
     setTesting(true);
-    try { await onTest(); } finally { setTesting(false); }
+    try {
+      const ok = await onTest();
+      if (ok === true) {
+        setCelebrate(true);
+        setTestedAt(Date.now());
+        window.clearTimeout(celebrateTimer.current);
+        celebrateTimer.current = window.setTimeout(() => setCelebrate(false), 1200);
+      }
+    } finally { setTesting(false); }
   };
 
   return (
-    <div className={cn('overflow-hidden transition-colors', SETTINGS_CARD)}>
+    <div className={cn('provider-card overflow-hidden transition-colors', live && 'provider-card-live', celebrate && 'provider-card-ok', SETTINGS_CARD)}>
       {/* Header is a flex row, not a single <button>, so the Test button can
           live here without nesting interactive elements. Two toggle regions
           (the main info area + the status/chevron) flank the Test action. */}
       <div className="flex w-full items-center gap-3 px-4 py-3.5">
         <button type="button" className="flex min-w-0 flex-1 items-center gap-3 text-left" onClick={() => setOpen(o => !o)}>
-          <ProviderLogo slug={slug} color={p.color} icon={Icon} />
+          <span className="relative shrink-0">
+            <ProviderLogo slug={slug} color={p.color} icon={Icon} />
+            {/* Corner status dot on the monogram — breathes when connected. */}
+            <span
+              className={cn(
+                'absolute -bottom-0.5 -right-0.5 size-2.5 rounded-full border-2 border-[var(--bg)]',
+                live && 'settings-dot-live',
+              )}
+              style={{ background: STATUS_TONE[pillTone].dot, boxShadow: live ? `0 0 6px ${STATUS_TONE[pillTone].dot}` : undefined }}
+              aria-hidden="true"
+            />
+          </span>
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-[14px] font-semibold text-ink">{p.name}</span>
@@ -518,7 +730,7 @@ export function ProviderCard({ providerKey, fields = [], defaultOpen = false, st
           </Button>
         ) : null}
         <button type="button" className="flex shrink-0 items-center gap-3" onClick={() => setOpen(o => !o)} aria-label={open ? 'Collapse' : 'Expand'}>
-          <BadgeWithDot color={statusColor}>{statusLabel}</BadgeWithDot>
+          <StatusPill tone={pillTone} breathe={live}>{testedAt ? 'Verified' : statusLabel}</StatusPill>
           <IcChevDown className={cn('size-4 shrink-0 text-ink-soft transition-transform duration-200', open && 'rotate-180')} />
         </button>
       </div>
@@ -1231,15 +1443,20 @@ function LiveTemplatePreview({ tab, template }: { tab: MediaType; template: stri
     );
   }
   return (
-    <div className="naming-preview-list">
+    <div className="naming-preview-list anim-stagger">
       {samples.map((s, i) => (
-        <div key={i} className="naming-preview-row">
+        <div key={i} className="naming-preview-row" style={{ ['--i' as string]: Math.min(i, 6) }}>
           {s.error ? (
             <span style={{ color: 'var(--conf-low)', fontSize: 12 }}>{s.filename}: {s.error}</span>
           ) : (
             <>
               <div className="naming-preview-src">{s.filename}</div>
-              <div className="preview-path"><span className="seg-new">{s.rendered}</span></div>
+              {/* Re-key the rendered span on the path string so it re-fires the
+                  morph-in animation each time an edit produces a new path —
+                  the live preview visibly "lands" on every keystroke. */}
+              <div className="preview-path">
+                <span key={s.rendered} className="seg-new naming-preview-morph">{s.rendered}</span>
+              </div>
             </>
           )}
         </div>

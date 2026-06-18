@@ -128,6 +128,11 @@ export interface MediaFile {
    *  multi-sub chips. */
   audio_langs?: string[];
   sub_langs?: string[];
+  /** Wanted subtitle languages this file is MISSING (2-letter codes). undefined
+   *  = unknown (never inspected / no preference); [] = fully covered; non-empty
+   *  drives the "No EN subs" chip + the per-row "Get subtitles" action. Mirrors
+   *  the same field on LibFile (carried through the grouping adapter). */
+  missingSubs?: string[];
   /** The clean title the parser extracted from the filename — e.g.
    *  "Kanojo, Okarishimasu" from "[Moozzi2] Kanojo, Okarishimasu-01.mkv".
    *  Used as the Manual Search seed because the *current* match.title is
@@ -163,13 +168,13 @@ export interface SearchResult {
   tracks?: number;
 }
 
-export type ProviderKey = 'TMDB' | 'TVDB' | 'AniDB' | 'MusicBrainz' | 'AcoustID' | 'fanart.tv';
+export type ProviderKey = 'TMDB' | 'TVDB' | 'AniDB' | 'MusicBrainz' | 'AcoustID' | 'fanart.tv' | 'OpenSubtitles' | 'SubDL' | 'SubSource';
 
 export interface ProviderMeta {
   name: string;
   for: MediaType[];
   color: string;
-  icon: 'film' | 'tv' | 'anime' | 'disc' | 'waveform';
+  icon: 'film' | 'tv' | 'anime' | 'disc' | 'waveform' | 'caption';
   desc: string;
 }
 
@@ -194,6 +199,18 @@ export interface ToastData {
   kind?: 'success' | 'error';
 }
 
+/** Tech-tag (MediaInfo) enrichment, surfaced as the scan popup's 3rd line.
+ *  Driven by the detached `mediainfo_enrich` pass; only present when the
+ *  "Read file metadata" feature is on. `queued` = feature on but the pass
+ *  hasn't begun yet (it's spawned a beat after matching finishes). */
+export interface TechProgress {
+  active: boolean;
+  done: number;
+  total: number | null;
+  state: 'running' | 'done' | 'error';
+  queued?: boolean;
+}
+
 export interface AppState {
   files: MediaFile[];
   scanRunning: boolean;
@@ -204,6 +221,9 @@ export interface AppState {
    *  full-range bars: an indeterminate sweep while DISCOVERING files (no
    *  total is known yet), then a real 0–100% bar while MATCHING. */
   scanPhase: 'idle' | 'scanning' | 'matching' | 'done';
+  /** Live tech-tag (MediaInfo) tail of a scan, shown as the popup's 3rd line.
+   *  Null when the feature is off or the pass isn't part of the current scan. */
+  scanTech: TechProgress | null;
   /** False until the first /files fetch resolves (success OR failure).
    *  Pages use this to suppress empty-state UIs during the initial load
    *  window — without it, the user sees "No library scanned yet" / "Library
@@ -254,6 +274,10 @@ export interface LibFile {
    *  multi-sub chips. */
   audio_langs?: string[];
   sub_langs?: string[];
+  /** Wanted subtitle languages this file is MISSING (2-letter codes). undefined
+   *  = unknown (never inspected / no preference); [] = fully covered; non-empty
+   *  drives the "No EN subs" chip + the per-row "Get subtitles" action. */
+  missingSubs?: string[];
   releaseGroup?: string | null;
   /** Index into the parent item's `episodes` array; null when unmatched. */
   matchedToEpisode: number | null;

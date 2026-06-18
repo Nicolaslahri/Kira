@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -15,6 +16,10 @@ from kira.settings_store import unwrap_str as _unwrap_path  # canonical settings
 VALID_STATUSES = {"pending", "matching", "matched", "approved", "rejected", "no_match", "discovered"}
 
 router = APIRouter(prefix="/files", tags=["files"])
+
+
+class VerifyExistIn(BaseModel):
+    ids: list[int]
 
 
 async def _managed_roots(session: AsyncSession) -> list[str]:
@@ -39,6 +44,77 @@ async def _managed_roots(session: AsyncSession) -> list[str]:
     return roots
 
 
+async def _managed_roots_aliased(session: AsyncSession) -> list[str]:
+    """`_managed_roots` plus each root's RESOLVED spelling, so a containment
+    check matches a path persisted under a different spelling of the same
+    location. The rename engine stores resolved paths — on Windows a mapped
+    drive (`Z:\\`) resolves to its UNC target (`\\\\192.168.0.63\\Data\\...`),
+    so `RenameHistory.created_assets` is UNC while `paths.library_root` is the
+    drive-letter form. Undo's asset + folder cleanup is gated by
+    `path_under_roots`, which is purely lexical → it skipped EVERY recorded
+    asset (UNC not under `Z:\\`), orphaning the NFO/artwork/subs it should
+    delete. Mirrors the scan prune's drive-letter↔UNC bridge: resolve each root
+    ONCE (a filesystem round-trip) — never per file. Best-effort; an
+    unreachable root just contributes no alias."""
+    roots = await _managed_roots(session)
+    seen = {r.lower() for r in roots if r}
+
+    def _resolved() -> list[str]:
+        acc: list[str] = []
+        for p in roots:
+            try:
+                rp = str(Path(p).resolve())
+            except OSError:
+                continue
+            if rp and rp.lower() not in seen:
+                seen.add(rp.lower())
+                acc.append(rp)
+        return acc
+
+    return list(roots) + await asyncio.to_thread(_resolved)
+
+
+@router.post("/verify-exist")
+async def verify_exist(
+    payload: VerifyExistIn,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Report which of the given tracked files no longer exist on disk.
+
+    The duplicate-resolution UI calls this for the FEW files that collide on one
+    episode, so it can drop a stale ghost row from the group BEFORE showing a
+    "duplicate" — e.g. a file you renamed away on disk leaves a row pointing at
+    the old path; without this it looks like a second copy and the modal would
+    offer to delete your only real file. Report-only: the row itself is removed
+    by the next scan's (drive-letter/UNC alias-aware) prune.
+
+    Confirmed-gone == FileNotFoundError; a permission / NAS hiccup (OSError)
+    counts as "present", so a momentary blip never hides a real file. The stat
+    runs off the event loop. Bounded to 1000 ids (only collision candidates are
+    ever sent, so this is tiny in practice)."""
+    ids = list(dict.fromkeys(payload.ids))[:1000]
+    if not ids:
+        return {"missing": []}
+    rows = (await session.execute(
+        select(MediaFile.id, MediaFile.file_path).where(MediaFile.id.in_(ids))
+    )).all()
+
+    def _gone(p: str) -> bool:
+        try:
+            Path(p).stat()
+            return False
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    missing: list[int] = []
+    for fid, fp in rows:
+        if fp and await asyncio.to_thread(_gone, fp):
+            missing.append(fid)
+    return {"missing": missing}
+
+
 @router.get("", response_model=list[MediaFileOut])
 async def list_files(
     media_type: str | None = None,
@@ -58,9 +134,17 @@ async def list_files(
         stmt = stmt.where(MediaFile.status == status)
     result = await session.scalars(stmt)
     files = list(result)
-    # Sort matches per file by confidence desc — DB order isn't guaranteed.
+    # Wanted subtitle languages, read once for the whole page. Coverage is a
+    # pure read over each row's parsed_data (no disk I/O), attached as a
+    # non-mapped attribute the MediaFileOut serializer picks up.
+    from kira.subtitles.coverage import missing_languages
+    from kira.subtitles.prefs import load_subtitle_prefs
+    prefs = await load_subtitle_prefs(session)
     for f in files:
+        # Sort matches per file by confidence desc — DB order isn't guaranteed.
         f.matches.sort(key=lambda m: m.confidence, reverse=True)
+        # Wanted languages are per media type (anime may differ from movies).
+        f.missing_subs = missing_languages(f.parsed_data, prefs.languages_for(f.media_type))
     return files
 
 

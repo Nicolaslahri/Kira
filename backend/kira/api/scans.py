@@ -2,7 +2,9 @@
 polls /scans/{id} for live progress while rows appear in real time.
 """
 
+import logging
 import asyncio
+import os
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +36,8 @@ from kira.schemas import ScanCreate, ScanOut
 # CR-11: canonical strong-ref fire-and-forget helper (replaces this module's
 # old `_MI_ENRICH_TASKS` registry).
 from kira.tasks import spawn_tracked
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/scans", tags=["scans"])
 
@@ -80,10 +84,14 @@ async def _read_mediainfo_setting(session) -> bool:
     and accept the per-file I/O. (No-op regardless if pymediainfo isn't installed.)"""
     try:
         from kira.models import Setting
+        from kira.settings_store import unwrap
         row = await session.get(Setting, "parsing.read_mediainfo")
         if row is None:
             return False
-        return bool(row.value)
+        # unwrap the optional {"value": …} shape — every other reader does, and
+        # `bool({"value": False})` is True (non-empty dict), which would read OFF
+        # as ON. SSOT in kira.settings_store.
+        return bool(unwrap(row.value))
     except Exception:
         return False
 
@@ -102,12 +110,42 @@ async def _read_mediainfo_authoritative_setting(session) -> bool:
     ("Authoritative tech tags")."""
     try:
         from kira.models import Setting
+        from kira.settings_store import unwrap
         row = await session.get(Setting, "parsing.mediainfo_authoritative")
         if row is None:
             return False
-        return bool(row.value)
+        # unwrap before bool() — see _read_mediainfo_setting.
+        return bool(unwrap(row.value))
     except Exception:
         return False
+
+
+async def _ids_missing_tech_tags(session, *, limit: int = 20000) -> list[int]:
+    """File IDs whose container has NEVER been read (no `mi_stamp` in parsed_data).
+
+    Lets a plain *rescan* dependably fill tech tags for files that pre-date the
+    feature (or were added while it was off / never enriched), not only the files
+    discovered THIS scan. Without this, a rescan that turns up nothing new leaves
+    the enrich pass with an empty set and it silently no-ops — which reads to the
+    user as "the tech-tag scan didn't start".
+
+    Self-limiting: the enrich pass stamps `mi_stamp` on every file it inspects
+    (even ones MediaInfo can't read — the stat still succeeds), so an inspected
+    file drops out of this set and is never re-read on the next scan. Bounded by
+    `limit` and fully best-effort — a query failure returns [] and the caller
+    falls back to the new-files set, so this never breaks a scan."""
+    try:
+        from sqlalchemy import select, func
+        stmt = (
+            select(MediaFile.id)
+            .where(func.json_extract(MediaFile.parsed_data, "$.mi_stamp").is_(None))
+            .limit(limit)
+        )
+        res = await session.execute(stmt)
+        return [int(r[0]) for r in res.all()]
+    except Exception as e:
+        logger.warning(f"_ids_missing_tech_tags: query failed (non-fatal): {e!r}")
+        return []
 
 
 async def _read_auto_approve_setting(session) -> tuple[bool, float]:
@@ -139,7 +177,11 @@ async def _read_auto_approve_setting(session) -> tuple[bool, float]:
             th = 95.0
         return enabled, max(0.0, min(100.0, th)) / 100.0
     except Exception:
-        return True, 0.95
+        # Fail CLOSED. A transient DB error (e.g. `database is locked` while a
+        # watcher scan overlaps a manual one) must NOT silently flip auto-approve
+        # ON — the documented default is DISABLED and the user expects to review
+        # matches. Leaving them pending is the safe failure.
+        return False, 0.95
 
 
 async def _apply_xattr_ids(parsed: ParsedFile, file_path: str | None) -> None:
@@ -158,38 +200,12 @@ async def _apply_xattr_ids(parsed: ParsedFile, file_path: str | None) -> None:
         if stamped:
             parsed.provider_ids = stamped
     except Exception as e:
-        print(f"_apply_xattr_ids: read failed for {file_path} (non-fatal): {e!r}")
+        logger.warning(f"_apply_xattr_ids: read failed for {file_path} (non-fatal): {e!r}")
 
 
-async def _maybe_enrich_mediainfo(
-    parsed: ParsedFile, path: str, enabled: bool, authoritative: bool = False
-) -> bool:
-    """Phase 16: merge the file's REAL container metadata (quality/codec/HDR/
-    channels/audio/duration + per-track languages) onto a ParsedFile. Reads off
-    the event loop; a full no-op when disabled or the native lib is absent.
-    Returns True if anything changed.
-
-    Always reads the container when enabled. `enrich_parsed` then FILLS missing
-    fields (fallback) or OVERRIDES them (authoritative) — so fallback still keeps
-    an explicit filename quality tag, it just no longer SKIPS the read. We used to
-    skip any quality-tagged file to bound I/O, but that also skipped channels /
-    duration / per-track LANGUAGES, which have no filename source and so would
-    never populate (the "no dual-audio chips on most files" bug). The read is
-    paced + off the critical path in `enrich_mediainfo_background`, so reading
-    every file the pass is handed (new files on a scan; the whole library on an
-    explicit backfill) is affordable.
-
-    NOTE: a NAS round-trip per file — heavy. Callers on a hot path (scan/match)
-    must defer this to `enrich_mediainfo_background`, not await it inline."""
-    if not enabled or not _mediainfo.available():
-        return False
-    try:
-        mi = await asyncio.to_thread(_mediainfo.read_media_info, path)
-        return _mediainfo.enrich_parsed(parsed, mi, authoritative=authoritative)
-    except Exception as e:
-        print(f"_maybe_enrich_mediainfo failed for {path}: {e!r}")
-        return False
-
+# Phase 16 history: a `_maybe_enrich_mediainfo(parsed, path, …)` helper used to
+# do one blocking read per call; `enrich_mediainfo_background` now inlines the
+# read with bounded concurrency + a (size, mtime) stamp cache instead.
 
 # CR-11: the strong-ref registry + done-callback fire-and-forget pattern now
 # lives once in kira.tasks.spawn_tracked (imported at module top). This module
@@ -210,7 +226,7 @@ async def _post_notification(kind: str, title: str, body: str) -> None:
             session.add(Notification(kind=kind, title=title, body=body))
             await session.commit()
     except Exception as e:
-        print(f"_post_notification failed (non-fatal): {e!r}")
+        logger.warning(f"_post_notification failed (non-fatal): {e!r}")
 
 
 def _spawn_mediainfo_enrich(file_ids: list[int], *, reason: str | None = None) -> None:
@@ -289,40 +305,119 @@ async def enrich_mediainfo_background(file_ids: list[int], *, reason: str | None
             authoritative = await _read_mediainfo_authoritative_setting(session)
             activity.begin(_MI_ENRICH_JOB, "Reading file media info", total=total)
             started = True
-            for i, fid in enumerate(file_ids, start=1):
+
+            # Phase A (serial): load each row's path + cached read stamp so the
+            # reads can run without touching the session.
+            work: list[tuple[int, str, list[int] | None, dict | None]] = []
+            for fid in file_ids:
+                mf = await session.get(MediaFile, fid)
+                if mf is None or not mf.file_path or not mf.parsed_data:
+                    continue
+                # Defensive: parsed_data is occasionally malformed (and one bad
+                # row must never abort the whole pass — the per-file isolation
+                # lives in the consume loop, which will rollback just that row).
+                pd = mf.parsed_data if isinstance(mf.parsed_data, dict) else {}
+                work.append((fid, mf.file_path,
+                             pd.get("mi_stamp"), pd.get("mi_raw")))
+
+            # Phase B: the NAS round-trips run CONCURRENTLY (they're pure
+            # latency, not CPU), bounded so we never hammer the share. Each
+            # worker stats the file first — when (size, mtime) matches the
+            # stored stamp it reuses the cached raw dict and skips the parse
+            # entirely, which makes re-runs (rescans, toggling Authoritative
+            # tech tags) near-free. DB writes stay STRICTLY in this coroutine:
+            # the AsyncSession is not concurrency-safe.
+            #
+            # Width follows Settings → Advanced → "Concurrent sidecar fetches"
+            # (`rename.concurrency`) — same knob, same kind of work (parallel
+            # per-file I/O against the same share). Default 8 when unset.
+            try:
+                from kira.models import Setting
+                _c_row = await session.get(Setting, "rename.concurrency")
+                _c_val = _c_row.value if _c_row else None
+                if isinstance(_c_val, dict) and "value" in _c_val:
+                    _c_val = _c_val["value"]
+                width = max(1, min(32, int(_c_val)))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                width = 8
+            sem = asyncio.Semaphore(width)
+
+            # Sidecar subtitle languages already on disk — one directory listing
+            # per parent folder (not per file), computed off the loop. Folded
+            # into parsed_data so the coverage chip knows about subs we didn't
+            # write ourselves (e.g. a release that shipped an external .srt).
+            from kira.subtitles.coverage import scan_sidecar_langs
+            try:
+                sidecar_map = await asyncio.to_thread(
+                    scan_sidecar_langs, [w[1] for w in work]
+                )
+            except Exception as e:  # never let a sidecar scan abort the enrich
+                logger.warning(f"enrich_mediainfo_background: sidecar scan failed (non-fatal): {e!r}")
+                sidecar_map = {}
+
+            async def _read_one(fid: int, path: str,
+                                stamp: list[int] | None, cached: dict | None):
+                def _work():
+                    # Stat is advisory: a failed stat (network blip, exotic FS)
+                    # just means "no stamp this round" — we still attempt the
+                    # parse, exactly like the pre-cache behaviour.
+                    try:
+                        st = os.stat(path)
+                        cur = [int(st.st_size), int(st.st_mtime)]
+                    except OSError:
+                        cur = None
+                    if cur is not None and stamp == cur and cached is not None:
+                        return cached, cur  # unchanged file → cache hit, no parse
+                    return _mediainfo.read_media_info(path), cur
+                async with sem:
+                    mi, cur = await asyncio.to_thread(_work)
+                return fid, mi, cur
+
+            path_by_fid = {w[0]: w[1] for w in work}
+            done = 0
+            for fut in asyncio.as_completed([_read_one(*w) for w in work]):
                 try:
-                    mf = await session.get(MediaFile, fid)
-                    if mf is None or not mf.file_path or not mf.parsed_data:
-                        continue
-                    parsed = ParsedFile(**mf.parsed_data)
-                    changed = await _maybe_enrich_mediainfo(
-                        parsed, mf.file_path, True, authoritative
-                    )
-                    if changed:
-                        mf.parsed_data = parsed.to_dict()
-                        await session.commit()
-                        updated += 1
+                    fid, mi, cur = await fut
+                    done += 1
+                    if mi is not None or cur is not None:
+                        mf = await session.get(MediaFile, fid)
+                        if mf is not None and mf.parsed_data:
+                            parsed = ParsedFile(**mf.parsed_data)
+                            changed = _mediainfo.enrich_parsed(parsed, mi, authoritative=authoritative)
+                            if cur is not None and (parsed.mi_stamp != cur or parsed.mi_raw != mi):
+                                parsed.mi_stamp, parsed.mi_raw = cur, mi
+                                changed = True
+                            # Record on-disk sidecar languages ([] = looked, none
+                            # found) so coverage is accurate even for subs we
+                            # didn't write. Always set it here — this pass IS the
+                            # authoritative "we inspected this file" moment.
+                            sidecars = sidecar_map.get(path_by_fid.get(fid, ""), [])
+                            if parsed.sub_sidecars != sidecars:
+                                parsed.sub_sidecars = sidecars
+                                changed = True
+                            if changed:
+                                mf.parsed_data = parsed.to_dict()
+                                await session.commit()
+                                updated += 1
                 except Exception as e:
-                    print(f"enrich_mediainfo_background: file {fid} failed (non-fatal): {e!r}")
+                    done += 1
+                    logger.warning(f"enrich_mediainfo_background: file failed (non-fatal): {e!r}")
                     try:
                         await session.rollback()
                     except Exception:
                         pass
-                # Report after every file: cheap in-memory write, and it keeps the
-                # job from being marked stale during a slow NAS read.
-                activity.progress(_MI_ENRICH_JOB, i, total)
-                # Pace: yield the loop (and ease NAS pressure) between files so a
-                # big backfill never monopolises the worker.
-                await asyncio.sleep(0.02)
+                # Report after every completion: cheap in-memory write, and it
+                # keeps the job from being marked stale during a slow NAS read.
+                activity.progress(_MI_ENRICH_JOB, done, total)
     except Exception as e:
-        print(f"enrich_mediainfo_background: aborted (non-fatal): {e!r}")
+        logger.warning(f"enrich_mediainfo_background: aborted (non-fatal): {e!r}")
     finally:
         # Clear the pill even on early-abort. Guarded so a disabled/no-op run
         # (returned before begin) never flashes an empty job.
         if started:
             activity.end(_MI_ENRICH_JOB)
     if updated:
-        print(f"enrich_mediainfo_background: enriched {updated}/{len(file_ids)} file(s)")
+        logger.info(f"enrich_mediainfo_background: enriched {updated}/{len(file_ids)} file(s)")
     # Durable completion record for an explicit user action (just toggled it on).
     # Fires even when 0 changed — "checked N, updated 0" is the reassurance that
     # it ran and covered everything (their filenames simply already had the tags).
@@ -338,6 +433,32 @@ async def enrich_mediainfo_background(file_ids: list[int], *, reason: str | None
                     "your filenames already carried these tags. (Turn on "
                     "“Authoritative tech tags” to override them with the container's.)")
         await _post_notification("success", "Finished reading file media info", body)
+
+    # Auto-backfill: once a file's container has been read, we KNOW which
+    # wanted languages it's missing — so opt-in users get subs fetched
+    # automatically without a manual click. Best-effort + gated; the backfill
+    # itself filters to files actually missing a language and narrates its own
+    # progress pill. Skipped silently when the toggle is off.
+    try:
+        async with SessionLocal() as _bf_session:
+            from kira.subtitles.prefs import load_subtitle_prefs
+            _prefs = await load_subtitle_prefs(_bf_session)
+        if _prefs.backfill_after_scan and _prefs.any_source_enabled:
+            from kira.subtitles.backfill import spawn_subtitle_backfill
+            spawn_subtitle_backfill(list(file_ids))
+        # Upgrade-over-time: also re-check low-scoring subs for a better one.
+        if _prefs.upgrade and _prefs.any_source_enabled:
+            from kira.subtitles.backfill import spawn_subtitle_upgrade
+            spawn_subtitle_upgrade()
+    except Exception as e:
+        logger.warning(f"enrich_mediainfo_background: auto-backfill spawn failed (non-fatal): {e!r}")
+    # Persist anime poster URLs onto their matches so covers render from a
+    # stored URL (like TV/movies) instead of a throttled per-card AniDB lookup.
+    try:
+        from kira.posters import spawn_poster_warmup
+        spawn_poster_warmup()
+    except Exception as e:
+        logger.warning(f"enrich_mediainfo_background: poster warmup spawn failed (non-fatal): {e!r}")
     return updated
 
 
@@ -381,7 +502,7 @@ async def _maybe_rescue_title_from_mediainfo(mf: MediaFile) -> bool:
     mf.media_type = fresh.media_type
     mf.series_key = _compute_series_key(fresh)
     mf.variant_key = _compute_variant_key(fresh)
-    print(f"title-rescue: {src.name!r} -> {fresh.title!r} ({fresh.media_type}) via embedded title")
+    logger.info(f"title-rescue: {src.name!r} -> {fresh.title!r} ({fresh.media_type}) via embedded title")
     return True
 
 
@@ -406,13 +527,17 @@ async def _match_singleton(session, engine, fid: int) -> None:
     try:
         scored = await engine.match(parsed, limit=5)
     except Exception as e:
-        print(f"_match_singleton: matcher raised for file {fid}: {e!r}")
+        logger.info(f"_match_singleton: matcher raised for file {fid}: {e!r}")
         return
 
     # Resolve an episode title for the top match before we touch the DB.
     # Episode-list fetch routes through `_fetch_episodes_for_match` which
     # prefers TVDB cross-ref over AniDB direct calls — AniDB-ban hardening.
     ep_title: str | None = None
+    # Pre-init: only the tv_episode branch below assigns it, but the Match loop
+    # (resolve_canonical_season(..., episode=ep_num)) runs for EVERY match —
+    # incl. movies — so it must always be bound.
+    ep_num: int | None = None
     if scored and scored[0].match_type == "tv_episode":
         # Phase 4 validation gate: fetch the top's episode list and, for a
         # western-TV singleton whose TVDB/TMDB match doesn't contain the
@@ -424,7 +549,7 @@ async def _match_singleton(session, engine, fid: int) -> None:
                 scored, [(fid, parsed)], parsed.season, parsed.media_type, engine.registry,
             )
         except Exception as e:
-            print(f"_match_singleton: episode validation failed for file {fid}: {e!r}")
+            logger.warning(f"_match_singleton: episode validation failed for file {fid}: {e!r}")
             episodes_by_key = {}
         ep_num = parsed.absolute_episode if parsed.absolute_episode is not None else parsed.episode
         if ep_num is not None and episodes_by_key:
@@ -460,7 +585,7 @@ async def _match_singleton(session, engine, fid: int) -> None:
         # group so sibling films share a card-band.
         if rank == 0 and m.match_type == "movie" and coll_id:
             gid = f"tmdb-collection:{coll_id}"
-        canonical_season = await resolve_canonical_season(m.provider, m.provider_id, parsed.season)
+        canonical_season = await resolve_canonical_season(m.provider, m.provider_id, parsed.season, episode=ep_num)
         row_overview = m.overview or (top_overview_fallback if rank == 0 else None)
         session.add(Match(
             media_file_id=fid,
@@ -554,7 +679,7 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
         scored = await engine.match(rep_parsed, limit=5)
         matched_ok = True
     except Exception as e:
-        print(f"_match_cluster: matcher raised for cluster of {len(files)} files: {e!r}")
+        logger.info(f"_match_cluster: matcher raised for cluster of {len(files)} files: {e!r}")
         return  # leave existing Match rows untouched
 
     if not scored:
@@ -595,7 +720,7 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
             )
             top = scored[0]
         except Exception as e:
-            print(f"_match_cluster: episode validation/fetch failed: {e!r}")  # non-fatal
+            logger.warning(f"_match_cluster: episode validation/fetch failed: {e!r}")  # non-fatal
 
     # ── Per-file cour routing (Platinum solution) ──────────────────
     # When the cluster's top match is a Fribb-confirmed cour of a
@@ -632,10 +757,10 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
         except Exception as e:
             # Routing is best-effort. On ANY failure, fall back to
             # single-AID matching (no cour split).
-            print(f"_match_cluster: cour routing build failed: {e!r}")
+            logger.warning(f"_match_cluster: cour routing build failed: {e!r}")
             cour_routing = None
         if cour_routing:
-            print(
+            logger.info(
                 f"_match_cluster: cour routing for top AID {top.provider_id} "
                 f"s={rep_parsed.season}: {cour_routing}"
             )
@@ -651,7 +776,7 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
                     )
                     cour_episodes_by_aid[sib_aid] = list(eps)
                 except Exception as e:
-                    print(
+                    logger.info(
                         f"_match_cluster: cour {sib_aid} episode "
                         f"fetch failed: {e!r}"
                     )
@@ -688,7 +813,7 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
                 if season_url:
                     top.poster_url = season_url
         except Exception as e:
-            print(f"_match_cluster: per-season poster fetch failed: {e!r}")
+            logger.warning(f"_match_cluster: per-season poster fetch failed: {e!r}")
     # Other-rank matches each get their own group id (they're alternate
     # candidates, not part of this series).
     other_group_ids: dict[int, str] = {}
@@ -752,7 +877,7 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
                             if a.matched_via != "unpaired":
                                 bipartite_assignments[fid] = a
                 except Exception as e:
-                    print(f"_match_cluster: DVD-order retry failed: {e!r}")
+                    logger.warning(f"_match_cluster: DVD-order retry failed: {e!r}")
 
     # ── Franchise rescue (episode-title + franchise-absolute) ─────────
     # Files every number pass left unpaired may belong to a DIFFERENT cour
@@ -776,9 +901,9 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
                     unpaired_files, top.provider_id, engine.registry,
                 )
                 if franchise_rescued:
-                    print(f"_match_cluster: franchise rescue placed {len(franchise_rescued)} file(s)")
+                    logger.info(f"_match_cluster: franchise rescue placed {len(franchise_rescued)} file(s)")
             except Exception as e:
-                print(f"_match_cluster: franchise rescue failed (non-fatal): {e!r}")
+                logger.warning(f"_match_cluster: franchise rescue failed (non-fatal): {e!r}")
 
     # ── Title arbitration: the file's own episode title outranks a lying
     # number. Old renames can stamp wrong SxE numbers ("S04E13 - The Town
@@ -816,9 +941,9 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
                     challenged, top.provider_id, engine.registry, title_only=True,
                 )
                 if title_overrides:
-                    print(f"_match_cluster: title arbitration overrode {len(title_overrides)} number placement(s)")
+                    logger.info(f"_match_cluster: title arbitration overrode {len(title_overrides)} number placement(s)")
             except Exception as e:
-                print(f"_match_cluster: title arbitration failed (non-fatal): {e!r}")
+                logger.warning(f"_match_cluster: title arbitration failed (non-fatal): {e!r}")
 
     # Absolute→season-local map for cour routing. Lets pure-absolute-numbered
     # files (AoT Final Season "- 60".."- 89") reach the season-local cour table:
@@ -856,7 +981,7 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
         except (ValueError, TypeError):
             is_flat_umbrella = False
         except Exception as e:
-            print(f"_match_cluster: flat-umbrella check failed for {top.provider_id}: {e!r}")
+            logger.warning(f"_match_cluster: flat-umbrella check failed for {top.provider_id}: {e!r}")
             is_flat_umbrella = False
     # Reverse abs→local into local→abs for the flat-umbrella remap. `abs_to_local`
     # is keyed by absolute (unique), but the REVERSE can collide: if the episode
@@ -1042,7 +1167,7 @@ async def _match_cluster(session, engine, fids: list[int]) -> None:
             # Use the (possibly-routed) row_provider_id so a sibling cour
             # AID's canonical season is consulted (still = parsed.season
             # since all cours of a TVDB season share one season number).
-            canonical_season = await resolve_canonical_season(m.provider, row_provider_id, parsed.season)
+            canonical_season = await resolve_canonical_season(m.provider, row_provider_id, parsed.season, episode=ep_num)
             # For non-top candidates, preserve them so the user can override.
             # episode_title only meaningful on the selected (top) candidate.
             row_overview = m.overview or (top_overview_fallback if rank == 0 else None)
@@ -1114,7 +1239,7 @@ async def _try_cross_ref(provider, provider_id: str, season: int) -> tuple[bool,
     try:
         return True, await provider.get_episodes(provider_id, season)
     except Exception as e:
-        print(f"_fetch_episodes cross-ref failed for {provider_id}/s{season}: {e!r}")
+        logger.warning(f"_fetch_episodes cross-ref failed for {provider_id}/s{season}: {e!r}")
         return False, []
 
 
@@ -1154,7 +1279,7 @@ async def _franchise_rescue_unpaired(
         anidb = registry.build("anidb")
         offsets = await anidb.get_franchise_offsets(top_provider_id)
     except Exception as e:
-        print(f"_franchise_rescue: offsets unavailable (non-fatal): {e!r}")
+        logger.warning(f"_franchise_rescue: offsets unavailable (non-fatal): {e!r}")
         return {}
     if not offsets or len(offsets) > 12:
         return {}
@@ -1338,7 +1463,7 @@ async def _fetch_episodes_for_match(
                         # so downstream stays substrate-agnostic.
                         return [ep.model_copy(update={"season": 1}) for ep in result]
                 except Exception as e:
-                    print(f"_fetch_episodes cross-ref TVDB setup failed for AID {provider_id}: {e!r}")
+                    logger.warning(f"_fetch_episodes cross-ref TVDB setup failed for AID {provider_id}: {e!r}")
 
             tmdb_id = await AnimeMappings.tmdb_tv_id(aid_i)
             if tmdb_id and registry.has("tmdb"):
@@ -1350,7 +1475,7 @@ async def _fetch_episodes_for_match(
                         # Same AniDB-contract normalization as TVDB above.
                         return [ep.model_copy(update={"season": 1}) for ep in result]
                 except Exception as e:
-                    print(f"_fetch_episodes cross-ref TMDB setup failed for AID {provider_id}: {e!r}")
+                    logger.warning(f"_fetch_episodes cross-ref TMDB setup failed for AID {provider_id}: {e!r}")
         # Cross-ref unavailable / both providers transiently failed —
         # we're about to consider AniDB direct. EE-1: check the circuit
         # breaker BEFORE queuing, so a bulk worker fanning out 800 stale
@@ -1375,7 +1500,7 @@ async def _fetch_episodes_for_match(
     try:
         return await p.get_episodes(provider_id, season_for_lookup)
     except Exception as e:
-        print(f"_fetch_episodes direct {provider_key} failed: {e!r}")
+        logger.warning(f"_fetch_episodes direct {provider_key} failed: {e!r}")
         return []
 
 
@@ -1475,7 +1600,7 @@ async def _validate_and_rerank_by_episodes(
 
     if best_idx != 0 and should_promote(top_cov, best_cov):
         promoted = scored[best_idx]
-        print(
+        logger.info(
             f"_validate: episode-coverage re-rank — promoted "
             f"{promoted.provider}:{promoted.provider_id} (cov {best_cov:.2f}) over "
             f"{top.provider}:{top.provider_id} (cov {top_cov:.2f})"
@@ -1572,7 +1697,7 @@ async def _apply_folder_series_lock(session, all_new: list[int]) -> int:
         for fid, new_key in relocks.items():
             mf = mf_by_fid.get(fid)
             if mf is not None and mf.series_key != new_key:
-                print(
+                logger.info(
                     f"_folder_lock: relock file {fid} "
                     f"{mf.series_key!r} → {new_key!r}"
                 )
@@ -1586,6 +1711,38 @@ async def _apply_folder_series_lock(session, all_new: list[int]) -> int:
 # CR-07: `_compute_series_key` / `_compute_variant_key` are imported at module
 # top from kira.matcher.keys (as back-compat aliases). Their old bodies lived
 # here; see the top-of-file import.
+
+
+async def _selected_match_is_anime(
+    provider: str | None, provider_id, match_type: str | None
+) -> bool:
+    """True when the selected match identifies an ANIME — independent of the
+    file's folder.
+
+    Two authoritative signals:
+      • AniDB is an anime-only source → an AniDB match IS anime.
+      • A TVDB/TMDB *series* whose id cross-references to an AniDB id in Fribb
+        is also anime. Fribb catalogs ONLY anime, so an AID hit is definitive —
+        the same signal `fribb_aid_filter` trusts. This catches anime sitting
+        in a generic `/tv/` folder (so it never queried AniDB), e.g. a usenet
+        download whose category folder is "tv".
+
+    Movies are deliberately excluded (anime films are handled as movies, not
+    flipped onto the anime-series shelf)."""
+    if provider == "anidb":
+        return True
+    if provider in ("tvdb", "tmdb") and match_type == "tv_episode":
+        try:
+            pid = int(provider_id)
+        except (TypeError, ValueError):
+            return False
+        from kira.providers.anime_mappings import AnimeMappings
+        aid = (
+            await AnimeMappings.aid_by_tvdb(pid) if provider == "tvdb"
+            else await AnimeMappings.aid_by_tmdb_tv(pid)
+        )
+        return aid is not None
+    return False
 
 
 async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
@@ -1632,7 +1789,7 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
                 try:
                     await _maybe_rescue_title_from_mediainfo(mf)
                 except Exception as e:
-                    print(f"_match_phase: title rescue failed for {fid}: {e!r}")
+                    logger.warning(f"_match_phase: title rescue failed for {fid}: {e!r}")
         await session.commit()
         await asyncio.sleep(0)
 
@@ -1650,12 +1807,15 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
             select(Match.media_file_id).where(Match.media_file_id.in_(cfids))
         )).all())
         sel_rows = (await session.execute(
-            select(Match.media_file_id, Match.provider, Match.confidence).where(
+            select(Match.media_file_id, Match.provider, Match.confidence,
+                   Match.provider_id, Match.match_type).where(
                 Match.media_file_id.in_(cfids), Match.is_selected.is_(True)
             )
         )).all()
-        sel_provider_by_fid = {fid: prov for fid, prov, _ in sel_rows}
-        sel_conf_by_fid = {fid: conf for fid, _, conf in sel_rows}
+        sel_provider_by_fid = {fid: prov for fid, prov, _, _, _ in sel_rows}
+        sel_conf_by_fid = {fid: conf for fid, _, conf, _, _ in sel_rows}
+        sel_pid_by_fid = {fid: pid for fid, _, _, pid, _ in sel_rows}
+        sel_mtype_by_fid = {fid: mt for fid, _, _, _, mt in sel_rows}
 
         for fid in cfids:
             has_match = fid in matched_fids
@@ -1678,7 +1838,14 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
                 # its anime siblings. Recompute the series/variant keys off the
                 # corrected media_type so it re-clusters under the anime identity.
                 if mf and mf.media_type != "anime" and mf.parsed_data:
-                    if sel_provider_by_fid.get(fid) == "anidb":
+                    # Anime detection independent of folder: a direct AniDB match
+                    # OR a TVDB/TMDB series whose id cross-refs to an AniDB id in
+                    # Fribb (so anime in a generic /tv/ folder is caught too).
+                    if await _selected_match_is_anime(
+                        sel_provider_by_fid.get(fid),
+                        sel_pid_by_fid.get(fid),
+                        sel_mtype_by_fid.get(fid),
+                    ):
                         # CR-09: shared helper sets media_type FIRST then
                         # recomputes the keys, so even if the recompute raises
                         # the grouping fix ("at least set media_type=anime")
@@ -1688,7 +1855,7 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
                             apply_media_type_and_recompute_keys(mf, "anime")
                         except Exception as e:
                             mf.media_type = "anime"  # at least fix the grouping
-                            print(f"_match_phase: media_type correction key recompute failed for {fid}: {e!r}")
+                            logger.warning(f"_match_phase: media_type correction key recompute failed for {fid}: {e!r}")
             elif mf and mf.status == "matching":
                 mf.status = "no_match"
 
@@ -1723,7 +1890,6 @@ async def _prune_missing_files(
     CALLER CONTRACT: invoke ONLY after a fully healthy walk (no unreachable root,
     no scandir error) — otherwise an unreadable subtree makes present files look
     missing and this would nuke them. Returns the number of rows pruned."""
-    from kira.api.webhooks import path_under_roots
     from kira.api.files import _delete_one
 
     def _confirmed_gone(p: str) -> bool:
@@ -1735,11 +1901,29 @@ async def _prune_missing_files(
         except OSError:
             return False                 # permission / NAS hiccup → keep
 
+    # Scope check, drive-letter/UNC AWARE. A row stored under one spelling of a
+    # share — e.g. the UNC `\\192.168.0.63\Data\…` form an earlier rename wrote —
+    # must still count as "under" a root scanned via its mapped-drive spelling
+    # (`Z:\…`); otherwise the raw-string `path_under_roots` judges it out-of-scope
+    # and the stale row can NEVER be pruned (this is the phantom-duplicate bug:
+    # a file renamed away on disk leaves an unreachable ghost row that then looks
+    # like a second copy of the episode). `norm_fn` already emits the alias-
+    # swapped + both-slash forms (it carries the resolved root prefixes), so we
+    # compare normalized prefixes instead of the raw string.
+    root_prefixes = {f.rstrip("/\\") for r in root_paths for f in norm_fn(r)}
+
+    def _under_scanned_roots(p: str) -> bool:
+        for f in norm_fn(p):
+            for rp in root_prefixes:
+                if f == rp or f.startswith(rp + "/") or f.startswith(rp + "\\"):
+                    return True
+        return False
+
     rows = (await session.execute(select(MediaFile.id, MediaFile.file_path))).all()
     candidates: list[int] = []
     for fid, fp in rows:
-        if not fp or not path_under_roots(fp, root_paths):
-            continue                     # outside the scanned scope
+        if not fp or not _under_scanned_roots(fp):
+            continue                     # outside the scanned scope (alias-aware)
         if norm_fn(fp) & walked_norm:
             continue                     # the walk saw it this scan → present
         if await asyncio.to_thread(_confirmed_gone, fp):
@@ -1754,7 +1938,7 @@ async def _prune_missing_files(
             await _delete_one(session, mf, keep_on_disk=True, roots=[])
             removed += 1
         except Exception as e:
-            print(f"_prune_missing_files: {fid} failed (non-fatal): {e!r}")
+            logger.warning(f"_prune_missing_files: {fid} failed (non-fatal): {e!r}")
 
     if removed:
         from kira.models import Notification
@@ -1766,7 +1950,7 @@ async def _prune_missing_files(
                   "them from Review. Rename history is kept."),
         ))
         await session.commit()
-        print(f"_scan_worker: pruned {removed} file(s) gone from disk")
+        logger.info(f"_scan_worker: pruned {removed} file(s) gone from disk")
     return removed
 
 
@@ -1876,6 +2060,18 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
             # here (not inside scanner.walk) because walk() recurses on
             # symlinked dirs and a per-call reset would erase parent state.
             scanner.reset_walk_errors()
+            # User-defined ignore globs (Settings → Paths) — refreshed per
+            # scan so edits apply to the very next run.
+            try:
+                from kira.models import Setting as _Setting
+                _ig_row = await session.get(_Setting, "scanning.ignore_patterns")
+                _ig = _ig_row.value if _ig_row else None
+                if isinstance(_ig, dict) and "value" in _ig:
+                    _ig = _ig["value"]
+                scanner.set_user_ignores(_ig if isinstance(_ig, list) else None)
+            except Exception as e:
+                logger.warning(f"scan: ignore-patterns load failed (non-fatal): {e!r}")
+                scanner.set_user_ignores(None)
             # Bug A: walk every configured root in sequence. All
             # discovered files land in the same `new_files` list →
             # one Phase 2 pass matches them all together so clusters
@@ -1986,7 +2182,7 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
                         session, root_paths, walked_paths_this_scan, _norm,
                     )
                 except Exception as e:
-                    print(f"_scan_worker: prune-missing failed (non-fatal): {e!r}")
+                    logger.warning(f"_scan_worker: prune-missing failed (non-fatal): {e!r}")
 
             # RESUME: also match files a prior interrupted scan left in
             # "discovered" (boot reset stuck "matching" → "discovered"). The
@@ -2050,7 +2246,7 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
             ]
             match_ids = all_new + _leftover
             if _leftover:
-                print(f"_scan_worker: resuming {len(_leftover)} leftover file(s) from a prior interrupted scan")
+                logger.info(f"_scan_worker: resuming {len(_leftover)} leftover file(s) from a prior interrupted scan")
 
             scan = await session.get(Scan, scan_id)
             if scan:
@@ -2071,9 +2267,9 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
             try:
                 relocked = await _apply_folder_series_lock(session, all_new)
                 if relocked:
-                    print(f"_scan_worker: folder-lock relocked {relocked} outlier file(s)")
+                    logger.info(f"_scan_worker: folder-lock relocked {relocked} outlier file(s)")
             except Exception as e:
-                print(f"_scan_worker: folder-lock pass failed (non-fatal): {e!r}")
+                logger.warning(f"_scan_worker: folder-lock pass failed (non-fatal): {e!r}")
 
             # ── Phase 2: match. Cluster by series_key first so a 26-episode
             # anime fires 2 API calls (one search + one episode list) instead
@@ -2145,7 +2341,7 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
                     await notify.fan_out("info", _auto_title,
                                          "New media was found in a watched folder and matched.")
                 except Exception as e:
-                    print(f"_scan_worker: notification fan-out failed (non-fatal): {e!r}")
+                    logger.warning(f"_scan_worker: notification fan-out failed (non-fatal): {e!r}")
             await session.commit()
 
             # Self-prune the rename log to the configured retention window.
@@ -2156,7 +2352,17 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
                 from kira.api.history import prune_old_history
                 await prune_old_history(session)
             except Exception as e:
-                print(f"_scan_worker: history prune failed (non-fatal): {e!r}")
+                logger.warning(f"_scan_worker: history prune failed (non-fatal): {e!r}")
+
+            # Reap expired subtitle reuse-cache entries on the same recurring
+            # event (subtitles.cache_retention_days; 0 = keep forever). Riding
+            # along with the history prune keeps the "self-prunes without a
+            # scheduler" promise. Best-effort — never fails a completed scan.
+            try:
+                from kira.subtitles.subcache import sweep_expired
+                await sweep_expired()
+            except Exception as e:
+                logger.warning(f"_scan_worker: subtitle-cache sweep failed (non-fatal): {e!r}")
 
             # CR-10: the per-folder auto_rename hook USED to run here, INSIDE
             # the `_SCAN_LOCK` + DB scan-lock. A slow rename (artwork download
@@ -2168,21 +2374,39 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
                 auto_rename_ids = list(all_new)
 
             # Background tech-tag enrichment (ALL scan sources). Reads true
-            # container metadata (resolution/codec/HDR/channels/audio) for this
-            # scan's new files OFF the critical path — detached so the scan is
-            # already "completed" and results are on screen; the chips + dupe
-            # ranker just sharpen on the next /files poll. No-op unless
-            # `parsing.read_mediainfo` is on (and the native lib is present).
-            # (Fire-and-forget — returns immediately, doesn't hold the lock.)
-            _spawn_mediainfo_enrich(all_new)
-        except Exception as e:
-            scan = await session.get(Scan, scan_id)
-            if scan:
-                scan.status = f"failed: {e}"[:200]
-                # Naive UTC to match SQLite's storage of `server_default=func.now()`
-                # — comparing aware vs naive 500s every downstream filter.
-                scan.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
-            await session.commit()
+            # container metadata (resolution/codec/HDR/channels/audio) OFF the
+            # critical path — detached so the scan is already "completed" and
+            # results are on screen; the chips + dupe ranker just sharpen on the
+            # next /files poll. No-op unless `parsing.read_mediainfo` is on (and
+            # the native lib is present). (Fire-and-forget — doesn't hold the lock.)
+            #
+            # Covers this scan's NEW files PLUS any already-known file that has
+            # never had its container read (`mi_stamp` is null) — so a plain
+            # rescan dependably backfills tech tags for the whole library, not
+            # just freshly-discovered files. The union is gated on the setting so
+            # a feature-off scan stays a pure no-op; self-limiting otherwise.
+            enrich_ids = list(all_new)
+            try:
+                if await _read_mediainfo_setting(session):
+                    _seen = set(enrich_ids)
+                    enrich_ids.extend(
+                        i for i in await _ids_missing_tech_tags(session) if i not in _seen
+                    )
+            except Exception as e:
+                logger.warning(f"_scan_worker: tech-tag backfill set failed (non-fatal): {e!r}")
+            _spawn_mediainfo_enrich(enrich_ids)
+        except Exception:
+            # The worker session may be POISONED here: a commit that lost SQLite's
+            # single write-lock (busy_timeout, under scan↔auto-heal contention)
+            # leaves the session rollback-pending, so recording the failure ON IT
+            # raises AGAIN (PendingRollbackError) and buries the real cause behind a
+            # bare "failed". Roll back and re-raise — `_scan_worker_locked` records
+            # the failure WITH its reason and scrubs partial rows on a FRESH session.
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            raise
     # CR-10: returned to `_scan_worker_locked` so the auto-rename phase runs
     # OUTSIDE the scan lock. None ⇒ nothing to auto-rename (manual scan, no new
     # files, or the worker errored before deciding).
@@ -2301,7 +2525,7 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
         try:
             try:
                 auto_rename_ids = await _scan_worker(scan_id, root_paths)
-            except Exception:
+            except Exception as e:
                 async with SessionLocal() as cleanup:
                     # Delete dependent Match rows FIRST. The matches FK has no
                     # ON DELETE CASCADE on already-created DBs, so with
@@ -2316,7 +2540,19 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
                     await cleanup.execute(
                         delete(MediaFile).where(MediaFile.scan_id == scan_id)
                     )
+                    # Mark the scan FAILED so it doesn't sit at "scanning" forever.
+                    # Previously the row was left untouched on a worker exception —
+                    # the lock released, but the status never flipped, so a crash
+                    # before the first file showed in the UI as an eternal
+                    # in-progress scan at 0 files (exactly what the user saw).
+                    _failed = await cleanup.get(Scan, scan_id)
+                    if _failed is not None and _failed.status == "scanning":
+                        # Record the REAL reason (e.g. "database is locked") instead
+                        # of a bare "failed", so the UI + logs explain the failure.
+                        _failed.status = f"failed: {e}"[:200]
+                        _failed.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     await cleanup.commit()
+                logger.exception(f"_scan_worker_locked: scan {scan_id} failed — marked failed")
                 raise
         finally:
             # Always drop the DB lock — success, crash, cancellation.
@@ -2325,7 +2561,7 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
             try:
                 await _release_db_scan_lock()
             except Exception as e:
-                print(f"_scan_worker_locked: failed to release scan lock: {e!r}")
+                logger.warning(f"_scan_worker_locked: failed to release scan lock: {e!r}")
 
     # CR-10: BOTH locks are now released (the `async with _SCAN_LOCK` block has
     # exited and its finally dropped the DB flag). Run the auto-rename phase
@@ -2337,7 +2573,7 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
             from kira.watcher import maybe_auto_rename
             await maybe_auto_rename(scan_id, auto_rename_ids)
         except Exception as e:
-            print(f"_scan_worker_locked: auto_rename hook failed (non-fatal): {e!r}")
+            logger.warning(f"_scan_worker_locked: auto_rename hook failed (non-fatal): {e!r}")
 
 
 async def _reparse_worker(scan_id: int) -> None:
@@ -2372,7 +2608,7 @@ async def _reparse_worker(scan_id: int) -> None:
                 try:
                     parsed = parse_path(mf.file_path)
                 except Exception as e:
-                    print(f"_reparse_worker: parse failed for {fid}: {e!r}")
+                    logger.warning(f"_reparse_worker: parse failed for {fid}: {e!r}")
                     continue
                 mf.parsed_data = parsed.to_dict()
                 mf.media_type = parsed.media_type
@@ -2391,9 +2627,9 @@ async def _reparse_worker(scan_id: int) -> None:
             try:
                 relocked = await _apply_folder_series_lock(session, all_ids)
                 if relocked:
-                    print(f"_reparse_worker: folder-lock relocked {relocked} file(s)")
+                    logger.info(f"_reparse_worker: folder-lock relocked {relocked} file(s)")
             except Exception as e:
-                print(f"_reparse_worker: folder-lock failed (non-fatal): {e!r}")
+                logger.warning(f"_reparse_worker: folder-lock failed (non-fatal): {e!r}")
 
             # ── Re-match, preserving manual pins ──
             scan = await session.get(Scan, scan_id)
@@ -2435,12 +2671,23 @@ async def _reparse_worker(scan_id: int) -> None:
             # file without blocking the request.
             _spawn_mediainfo_enrich(all_ids)
         except Exception as e:
-            print(f"_reparse_worker failed: {e!r}")
-            scan = await session.get(Scan, scan_id)
-            if scan:
-                scan.status = f"failed: {e}"[:200]
-                scan.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
-            await session.commit()
+            logger.warning(f"_reparse_worker failed: {e!r}")
+            # Same poisoned-session guard as _scan_worker: a lost-write-lock commit
+            # leaves this session rollback-pending, so stamp the failure on a FRESH
+            # one (recording on the poisoned session would raise PendingRollbackError).
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            try:
+                async with SessionLocal() as _es:
+                    scan = await _es.get(Scan, scan_id)
+                    if scan:
+                        scan.status = f"failed: {e}"[:200]
+                        scan.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    await _es.commit()
+            except Exception as _e2:
+                logger.warning(f"_reparse_worker: recording failure status failed: {_e2!r}")
 
 
 async def _reparse_worker_locked(scan_id: int) -> None:
@@ -2457,7 +2704,7 @@ async def _reparse_worker_locked(scan_id: int) -> None:
             try:
                 await _release_db_scan_lock()
             except Exception as e:
-                print(f"_reparse_worker_locked: failed to release scan lock: {e!r}")
+                logger.warning(f"_reparse_worker_locked: failed to release scan lock: {e!r}")
 
 
 @router.post("/reparse", response_model=ScanOut, status_code=201)
@@ -2501,7 +2748,7 @@ async def reparse_library(
         try:
             await _release_db_scan_lock()
         except Exception as e:
-            print(f"reparse_library: lock release after failure also failed: {e!r}")
+            logger.warning(f"reparse_library: lock release after failure also failed: {e!r}")
         raise
 
 
@@ -2574,7 +2821,7 @@ async def _start_scan(paths: list[str], source: str = "manual") -> int | None:
             try:
                 await _release_db_scan_lock()
             except Exception as e:
-                print(f"_start_scan: lock release after failure also failed: {e!r}")
+                logger.warning(f"_start_scan: lock release after failure also failed: {e!r}")
             raise
 
     # Launch outside the session context. CR-11: route through spawn_tracked so

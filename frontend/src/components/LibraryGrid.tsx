@@ -3,12 +3,12 @@
 // Owns: CoverCard (atomic unit), section headers, scan-in-progress floater,
 //       empty / zero-result states.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { LibraryItem, MediaType } from '../lib/types';
 import { pluralize } from '../lib/format';
 import {
   IcCheck, IcX, IcSearch, IcAlertTri, IcDownload,
-  IcTv, IcAnime, IcFilm, IcMusic, IcDisc, IcReview,
+  IcTv, IcAnime, IcFilm, IcMusic, IcDisc, IcReview, IcCaption,
 } from '../lib/icons';
 import { MediaTypeIcon } from './ui';
 import { fetchAnidbPoster, getCachedAnidbPoster } from '../lib/posters';
@@ -325,7 +325,14 @@ export function CoverCard({
   return (
     <div
       className={cardClass}
-      style={{ ['--i' as never]: index } as React.CSSProperties}
+      style={{
+        ['--i' as never]: index,
+        // Expose the poster tint as CSS vars so the cinematic hover glow
+        // (a transform/opacity-only `::before` in index.css) can bleed the
+        // card's own dominant colors without any JS or per-card state.
+        ['--tint-a' as never]: tint[0],
+        ['--tint-b' as never]: tint[1],
+      } as React.CSSProperties}
       onClick={handleCardClick}
       onKeyDown={handleCardKey}
       role="button"
@@ -422,6 +429,21 @@ export function CoverCard({
           {sonarrQueue && sonarrQueue.length > 0 ? (
             <CardSonarrPill entries={sonarrQueue} />
           ) : null}
+
+          {/* Missing-preferred-subtitles badge (bottom-right): the at-a-glance
+              signal that some files in this title lack a wanted language.
+              Count = affected files; the popup's "Get subtitles" fixes them. */}
+          {(() => {
+            const n = item.files.filter(f => f.missingSubs && f.missingSubs.length > 0).length;
+            if (n === 0) return null;
+            const langs = [...new Set(item.files.flatMap(f => f.missingSubs ?? []))]
+              .map(l => l.toUpperCase()).join(', ');
+            return (
+              <span className="cc-sub-missing" title={`${n} file${n === 1 ? '' : 's'} missing ${langs} subtitles — open and click “Get subtitles”`}>
+                <IcCaption /> {n}
+              </span>
+            );
+          })()}
         </div>
       )}
 
@@ -567,6 +589,25 @@ export function LibraryGrid({
       else out[it.mediaType]?.push(it);
     });
     return { needsMatching: nm, grouped: out };
+  }, [items]);
+
+  // A franchise renders as a collection SHELF once it has ≥2 members in the
+  // grid — and, once it has, it STAYS a shelf until every member is processed
+  // out, so renaming all-but-one season doesn't collapse the survivor back
+  // into a lone card mid-session. We remember the "graduated" group ids in a
+  // ref (it survives the post-rename re-render) and forget a group the moment
+  // it fully empties, so a later rescan starts it fresh. Resets on a hard
+  // reload — acceptable; the persistence that matters is within a rename pass.
+  const everShelvedRef = useRef<Set<string>>(new Set());
+  const shelfGroupIds = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const it of items) {
+      if (it.seriesGroupId) counts.set(it.seriesGroupId, (counts.get(it.seriesGroupId) ?? 0) + 1);
+    }
+    const ever = everShelvedRef.current;
+    for (const [gid, n] of counts) if (n >= 2) ever.add(gid);
+    for (const gid of Array.from(ever)) if (!counts.has(gid)) ever.delete(gid);
+    return new Set(ever);
   }, [items]);
 
   const anySelected = selected.size > 0;
@@ -716,7 +757,7 @@ export function LibraryGrid({
               arr, sec.key,
               { selected, setSelected, focusedId, setFocusedId, anySelected,
                 onOpenCover, onApprove, onReject, onManualSearch,
-                sonarrQueueMaps },
+                sonarrQueueMaps, shelfGroupIds },
             )}
           </section>
         );
@@ -742,7 +783,8 @@ export function LibraryGrid({
           {renderSectionBody(
             needsMatching, 'anime',
             { selected, setSelected, focusedId, setFocusedId, anySelected,
-              onOpenCover, onApprove, onReject, onManualSearch, sonarrQueueMaps },
+              onOpenCover, onApprove, onReject, onManualSearch, sonarrQueueMaps,
+              shelfGroupIds },
           )}
         </section>
       ) : null}
@@ -769,6 +811,10 @@ interface SectionCtx {
    *  own slice. Keeping the maps on ctx avoids passing them through
    *  every intermediate prop while still scoping lookup to the grid. */
   sonarrQueueMaps: QueueMaps;
+  /** Group ids that should render as a franchise SHELF even at a single
+   *  remaining member — a franchise that was once ≥2 in the grid and hasn't
+   *  fully emptied (see `shelfGroupIds` in LibraryGrid). */
+  shelfGroupIds: Set<string>;
 }
 
 /** Resolve a card's Sonarr queue entries.
@@ -880,7 +926,10 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
     if (consumed.has(it.id)) return;
     const gid = it.seriesGroupId;
     const members = gid ? byGroup.get(gid) : undefined;
-    if (members && members.length >= 2) {
+    // ≥2 members forms a shelf; a franchise already "graduated" to a shelf
+    // (in shelfGroupIds) stays one down to its last member, so renaming all
+    // but one season doesn't collapse the survivor into a lone card.
+    if (members && (members.length >= 2 || ctx.shelfGroupIds.has(gid!))) {
       groupBlocks.push({ kind: 'group', key: gid!, items: members });
       members.forEach(m => consumed.add(m.id));
     } else {
@@ -1020,6 +1069,9 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
           <span className="lib-franchise-tick" />
           <h3 className="lib-franchise-title">{franchiseTitle}</h3>
           <span className="lib-franchise-meta">{counter}</span>
+          {/* Collection-shelf count chip: reads "N" seasons/entries at a
+              glance. Pure presentational; mirrors the section-head count. */}
+          <span className="lib-franchise-badge" aria-hidden="true">{totalSeasons}</span>
         </header>
         <div className={`lib-grid ${shape} lib-franchise-grid`}>
           {sorted.map((item, i) => (

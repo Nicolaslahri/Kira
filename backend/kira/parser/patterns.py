@@ -44,8 +44,12 @@ class SxEMatch:
 #    `~03`, `& E02`, ` and 02`). Group 4 covers the GLUED form `S01E01E02`
 #    (no separator at all) that batch rippers emit — without it the second
 #    episode silently dropped and a 2-parter imported as a single episode.
+#    The `(?:E\d{1,4})*` before group 4 absorbs ANY extra glued episodes so
+#    a 3+-parter (`S01E01E02E03`) still matches — group 4 captures the LAST
+#    one as the upper bound. Without it the trailing `\b` can't anchor between
+#    two glued `E\d` tokens and the WHOLE match fails (file → unmatchable).
 _P1_STANDARD = re.compile(
-    r"\bS(\d{1,2})E(\d{1,4})(?:(?:\s*[-~&+]\s*|\s+and\s+)E?(\d{1,4})|E(\d{1,4}))?\b",
+    r"\bS(\d{1,2})E(\d{1,4})(?:(?:\s*[-~&+]\s*|\s+and\s+)E?(\d{1,4})|(?:E\d{1,4})*E(\d{1,4}))?\b",
     re.IGNORECASE,
 )
 

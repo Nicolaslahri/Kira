@@ -240,6 +240,7 @@ class WatcherService:
             asyncio.create_task(self._awatch_loop(), name="kira-watcher-awatch"),
             asyncio.create_task(self._debounce_loop(), name="kira-watcher-debounce"),
             asyncio.create_task(self._poll_loop(), name="kira-watcher-poll"),
+            asyncio.create_task(self._startup_catchup(), name="kira-watcher-catchup"),
         ]
         _log.info(
             "watcher: armed over %d dir(s); debounce=%ds poll=%ds",
@@ -263,22 +264,50 @@ class WatcherService:
 
     # ── trigger loops ────────────────────────────────────────────────────
 
+    async def _startup_catchup(self) -> None:
+        """One catch-up scan shortly after the watcher arms.
+
+        Neither trigger covers files that arrived while Kira was NOT running:
+        awatch only reports future changes, and the poll loop's first tick
+        deliberately records a baseline without firing — so a download that
+        finished while the server was off (or the machine asleep) would sit
+        on disk unscanned until some unrelated change happened to wake a
+        trigger. The catch-up closes that gap; the scan is incremental, so
+        an unchanged library makes it a cheap no-op.
+        """
+        try:
+            await asyncio.sleep(15)  # let boot (and uvicorn reload storms) settle
+            if self._stop_event is None or self._stop_event.is_set():
+                return
+            await self._fire("startup")
+        except asyncio.CancelledError:
+            raise
+
     async def _awatch_loop(self) -> None:
         try:
             from watchfiles import awatch
         except Exception as e:  # noqa: BLE001
             _log.warning("watcher: watchfiles unavailable, FS events off: %r", e)
             return
-        assert self._stop_event is not None
-        try:
-            async for changes in awatch(*self._dirs, stop_event=self._stop_event, recursive=True):
-                if any(not _is_ignored_path(path) for _change, path in changes):
-                    self._dirty = True
-                    self._last_event = time.monotonic()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 — a vanished dir etc. mustn't crash boot
-            _log.warning("watcher: awatch loop ended: %r", e)
+        # Retry with backoff: a transient failure (an SMB hiccup, a briefly
+        # vanished mount) must not permanently end FS events — before this,
+        # one exception here silenced the event trigger until restart.
+        backoff = 5
+        while self._stop_event is not None and not self._stop_event.is_set():
+            try:
+                async for changes in awatch(*self._dirs, stop_event=self._stop_event, recursive=True):
+                    backoff = 5  # healthy again
+                    if any(not _is_ignored_path(path) for _change, path in changes):
+                        self._dirty = True
+                        self._last_event = time.monotonic()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — a vanished dir etc. mustn't crash boot
+                _log.warning("watcher: awatch loop crashed (%r) — restarting in %ds", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 300)
+            else:
+                return  # clean exit via stop_event
 
     async def _debounce_loop(self) -> None:
         try:
@@ -287,8 +316,11 @@ class WatcherService:
                 if not self._dirty:
                     continue
                 if (time.monotonic() - self._last_event) >= self._debounce_seconds:
-                    self._dirty = False
-                    await self._fire("event")
+                    # Only consume the dirty flag when a scan actually
+                    # started — a skipped fire (another scan already running)
+                    # must retry, not drop the change on the floor.
+                    if await self._fire("event"):
+                        self._dirty = False
         except asyncio.CancelledError:
             raise
 
@@ -307,8 +339,11 @@ class WatcherService:
                     break
                 sig = await asyncio.to_thread(self._compute_signature)
                 if self._last_signature is not None and sig != self._last_signature:
-                    self._last_signature = sig
-                    await self._fire("poll")
+                    # Advance the signature only when the scan actually
+                    # started; on a skipped fire keep the old one so the
+                    # change re-triggers on the next tick.
+                    if await self._fire("poll"):
+                        self._last_signature = sig
                 else:
                     self._last_signature = sig
         except asyncio.CancelledError:
@@ -339,14 +374,16 @@ class WatcherService:
 
     # ── fire ─────────────────────────────────────────────────────────────
 
-    async def _fire(self, reason: str) -> None:
+    async def _fire(self, reason: str) -> bool:
+        """Trigger an auto-scan. Returns True only when a scan actually
+        started — callers use this to retry instead of losing the change."""
         try:
             from kira.api.scans import _start_scan  # lazy: avoid import cycle
 
             scan_id = await _start_scan(list(self._dirs), source="auto")
             if scan_id is None:
                 _log.debug("watcher: skip auto-scan (%s) — scan already running", reason)
-                return
+                return False
             self._last_fire_at = datetime.now(timezone.utc).isoformat()
             self._last_reason = reason
             _log.info("watcher: auto-scan triggered (%s), scan_id=%s", reason, scan_id)
@@ -354,8 +391,10 @@ class WatcherService:
             # hook (scans.py → maybe_auto_rename, which actually renames the
             # files that clear threshold). The scan itself is fire-and-forget;
             # we don't await it here.
+            return True
         except Exception as e:  # noqa: BLE001 — a trigger failure must not kill the loop
             _log.warning("watcher: failed to fire auto-scan (%s): %r", reason, e)
+            return False
 
     # ── status ───────────────────────────────────────────────────────────
 

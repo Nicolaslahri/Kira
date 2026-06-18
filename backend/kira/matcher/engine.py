@@ -9,6 +9,8 @@ Confidence is a weighted blend (see plan §3c):
 
 from __future__ import annotations
 
+import logging
+
 import asyncio
 import contextvars
 import re as _engine_re
@@ -33,6 +35,8 @@ from kira.providers.base import (
     TVResult,
 )
 from kira.providers.factory import KEYLESS_PROVIDERS
+
+logger = logging.getLogger(__name__)
 
 
 # Retry policy. TWO schedules, picked by error class — this matters a LOT:
@@ -80,7 +84,7 @@ async def _provider_call_with_retry(coro_factory, *, what: str):
         if attempt >= len(backoffs):
             break
         delay = backoffs[attempt] + random.uniform(0, jitter)
-        print(f"matcher: {what} {kind} error ({last_err!r}); retry {attempt + 1}/{len(backoffs)} in {delay:.2f}s")
+        logger.warning(f"matcher: {what} {kind} error ({last_err!r}); retry {attempt + 1}/{len(backoffs)} in {delay:.2f}s")
         await asyncio.sleep(delay)
         attempt += 1
     # Out of retries — raise as a typed exception so callers can distinguish
@@ -131,6 +135,37 @@ def resolve_provider_order(media_type: str, settings: dict | None) -> list[Provi
         return list(default)
     tail = [p for p in default if p not in chosen]   # soft: keep omitted defaults as fallback
     return chosen + tail  # type: ignore[return-value]
+
+
+# Anime cross-reference order: when a title is matched on AniDB (sparse episode
+# titles, no cast/studio data), Kira enriches via the Fribb cross-ref to a
+# fuller provider — episode names in the popup AND cast/studio in the NFO.
+# Default TVDB-first (richer English titles), TMDB fallback. The user flips it
+# via `matching.anime_crossref_order`. Only TVDB/TMDB carry the Fribb cross-ref,
+# so the set is fixed; SOFT like the provider order — the omitted source stays a
+# trailing fallback so a flip never strands enrichment.
+_ANIME_CROSSREF_DEFAULT: list[str] = ["tvdb", "tmdb"]
+_CROSSREF_KEYS: frozenset[str] = frozenset({"tvdb", "tmdb"})
+
+
+def resolve_anime_crossref_order(settings: dict | None) -> list[str]:
+    """Ordered cross-ref providers for AniDB enrichment (episode titles + NFO
+    metadata), honoring `matching.anime_crossref_order`. Default ["tvdb","tmdb"].
+    SOFT: the user's pick comes first, the omitted default is appended as a
+    fallback. Unknown / junk keys (incl. "anidb" — it's the source, not a
+    cross-ref target) are dropped; empty/missing yields the default."""
+    if not settings:
+        return list(_ANIME_CROSSREF_DEFAULT)
+    raw = settings.get("matching.anime_crossref_order")
+    if isinstance(raw, dict):            # tolerate a {"value": [...]} wrapper
+        raw = raw.get("value")
+    if not isinstance(raw, list):
+        return list(_ANIME_CROSSREF_DEFAULT)
+    chosen = [p for p in raw if isinstance(p, str) and p in _CROSSREF_KEYS]
+    if not chosen:
+        return list(_ANIME_CROSSREF_DEFAULT)
+    tail = [p for p in _ANIME_CROSSREF_DEFAULT if p not in chosen]
+    return chosen + tail
 
 
 @dataclass
@@ -296,18 +331,18 @@ class MatchEngine:
                 # must fix. Record it (first wins) so the scan worker surfaces
                 # a notification instead of leaving silent no-matches.
                 self.provider_errors.setdefault(key, f"authentication / configuration error ({e})")
-                print(f"matcher: provider {key} permanent error: {e!r}")
+                logger.warning(f"matcher: provider {key} permanent error: {e!r}")
                 continue
             except ProviderTransientError as e:
                 # Retries exhausted — provider unreachable / timing out / down.
                 self.provider_errors.setdefault(key, f"unreachable or timing out ({e})")
-                print(f"matcher: provider {key} transient error: {e!r}")
+                logger.warning(f"matcher: provider {key} transient error: {e!r}")
                 continue
             except Exception as e:
                 # Provider raised something else — keep trying the others. We do
                 # NOT discard previously-gathered scored matches here.
                 self.provider_errors.setdefault(key, f"unexpected error ({type(e).__name__})")
-                print(f"matcher: provider {key} raised: {e!r}")
+                logger.info(f"matcher: provider {key} raised: {e!r}")
                 continue
             if not scored:
                 continue
@@ -378,10 +413,10 @@ class MatchEngine:
             # exempt — it returns a dict even with no display title, because the
             # AID itself is a valid identity.)
             if meta is None:
-                print(f"matcher: embedded-id {key}:{pid} did not resolve ({mt}) — skipping")
+                logger.warning(f"matcher: embedded-id {key}:{pid} did not resolve ({mt}) — skipping")
                 continue
             title = meta.get("title") or parsed.title or f"{key}:{pid}"
-            print(f"matcher: embedded-id match {key}:{pid} -> {title!r}")
+            logger.info(f"matcher: embedded-id match {key}:{pid} -> {title!r}")
             return [ScoredMatch(
                 provider=key, provider_id=str(pid), match_type=mt,
                 confidence=1.0, title=title,
@@ -426,7 +461,7 @@ class MatchEngine:
                 # All retries exhausted on this rung — fall through to the
                 # next, simpler query; if it also fails the file ends up
                 # no_match for this run. Next scan will retry.
-                print(f"matcher: {label} gave up: {e!r}")
+                logger.info(f"matcher: {label} gave up: {e!r}")
                 continue
             if results:
                 break
@@ -696,7 +731,7 @@ async def _filter_anime_to_known_aids(
     # R2-C3 short-circuit: empty Fribb → fetch extended metadata for
     # high-trigram candidates only, keep the JP-origin ones.
     if not AnimeMappings._by_aid:
-        print("matcher: Fribb cache empty; falling back to language-based anime detection.")
+        logger.info("matcher: Fribb cache empty; falling back to language-based anime detection.")
         if provider is None or not hasattr(provider, "get_series_extended"):
             # No way to language-check — fall back to unfiltered pass.
             # Anime floor (0.80) will filter most junk; some junk may
@@ -1215,7 +1250,7 @@ async def fetch_match_metadata(
         if hasattr(provider, "get_series_extended"):
             return await provider.get_series_extended(provider_id)  # type: ignore[attr-defined]
     except Exception as e:
-        print(f"fetch_match_metadata: {provider_key}/{provider_id} failed: {e!r}")
+        logger.warning(f"fetch_match_metadata: {provider_key}/{provider_id} failed: {e!r}")
         return None
     return None
 
@@ -1239,26 +1274,35 @@ async def _anime_metadata_via_cross_ref(
     except (ValueError, TypeError):
         return {}
 
-    # Prefer TVDB (richer character/cast data); fall back to TMDB.
-    tvdb_id = await AnimeMappings.tvdb_id(aid_i)
-    if tvdb_id and registry.has("tvdb"):
-        try:
+    # Cross-ref order honors `matching.anime_crossref_order` (default TVDB-first
+    # — richer character/cast data; TMDB fallback). First non-empty result wins.
+    order = resolve_anime_crossref_order(await _load_db_settings())
+
+    async def _from_tvdb() -> dict:
+        tvdb_id = await AnimeMappings.tvdb_id(aid_i)
+        if tvdb_id and registry.has("tvdb"):
             tvdb = registry.build("tvdb")
             if hasattr(tvdb, "get_series_extended"):
-                data = await tvdb.get_series_extended(str(tvdb_id))  # type: ignore[attr-defined]
-                if data:
-                    return data
-        except Exception:
-            pass
+                return await tvdb.get_series_extended(str(tvdb_id)) or {}  # type: ignore[attr-defined]
+        return {}
 
-    tmdb_id = await AnimeMappings.tmdb_tv_id(aid_i)
-    if tmdb_id and registry.has("tmdb"):
-        try:
+    async def _from_tmdb() -> dict:
+        tmdb_id = await AnimeMappings.tmdb_tv_id(aid_i)
+        if tmdb_id and registry.has("tmdb"):
             tmdb = registry.build("tmdb")
             if hasattr(tmdb, "get_tv_details"):
-                data = await tmdb.get_tv_details(str(tmdb_id))  # type: ignore[attr-defined]
-                if data:
-                    return data
+                return await tmdb.get_tv_details(str(tmdb_id)) or {}  # type: ignore[attr-defined]
+        return {}
+
+    fetchers = {"tvdb": _from_tvdb, "tmdb": _from_tmdb}
+    for key in order:
+        fn = fetchers.get(key)
+        if fn is None:
+            continue
+        try:
+            data = await fn()
+            if data:
+                return data
         except Exception:
             pass
 
@@ -1269,8 +1313,14 @@ async def resolve_canonical_season(
     provider_key: ProviderKey,
     provider_id: str,
     parsed_season: int | None,
+    episode: int | None = None,
 ) -> int | None:
     """Return the authoritative season number for this match.
+
+    When `episode` is known, the ScudLee anime-lists per-EPISODE TVDB season is
+    consulted FIRST — it's the only signal that splits a flat absolute umbrella
+    (One Piece AID 69) into its real per-arc TVDB seasons (ep 1156 → S23). The
+    rename uses the SAME resolver, so the stored season equals what we write.
 
     For AniDB matches, the Fribb cross-reference IS the ground truth: each
     AID maps to exactly one TVDB/TMDB season number, regardless of how the
@@ -1289,6 +1339,13 @@ async def resolve_canonical_season(
         try:
             from kira.providers.anime_mappings import AnimeMappings
             aid = int(provider_id)
+            # ScudLee per-episode TVDB season — most precise; the only thing that
+            # gives a flat absolute umbrella (One Piece) a real per-arc season.
+            if episode is not None:
+                from kira.providers.anime_lists import resolve_anidb_to_tvdb
+                scud = await resolve_anidb_to_tvdb(aid, episode)
+                if scud is not None:
+                    return scud[0]
             mapped = await AnimeMappings.tvdb_season(aid)
             if mapped is not None:
                 return mapped
@@ -1301,18 +1358,37 @@ async def resolve_canonical_season(
             # the new cour lands beside its siblings, not in Season 1.
             tvdb = await AnimeMappings.tvdb_id(aid)
             if tvdb is not None:
-                seasoned: list[tuple[int, int]] = []
+                seasoned: list[tuple[int, int]] = []   # POSITIVE-season siblings only
+                saw_zero_sibling = False
                 for sib in await AnimeMappings.aids_by_tvdb(tvdb):
                     if sib == aid:
                         continue
                     s = await AnimeMappings.tvdb_season(sib)
-                    if s is not None:
+                    # A movie/special sibling maps to season 0; its season must
+                    # NOT define the main run's — inheriting 0 collapses regular
+                    # episodes toward "Specials". Keep only real (positive) cours.
+                    if s is not None and s > 0:
                         seasoned.append((sib, s))
+                    elif s == 0:
+                        saw_zero_sibling = True
                 if seasoned:
                     below = [(a, s) for (a, s) in seasoned if a < aid]
                     # nearest prequel (highest AID below this one); else nearest sibling
                     pick = max(below or seasoned, key=lambda t: t[0])
                     return pick[1]
+                if saw_zero_sibling:
+                    # Flat umbrella: a seasonless, absolute-numbered series (One
+                    # Piece AID 69, Naruto, Detective Conan …) whose ONLY mapped
+                    # siblings are its movies/specials (all season 0). There is no
+                    # real per-cour season, so pin ONE stable basis — Season 1 — for
+                    # the whole series. Returning 0 here used to send regular
+                    # episodes toward Specials; the rename guard then papered over it
+                    # by echoing each FILE'S parsed Sxx, scattering the library
+                    # (ep 1165 → "Season 23", 1156-1164 → "Season 1"). The absolute
+                    # episode number still rides in the filename; only the folder
+                    # unifies. (A genuine special's OWN aid maps to season 0 via the
+                    # `tvdb_season(aid)` check above and is unaffected.)
+                    return 1
         except Exception:
             pass
     return parsed_season
@@ -1595,6 +1671,30 @@ def _tmdb_language_code(value: object) -> str | None:
     return None
 
 
+_TVDB_LANGUAGE_LABELS: dict[str, str] = {
+    "english": "eng", "français": "fra", "french": "fra",
+    "deutsch": "deu", "german": "deu", "español": "spa", "spanish": "spa",
+    "italiano": "ita", "italian": "ita", "português": "por", "portuguese": "por",
+    "日本語": "jpn", "japanese": "jpn",
+}
+
+
+def _tvdb_language_code(value: object) -> str | None:
+    """Map a UI language label (or bare ISO 639-2 code) to a TVDB search
+    language code, e.g. 'eng'. Unknown / empty → None (provider keeps 'eng')."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    mapped = _TVDB_LANGUAGE_LABELS.get(v.lower())
+    if mapped:
+        return mapped
+    if len(v) == 3 and v.isalpha():
+        return v.lower()
+    return None
+
+
 # Convenience constructor reading from app settings (one client per app).
 async def registry_from_settings(client: httpx.AsyncClient) -> ProviderRegistry:
     from kira.config import settings
@@ -1611,7 +1711,10 @@ async def registry_from_settings(client: httpx.AsyncClient) -> ProviderRegistry:
         )
     tvdb_key = db.get("providers.tvdb.api_key") or settings.tvdb_api_key
     if tvdb_key:
-        configs["tvdb"] = ProviderConfig(mode=ProviderMode.DIRECT, api_key=tvdb_key)
+        configs["tvdb"] = ProviderConfig(
+            mode=ProviderMode.DIRECT, api_key=tvdb_key,
+            tvdb_language=_tvdb_language_code(db.get("providers.tvdb.language")),
+        )
 
     # AniDB's read-only HTTP API needs no user key — always register it.
     # Client name + version flow from settings so the user can paste their

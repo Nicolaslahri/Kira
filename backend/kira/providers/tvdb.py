@@ -86,6 +86,10 @@ class TVDBProvider(MetadataProvider):
     def __init__(self, base_url: str, auth: ProviderAuth, client: httpx.AsyncClient):
         super().__init__(base_url=base_url, auth=auth, client=client)
         self._token: str | None = None
+        # TVDB /search `language` param (ISO 639-2, e.g. "eng"). English by
+        # default; the factory overrides it from `providers.tvdb.language` so
+        # non-English users get localized result names.
+        self.language: str = "eng"
 
     # ── Auth ──────────────────────────────────────────────────────────────
     def _is_cloud(self) -> bool:
@@ -177,7 +181,7 @@ class TVDBProvider(MetadataProvider):
 
     # ── Searches ──────────────────────────────────────────────────────────
     async def search_movie(self, title: str, year: int | None = None) -> list[MovieResult]:
-        params: dict[str, Any] = {"query": title, "type": "movie", "language": "eng"}
+        params: dict[str, Any] = {"query": title, "type": "movie", "language": self.language}
         if year is not None:
             params["year"] = year
         data = await self._get("/search", params=params)
@@ -196,7 +200,7 @@ class TVDBProvider(MetadataProvider):
         return out
 
     async def search_tv(self, title: str, year: int | None = None) -> list[TVResult]:
-        params: dict[str, Any] = {"query": title, "type": "series", "language": "eng"}
+        params: dict[str, Any] = {"query": title, "type": "series", "language": self.language}
         if year is not None:
             params["year"] = year
         data = await self._get("/search", params=params)

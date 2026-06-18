@@ -1,15 +1,18 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { AnimatePresence, motion, MotionConfig } from 'motion/react';
-import type { AppState, ModalState, Page, ToastData, MediaFile, SearchResult } from './lib/types';
-import { api, getBackendOnline, onBackendConnectivity } from './lib/api';
+import type { AppState, ModalState, Page, ToastData, MediaFile, SearchResult, TechProgress } from './lib/types';
+import { api, getBackendOnline, onBackendConnectivity, type ApiActivityJob } from './lib/api';
 import { apiToMediaFile } from './lib/adapters';
 import { cacheGet, cacheSet } from './lib/cache';
-import { setConfBands } from './lib/confBands';
+import { setConfBands, getConfBands } from './lib/confBands';
 import { ScanProgress } from './components/ScanProgress';
 import { Sidebar, Topbar, Toast } from './components/ui';
 import { useActivity, ActivityPill } from './components/ActivityIndicator';
+import { SubtitleBrowseModal } from './components/SubtitleBrowseModal';
 import { ManualSearchModal, RenamePreviewModal, KeyboardShortcutsModal, FileDetailsModal } from './components/modals';
-import { Onboarding, isOnboarded } from './components/Onboarding';
+import { Onboarding, isOnboarded, setOnboarded } from './components/Onboarding';
+import { LoginGate } from './components/LoginGate';
+import { hasStoredAuth } from './lib/api';
 import { DashboardPage } from './pages/DashboardPage';
 import { ReviewPage } from './pages/ReviewPage';
 import { HistoryPage } from './pages/HistoryPage';
@@ -17,8 +20,57 @@ import { SettingsPage } from './pages/SettingsPage';
 
 // Settings sub-sections — now first-class routes (#/settings/<section>) so
 // the sidebar's nested Settings nav drives them and refresh/back/forward work.
-const SETTINGS_SECTIONS = ['connections', 'paths', 'integrations', 'naming', 'cleanup', 'confidence', 'labs', 'advanced'] as const;
+const SETTINGS_SECTIONS = ['connections', 'paths', 'integrations', 'matching', 'naming', 'subtitles', 'cleanup', 'advanced'] as const;
 export type SettingsSection = (typeof SETTINGS_SECTIONS)[number];
+
+// A boolean setting may arrive as a bare `true`/`false` or wrapped as `{value}`
+// depending on which write path produced it — read either shape truthily.
+function settingIsOn(v: unknown): boolean {
+  if (typeof v === 'boolean') return v;
+  if (v && typeof v === 'object' && 'value' in v) return !!(v as { value?: unknown }).value;
+  return !!v;
+}
+
+// Narrate the detached tech-tag (MediaInfo) pass as the scan popup's 3rd line.
+// The scan tracker calls this right after matching completes and KEEPS the
+// popup up (leaves `scanRunning` true) until it returns — so the read shows as
+// part of the scan instead of a separate, easy-to-miss pill. The pass is
+// spawned a beat after completion, so we wait briefly for its job to appear,
+// then poll it to completion. Feature off → returns at once (no popup delay).
+// Fully self-contained + swallows transient errors so it never breaks a scan.
+async function narrateTechTail(
+  setScanTech: (t: TechProgress | null) => void,
+  featureOn: boolean,
+  onDone?: (job: ApiActivityJob) => void,
+): Promise<void> {
+  if (!featureOn) { setScanTech(null); return; }
+  setScanTech({ active: false, done: 0, total: null, state: 'running', queued: true });
+  const appearBy = Date.now() + 5000;   // grace for the spawn-at-tail latency
+  let seen = false;
+  for (let i = 0; i < 5000; i++) {       // safety cap; a real pass ends well before
+    let job: ApiActivityJob | undefined;
+    try { job = (await api.getActivity()).jobs.find(j => j.name === 'mediainfo_enrich'); }
+    catch { /* transient backend blip — keep polling */ }
+    if (job?.active) {
+      seen = true;
+      setScanTech({ active: true, done: job.done, total: job.total, state: 'running' });
+    } else if (seen) {
+      // Ran and finished — show a brief "done" beat (the caller clears it), and
+      // hand the finished job to onDone so the ActivityPill doesn't ALSO surface
+      // it as a separate "Done" pill once the scan popup closes (it lingers in
+      // the /activity snapshot for ~15s). The Settings-toggle path never calls
+      // narrateTechTail, so its own pill is left intact.
+      if (job) { setScanTech({ active: false, done: job.done, total: job.total, state: 'done' }); onDone?.(job); }
+      else setScanTech(null);
+      return;
+    } else if (Date.now() > appearBy) {
+      setScanTech(null);                 // never started (nothing to read / lib missing)
+      return;
+    }
+    await new Promise(r => setTimeout(r, 700));
+  }
+  setScanTech(null);
+}
 
 // Parse `#/<page>` or `#/settings/<section>` out of the URL hash. Falls back to
 // review (the main work surface) / connections if missing or unknown.
@@ -58,17 +110,61 @@ export default function App() {
   const [active, setActiveState] = useState<Page>(() => parseHash().page);
   const [settingsSection, setSettingsSectionState] = useState<SettingsSection>(() => parseHash().section);
   const [onboarded, setOnboardedState] = useState<boolean>(() => isOnboarded());
+  // Auth state machine: 'setup' on first run (no account exists yet — the
+  // sign-up screen creates it), 'login' when an account/env credentials
+  // exist and this tab holds none, 'open' when usable. Starts 'unknown'
+  // UNLESS this tab already holds credentials — and while unknown the app
+  // tree does NOT render, so an unauthenticated refresh can never flash the
+  // dashboard before the gate appears. Raised reactively by the api layer's
+  // 401 handler ('kira:auth-required') too.
+  const [authState, setAuthState] = useState<'unknown' | 'login' | 'setup' | 'open'>(
+    () => (hasStoredAuth() ? 'open' : 'unknown'),
+  );
+  useEffect(() => {
+    let cancelled = false;
+    void api.getAuthStatus()
+      .then(s => {
+        if (cancelled) return;
+        if (s.setup) setAuthState('setup');
+        else if (s.required && !hasStoredAuth()) setAuthState('login');
+        else setAuthState('open');
+        // Onboarding is a SERVER fact (set on completion; legacy instances
+        // with a populated library count as onboarded). The localStorage
+        // flag remains only as a fast first-paint hint.
+        setOnboardedState(s.onboarded);
+        setOnboarded(s.onboarded);
+      })
+      // Offline → open: the connectivity UI handles "backend unreachable",
+      // and there's nothing sensitive to protect when nothing can load.
+      .catch(() => { if (!cancelled) setAuthState('open'); });
+    const onAuthRequired = () => setAuthState('login');
+    window.addEventListener('kira:auth-required', onAuthRequired);
+    return () => { cancelled = true; window.removeEventListener('kira:auth-required', onAuthRequired); };
+  }, []);
+  // Post-onboarding "grand entrance": one-shot flag that amplifies the
+  // dashboard's entry animations (deeper rise, blur-in hero, longer cascade)
+  // for the very first landing, then expires so normal nav stays snappy.
+  const [grandEntry, setGrandEntry] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   // Mobile nav drawer (hamburger). Ignored on lg+ where the sidebar is static.
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
+  // Settings now buffers edits until Save; this mirrors SettingsPage's dirty
+  // state so leaving the page (sidebar/topbar nav) can confirm before the draft
+  // is lost. Section switches stay on the page, so they're never guarded.
+  const settingsDirtyRef = useRef(false);
+
   // Keep the hash in sync. Navigating to Settings preserves the last-open
   // section; everything else is a bare `#/<page>`.
   const setActive = useCallback((p: Page) => {
+    if (active === 'settings' && p !== 'settings' && settingsDirtyRef.current) {
+      if (!window.confirm('You have unsaved settings changes. Leave and discard them?')) return;
+      settingsDirtyRef.current = false;
+    }
     setActiveState(p);
     const hash = p === 'settings' ? `#/settings/${settingsSection}` : `#/${p}`;
     if (window.location.hash !== hash) window.location.hash = hash;
-  }, [settingsSection]);
+  }, [settingsSection, active]);
 
   // Select a Settings sub-section (from the nested sidebar nav). Also flips
   // the active page to settings.
@@ -109,6 +205,7 @@ export default function App() {
     scanFound: 0,
     scanMessage: 'Looking for media files…',
     scanPhase: 'idle',
+    scanTech: null,
     // If we restored from cache, treat the page as hydrated for layout
     // purposes — the previous data is good enough to render. The
     // background fetch below will replace it with fresher data when it
@@ -128,7 +225,7 @@ export default function App() {
   // Cache write: every successful response gets persisted so the next
   // refresh can hydrate the previous data instantly (stale-while-revalidate).
   useEffect(() => {
-    api.listFiles({ limit: 1000 })
+    api.listAllFiles()
       .then(rows => {
         const mapped = rows.map(apiToMediaFile);
         bumpFilesGen(); setState(s => ({ ...s, files: mapped }));
@@ -192,10 +289,11 @@ export default function App() {
     setToasts(xs => xs.filter(x => x.id !== id));
   }, []);
 
-  // Background-activity poll (boot auto-heal, anime-mapping warm-up) + the
-  // one-time "recovered after restart" toast. Always mounted so polling
-  // survives page changes and the boot toast can't re-fire.
-  const activeJob = useActivity(pushToast);
+  // Background-activity poll (boot auto-heal, subtitle fetches, ffmpeg
+  // install…) + the one-time "recovered after restart" toast. Always mounted
+  // so polling survives page changes. Returns the running job OR the most
+  // recent finished one (green summary / sticky red error) for the pill.
+  const { job: activeJob, dismissJob } = useActivity(pushToast);
 
   const [focusedId, setFocusedId] = useState(state.files[0]?.id ?? '');
 
@@ -205,10 +303,19 @@ export default function App() {
   const [savedOp, setSavedOp] = useState<string>('move');
   const [savedProfile, setSavedProfile] = useState<string>('Plex');
   const [scanRoot, setScanRoot] = useState<string>('/media');
+  // Whether "Read file metadata" (tech tags) is on — drives the scan popup's
+  // 3rd line. Settings values come through as a bare value or `{value}`.
+  const [techTagsOn, setTechTagsOn] = useState(false);
+  // Mirror to a ref so the scan tracker (a useCallback) can read the live value
+  // when it narrates the tech-tag tail, without churning its dependency list.
+  const techTagsOnRef = useRef(techTagsOn);
+  useEffect(() => { techTagsOnRef.current = techTagsOn; }, [techTagsOn]);
+
   useEffect(() => {
     const loadDefaults = async () => {
       try {
         const s = await api.getSettings();
+        setTechTagsOn(settingIsOn(s['parsing.read_mediainfo']));
         if (typeof s['rename.default_op'] === 'string') setSavedOp(s['rename.default_op'] as string);
         if (typeof s['naming.profile'] === 'string') setSavedProfile(s['naming.profile'] as string);
         // Confidence badge cutoffs — feed the shared module so every badge
@@ -240,7 +347,7 @@ export default function App() {
 
   const refreshFiles = useCallback(async () => {
     try {
-      const rows = await api.listFiles({ limit: 1000 });
+      const rows = await api.listAllFiles();
       const mapped = rows.map(apiToMediaFile);
       bumpFilesGen(); setState(s => ({ ...s, files: mapped }));
       cacheSet('files', mapped);
@@ -288,7 +395,7 @@ export default function App() {
           lastCount = s.file_count;
           try {
             const gen = filesGenRef.current;
-            const rows = await api.listFiles({ limit: 1000 });
+            const rows = await api.listAllFiles();
             // Drop this background replace if a user mutation bumped the gen
             // while we were fetching — don't clobber a fresh manual match.
             setState(st => (gen === filesGenRef.current ? { ...st, files: rows.map(apiToMediaFile) } : st));
@@ -346,8 +453,12 @@ export default function App() {
         kind: 'error',
       });
     } finally {
-      // Brief delay so the user sees 100% before the banner disappears.
-      setTimeout(() => setState(s => ({ ...s, scanRunning: false })), 1600);
+      // Narrate the detached tech-tag pass as the popup's 3rd line, holding the
+      // popup open until it finishes (feature off → returns at once). Wrapped so
+      // it can never block the banner from clearing.
+      try { await narrateTechTail(t => setState(s => ({ ...s, scanTech: t })), techTagsOnRef.current, dismissJob); } catch { /* ignore */ }
+      // Brief delay so the user sees the final state before the banner disappears.
+      setTimeout(() => setState(s => ({ ...s, scanRunning: false, scanTech: null })), 1600);
     }
   }, [pushToast, refreshFiles]);
 
@@ -427,8 +538,13 @@ export default function App() {
     // negligible compared to the scan itself.
     let effectiveRoot = SCAN_ROOT;
     let extraRoots: string[] = [];
+    let techOn = false;
     try {
       const s = await api.getSettings();
+      // Refresh the tech-tag flag at scan time so the 3rd line reflects a
+      // toggle made since mount (the popup shows "queued…" only when it's on).
+      techOn = settingIsOn(s['parsing.read_mediainfo']);
+      setTechTagsOn(techOn);
       // library_root may be saved as a bare string OR as {value: "..."}
       // depending on which write path produced it — mirror the same
       // parsing as the loadDefaults effect.
@@ -454,6 +570,9 @@ export default function App() {
     setState(s => ({
       ...s,
       scanRunning: true, scanProgress: 0, scanFound: 0, scanPhase: 'scanning',
+      // Preview the tech-tag line as "queued…" from the start when the feature
+      // is on, so the 3rd line is present throughout (the tail fills in counts).
+      scanTech: techOn ? { active: false, done: 0, total: null, state: 'running', queued: true } : null,
       scanMessage: allRoots.length > 1
         ? `Looking through ${allRoots.length} folders…`
         : `Looking through ${effectiveRoot}…`,
@@ -509,7 +628,7 @@ export default function App() {
         try { s = await api.getScan(scan.id); } catch { continue; }
         try {
           const gen = filesGenRef.current;
-          const rows = await api.listFiles({ limit: 1000 });
+          const rows = await api.listAllFiles();
           // Drop this background replace if a user mutation bumped the gen
           // mid-fetch — don't revert a manual match made during reparse.
           setState(st => (gen === filesGenRef.current ? { ...st, files: rows.map(apiToMediaFile) } : st));
@@ -558,7 +677,10 @@ export default function App() {
         kind: 'error',
       });
     } finally {
-      setTimeout(() => setState(s => ({ ...s, scanRunning: false })), 1600);
+      // Re-parse also spawns the tech-tag pass over the whole library — narrate
+      // it as the popup's 3rd line too, so the read isn't an invisible pill.
+      try { await narrateTechTail(t => setState(s => ({ ...s, scanTech: t })), techTagsOnRef.current, dismissJob); } catch { /* ignore */ }
+      setTimeout(() => setState(s => ({ ...s, scanRunning: false, scanTech: null })), 1600);
     }
   }, [state.scanRunning, pushToast, refreshFiles]);
 
@@ -754,7 +876,7 @@ export default function App() {
   // check (no in-flight scan to defer to). On subsequent runs, scan
   // starts by bumping it to Date.now() so the watchdog has a baseline.
   const lastProgressAtRef = useRef<number>(0);
-  const renameFilesDirectly = useCallback(async (fileIds: string[]): Promise<void> => {
+  const renameFilesDirectly = useCallback(async (fileIds: string[], opts?: { profile?: string; op?: string }): Promise<void> => {
     const backendIds = fileIds.map(Number).filter(Number.isFinite);
     if (backendIds.length === 0) return;
     // Chain onto whatever's already in-flight. We capture the previous
@@ -781,8 +903,10 @@ export default function App() {
         // Kick the activity pill so the rename progress bar shows up immediately
         // — the backend emits begin/progress for the batch on /activity.
         try { window.dispatchEvent(new Event('kira:activity-refresh')); } catch { /* no window */ }
-        const res = await api.rename({ file_ids: backendIds, profile: savedProfile, op: savedOp });
-        const rows = await api.listFiles({ limit: 1000 });
+        const effProfile = opts?.profile ?? savedProfile;
+        const effOp = opts?.op ?? savedOp;
+        const res = await api.rename({ file_ids: backendIds, profile: effProfile, op: effOp });
+        const rows = await api.listAllFiles();
         bumpFilesGen(); setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
         if (res.failed === 0) {
           // Tier 1.2: the backend tags videos whose sidecar files were
@@ -798,7 +922,7 @@ export default function App() {
             : '';
           pushToast({
             title: `${res.succeeded} file${res.succeeded === 1 ? '' : 's'} renamed`,
-            sub: `${savedOp} · ${savedProfile}${subNote} — see Renamed filter or History.`,
+            sub: `${effOp} · ${effProfile}${subNote} — see Renamed filter or History.`,
             kind: 'success',
           });
           // Pre-warm History's cache so navigating to that tab paints
@@ -884,9 +1008,10 @@ export default function App() {
     }
   }, [pushToast]);
 
-  // Manual subtitle fetch (#11): download OpenSubtitles .srt sidecars for one
-  // file on demand (complements the post-rename auto-fetch). No identity
-  // change, so the details modal stays open — just a result toast.
+  // Manual subtitle fetch: queue a backfill for one file through the full
+  // aggregator (embedded → OpenSubtitles → YIFY). The activity pill IS the
+  // feedback — it appears immediately (the kick below), narrates each phase,
+  // and ends green/red with the outcome. No redundant "watch the pill" toast.
   const handleFetchSubtitles = useCallback(async (file: MediaFile) => {
     const backendId = Number(file.id);
     if (!Number.isFinite(backendId)) {
@@ -894,12 +1019,10 @@ export default function App() {
       return;
     }
     try {
-      const res = await api.fetchSubtitles(backendId);
-      if (res.count > 0) {
-        const names = res.saved.map(p => p.split(/[\\/]/).pop()).filter(Boolean).join(', ');
-        pushToast({ title: `Downloaded ${res.count} subtitle${res.count === 1 ? '' : 's'}`, sub: names, kind: 'success' });
-      } else {
-        pushToast({ title: 'No subtitles found', sub: `OpenSubtitles had nothing for ${res.languages.join(', ')}.`, kind: 'error' });
+      const res = await api.backfillSubtitles({ file_ids: [backendId] });
+      window.dispatchEvent(new Event('kira:activity-refresh'));
+      if (!res.started) {
+        pushToast({ title: 'Nothing to fetch', sub: res.detail ?? 'Already covered.', kind: 'success' });
       }
     } catch (e) {
       pushToast({ title: 'Subtitle fetch failed', sub: (e as Error).message, kind: 'error' });
@@ -918,14 +1041,14 @@ export default function App() {
 
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'a') {
         e.preventDefault();
-        const ids = state.files.filter(f => f.confidence >= 85 && f.status === 'pending').map(f => f.id);
+        const ids = state.files.filter(f => f.confidence >= getConfBands().high && f.status === 'pending').map(f => f.id);
         void setFileStatusBulk(ids, 'approved');
         pushToast({ title: `${ids.length} high-confidence matches approved`, kind: 'success' });
         return;
       }
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
         e.preventDefault();
-        openModal('renamePreview', state.files.filter(f => f.status === 'approved' || f.confidence >= 85));
+        openModal('renamePreview', state.files.filter(f => f.status === 'approved' || f.confidence >= getConfBands().high));
         return;
       }
 
@@ -1010,62 +1133,27 @@ export default function App() {
     // Only ship files with a REAL provider+providerId — synthesised
     // matches (built from parsed data for no_match cards) would otherwise
     // get sent and the backend would reject each one individually.
-    const backendIds = target
+    const ids = target
       .filter(f => f.match?.provider && f.match?.providerId)
-      .map(f => Number(f.id))
-      .filter(Number.isFinite);
-    if (backendIds.length === 0) {
+      .map(f => f.id);
+    if (ids.length === 0) {
       pushToast({ title: 'Nothing to rename', sub: 'No files with matches selected.', kind: 'error' });
       closeModal();
       return;
     }
+    // Route through the SAME serialized rename chain as every other path, with
+    // this preview's per-batch profile/op override. A direct api.rename here
+    // raced renameFilesDirectly (and its own setFileStatusBulk) — the exact
+    // wrong-target / double-record race renameChainRef exists to prevent. The
+    // chain owns the toast / files-refresh / "kira:rename-success" + history
+    // pre-warm, so we just close the modal once it settles.
     try {
-      // Kick the activity pill so the rename progress bar appears immediately.
-      try { window.dispatchEvent(new Event('kira:activity-refresh')); } catch { /* no window */ }
-      const res = await api.rename({ file_ids: backendIds, profile: opts.profile, op: opts.op });
-      // Refresh from backend — files that moved have new paths + 'renamed' status.
-      const rows = await api.listFiles({ limit: 1000 });
-      bumpFilesGen(); setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
-      if (res.failed === 0) {
-        // Tier 1.2: surface sidecar count alongside the success — see
-        // the matching enhancement on the primary rename path earlier
-        // in this file for the same pattern.
-        const withSubs = res.items.filter(
-          i => i.ok && typeof i.error === 'string' && i.error.startsWith('[SIDECARS]'),
-        ).length;
-        const subNote = withSubs > 0
-          ? ` Sidecars moved on ${withSubs} of ${res.succeeded}.`
-          : '';
-        pushToast({
-          title: `${res.succeeded} file${res.succeeded === 1 ? '' : 's'} renamed`,
-          sub: `Switched to "Renamed" view — also visible on the History page.${subNote}`,
-          kind: 'success',
-        });
-        // Auto-switch the Review filter so the user immediately SEES the
-        // result instead of staring at the Pending view that just lost
-        // these files. Without this, every successful rename feels like
-        // a no-op — files vanish from the current view with no breadcrumb.
-        window.dispatchEvent(new CustomEvent('kira:rename-success'));
-      } else if (res.succeeded > 0) {
-        pushToast({
-          title: `${res.succeeded} renamed, ${res.failed} failed`,
-          sub: res.items.find(i => !i.ok)?.error ?? 'See History page for details.',
-          kind: 'error',
-        });
-      } else {
-        // 0 succeeded — show the FIRST error so the user knows what to fix
-        // (e.g. "No match to rename to — match the file first.").
-        pushToast({
-          title: `Rename failed`,
-          sub: res.items.find(i => !i.ok)?.error ?? 'See History page for details.',
-          kind: 'error',
-        });
-      }
-    } catch (e) {
-      pushToast({ title: 'Apply failed', sub: (e as Error).message, kind: 'error' });
+      await renameFilesDirectly(ids, { profile: opts.profile, op: opts.op });
+    } catch {
+      // renameFilesDirectly already surfaced the failure toast.
     }
     closeModal();
-  }, [modal, pushToast]);
+  }, [modal, pushToast, renameFilesDirectly]);
 
   const handleManualSelect = useCallback(async (selection: SearchResult & { _provider?: string; _providerId?: string; _posterUrl?: string | null }) => {
     if (modal?.kind !== 'manualSearch') return;
@@ -1108,7 +1196,7 @@ export default function App() {
           overview: selection.overview ?? null,
           media_type: selection.mediaType ?? file.mediaType,
         });
-        const rows = await api.listFiles({ limit: 1000 });
+        const rows = await api.listAllFiles();
         bumpFilesGen(); setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
         pushToast({
           title: `Pinned ${res.updated} file${res.updated === 1 ? '' : 's'} to ${selection.title}`,
@@ -1174,7 +1262,7 @@ export default function App() {
       // Refetch all files so the new matches propagate everywhere
       // (Needs matching section recomputes, cards re-render with the
       // matched cover, the no_match counts drop).
-      const rows = await api.listFiles({ limit: 1000 });
+      const rows = await api.listAllFiles();
       bumpFilesGen(); setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
       pushToast({
         title: `Pinned ${res.updated} file${res.updated === 1 ? '' : 's'} to ${selection.title}`,
@@ -1186,14 +1274,33 @@ export default function App() {
     }
   }, [pushToast]);
 
+  // Until auth state is known, render NOTHING but the backdrop — otherwise a
+  // refresh on an auth-protected server flashes the dashboard (with cached
+  // library data) for the beat it takes /auth/status to answer. Tabs that
+  // already hold credentials start at 'open', so the signed-in refresh path
+  // renders instantly with no splash.
+  if (authState !== 'open') {
+    return (
+      <MotionConfig reducedMotion="user">
+        <div className="backdrop" />
+        {(authState === 'login' || authState === 'setup') && <LoginGate mode={authState} />}
+      </MotionConfig>
+    );
+  }
+
   return (
     <MotionConfig reducedMotion="user">
       <div className="backdrop" />
       {!onboarded && (
         <Onboarding onComplete={() => {
           setOnboardedState(true);
+          // Land on the dashboard with the one-shot entrance choreography,
+          // then kick the first scan once the cascade has had its moment.
+          setActive('dashboard');
+          setGrandEntry(true);
+          setTimeout(() => setGrandEntry(false), 3600);
           pushToast({ title: "You're all set", sub: 'Running your first scan now…', kind: 'success' });
-          setTimeout(() => runScan(), 350);
+          setTimeout(() => runScan(), 900);
         }} />
       )}
       <div className="relative z-[1] min-h-screen lg:grid lg:grid-cols-[var(--side-w)_1fr]">
@@ -1202,7 +1309,7 @@ export default function App() {
         {mobileNavOpen ? (
           <div className="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm lg:hidden" onClick={() => setMobileNavOpen(false)} />
         ) : null}
-        <main className="main min-w-0">
+        <main className="main relative min-w-0">
           <Topbar
             active={active}
             onScan={runScan}
@@ -1213,19 +1320,37 @@ export default function App() {
             onMenuClick={() => setMobileNavOpen(true)}
           />
 
-          {/* Page-change crossfade. Keyed by `active` so switching the top-level
-              page fades content out→in; switching Settings sub-sections (active
+          {/* Brand sweep — a thin orange→magenta line wipes across the top of the
+              content column each time the page changes, giving the transition a
+              "loading into place" energy. Keyed by `active` so it replays per page
+              switch. Absolutely positioned overlay (NOT an ancestor of page
+              content) so it can use transform freely without creating a
+              containing block for the pages' sticky headers. */}
+          <AnimatePresence>
+            <motion.span
+              key={`sweep-${active}`}
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-x-0 top-[62px] z-40 h-[2px] origin-left"
+              style={{ background: 'var(--brand-grad)' }}
+              initial={{ scaleX: 0, opacity: 0.9 }}
+              animate={{ scaleX: 1, opacity: 0 }}
+              transition={{ duration: 0.55, ease: [0.16, 1, 0.3, 1] }}
+            />
+          </AnimatePresence>
+
+          {/* Page-change transition. Keyed by `active` so switching the top-level
+              page remounts the stage and replays the CSS entrance (kFade here +
+              the .page-stage-inner rise); switching Settings sub-sections (active
               stays 'settings') does NOT replay — the sidebar sub-nav handles that.
-              Opacity-only by design: a transform here would become a containing
-              block and break the sticky row-header / scan bar inside the pages. */}
-          <AnimatePresence mode="wait">
-            <motion.div
-              key={active}
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              transition={{ duration: 0.15, ease: [0.2, 0.9, 0.3, 1] }}
-            >
+              Deliberately NO exit animation / AnimatePresence: the stage's CSS
+              entrance (fill-mode: both) overrode motion's inline exit opacity, so
+              under mode="wait" the OLD page froze at full opacity for the whole
+              exit duration and then popped away — read as "the previous page
+              flashes" when navigating. One animation owner (CSS) fixes it and
+              makes navigation instant. Opacity-only on this wrapper by design: a
+              transform here would become a containing block and break the sticky
+              row-header / scan bar inside the pages. */}
+          <div key={active} className={grandEntry ? "page-stage grand-entry" : "page-stage"}>
               {active === 'dashboard' && (
                 <DashboardPage state={state} openModal={openModal} runScan={runScan} runReparse={runReparse} setActive={setActive} scanRoot={SCAN_ROOT} />
               )}
@@ -1245,10 +1370,9 @@ export default function App() {
                 <HistoryPage pushToast={pushToast} />
               )}
               {active === 'settings' && (
-                <SettingsPage state={state} pushToast={pushToast} section={settingsSection} setSection={setSettingsSection} />
+                <SettingsPage state={state} pushToast={pushToast} section={settingsSection} setSection={setSettingsSection} onDirtyChange={d => { settingsDirtyRef.current = d; }} />
               )}
-            </motion.div>
-          </AnimatePresence>
+            </div>
         </main>
       </div>
 
@@ -1272,9 +1396,20 @@ export default function App() {
           file={state.files.find(f => f.id === modal.payload.id) || modal.payload}
           onClose={closeModal}
           onApprove={(id, st = 'approved') => {
-            void setFileStatus(id, st as 'approved' | 'pending');
+            if (st !== 'approved') { void setFileStatus(id, st as 'approved' | 'pending'); return; }
             const f = state.files.find(x => x.id === id);
-            if (st === 'approved') pushToast({ title: 'Approved', sub: f?.match?.title || f?.filename, kind: 'success' });
+            // Approve + rename in one shot — same contract as the card check,
+            // bulk bar, and keyboard 'a'. A bare status flip here strands the
+            // file in 'approved' limbo: gone from Pending, never renamed, never
+            // in History. The rename toast replaces the old "Approved" one.
+            void (async () => {
+              await setFileStatus(id, 'approved');
+              if (f?.match?.provider && f?.match?.providerId) {
+                await renameFilesDirectly([id]);
+              } else {
+                pushToast({ title: 'Approved', sub: f?.match?.title || f?.filename, kind: 'success' });
+              }
+            })();
           }}
           onReject={(id) => {
             void setFileStatus(id, 'rejected');
@@ -1296,11 +1431,15 @@ export default function App() {
             progress={state.scanProgress}
             found={state.scanFound}
             message={state.scanMessage}
+            tech={state.scanTech}
           />
         ) : activeJob ? (
-          <ActivityPill job={activeJob} />
+          <ActivityPill job={activeJob} onDismiss={dismissJob} />
         ) : null}
       />
+
+      {/* Manual subtitle browse-and-pick — opens on any "No EN" chip click. */}
+      <SubtitleBrowseModal pushToast={pushToast} />
     </MotionConfig>
   );
 }

@@ -1,12 +1,14 @@
-import { useState, useEffect, useRef, type CSSProperties, type ReactNode } from 'react';
+import { useState, useEffect, type CSSProperties, type ReactNode } from 'react';
 import type { ContentTypes } from '../lib/types';
 import { api } from '../lib/api';
 import {
   IcLogoMark, IcScan, IcSparkles, IcShieldCheck, IcLink,
   IcCheck, IcX, IcAlertTri, IcSpin, IcFolder, IcKey, IcArrowRight,
-  IcFilm, IcTv, IcAnime, IcMusic, IcTag,
+  IcFilm, IcTv, IcAnime, IcMusic, IcTag, IcUndo,
 } from '../lib/icons';
 import { FolderPickerModal } from './FolderPickerModal';
+import { useScrollLock } from './LoginGate';
+import { FfmpegStatusRow } from './FfmpegStatus';
 
 const ONBOARDING_KEY = 'kira.onboarded.v1';
 
@@ -20,18 +22,20 @@ export function setOnboarded(v: boolean) {
 type ValidationState =
   | { state: 'idle' }
   | { state: 'checking' }
-  | { state: 'success'; latencyMs?: number | null }
+  | { state: 'success'; latencyMs?: number | null; existing?: boolean }
   | { state: 'error'; error: string };
 
-async function validateTmdbKey(key: string): Promise<{ ok: true; latencyMs: number | null } | { ok: false; error: string }> {
-  const k = (key || '').trim();
-  if (k.length < 16) return { ok: false, error: 'Key is too short. TMDB keys are 32 characters.' };
-  // Persist the key first so the backend's test endpoint uses it.
+/** Validate a provider key by saving it then hitting the test endpoint.
+ *  Only called once the key LOOKS complete (length gate at the call site),
+ *  so we never persist half-typed garbage over a working key. */
+async function validateProviderKey(
+  provider: 'tmdb' | 'tvdb', settingKey: string, key: string,
+): Promise<{ ok: true; latencyMs: number | null } | { ok: false; error: string }> {
   try {
-    await api.putSettings({ 'providers.tmdb.api_key': k });
-    const res = await api.testProvider('tmdb');
+    await api.putSettings({ [settingKey]: key });
+    const res = await api.testProvider(provider);
     if (res.ok) return { ok: true, latencyMs: res.latency_ms ?? null };
-    return { ok: false, error: res.detail || 'TMDB rejected the key.' };
+    return { ok: false, error: res.detail || `${provider.toUpperCase()} rejected the key.` };
   } catch (e) {
     return { ok: false, error: (e as Error).message };
   }
@@ -43,36 +47,29 @@ interface OnboardingProps {
   onComplete: (data: { apiKey: string; folder: string; profile: string; contentTypes: ContentTypes }) => void;
 }
 
+// ─── Step 0 · Welcome ────────────────────────────────────────────────
+
 function WelcomeStep() {
   return (
-    <div className="onboarding-hero">
+    <div className="onb-hero">
       <div className="mark" style={idx(0)}><IcLogoMark /></div>
-      <h1 style={idx(1)}>Welcome to Kira</h1>
+      <h1 style={idx(1)}>Welcome to <span className="grad">Kira</span></h1>
       <div className="tag" style={idx(2)}>Rename, organize, done.</div>
       <div className="bullets" style={idx(3)}>
-        <div><IcScan /><span>Scans your media for messy filenames</span></div>
-        <div><IcSparkles /><span>Matches against TMDB metadata</span></div>
+        <div><IcScan /><span>Scans your library for messy filenames</span></div>
+        <div><IcSparkles /><span>Matches against TMDB, TVDB &amp; AniDB</span></div>
         <div><IcShieldCheck /><span>Nothing renamed without your approval</span></div>
+        <div><IcUndo /><span>Every rename is one click to undo</span></div>
         <div><IcLink /><span>Hardlinks keep disk usage flat</span></div>
       </div>
     </div>
   );
 }
 
-interface TmdbStepProps {
-  value: string;
-  setValue: (v: string) => void;
-  validation: ValidationState;
-  setValidation: (v: ValidationState) => void;
-}
+// ─── Step 1 · Library (content types) ────────────────────────────────
 
-interface ContentTypeStepProps {
-  types: ContentTypes;
-  setTypes: (t: ContentTypes) => void;
-}
-
-function ContentTypeStep({ types, setTypes }: ContentTypeStepProps) {
-  const items: { key: keyof ContentTypes; icon: ReactNode; label: string; desc: string; ex: string; color: string }[] = [
+function ContentTypeStep({ types, setTypes }: { types: ContentTypes; setTypes: (t: ContentTypes) => void }) {
+  const items: { key: keyof ContentTypes; icon: ReactNode; label: string; desc: string; ex: string; color: string; soon?: boolean }[] = [
     { key: 'movies', icon: <IcFilm />,  label: 'Movies',
       desc: 'Film files in any common format.',
       ex: 'Dune · Past Lives · Oppenheimer', color: 'var(--ink-2)' },
@@ -80,40 +77,44 @@ function ContentTypeStep({ types, setTypes }: ContentTypeStepProps) {
       desc: 'Series with seasons and episodes.',
       ex: 'Severance · The Bear · Shōgun', color: 'var(--info)' },
     { key: 'anime',  icon: <IcAnime />, label: 'Anime',
-      desc: 'Uses release groups and absolute episode numbers.',
+      desc: 'Cour-aware matching, absolute numbering, franchises.',
       ex: 'Frieren · Jujutsu Kaisen · Spy × Family', color: 'var(--media-anime)' },
     { key: 'music',  icon: <IcMusic />, label: 'Music',
-      desc: 'Albums and individual tracks.',
-      ex: 'Radiohead · Pink Floyd · Kendrick Lamar', color: 'var(--media-music)' },
+      desc: 'Albums and tracks — arriving in a later release.',
+      ex: 'Radiohead · Pink Floyd · Kendrick Lamar', color: 'var(--media-music)', soon: true },
   ];
   return (
     <>
-      <div className="onboarding-eyebrow" style={idx(0)}>
-        <span className="step-n">Step 1 of 5</span>
+      <div className="onb-eyebrow" style={idx(0)}>
+        <span className="step-n">Step 1 of 6</span>
         <span>Required</span>
       </div>
-      <div className="onboarding-title" style={idx(1)}>What kind of media do you have?</div>
-      <div className="onboarding-sub" style={idx(2)}>
-        Pick all that apply. We'll only set up the providers you actually need.
+      <div className="onb-title" style={idx(1)}>What's in your library?</div>
+      <div className="onb-sub" style={idx(2)}>
+        Pick all that apply — it tunes the matching defaults and the first-scan summary.
       </div>
 
       <div className="ct-grid" style={idx(3)} role="group" aria-label="Content types">
         {items.map(it => {
-          const on = !!types[it.key];
+          const on = !it.soon && !!types[it.key];
           return (
             <button key={it.key}
                  type="button"
                  role="checkbox"
                  aria-checked={on}
+                 aria-disabled={it.soon || undefined}
                  aria-label={`${it.label} — ${it.desc}`}
-                 className={`ct-card ${on ? 'selected' : ''}`}
-                 onClick={() => setTypes({ ...types, [it.key]: !on })}>
+                 className={`ct-card ${on ? 'selected' : ''} ${it.soon ? 'soon' : ''}`}
+                 onClick={() => { if (!it.soon) setTypes({ ...types, [it.key]: !on }); }}>
               <div className="ct-card-head">
                 <div className="ct-icon" style={{ color: it.color }}>
                   <span style={{ display: 'inline-flex', width: 18, height: 18 }}>{it.icon}</span>
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div className="ct-name">{it.label}</div>
+                  <div className="ct-name">
+                    {it.label}
+                    {it.soon ? <span className="ct-soon">Coming soon</span> : null}
+                  </div>
                   <div className="ct-desc">{it.desc}</div>
                 </div>
                 <div className={`ct-check ${on ? 'on' : ''}`}>{on ? <IcCheck /> : null}</div>
@@ -124,141 +125,221 @@ function ContentTypeStep({ types, setTypes }: ContentTypeStepProps) {
         })}
       </div>
 
-      <div className="text-xs text-muted" style={idx(4)}>
-        Don't see what you have? Movies + TV covers most libraries — you can enable more later in Settings.
+      <div className="onb-hint" style={idx(4)}>
+        Movies + TV covers most libraries — everything stays switchable in Settings.
       </div>
     </>
   );
 }
 
-function TmdbStep({ value, setValue, validation, setValidation }: TmdbStepProps) {
-  const ref = useRef<HTMLInputElement>(null);
-  useEffect(() => { ref.current?.focus(); }, []);
+// ─── Step 2 · Connect (TMDB required, TVDB optional) ─────────────────
 
-  useEffect(() => {
-    const k = (value || '').trim();
-    if (!k) { setValidation({ state: 'idle' }); return; }
-    setValidation({ state: 'checking' });
-    const handle = setTimeout(async () => {
-      const result = await validateTmdbKey(k);
-      setValidation(
-        result.ok
-          ? { state: 'success', latencyMs: result.latencyMs }
-          : { state: 'error', error: result.error }
-      );
-    }, 350);
-    return () => clearTimeout(handle);
-  }, [value, setValidation]);
-
+function KeyField({ label, required, placeholder, value, setValue, validation, helpHref, helpLabel }: {
+  label: string;
+  required: boolean;
+  placeholder: string;
+  value: string;
+  setValue: (v: string) => void;
+  validation: ValidationState;
+  helpHref: string;
+  helpLabel: string;
+}) {
   const state = validation.state;
+  return (
+    <div className="onb-keyfield">
+      <div className="head">
+        <span className="lbl">{label}</span>
+        <span className={`req ${required ? '' : 'opt'}`}>{required ? 'Required' : 'Optional'}</span>
+        <a href={helpHref} target="_blank" rel="noreferrer">{helpLabel} →</a>
+      </div>
+      <div className="onb-input-wrap">
+        <input
+          className="input mono"
+          placeholder={placeholder}
+          value={value}
+          onChange={e => setValue(e.target.value)}
+          spellCheck={false}
+        />
+        <div className="state">
+          {state === 'checking' && <span style={{ color: 'var(--ink-3)' }}><IcSpin /></span>}
+          {state === 'success' && <span style={{ color: 'var(--accent)' }}><IcCheck /></span>}
+          {state === 'error' && <span style={{ color: 'var(--conf-low)' }}><IcX /></span>}
+        </div>
+      </div>
+      {state === 'success' && (
+        <div className="onb-state success">
+          <IcCheck />
+          <span>
+            {validation.state === 'success' && validation.existing
+              ? <><b>Already connected</b> — a working key is on file. Paste a new one to replace it.</>
+              : <><b>Key verified.</b>{validation.state === 'success' && typeof validation.latencyMs === 'number' ? <> Responded in {validation.latencyMs}&nbsp;ms.</> : null}</>}
+          </span>
+        </div>
+      )}
+      {state === 'error' && validation.state === 'error' && (
+        <div className="onb-state error"><IcAlertTri /><span>{validation.error}</span></div>
+      )}
+      {state === 'checking' && (
+        <div className="onb-state checking"><IcSpin /><span>Verifying…</span></div>
+      )}
+    </div>
+  );
+}
+
+function ConnectStep({ types, tmdbKey, setTmdbKey, tmdbVal, setTmdbVal, tvdbKey, setTvdbKey, tvdbVal, setTvdbVal }: {
+  types: ContentTypes;
+  tmdbKey: string; setTmdbKey: (v: string) => void;
+  tmdbVal: ValidationState; setTmdbVal: (v: ValidationState) => void;
+  tvdbKey: string; setTvdbKey: (v: string) => void;
+  tvdbVal: ValidationState; setTvdbVal: (v: ValidationState) => void;
+}) {
+  const wantsTvdb = !!types.tv || !!types.anime;
+
+  // Detect keys that are ALREADY configured on the backend (a wiped
+  // localStorage re-runs onboarding, but the server still has the keys —
+  // forcing the user to dig them out again was hostile).
+  useEffect(() => {
+    let cancelled = false;
+    void api.getSettings().then(s => {
+      if (cancelled) return;
+      const has = (k: string) => {
+        const v = s[k];
+        return (typeof v === 'object' && v !== null && (v as { set?: boolean }).set === true)
+          || (typeof v === 'string' && v.length > 0);
+      };
+      if (tmdbVal.state === 'idle' && !tmdbKey && has('providers.tmdb.api_key')) {
+        setTmdbVal({ state: 'success', existing: true });
+      }
+      if (tvdbVal.state === 'idle' && !tvdbKey && has('providers.tvdb.api_key')) {
+        setTvdbVal({ state: 'success', existing: true });
+      }
+    }).catch(() => { /* backend offline — typing still validates */ });
+    return () => { cancelled = true; };
+    // mount-only by design
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Debounced validation — only fires once the key LOOKS complete (≥ 26
+  // chars), so we never persist a half-typed key over a working one.
+  const useKeyValidation = (key: string, provider: 'tmdb' | 'tvdb', settingKey: string,
+                            setVal: (v: ValidationState) => void, existing: boolean) => {
+    useEffect(() => {
+      const k = (key || '').trim();
+      if (!k) {
+        if (!existing) setVal({ state: 'idle' });
+        return;
+      }
+      if (k.length < 26) { setVal({ state: 'idle' }); return; }
+      setVal({ state: 'checking' });
+      const handle = setTimeout(async () => {
+        const result = await validateProviderKey(provider, settingKey, k);
+        setVal(result.ok
+          ? { state: 'success', latencyMs: result.latencyMs }
+          : { state: 'error', error: result.error });
+      }, 400);
+      return () => clearTimeout(handle);
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [key]);
+  };
+  useKeyValidation(tmdbKey, 'tmdb', 'providers.tmdb.api_key', setTmdbVal,
+    tmdbVal.state === 'success' && !!tmdbVal.existing);
+  useKeyValidation(tvdbKey, 'tvdb', 'providers.tvdb.api_key', setTvdbVal,
+    tvdbVal.state === 'success' && !!tvdbVal.existing);
 
   return (
     <>
-      <div className="onboarding-eyebrow" style={idx(0)}>
-        <span className="step-n">Step 2 of 5</span>
+      <div className="onb-eyebrow" style={idx(0)}>
+        <span className="step-n">Step 2 of 6</span>
         <span>Required</span>
       </div>
-      <div className="onboarding-title" style={idx(1)}>Connect to TMDB</div>
-      <div className="onboarding-sub" style={idx(2)}>
-        Kira needs a free TMDB API key to look up titles, posters, and episode metadata.{' '}
-        <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noreferrer">Get one here →</a>
+      <div className="onb-title" style={idx(1)}>Connect your metadata</div>
+      <div className="onb-sub" style={idx(2)}>
+        Free API keys power the matching — titles, posters, episode lists.
+        Keys never leave this server.
       </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 4, ...idx(3) }}>
-        <div className="onboarding-input-wrap">
-          <input
-            ref={ref}
-            className="input mono"
-            placeholder="Paste your TMDB API key…"
-            value={value}
-            onChange={e => setValue(e.target.value)}
-            spellCheck={false}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 18, marginTop: 4, ...idx(3) }}>
+        <KeyField
+          label="TMDB"
+          required
+          placeholder="Paste your TMDB API key…"
+          value={tmdbKey}
+          setValue={setTmdbKey}
+          validation={tmdbVal}
+          helpHref="https://www.themoviedb.org/settings/api"
+          helpLabel="Get a key"
+        />
+        {wantsTvdb ? (
+          <KeyField
+            label="TVDB"
+            required={false}
+            placeholder="Paste your TVDB v4 API key…"
+            value={tvdbKey}
+            setValue={setTvdbKey}
+            validation={tvdbVal}
+            helpHref="https://thetvdb.com/api-information"
+            helpLabel="Get a key"
           />
-          <div className="state">
-            {state === 'checking' && <span style={{ color: 'var(--ink-3)' }}><IcSpin /></span>}
-            {state === 'success' && <span style={{ color: 'var(--accent)' }}><IcCheck /></span>}
-            {state === 'error' && <span style={{ color: 'var(--conf-low)' }}><IcX /></span>}
-          </div>
-        </div>
+        ) : null}
+      </div>
 
-        {state === 'success' && (
-          <div className="onboarding-state success">
-            <IcCheck />
-            <span>
-              <b>Key verified.</b>
-              {validation.state === 'success' && typeof validation.latencyMs === 'number'
-                ? <> TMDB responded in {validation.latencyMs}&nbsp;ms.</>
-                : null}
-              {' '}You're good to go.
-            </span>
-          </div>
-        )}
-        {state === 'error' && validation.state === 'error' && (
-          <div className="onboarding-state error">
-            <IcAlertTri /><span>{validation.error}</span>
-          </div>
-        )}
-        {state === 'checking' && (
-          <div className="onboarding-state checking"><IcSpin /><span>Verifying with TMDB…</span></div>
-        )}
-        {state === 'idle' && (
-          <div className="text-xs text-muted" style={{ padding: '4px 2px' }}>
-            Your key stays on this server — Kira never sends it anywhere else.
-          </div>
-        )}
+      {wantsTvdb ? (
+        <div className="onb-hint" style={idx(4)}>
+          TVDB sharpens TV &amp; anime episode data{types.anime ? ' (AniDB needs no key for matching)' : ''} — add it now or later in Settings.
+        </div>
+      ) : null}
+
+      {/* ffmpeg check — extras like embedded-subtitle extraction need it.
+          Docker ships it (the row just shows Ready); on bare installs the
+          one-click button has Kira install its own copy, nothing else needed. */}
+      <div className="onb-folder-card" style={{ marginTop: 14, ...idx(5) }}>
+        <FfmpegStatusRow compact />
       </div>
     </>
   );
 }
 
-interface MediaFolderStepProps {
-  folder: string;
-  setFolder: (s: string) => void;
-  watchFolder: boolean;
-  setWatchFolder: (v: boolean) => void;
-}
+// ─── Step 3 · Folder ─────────────────────────────────────────────────
 
-function MediaFolderStep({ folder, setFolder, watchFolder, setWatchFolder }: MediaFolderStepProps) {
-  // Real folder picker — clicking Browse opens the FolderPickerModal,
-  // which calls /api/v1/folders to walk the filesystem. Previously the
-  // button had no onClick and the breakdown numbers (342 files, 128
-  // movies, etc.) were hardcoded — onboarding was lying to users about
-  // what they were about to scan.
+function MediaFolderStep({ folder, setFolder, watchFolder, setWatchFolder }: {
+  folder: string; setFolder: (s: string) => void;
+  watchFolder: boolean; setWatchFolder: (v: boolean) => void;
+}) {
   const [pickerOpen, setPickerOpen] = useState(false);
-
   return (
     <>
-      <div className="onboarding-eyebrow" style={idx(0)}>
-        <span className="step-n">Step 3 of 5</span>
+      <div className="onb-eyebrow" style={idx(0)}>
+        <span className="step-n">Step 3 of 6</span>
         <span>Required</span>
       </div>
-      <div className="onboarding-title" style={idx(1)}>Where's your media?</div>
-      <div className="onboarding-sub" style={idx(2)}>
-        Kira will scan this folder for video files. The first scan after onboarding
-        tells you exactly how many movies / TV / anime were found.
+      <div className="onb-title" style={idx(1)}>Where's your media?</div>
+      <div className="onb-sub" style={idx(2)}>
+        Kira scans this folder for video files. The first scan tells you exactly
+        how many movies / TV / anime it found — nothing is touched yet.
       </div>
 
-      <div className="onboarding-folder-card found" style={idx(3)}>
-        <div className="onboarding-folder-icon"><IcFolder /></div>
-        <div className="onboarding-folder-info">
+      <div className="onb-folder-card" style={idx(3)}>
+        <div className="icon"><IcFolder /></div>
+        <div className="info">
           <div className="path">{folder || '(no folder selected)'}</div>
-          <div className="meta" style={{ color: 'var(--ink-3)', fontSize: 11 }}>
-            Click Browse to pick a different folder
-          </div>
+          <div className="meta">Click Browse to pick a different folder</div>
         </div>
         <button className="btn btn-sm" onClick={() => setPickerOpen(true)}>
           <IcFolder /> Browse…
         </button>
       </div>
 
-      <label className="flex items-center gap-2" style={{ marginTop: 8, fontSize: 12, color: 'var(--ink-2)', cursor: 'pointer', ...idx(4) }}>
+      <label className="onb-checkrow" style={idx(4)}>
         <input
           type="checkbox"
           checked={watchFolder}
           onChange={e => setWatchFolder(e.target.checked)}
           style={{ accentColor: 'var(--accent)' }}
         />
-        Watch this folder for new files automatically
+        <span>
+          Watch this folder and scan automatically when new files appear
+          <span className="sub">Turns on the auto-scan daemon — new downloads land in Review without clicking Scan.</span>
+        </span>
       </label>
 
       {pickerOpen ? (
@@ -272,12 +353,81 @@ function MediaFolderStep({ folder, setFolder, watchFolder, setWatchFolder }: Med
   );
 }
 
-interface NamingStepProps {
-  profile: string;
-  setProfile: (p: string) => void;
+// ─── Step 4 · Handling (file operation + rename mode) ────────────────
+
+function HandlingStep({ op, setOp, mode, setMode }: {
+  op: string; setOp: (v: string) => void;
+  mode: string; setMode: (v: string) => void;
+}) {
+  const ops = [
+    { key: 'hardlink', label: 'Hardlink', rec: true,
+      desc: 'Renamed copy appears in the library; the original stays put. Zero extra disk — seeding keeps working.' },
+    { key: 'move', label: 'Move',
+      desc: 'Relocate the file itself. The source folder is cleaned up afterwards.' },
+    { key: 'copy', label: 'Copy',
+      desc: 'Duplicate into the library. Safest, but uses double the space.' },
+    { key: 'symlink', label: 'Symlink',
+      desc: 'A pointer at the original. Light, but breaks if the source moves.' },
+  ];
+  const modes = [
+    { key: 'in-place', label: 'In place',
+      desc: 'Files stay in their current folders — only the names change.' },
+    { key: 'move-to-library', label: 'Into the library',
+      desc: 'Build a fresh, fully organized tree under your media root.' },
+  ];
+  return (
+    <>
+      <div className="onb-eyebrow" style={idx(0)}>
+        <span className="step-n">Step 4 of 6</span>
+        <span>Optional</span>
+      </div>
+      <div className="onb-title" style={idx(1)}>How should files be placed?</div>
+      <div className="onb-sub" style={idx(2)}>
+        What happens to the original when Kira lands the renamed copy. Hardlink is
+        the safe default — switchable per-batch later.
+      </div>
+
+      <div className="ct-grid" style={idx(3)} role="radiogroup" aria-label="File operation">
+        {ops.map(o => (
+          <button key={o.key} type="button" role="radio" aria-checked={op === o.key}
+                  className={`ct-card ${op === o.key ? 'selected' : ''}`}
+                  onClick={() => setOp(o.key)}>
+            <div className="ct-card-head">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="ct-name">
+                  {o.label}
+                  {o.rec ? <span className="ct-soon rec">Recommended</span> : null}
+                </div>
+                <div className="ct-desc">{o.desc}</div>
+              </div>
+              <div className={`ct-check ${op === o.key ? 'on' : ''}`}>{op === o.key ? <IcCheck /> : null}</div>
+            </div>
+          </button>
+        ))}
+      </div>
+
+      <div className="onb-naming" style={idx(4)} role="radiogroup" aria-label="Rename mode">
+        {modes.map(m => (
+          <button key={m.key} type="button" role="radio" aria-checked={mode === m.key}
+                  className={`naming-card ${mode === m.key ? 'selected' : ''}`}
+                  onClick={() => setMode(m.key)}>
+            <div className="naming-card-head">
+              <div>
+                <div className="naming-card-name">{m.label}</div>
+                <div className="text-xs text-muted">{m.desc}</div>
+              </div>
+              <div className="naming-card-check">{mode === m.key ? <IcCheck /> : null}</div>
+            </div>
+          </button>
+        ))}
+      </div>
+    </>
+  );
 }
 
-function NamingStep({ profile, setProfile }: NamingStepProps) {
+// ─── Step 5 · Naming ─────────────────────────────────────────────────
+
+function NamingStep({ profile, setProfile }: { profile: string; setProfile: (p: string) => void }) {
   const profiles = [
     {
       key: 'Plex',
@@ -315,16 +465,17 @@ function NamingStep({ profile, setProfile }: NamingStepProps) {
 
   return (
     <>
-      <div className="onboarding-eyebrow" style={idx(0)}>
-        <span className="step-n">Step 4 of 5</span>
+      <div className="onb-eyebrow" style={idx(0)}>
+        <span className="step-n">Step 5 of 6</span>
         <span>Optional</span>
       </div>
-      <div className="onboarding-title" style={idx(1)}>Pick a naming style</div>
-      <div className="onboarding-sub" style={idx(2)}>
-        Kira will rename files into folders that your media server understands. You can change this anytime.
+      <div className="onb-title" style={idx(1)}>Pick a naming style</div>
+      <div className="onb-sub" style={idx(2)}>
+        Files get renamed into folders your media server understands. Change it anytime —
+        including fully custom templates.
       </div>
 
-      <div className="onboarding-naming" style={idx(3)} role="radiogroup" aria-label="Naming style">
+      <div className="onb-naming" style={idx(3)} role="radiogroup" aria-label="Naming style">
         {profiles.map(p => (
           <button
             key={p.key}
@@ -346,40 +497,36 @@ function NamingStep({ profile, setProfile }: NamingStepProps) {
           </button>
         ))}
       </div>
-
-      <div className="text-xs text-muted" style={{ marginTop: 4, ...idx(4) }}>
-        Need something else? Pick either now — you can switch to a custom template in Settings later.
-      </div>
     </>
   );
 }
 
-interface ReadyStepProps {
-  data: { apiKey: string; folder: string; profile: string; contentTypes: ContentTypes };
-  gotoStep: (n: number) => void;
-}
+// ─── Step 5 · Launch ─────────────────────────────────────────────────
 
-function ReadyStep({ data, gotoStep }: ReadyStepProps) {
+function ReadyStep({ data, gotoStep }: {
+  data: { apiKey: string; tmdbExisting: boolean; folder: string; profile: string; contentTypes: ContentTypes; watchFolder: boolean; fileOp: string; renameMode: string };
+  gotoStep: (n: number) => void;
+}) {
   return (
     <>
-      <div className="onboarding-eyebrow" style={idx(0)}>
-        <span className="step-n">Step 5 of 5</span>
+      <div className="onb-eyebrow" style={idx(0)}>
+        <span className="step-n">Step 6 of 6</span>
         <span>Ready</span>
       </div>
-      <div className="onboarding-title" style={idx(1)}>You're all set.</div>
-      <div className="onboarding-sub" style={idx(2)}>
-        Review your setup below. Kira will run its first scan as soon as you click start —
-        nothing will be renamed without your approval.
+      <div className="onb-title" style={idx(1)}>You're all set.</div>
+      <div className="onb-sub" style={idx(2)}>
+        Kira runs its first scan when you hit start — every match waits for your
+        approval before anything is renamed.
       </div>
 
-      <div className="onboarding-summary" style={idx(3)}>
-        <div className="onboarding-summary-row">
-          <div className="onboarding-summary-icon"><IcSparkles /></div>
+      <div className="onb-summary" style={idx(3)}>
+        <div className="row">
+          <div className="icon"><IcSparkles /></div>
           <div>
-            <div className="lbl">Content types</div>
+            <div className="lbl">Library</div>
             <div className="val" style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
               {Object.entries(data.contentTypes).filter(([, v]) => v).map(([k]) => (
-                <span key={k} style={{ padding: '1px 8px', borderRadius: 5, background: 'rgba(255,255,255,0.06)', fontSize: 11.5, textTransform: 'capitalize', fontFamily: 'var(--font-ui)', fontWeight: 500 }}>
+                <span key={k} className="chip">
                   {k === 'tv' ? 'TV Shows' : k.charAt(0).toUpperCase() + k.slice(1)}
                 </span>
               ))}
@@ -387,141 +534,239 @@ function ReadyStep({ data, gotoStep }: ReadyStepProps) {
           </div>
           <button className="edit" onClick={() => gotoStep(1)}>Edit</button>
         </div>
-        <div className="onboarding-summary-row">
-          <div className="onboarding-summary-icon"><IcKey /></div>
+        <div className="row">
+          <div className="icon"><IcKey /></div>
           <div>
-            <div className="lbl">TMDB API</div>
-            <div className="val" style={{ color: 'var(--accent)' }}>Connected · key ending {data.apiKey.slice(-4)}</div>
+            <div className="lbl">Metadata</div>
+            <div className="val" style={{ color: 'var(--accent)' }}>
+              {data.tmdbExisting && !data.apiKey
+                ? 'TMDB connected · existing key'
+                : <>TMDB connected · key ending {data.apiKey.slice(-4)}</>}
+            </div>
           </div>
           <button className="edit" onClick={() => gotoStep(2)}>Edit</button>
         </div>
-        <div className="onboarding-summary-row">
-          <div className="onboarding-summary-icon"><IcFolder /></div>
+        <div className="row">
+          <div className="icon"><IcFolder /></div>
           <div>
             <div className="lbl">Media folder</div>
-            <div className="val">{data.folder}</div>
+            <div className="val">
+              {data.folder}
+              {data.watchFolder ? <span className="chip" style={{ marginLeft: 8 }}>auto-scan on</span> : null}
+            </div>
           </div>
           <button className="edit" onClick={() => gotoStep(3)}>Edit</button>
         </div>
-        <div className="onboarding-summary-row">
-          <div className="onboarding-summary-icon"><IcTag /></div>
+        <div className="row">
+          <div className="icon"><IcLink /></div>
           <div>
-            <div className="lbl">Naming profile</div>
-            <div className="val">{data.profile || 'Custom — configure later'}</div>
+            <div className="lbl">File handling</div>
+            <div className="val" style={{ textTransform: 'capitalize' }}>
+              {data.fileOp} · {data.renameMode === 'in-place' ? 'in place' : 'into the library'}
+            </div>
           </div>
           <button className="edit" onClick={() => gotoStep(4)}>Edit</button>
+        </div>
+        <div className="row">
+          <div className="icon"><IcTag /></div>
+          <div>
+            <div className="lbl">Naming profile</div>
+            <div className="val">{data.profile || 'Plex (default) — customize later'}</div>
+          </div>
+          <button className="edit" onClick={() => gotoStep(5)}>Edit</button>
         </div>
       </div>
     </>
   );
 }
 
+// ─── Shell ───────────────────────────────────────────────────────────
+
+const RAIL_STEPS = [
+  { n: 1, label: 'Library',  hint: 'What you have' },
+  { n: 2, label: 'Connect',  hint: 'Metadata keys' },
+  { n: 3, label: 'Folder',   hint: 'Where it lives' },
+  { n: 4, label: 'Handling', hint: 'Move or link' },
+  { n: 5, label: 'Naming',   hint: 'How it looks' },
+  { n: 6, label: 'Launch',   hint: 'First scan' },
+];
+
 export function Onboarding({ onComplete }: OnboardingProps) {
-  // 0=Welcome · 1=Content types · 2=TMDB · 3=Folder · 4=Naming · 5=Ready
+  // 0=Welcome · 1=Library · 2=Connect · 3=Folder · 4=Handling · 5=Naming · 6=Launch
   const [step, setStep] = useState(0);
   const [contentTypes, setContentTypes] = useState<ContentTypes>({ movies: true, tv: true, anime: false, music: false });
-  const [apiKey, setApiKey] = useState('');
-  const [validation, setValidation] = useState<ValidationState>({ state: 'idle' });
+  const [tmdbKey, setTmdbKey] = useState('');
+  const [tmdbVal, setTmdbVal] = useState<ValidationState>({ state: 'idle' });
+  const [tvdbKey, setTvdbKey] = useState('');
+  const [tvdbVal, setTvdbVal] = useState<ValidationState>({ state: 'idle' });
   const [folder, setFolder] = useState('/media');
   const [watchFolder, setWatchFolder] = useState(true);
   const [profile, setProfile] = useState('Plex');
+  const [fileOp, setFileOp] = useState('hardlink');
+  const [renameMode, setRenameMode] = useState('in-place');
+  const [version, setVersion] = useState<string | null>(null);
+  // The app renders (blurred) behind this overlay — it must not scroll under it.
+  useScrollLock();
 
-  const totalSteps = 5;
+  useEffect(() => {
+    let cancelled = false;
+    void api.health().then(h => { if (!cancelled && h.version) setVersion(h.version); }).catch(() => {});
+    // Re-run protection: a wiped localStorage restarts onboarding while the
+    // BACKEND still has real settings. Prefill folder + profile from the
+    // saved values so completing the flow can't clobber a configured library
+    // root with the '/media' default.
+    void api.getSettings().then(st => {
+      if (cancelled) return;
+      const root = st['paths.library_root'];
+      if (typeof root === 'string' && root.trim()) setFolder(root);
+      const prof = st['naming.profile'];
+      if (typeof prof === 'string' && prof.trim()) setProfile(prof);
+      const op = st['rename.default_op'];
+      if (typeof op === 'string' && op.trim()) setFileOp(op);
+      const mode = st['rename.mode'];
+      if (typeof mode === 'string' && mode.trim()) setRenameMode(mode);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   const anyContentSelected = Object.values(contentTypes).some(Boolean);
 
   const canContinue = () => {
-    if (step === 0) return true;
     if (step === 1) return anyContentSelected;
-    if (step === 2) return validation.state === 'success';
+    if (step === 2) return tmdbVal.state === 'success';
     if (step === 3) return folder.length > 0;
-    if (step === 4) return true;
-    if (step === 5) return true;
-    return false;
+    return true;
   };
-  const isOptional = step === 4;
+  const isOptional = step === 4 || step === 5;
 
-  const next = () => {
-    if (step < 5) setStep(step + 1);
-    else complete();
-  };
+  const next = () => { if (step < 6) setStep(step + 1); else void complete(); };
   const skip = () => {
-    if (step === 4) { setProfile(''); setStep(5); }
+    if (step === 4) { setFileOp('hardlink'); setRenameMode('in-place'); setStep(5); }
+    else if (step === 5) { setProfile(''); setStep(6); }
   };
   const back = () => { if (step > 0) setStep(step - 1); };
+
   const complete = async () => {
-    // Persist the user's folder + watch choice so the first scan + future
-    // auto-rescans pick them up. Without this, the data was collected and
-    // thrown on the floor.
+    // Persist everything the flow collected. The watch checkbox writes the
+    // REAL auto-scan config (watch.config — the settings PUT re-arms the
+    // watcher daemon); a previous version wrote a `paths.watch_enabled` key
+    // that nothing read, so the checkbox silently did nothing.
     try {
-      await api.putSettings({
+      const values: Record<string, unknown> = {
         'paths.library_root': folder,
-        'paths.watch_enabled': watchFolder,
-        'naming.profile': profile,
-      });
+        'naming.profile': profile || 'Plex',
+        'rename.default_op': fileOp,
+        'rename.mode': renameMode,
+        'onboarding.content_types': contentTypes,
+        // Server-side completion flag — a fresh browser on a configured
+        // server skips onboarding; a factory-reset server re-enters it.
+        'onboarding.completed': true,
+      };
+      if (watchFolder) {
+        values['watch.config'] = {
+          auto_scan: true, debounce_seconds: 30, poll_interval_seconds: 900, folders: {},
+        };
+      }
+      await api.putSettings(values);
     } catch { /* user can fix in Settings later */ }
     setOnboarded(true);
-    onComplete({ apiKey, folder, profile, contentTypes });
+    onComplete({ apiKey: tmdbKey, folder, profile: profile || 'Plex', contentTypes });
   };
+
+  const tmdbExisting = tmdbVal.state === 'success' && !!tmdbVal.existing;
+  const progress = step === 0 ? 0 : (step / 6) * 100;
 
   return (
     <div className="onboarding-root">
       <div className="backdrop" style={{ position: 'absolute' }} />
-      <div className="onboarding-card">
-        {step > 0 ? (
-          <div className="onboarding-progress">
-            {Array.from({ length: totalSteps }).map((_, i) => {
-              const stepIdx = i + 1;
-              const cls = step === 5 ? 'done'
-                : stepIdx < step ? 'done'
-                : stepIdx === step ? 'active' : '';
-              return <div key={i} className={`onboarding-step-dot ${cls}`} />;
-            })}
+      <div className="onb-shell">
+        {/* ── Left rail: brand + step map ── */}
+        <aside className="onb-rail">
+          <div className="brand">
+            <div className="mark"><IcLogoMark /></div>
+            <div>
+              <div className="name">Kira</div>
+              <div className="sub">Rename, organize, done.</div>
+            </div>
           </div>
-        ) : null}
+          <nav className="steps" aria-label="Setup steps">
+            {RAIL_STEPS.map(s => {
+              const state = step === 0 ? '' : s.n < step ? 'done' : s.n === step ? 'active' : '';
+              return (
+                <button
+                  key={s.n}
+                  type="button"
+                  className={`step ${state}`}
+                  disabled={step === 0 || s.n > step}
+                  onClick={() => { if (s.n < step) setStep(s.n); }}
+                >
+                  <span className="dot">{state === 'done' ? <IcCheck /> : s.n}</span>
+                  <span className="txt">
+                    <span className="l">{s.label}</span>
+                    <span className="h">{s.hint}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </nav>
+          <div className="foot">Self-hosted · v{version ?? '0.5.0'}</div>
+        </aside>
 
-        <div className="onboarding-body" key={step}>
-          {step === 0 && <WelcomeStep />}
-          {step === 1 && <ContentTypeStep types={contentTypes} setTypes={setContentTypes} />}
-          {step === 2 && <TmdbStep value={apiKey} setValue={setApiKey} validation={validation} setValidation={setValidation} />}
-          {step === 3 && (
-            <MediaFolderStep
-              folder={folder}
-              setFolder={setFolder}
-              watchFolder={watchFolder}
-              setWatchFolder={setWatchFolder}
-            />
-          )}
-          {step === 4 && <NamingStep profile={profile} setProfile={setProfile} />}
-          {step === 5 && <ReadyStep data={{ apiKey, folder, profile, contentTypes }} gotoStep={setStep} />}
-        </div>
+        {/* ── Right pane: step content ── */}
+        <section className="onb-pane">
+          <div className="onb-progress" aria-hidden>
+            <div className="bar" style={{ width: `${progress}%` }} />
+          </div>
+          <div className="onb-body" key={step}>
+            {step === 0 && <WelcomeStep />}
+            {step === 1 && <ContentTypeStep types={contentTypes} setTypes={setContentTypes} />}
+            {step === 2 && (
+              <ConnectStep
+                types={contentTypes}
+                tmdbKey={tmdbKey} setTmdbKey={setTmdbKey} tmdbVal={tmdbVal} setTmdbVal={setTmdbVal}
+                tvdbKey={tvdbKey} setTvdbKey={setTvdbKey} tvdbVal={tvdbVal} setTvdbVal={setTvdbVal}
+              />
+            )}
+            {step === 3 && (
+              <MediaFolderStep folder={folder} setFolder={setFolder} watchFolder={watchFolder} setWatchFolder={setWatchFolder} />
+            )}
+            {step === 4 && <HandlingStep op={fileOp} setOp={setFileOp} mode={renameMode} setMode={setRenameMode} />}
+            {step === 5 && <NamingStep profile={profile} setProfile={setProfile} />}
+            {step === 6 && (
+              <ReadyStep
+                data={{ apiKey: tmdbKey, tmdbExisting, folder, profile, contentTypes, watchFolder, fileOp, renameMode }}
+                gotoStep={setStep}
+              />
+            )}
+          </div>
 
-        <div className="onboarding-foot">
-          {step === 0 ? (
-            <>
-              <div className="text-xs text-muted">Self-hosted · v0.5.0 · Docker</div>
-              <button className="btn btn-brand" style={{ padding: '12px 24px', fontSize: 14 }} onClick={next}>
-                Get started <IcArrowRight />
-              </button>
-            </>
-          ) : (
-            <>
-              <button className="btn btn-ghost" onClick={back}>← Back</button>
-              <div className="right">
-                {isOptional && <button className="onboarding-skip" onClick={skip}>Skip — set up later</button>}
-                {step === 5 ? (
-                  <button className="btn btn-primary" style={{ padding: '11px 22px' }} onClick={complete}>
-                    <IcScan /> Start first scan
-                  </button>
-                ) : (
-                  <button className="btn btn-primary" disabled={!canContinue()} onClick={next}>
-                    Continue <IcArrowRight />
-                  </button>
-                )}
-              </div>
-            </>
-          )}
-        </div>
+          <div className="onb-foot">
+            {step === 0 ? (
+              <>
+                <div className="hint">Takes about two minutes</div>
+                <button className="btn btn-brand" style={{ padding: '12px 24px', fontSize: 14 }} onClick={next}>
+                  Get started <IcArrowRight />
+                </button>
+              </>
+            ) : (
+              <>
+                <button className="btn btn-ghost" onClick={back}>← Back</button>
+                <div className="right">
+                  {isOptional && <button className="onb-skip" onClick={skip}>Skip — set up later</button>}
+                  {step === 6 ? (
+                    <button className="btn btn-primary" style={{ padding: '11px 22px' }} onClick={() => void complete()}>
+                      <IcScan /> Start first scan
+                    </button>
+                  ) : (
+                    <button className="btn btn-primary" disabled={!canContinue()} onClick={next}>
+                      Continue <IcArrowRight />
+                    </button>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </section>
       </div>
     </div>
   );

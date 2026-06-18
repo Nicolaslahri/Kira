@@ -1,41 +1,86 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { AppState, ToastData } from '../lib/types';
 import type { SettingsSection } from '../App';
 import { IcTrash, IcCheck, IcRefresh, IcTag, IcArrowRight } from '../lib/icons';
 import { SegmentedControl } from '../components/base/segmented/segmented-control';
-import { ProviderCard, NamingTemplateTabs, SETTINGS_CARD, SETTINGS_NESTED, SETTINGS_DIVIDER, SettingsLayout, SettingsGrid, SectionCard, SettingRow, NestedBox, SliderField } from '../components/settings-blocks';
-import { BadgeWithDot } from '../components/base/badges/badges';
+import { ProviderCard, NamingTemplateTabs, SETTINGS_CARD, SETTINGS_NESTED, SETTINGS_DIVIDER, SettingsLayout, SectionCard, SettingRow, NestedBox, SliderField, SectionHeader, SettingsFilter, StatusPill } from '../components/settings-blocks';
 import { Button } from '../components/base/buttons/button';
 import { FeaturedIcon } from '../components/base/featured-icons/featured-icon';
 import { Toggle } from '../components/base/toggle/toggle';
 import { Input } from '../components/base/input/input';
-import { IcShieldCheck, IcChevDown, IcSettings, IcLink } from '../lib/icons';
+import { IcShieldCheck, IcChevDown, IcLink, IcSearch, IcHistory, IcUndo, IcFolder, IcSpin, IcCaption } from '../lib/icons';
+import { Select } from '../components/ui';
 import { api, type ApiProvider } from '../lib/api';
 import { strSetting } from './settings/helpers';
 import { AdvancedSection } from './settings/AdvancedSection';
 import { PathsSection } from './settings/PathsSection';
 import { SubtitlesCard } from './settings/SubtitlesCard';
 import { IntegrationsSection } from './settings/IntegrationsSection';
+import { FolderPickerModal } from '../components/FolderPickerModal';
 
 // Optional NFO fields the user can include/exclude (Settings → Naming).
 // Keys MUST match the backend's NFO_TOGGLEABLE (kira/renamer/nfo.py) and the
 // `naming.nfo_fields` setting dict. Structural identity — title, year,
 // season/episode, provider <uniqueid> — is always written and not listed here.
-const NFO_FIELDS: { key: string; label: string; hint?: string }[] = [
-  { key: 'plot',          label: 'Plot / overview' },
-  { key: 'genres',        label: 'Genres' },
-  { key: 'cast',          label: 'Cast' },
-  { key: 'director',      label: 'Director' },
-  { key: 'studio',        label: 'Studio / network' },
-  { key: 'runtime',       label: 'Runtime' },
-  { key: 'country',       label: 'Country' },
-  { key: 'originaltitle', label: 'Original title', hint: 'native / romaji' },
-  { key: 'artwork',       label: 'Artwork URLs',   hint: 'poster + fanart' },
-  { key: 'collection',    label: 'Collection set', hint: 'movies' },
-  { key: 'status',        label: 'Status',         hint: 'TV · Continuing / Ended' },
-  { key: 'showtitle',     label: 'Show title',     hint: 'episodes' },
-  { key: 'streamdetails', label: 'Stream details', hint: 'codec · HDR · audio' },
+// `targets` records which of the three .nfo files each field actually lands in
+// (verified against backend kira/renamer/nfo.py builders). Presentation only —
+// it drives the per-row M·S·E indicator so users can see at a glance that most
+// fields are series/movie-level and never reach an episode file.
+type NfoTarget = 'movie' | 'series' | 'episode';
+const NFO_FIELDS: { key: string; label: string; hint?: string; targets: NfoTarget[] }[] = [
+  { key: 'plot',          label: 'Plot / overview',                              targets: ['movie', 'series', 'episode'] },
+  { key: 'genres',        label: 'Genres',                                       targets: ['movie', 'series'] },
+  { key: 'cast',          label: 'Cast',                                         targets: ['movie', 'series'] },
+  { key: 'director',      label: 'Director',                                     targets: ['movie'] },
+  { key: 'studio',        label: 'Studio / network',                             targets: ['movie', 'series'] },
+  { key: 'runtime',       label: 'Runtime',                                      targets: ['movie', 'episode'] },
+  { key: 'country',       label: 'Country',                                      targets: ['movie', 'series'] },
+  { key: 'originaltitle', label: 'Original title', hint: 'native / romaji',      targets: ['movie', 'series'] },
+  { key: 'artwork',       label: 'Artwork URLs',   hint: 'poster + fanart',      targets: ['movie', 'series'] },
+  { key: 'seasonposters', label: 'Season posters', hint: 'anime cours · Kodi',   targets: ['series'] },
+  { key: 'collection',    label: 'Collection set', hint: 'movies',               targets: ['movie'] },
+  { key: 'status',        label: 'Status',         hint: 'TV · Continuing / Ended', targets: ['series'] },
+  { key: 'showtitle',     label: 'Show title',     hint: 'episodes',             targets: ['episode'] },
+  { key: 'streamdetails', label: 'Stream details', hint: 'codec · HDR · audio',  targets: ['movie', 'episode'] },
 ];
+
+// Renders the compact M·S·E indicator on each NFO field row. Filled (accent)
+// dots = the field lands in that file; dim outline = it doesn't. The title
+// attribute spells out the applicable files for hover/screen-reader users.
+const NFO_TARGET_META: { t: NfoTarget; letter: string; name: string }[] = [
+  { t: 'movie',   letter: 'M', name: 'Movie .nfo' },
+  { t: 'series',  letter: 'S', name: 'Series tvshow.nfo' },
+  { t: 'episode', letter: 'E', name: 'Episode .nfo' },
+];
+function NfoTargetDots({ targets, label }: { targets: NfoTarget[]; label: string }) {
+  const applies = NFO_TARGET_META.filter(m => targets.includes(m.t)).map(m => m.name);
+  const title = `${label} is written into: ${applies.join(', ')}`;
+  return (
+    <span
+      className="flex shrink-0 items-center gap-1 font-mono text-[10px] font-semibold leading-none"
+      title={title}
+      aria-label={title}
+    >
+      {NFO_TARGET_META.map((m, i) => {
+        const on = targets.includes(m.t);
+        return (
+          <span key={m.t} className="flex items-center gap-1" aria-hidden>
+            {i > 0 && <span className="text-ink-faint">·</span>}
+            <span
+              className={
+                on
+                  ? 'grid size-[15px] place-items-center rounded-[4px] bg-accent-soft text-accent ring-1 ring-inset ring-accent-line'
+                  : 'grid size-[15px] place-items-center rounded-[4px] text-ink-faint ring-1 ring-inset ring-line'
+              }
+            >
+              {m.letter}
+            </span>
+          </span>
+        );
+      })}
+    </span>
+  );
+}
 
 // Artwork kinds Kira can save beside each renamed file (Settings → Naming).
 // Keys + defaults MUST match the backend's fanart.tv ALL_KINDS + _ARTWORK_DEFAULTS
@@ -72,26 +117,44 @@ function deriveProviderStatus(info: ApiProvider | undefined, key: string): Block
   return 'connected';
 }
 
+// Stable deep-equality for the settings DRAFT vs the last-saved BASELINE — the
+// basis for "which keys are unsaved". Sorts object keys so a rebuilt-but-
+// identical dict (e.g. naming.nfo_fields) never falsely reads as changed.
+function stableStringify(v: unknown): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v ?? null) ?? 'null';
+  if (Array.isArray(v)) return '[' + v.map(stableStringify).join(',') + ']';
+  const o = v as Record<string, unknown>;
+  return '{' + Object.keys(o).sort().map(k => JSON.stringify(k) + ':' + stableStringify(o[k])).join(',') + '}';
+}
+const settingsEqual = (a: unknown, b: unknown) => stableStringify(a) === stableStringify(b);
+
 interface Props {
   pushToast: (t: Omit<ToastData, 'id'>) => void;
   state: AppState;
   /** Active sub-section — now driven by the nested sidebar nav (App owns it). */
   section: SettingsSection;
   setSection: (s: SettingsSection) => void;
+  /** Report unsaved-draft state up to App so it can guard navigation away. */
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 // Real provider test handler — returns a callback that hits the backend.
+// Resolves `true` on a verified connection so ProviderCard can fire its
+// success pulse. The toast behaviour (success / error) is unchanged; the
+// boolean is purely additive and ignored by any caller that doesn't need it.
 function makeTester(slug: string, pushToast: Props['pushToast'], displayName: string) {
-  return async () => {
+  return async (): Promise<boolean> => {
     try {
       const res = await api.testProvider(slug);
       if (res.ok) {
         pushToast({ title: `${displayName} verified`, sub: `${res.latency_ms ?? '—'} ms`, kind: 'success' });
-      } else {
-        pushToast({ title: `${displayName} test failed`, sub: res.detail ?? undefined, kind: 'error' });
+        return true;
       }
+      pushToast({ title: `${displayName} test failed`, sub: res.detail ?? undefined, kind: 'error' });
+      return false;
     } catch (e) {
       pushToast({ title: `${displayName} test failed`, sub: (e as Error).message, kind: 'error' });
+      return false;
     }
   };
 }
@@ -106,7 +169,7 @@ function LabsChip({ children }: { children: ReactNode }) {
   );
 }
 
-export function SettingsPage({ pushToast, section, setSection }: Props) {
+export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: Props) {
   const [profile, setProfile] = useState('Plex');
   const [defaultOp, setDefaultOp] = useState('hardlink');
   // Default OFF — must match the backend (`_read_auto_approve_setting`): a fresh
@@ -116,7 +179,11 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
   const [highT, setHighT] = useState(85);
   const [midT, setMidT] = useState(50);
   // All backend settings as a flat dict — read-through for provider keys etc.
+  // This is now the editable DRAFT: every control writes here, nothing is
+  // persisted until Save. `baseline` is the last-saved snapshot we diff against
+  // to know what's unsaved (and revert to on Cancel).
   const [rawSettings, setRawSettings] = useState<Record<string, unknown>>({});
+  const [baseline, setBaseline] = useState<Record<string, unknown>>({});
   const [loaded, setLoaded] = useState(false);
   // F-05 / F-06: live provider catalog from /providers, keyed by slug.
   // Drives Connected / Not configured / Coming soon labels per block.
@@ -124,9 +191,23 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
 
   // Hydrate from backend on mount.
   useEffect(() => {
+    // The six control-backed keys live in their own state with these defaults.
+    // Seed BOTH draft and baseline with their effective (loaded-or-default)
+    // values so the mirror-into-draft effect below never reads as "unsaved" on
+    // a fresh / partial load (a brand-new DB has none of them persisted yet).
+    const SIX_DEFAULTS: Record<string, unknown> = {
+      'naming.profile': 'Plex',
+      'rename.default_op': 'hardlink',
+      'matching.auto_approve': false,
+      'matching.auto_threshold': 95,
+      'matching.high_threshold': 85,
+      'matching.mid_threshold': 50,
+    };
     api.getSettings()
       .then(s => {
-        setRawSettings(s);
+        const seeded = { ...SIX_DEFAULTS, ...s };
+        setRawSettings(seeded);
+        setBaseline(seeded);
         if (typeof s['naming.profile'] === 'string') setProfile(s['naming.profile'] as string);
         if (typeof s['rename.default_op'] === 'string') setDefaultOp(s['rename.default_op'] as string);
         if (typeof s['matching.auto_approve'] === 'boolean') setAutoApprove(s['matching.auto_approve'] as boolean);
@@ -134,7 +215,7 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
         if (typeof s['matching.high_threshold'] === 'number') setHighT(s['matching.high_threshold'] as number);
         if (typeof s['matching.mid_threshold'] === 'number') setMidT(s['matching.mid_threshold'] as number);
       })
-      .catch(() => { /* backend down — keep defaults */ })
+      .catch(() => { setRawSettings(SIX_DEFAULTS); setBaseline(SIX_DEFAULTS); })
       .finally(() => setLoaded(true));
     // Pull live provider catalog in parallel so block statuses are correct.
     api.getProviders()
@@ -180,25 +261,20 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
     return p;
   };
 
+  // DRAFT writer — every control routes here (directly or via the sub-sections).
+  // It updates local state ONLY; the PUT happens once, on Save (commit), so
+  // nothing persists without an explicit click — and browser autofill can no
+  // longer silently overwrite a saved API key / token.
   const saveKey = (key: string) => (value: string | number | boolean) => {
     setRawSettings(s => ({ ...s, [key]: value }));
-    trackSave(api.putSettings({ [key]: value }))
-      .catch(e => pushToast({ title: 'Save failed', sub: (e as Error).message, kind: 'error' }));
   };
 
   // Custom naming templates persist as a single JSON object under
   // `naming.custom.Custom` (the shape the backend's _resolve_profile reads at
   // rename time). Edits optimistically update rawSettings so the editor stays
   // in sync, then debounce the PUT so we don't hammer the backend per keystroke.
-  const customSaveTimer = useRef<number | undefined>(undefined);
   const saveCustomTemplates = (dict: Record<string, string>) => {
     setRawSettings(s => ({ ...s, 'naming.custom.Custom': dict }));
-    if (customSaveTimer.current) window.clearTimeout(customSaveTimer.current);
-    customSaveTimer.current = window.setTimeout(() => {
-      void api.putSettings({ 'naming.custom.Custom': dict })
-        .then(() => window.dispatchEvent(new CustomEvent('kira:settings-saved')))
-        .catch(e => pushToast({ title: 'Save failed', sub: (e as Error).message, kind: 'error' }));
-    }, 500);
   };
   // Saved custom templates (if any) to seed the editor; undefined → defaults.
   const savedCustom = (() => {
@@ -219,8 +295,6 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
   const toggleNfoField = (key: string) => {
     const next = { ...nfoFields, [key]: !nfoFieldOn(key) };
     setRawSettings(s => ({ ...s, 'naming.nfo_fields': next }));
-    void api.putSettings({ 'naming.nfo_fields': next })
-      .catch(e => pushToast({ title: 'Save failed', sub: (e as Error).message, kind: 'error' }));
   };
 
   // Artwork-type picker — same shape as the NFO picker. Stored under
@@ -237,8 +311,6 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
   const toggleArtworkKind = (key: string) => {
     const next = { ...artworkTypes, [key]: !artworkKindOn(key) };
     setRawSettings(s => ({ ...s, 'naming.artwork_types': next }));
-    void api.putSettings({ 'naming.artwork_types': next })
-      .catch(e => pushToast({ title: 'Save failed', sub: (e as Error).message, kind: 'error' }));
   };
   // fanart.tv key is masked in GET /settings ({masked,set,tail}); the raw value
   // is a string only right after the user types it. `fanartKeySet` drives the
@@ -250,46 +322,141 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
     (!!fanartKeyRaw && typeof fanartKeyRaw === 'object' && (fanartKeyRaw as { set?: boolean }).set === true)
     || (typeof fanartKeyRaw === 'string' && fanartKeyRaw.length > 0);
 
-  // ── Preferred metadata source (provider preference per media type) ───────
-  // Stored as `matching.provider_order.<type> = [preferredKey]`. The backend's
-  // resolve_provider_order() SOFT-appends the remaining defaults as fallbacks,
-  // so picking one provider never strands a title the others could still match.
+  // OpenSubtitles — subtitle provider. Same masked-secret semantics as
+  // fanart: the server doesn't echo saved keys back, so "set" is the signal.
+  const keyIsSet = (settingKey: string) => {
+    const raw = rawSettings[settingKey];
+    return (!!raw && typeof raw === 'object' && (raw as { set?: boolean }).set === true)
+      || (typeof raw === 'string' && raw.length > 0);
+  };
+  const osKeySet = keyIsSet('providers.opensubtitles.api_key');
+  const subdlKeySet = keyIsSet('providers.subdl.api_key');
+  const subsourceKeySet = keyIsSet('providers.subsource.api_key');
+
+  // Music providers (MusicBrainz / AcoustID) are not implemented yet — NO
+  // backend code reads `providers.musicbrainz.*` / `providers.acoustid.*`, so
+  // their Connections cards collected credentials that did nothing (a setting
+  // that lies). Hide them until music matching lands; flip to `true` to restore
+  // both cards verbatim in one line.
+  const MUSIC_PROVIDERS_ENABLED = false;
+
+  // ── Provider preference (per media type) ─────────────────────────────────
+  // Stored as `matching.provider_order.<type>` = the FULL ordered list of
+  // provider keys. The backend's resolve_provider_order() tries them in this
+  // order and SOFT-appends any omitted default as a trailing fallback, so a
+  // reorder is a preference — never a hard exclude that could strand a title.
   const provName = (k: string) =>
     k === 'anidb' ? 'AniDB' : k === 'tvdb' ? 'TheTVDB' : k === 'tmdb' ? 'TMDB' : k;
-  const preferredSource = (mt: string, fallback: string): string => {
-    const v = rawSettings[`matching.provider_order.${mt}`];
-    return Array.isArray(v) && v.length && typeof v[0] === 'string' ? (v[0] as string) : fallback;
+  // Every candidate provider per type, in built-in default order. The reorder
+  // UI shows ALL of them; the saved value just permutes this set.
+  const PROVIDER_CANDS: Record<string, string[]> = {
+    movie: ['tmdb', 'tvdb'],
+    tv: ['tvdb', 'tmdb'],
+    anime: ['anidb', 'tvdb', 'tmdb'],
   };
-  const setPreferredSource = (mt: string, key: string) => {
+  // Current order: saved picks first (filtered to known cands), then any
+  // omitted cands appended — mirrors the backend so the UI always lists every
+  // provider exactly once even from a partial saved value.
+  const providerOrder = (mt: string): string[] => {
+    const cands = PROVIDER_CANDS[mt] ?? [];
+    const v = rawSettings[`matching.provider_order.${mt}`];
+    const saved = Array.isArray(v)
+      ? v.filter((x): x is string => typeof x === 'string' && cands.includes(x))
+      : [];
+    return [...saved, ...cands.filter(c => !saved.includes(c))];
+  };
+  const setProviderOrder = (mt: string, order: string[]) => {
     const sk = `matching.provider_order.${mt}`;
-    setRawSettings(s => ({ ...s, [sk]: [key] }));
-    trackSave(api.putSettings({ [sk]: [key] }))
+    setRawSettings(s => ({ ...s, [sk]: order }));
+  };
+  const moveProvider = (mt: string, idx: number, dir: -1 | 1) => {
+    const order = providerOrder(mt);
+    const j = idx + dir;
+    if (j < 0 || j >= order.length) return;
+    [order[idx], order[j]] = [order[j], order[idx]];
+    setProviderOrder(mt, order);
+  };
+
+  // Anime cross-ref enrichment source (episode titles + NFO cast/studio).
+  // `matching.anime_crossref_order` — only TVDB/TMDB carry the Fribb cross-ref,
+  // so the UI is a single primary pick; the backend soft-appends the other.
+  const animeCrossref = (): string => {
+    const v = rawSettings['matching.anime_crossref_order'];
+    return Array.isArray(v) && v.length && typeof v[0] === 'string' ? (v[0] as string) : 'tvdb';
+  };
+  const setAnimeCrossref = (key: string) => {
+    const sk = 'matching.anime_crossref_order';
+    const order = key === 'tmdb' ? ['tmdb', 'tvdb'] : ['tvdb', 'tmdb'];
+    setRawSettings(s => ({ ...s, [sk]: order }));
+  };
+
+  // These six live in their own state (bound to controls / clamps), so MIRROR
+  // them into the draft whenever they change — no PUT. That way the unified
+  // dirty-diff + Save below picks them up exactly like every saveKey field.
+  useEffect(() => {
+    if (!loaded) return;
+    setRawSettings(s => ({
+      ...s,
+      'naming.profile': profile,
+      'rename.default_op': defaultOp,
+      'matching.auto_approve': autoApprove,
+      'matching.auto_threshold': autoThreshold,
+      'matching.high_threshold': highT,
+      'matching.mid_threshold': midT,
+    }));
+  }, [loaded, profile, defaultOp, autoApprove, autoThreshold, highT, midT]);
+
+  // ── Unsaved-changes model ────────────────────────────────────────────────
+  // Dirty = keys whose draft value differs from the last-saved baseline. Save
+  // PUTs only those; Cancel reverts the draft (and the mirrored controls).
+  const dirtyKeys = useMemo(
+    () => Object.keys(rawSettings).filter(k => !settingsEqual(rawSettings[k], baseline[k])),
+    [rawSettings, baseline],
+  );
+  const dirty = dirtyKeys.length > 0;
+
+  // Bumped on discard() to force-remount the subtrees that hold seed-once LOCAL
+  // state (ProviderField API-key inputs, the NamingTemplateTabs editor), so
+  // Cancel fully reverts them to the restored draft. Without it those inputs
+  // keep stale typed text — which then silently re-commits on the next keystroke.
+  const [discardNonce, setDiscardNonce] = useState(0);
+
+  const commit = () => {
+    if (!dirty) return;
+    const patch: Record<string, unknown> = {};
+    for (const k of dirtyKeys) patch[k] = rawSettings[k];
+    trackSave(api.putSettings(patch))
+      .then(() => {
+        setBaseline(b => ({ ...b, ...patch }));
+        // Let App reload its rename-modal defaults / confidence bands.
+        window.dispatchEvent(new CustomEvent('kira:settings-saved'));
+      })
       .catch(e => pushToast({ title: 'Save failed', sub: (e as Error).message, kind: 'error' }));
   };
 
-  // Auto-save whenever any persisted setting changes (after initial hydrate).
+  const discard = () => {
+    setRawSettings(baseline);
+    setProfile(typeof baseline['naming.profile'] === 'string' ? baseline['naming.profile'] as string : 'Plex');
+    setDefaultOp(typeof baseline['rename.default_op'] === 'string' ? baseline['rename.default_op'] as string : 'hardlink');
+    setAutoApprove(baseline['matching.auto_approve'] === true);
+    setAutoThreshold(typeof baseline['matching.auto_threshold'] === 'number' ? baseline['matching.auto_threshold'] as number : 95);
+    setHighT(typeof baseline['matching.high_threshold'] === 'number' ? baseline['matching.high_threshold'] as number : 85);
+    setMidT(typeof baseline['matching.mid_threshold'] === 'number' ? baseline['matching.mid_threshold'] as number : 50);
+    // Remount the seed-once subtrees (provider key inputs, template editor) so
+    // their local state re-seeds from the just-restored draft instead of keeping
+    // the user's now-cancelled edits.
+    setDiscardNonce(n => n + 1);
+  };
+
+  // Surface dirty state to App (navigation guard) + warn on tab close / refresh.
+  useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
+  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
   useEffect(() => {
-    if (!loaded) return;
-    const handle = setTimeout(() => {
-      trackSave(api.putSettings({
-        'naming.profile': profile,
-        'rename.default_op': defaultOp,
-        'matching.auto_approve': autoApprove,
-        'matching.auto_threshold': autoThreshold,
-        'matching.high_threshold': highT,
-        'matching.mid_threshold': midT,
-      })).then(() => {
-        // Let App reload its rename-modal defaults from the saved values.
-        window.dispatchEvent(new CustomEvent('kira:settings-saved'));
-      }).catch((e) => {
-        // Previously swallowed — a failed threshold/profile save was invisible
-        // while every other field toasts on failure, so the user thought the
-        // change stuck. Surface it consistently.
-        pushToast({ title: 'Save failed', sub: (e as Error).message, kind: 'error' });
-      });
-    }, 500);
-    return () => clearTimeout(handle);
-  }, [loaded, profile, defaultOp, autoApprove, autoThreshold, highT, midT, pushToast]);
+    if (!dirty) return;
+    const h = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ''; };
+    window.addEventListener('beforeunload', h);
+    return () => window.removeEventListener('beforeunload', h);
+  }, [dirty]);
 
   // Settings deliberately renders even while !loaded — the defaults
   // (Profile=Plex, Op=hardlink, etc.) are the documented out-of-box
@@ -304,26 +471,59 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
   const PROVIDER_KEYS = ['tmdb', 'tvdb', 'anidb', 'musicbrainz', 'acoustid'] as const;
   const connectedCount = PROVIDER_KEYS.filter(k => deriveProviderStatus(providers[k], k) === 'connected').length;
 
+  // Per-section settings filter. Local + cosmetic only — it stamps the
+  // active section's `.settings-stage` with a query that CSS uses to dim/hide
+  // non-matching SettingRows. Reset whenever the section changes so a stale
+  // query never hides a freshly-opened section. NEVER touches save plumbing.
+  const [filter, setFilter] = useState('');
+  useEffect(() => { setFilter(''); }, [section]);
+  const filterQ = filter.trim().toLowerCase();
+  // The per-section filter input is wired into the Naming section header (the
+  // densest section). Other sections keep their card rhythm; `filter` resets
+  // on section change so a stale query never carries across.
+
+  // Apply the filter by toggling a hidden/match class on each `.setting-row`
+  // in the active section (rows stamp their searchable text in `data-search`).
+  // A small DOM pass keyed on (section, query) — far simpler than threading a
+  // query prop through every sub-page's SettingsLayout, and entirely
+  // presentational. Cards with zero visible rows collapse via CSS.
+  const sectionRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const root = sectionRef.current;
+    if (!root) return;
+    const rows = root.querySelectorAll<HTMLElement>('.setting-row[data-search]');
+    rows.forEach(row => {
+      const hay = row.dataset.search ?? '';
+      const hit = !filterQ || hay.includes(filterQ);
+      row.classList.toggle('setting-row-hidden', !hit);
+      row.classList.toggle('setting-row-hit', !!filterQ && hit);
+    });
+    // Deps are ONLY the query + section: each row re-stamps its own `data-search`
+    // on its own re-render, so we don't need to re-run this DOM pass on every
+    // `rawSettings`/`providers` change (i.e. on every keystroke in any field).
+  }, [filterQ, section]);
+
   return (
     <div className="page relative">
       {/* Plain page header — matches History/Dashboard (no boxed card). */}
       <div className="page-header">
         <div>
           <h1 className="page-title">Settings</h1>
-          <p className="page-sub">Configure Kira · changes save automatically</p>
+          <p className="page-sub">Configure Kira · review your changes, then Save</p>
         </div>
         {saveStatus !== 'idle' ? (
           <div
             role="status"
             aria-live="polite"
-            className={`inline-flex shrink-0 items-center gap-2 self-center rounded-full border px-3 py-1.5 text-[12px] font-medium ${
-              saveStatus === 'error' ? 'border-[rgba(255,91,110,0.4)] text-conf-low'
-                : saveStatus === 'saved' ? 'border-accent-line text-accent'
+            className={`save-indicator inline-flex shrink-0 items-center gap-2 self-center rounded-full border px-3 py-1.5 text-[12px] font-medium ${
+              saveStatus === 'error' ? 'save-indicator-error border-[rgba(255,91,110,0.4)] text-conf-low'
+                : saveStatus === 'saved' ? 'save-indicator-saved border-accent-line text-accent'
                 : 'border-line text-ink-muted'
             }`}
           >
             <span className={`size-1.5 rounded-full ${
-              saveStatus === 'error' ? 'bg-conf-low' : saveStatus === 'saved' ? 'bg-accent' : 'bg-ink-soft'
+              saveStatus === 'saving' ? 'save-indicator-spin bg-ink-soft'
+                : saveStatus === 'error' ? 'bg-conf-low' : saveStatus === 'saved' ? 'bg-accent' : 'bg-ink-soft'
             }`} />
             {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'saved' ? 'Saved' : 'Save failed'}
           </div>
@@ -334,66 +534,33 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
           active section is already labelled there, so no in-page section
           header is needed. Each section width-constrains its own content via
           SettingsLayout so the forms don't stretch edge-to-edge. */}
-      <div key={section}>
+      <div key={section} ref={sectionRef} className={filterQ ? 'settings-filtering' : undefined}>
           {section === 'connections' && (
             <SettingsLayout
-              intro="Kira pulls metadata from these providers. Each is configured independently."
-              actions={(
-                <BadgeWithDot color={connectedCount > 0 ? 'success' : 'gray'}>
-                  {connectedCount} of {PROVIDER_KEYS.length} connected
-                </BadgeWithDot>
+              header={(
+                <SectionHeader
+                  icon={<IcLink />}
+                  title="Connections"
+                  purpose="Metadata sources Kira pulls FROM to identify your media. Each provider is configured independently."
+                  status={(
+                    <StatusPill tone={connectedCount > 0 ? 'connected' : 'neutral'} breathe={connectedCount > 0}>
+                      {connectedCount} of {PROVIDER_KEYS.length} connected
+                    </StatusPill>
+                  )}
+                />
               )}
             >
-              {/* Preferred metadata source — which provider IDENTIFIES each
-                  media type. Soft preference: the rest stay as fallbacks, so a
-                  pick never strands a title the other sources could match. */}
-              {/* Two columns: the per-type source preference on the left, the
-                  provider connection cards stacked on the right. */}
-              <SettingsGrid>
-              <SectionCard
-                icon={<IcLink />}
-                title="Preferred metadata source"
-                desc="Which provider identifies each kind of title. Kira tries your pick first and only falls back to the others if it has no confident match. Applies to new scans — re-identify a show or rescan to change matches you already have."
-              >
-                <div className="flex flex-col gap-5">
-                  {[
-                    { mt: 'movie', label: 'Movies', cands: ['tmdb', 'tvdb'],
-                      hint: 'TMDB carries the richest movie data; TheTVDB is the fallback.' },
-                    { mt: 'tv', label: 'TV shows', cands: ['tvdb', 'tmdb'],
-                      hint: 'TheTVDB leads for TV seasons; TMDB is the fallback.' },
-                    { mt: 'anime', label: 'Anime', cands: ['anidb', 'tvdb'],
-                      hint: (<><strong className="text-ink">AniDB</strong> — richest anime metadata + original titles, but splits each cour into its own card. <strong className="text-ink">TheTVDB</strong> — one unified series with seasons + absolute numbering, best Plex / Jellyfin match.</>) },
-                  ].map(row => {
-                    const cur = preferredSource(row.mt, row.cands[0]);
-                    const curInfo = providers[cur];
-                    const curNeedsKey = !!curInfo && !curInfo.configured && !curInfo.keyless;
-                    return (
-                      <SettingRow key={row.mt} layout="stacked" label={row.label} desc={row.hint}>
-                        <div className="flex flex-col gap-2">
-                          <SegmentedControl
-                            fullWidth
-                            value={cur}
-                            onChange={v => setPreferredSource(row.mt, v)}
-                            options={row.cands.map(k => {
-                              const info = providers[k];
-                              const needsKey = !!info && !info.configured && !info.keyless;
-                              return { value: k, label: provName(k) + (needsKey ? ' · needs key' : '') };
-                            })}
-                          />
-                          {curNeedsKey && (
-                            <div className="text-[12px] leading-relaxed text-conf-mid">
-                              {provName(cur)} isn't configured yet — add its API key below, or Kira falls back to the next source automatically.
-                            </div>
-                          )}
-                        </div>
-                      </SettingRow>
-                    );
-                  })}
-                </div>
-              </SectionCard>
+              {/* Preferred metadata source + anime cross-ref live in the
+                  Matching section now (Identification band) — Connections is
+                  credentials only. */}
 
-              {/* Right column: the provider connection cards, stacked. */}
-              <div className="flex flex-col gap-3">
+              {/* The provider list — two INDEPENDENT columns on wide viewports
+                  (identification sources left, subtitle/artwork sources right).
+                  Flex columns, NOT a grid: expanding one card grows only its own
+                  column instead of stretching a shared grid row and leaving dead
+                  space beside its collapsed neighbour. */}
+              <div key={`conn-${discardNonce}`} className="flex flex-col gap-2.5 xl:flex-row xl:items-start">
+              <div className="flex min-w-0 flex-1 flex-col gap-2.5">
               <ProviderCard
                 providerKey="TMDB" status={deriveProviderStatus(providers['tmdb'], 'tmdb')}
                 fields={[
@@ -426,6 +593,10 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                     mono: true,
                     desc: 'Required for TV and as a secondary anime source. Sign up at thetvdb.com/api-information.',
                     onSave: saveKey('providers.tvdb.api_key') },
+                  { kind: 'select', label: 'Search language', value: strSetting(rawSettings, 'providers.tvdb.language') || 'English',
+                    options: ['English', 'Français', 'Deutsch', 'Español', 'Italiano', '日本語'],
+                    desc: 'Language for TVDB search result names. Leave on English unless your library titles are in another language.',
+                    onSave: saveKey('providers.tvdb.language') },
                 ]}
                 onTest={makeTester('tvdb', pushToast, 'TVDB')}
               />
@@ -452,6 +623,7 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                 fallbackChain={providers['anidb']?.fallback_chain ?? ['tvdb', 'tmdb']}
               />
 
+              {MUSIC_PROVIDERS_ENABLED && (<>
               <ProviderCard
                 providerKey="MusicBrainz" status={deriveProviderStatus(providers['musicbrainz'], 'musicbrainz')}
                 fields={[
@@ -472,16 +644,25 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                 providerKey="AcoustID" status={deriveProviderStatus(providers['acoustid'], 'acoustid')}
                 fields={[
                   { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.acoustid.api_key'),
-                    placeholder: 'paste your acoustid.org API key', mono: true,
+                    placeholder: keyIsSet('providers.acoustid.api_key')
+                      ? '••••••••••••••••  (key saved — enter a new one to replace)'
+                      : 'paste your acoustid.org API key', mono: true,
                     desc: 'Used for audio-fingerprint matching when filename metadata is missing. Get a free key at acoustid.org.',
                     onSave: saveKey('providers.acoustid.api_key') },
                   { kind: 'toggle', label: 'Auto-fingerprint untagged files',
+                    value: rawSettings['providers.acoustid.auto_fingerprint'] === true ? 'true' : 'false',
                     desc: 'When enabled, music files without ID3 tags are fingerprinted and matched automatically.',
+                    disabled: !keyIsSet('providers.acoustid.api_key'),
+                    disabledReason: 'Add an AcoustID API key above to enable fingerprint matching.',
                     onSave: saveKey('providers.acoustid.auto_fingerprint') },
                 ]}
                 onTest={makeTester('acoustid', pushToast, 'AcoustID')}
               />
+              </>)}
+              </div>
 
+              {/* Right column — artwork + subtitle sources. */}
+              <div className="flex min-w-0 flex-1 flex-col gap-2.5">
               <ProviderCard
                 providerKey="fanart.tv"
                 status={fanartKeySet ? 'connected' : 'not-configured'}
@@ -493,16 +674,73 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                     mono: true,
                     desc: 'Artwork only — clear logos, clear art, banners, disc & character art for the “Download artwork” option (Naming). Free personal key at fanart.tv → log in → API. Anime resolves its artwork via the TheTVDB cross-reference.',
                     onSave: saveKey('providers.fanarttv.api_key') },
+                  { kind: 'text', label: 'Client key (optional)', value: strSetting(rawSettings, 'providers.fanarttv.client_key'),
+                    placeholder: 'project client key — higher rate limits',
+                    mono: true,
+                    desc: 'A registered project key on top of the personal key lifts the fanart.tv rate limits and surfaces new artwork sooner. Leave blank to use the personal key alone.',
+                    onSave: saveKey('providers.fanarttv.client_key') },
                 ]}
                 onTest={makeTester('fanarttv', pushToast, 'fanart.tv')}
               />
+
+              <ProviderCard
+                providerKey="OpenSubtitles"
+                status={osKeySet ? 'connected' : 'not-configured'}
+                fields={[
+                  { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.opensubtitles.api_key'),
+                    placeholder: osKeySet
+                      ? '••••••••••••••••  (key saved — enter a new one to replace)'
+                      : 'paste the 32-char key from opensubtitles.com → API consumers',
+                    mono: true,
+                    desc: 'Enables subtitle SEARCH. Free key: opensubtitles.com → log in → API consumers.',
+                    onSave: saveKey('providers.opensubtitles.api_key') },
+                  { kind: 'text', label: 'Username', value: strSetting(rawSettings, 'providers.opensubtitles.username'),
+                    placeholder: 'your opensubtitles.com account',
+                    desc: 'Downloads count against your account quota — without a login, search works but nothing can be saved.',
+                    onSave: saveKey('providers.opensubtitles.username') },
+                  { kind: 'password', label: 'Password', value: strSetting(rawSettings, 'providers.opensubtitles.password'),
+                    placeholder: '••••••••',
+                    onSave: saveKey('providers.opensubtitles.password') },
+                ]}
+                onTest={makeTester('opensubtitles', pushToast, 'OpenSubtitles')}
+              />
+
+              <ProviderCard
+                providerKey="SubDL"
+                status={subdlKeySet ? 'connected' : 'not-configured'}
+                fields={[
+                  { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.subdl.api_key'),
+                    placeholder: subdlKeySet
+                      ? '••••••••••••••••  (key saved — enter a new one to replace)'
+                      : 'paste your SubDL API key',
+                    mono: true,
+                    desc: 'Subtitle source. Free key at subdl.com → panel → API. Enable it in Settings → Subtitles.',
+                    onSave: saveKey('providers.subdl.api_key') },
+                ]}
+                onTest={makeTester('subdl', pushToast, 'SubDL')}
+              />
+
+              <ProviderCard
+                providerKey="SubSource"
+                status={subsourceKeySet ? 'connected' : 'not-configured'}
+                fields={[
+                  { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.subsource.api_key'),
+                    placeholder: subsourceKeySet
+                      ? '••••••••••••••••  (key saved — enter a new one to replace)'
+                      : 'paste your SubSource API key',
+                    mono: true,
+                    desc: "Subtitle source (Subscene's successor). Free key from your subsource.net profile. Enable it in Settings → Subtitles.",
+                    onSave: saveKey('providers.subsource.api_key') },
+                ]}
+                onTest={makeTester('subsource', pushToast, 'SubSource')}
+              />
               </div>
-              </SettingsGrid>
+              </div>
             </SettingsLayout>
           )}
 
           {section === 'paths' && (
-            <PathsSection rawSettings={rawSettings} setRawSettings={setRawSettings} saveKey={saveKey} pushToast={pushToast} />
+            <PathsSection rawSettings={rawSettings} setRawSettings={setRawSettings} saveKey={saveKey} />
           )}
 
           {section === 'integrations' && (
@@ -510,7 +748,19 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
           )}
 
           {section === 'naming' && (
-            <SettingsLayout wide intro="Choose how Kira names files and lays them out on disk. Changes apply to new scans.">
+            <SettingsLayout
+              wide
+              header={(
+                <SectionHeader
+                  accent
+                  icon={<IcTag />}
+                  title="Naming"
+                  purpose="How Kira names files and lays them out on disk. Pick a profile, tune the template, watch the live preview, then choose the sidecars to write. Applies to new scans."
+                  status={<StatusPill tone="accent">{profile} profile</StatusPill>}
+                  filter={<SettingsFilter value={filter} onChange={setFilter} />}
+                />
+              )}
+            >
               {/* Naming profile + templates */}
               <SectionCard
                 icon={<IcTag />}
@@ -535,15 +785,18 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                       Each media type uses its own tokens. {profile === 'Custom' ? 'Editable — changes autosave.' : 'Pick the Custom profile to edit these.'}
                     </div>
                     <div className="mt-3">
-                      <NamingTemplateTabs profile={profile} savedCustom={savedCustom} onSaveCustom={saveCustomTemplates} />
+                      <NamingTemplateTabs key={`naming-${discardNonce}`} profile={profile} savedCustom={savedCustom} onSaveCustom={saveCustomTemplates} />
                     </div>
                   </div>
                 </div>
               </SectionCard>
 
-              {/* File handling + Sidecar files — two columns side by side so
-                  the wide naming section uses its horizontal space. */}
-              <SettingsGrid>
+              {/* Two height-packed columns: left = file ops (File handling +
+                  cleanup breadcrumb), right = sidecar output (NFO / artwork +
+                  subtitles). Independent flex columns so short cards never
+                  leave a hole beside tall neighbours. */}
+              <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
+              <div className="flex flex-col gap-4">
               <SectionCard
                 icon={<IcRefresh />}
                 title="File handling"
@@ -615,6 +868,20 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                 </div>
               </SectionCard>
 
+              {/* Folder cleanup breadcrumb — full settings live in their own section. */}
+              <SectionCard
+                icon={<IcTrash />}
+                title="Folder cleanup"
+                desc="Empty-folder removal, the Plex / Jellyfin / Kodi artifact sweep, and the deleted-pattern list live in their own section."
+                action={(
+                  <Button color="secondary" size="sm" iconTrailing={<IcArrowRight className="size-3.5" />} onClick={() => setSection('cleanup')}>
+                    Open
+                  </Button>
+                )}
+              />
+              </div>
+
+              <div className="flex flex-col gap-4">
               {/* Sidecar files — NFO + artwork output (right column). */}
               <SectionCard
                 icon={<IcTag />}
@@ -636,18 +903,31 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                   {/* Per-field NFO picker — only relevant when NFOs are on. */}
                   {rawSettings['naming.write_nfo'] === true && (
                     <NestedBox className="px-3.5 py-3">
-                      <div className="mb-3 text-[12.5px] leading-relaxed text-ink-muted">
-                        Fields to include in each <span className="font-mono text-ink">.nfo</span>
-                        <span className="text-ink-soft"> — title, year, season/episode and provider IDs are always written.</span>
+                      <div className="mb-2.5 text-[12.5px] leading-relaxed text-ink-muted">
+                        Fields written into the movie <span className="font-mono text-ink">.nfo</span> and series <span className="font-mono text-ink">tvshow.nfo</span>
+                        <span className="text-ink-soft"> — episode files stay lean by design (genres, cast, studio, artwork and the like live in the series file, where Plex/Jellyfin read them; episodes get title, plot, aired, runtime + stream details). Title, year, season/episode and provider IDs are always written, and an existing <span className="font-mono">tvshow.nfo</span> from your media server is never overwritten.</span>
+                      </div>
+                      {/* Legend: decodes the per-field M·S·E dots below. */}
+                      <div className={`mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-t pt-2.5 text-[11px] leading-none text-ink-soft ${SETTINGS_DIVIDER}`}>
+                        <span className="text-ink-muted">Each field lands in:</span>
+                        {NFO_TARGET_META.map(m => (
+                          <span key={m.t} className="flex items-center gap-1.5">
+                            <span className="grid size-[15px] shrink-0 place-items-center rounded-[4px] bg-accent-soft font-mono text-[10px] font-semibold leading-none text-accent ring-1 ring-inset ring-accent-line">{m.letter}</span>
+                            {m.name}
+                          </span>
+                        ))}
                       </div>
                       <fieldset className="m-0 min-w-0 border-0 p-0">
                       <legend className="sr-only">Fields to include in each .nfo file</legend>
                       <div className="grid grid-cols-1 gap-x-6 gap-y-2.5 sm:grid-cols-2">
                         {NFO_FIELDS.map(f => (
                           <label key={f.key} className="flex cursor-pointer items-center justify-between gap-3">
-                            <span className="text-[13px] text-ink">
-                              {f.label}
-                              {f.hint ? <span className="ml-1.5 text-[11px] text-ink-soft">{f.hint}</span> : null}
+                            <span className="flex min-w-0 items-center gap-2">
+                              <span className="truncate text-[13px] text-ink">
+                                {f.label}
+                                {f.hint ? <span className="ml-1.5 text-[11px] text-ink-soft">{f.hint}</span> : null}
+                              </span>
+                              <NfoTargetDots targets={f.targets} label={f.label} />
                             </span>
                             <Toggle
                               isSelected={nfoFieldOn(f.key)}
@@ -684,20 +964,27 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                       <fieldset className="m-0 min-w-0 border-0 p-0">
                       <legend className="sr-only">Artwork types to download</legend>
                       <div className="grid grid-cols-1 gap-x-6 gap-y-2.5 sm:grid-cols-2">
-                        {ARTWORK_KINDS.map(a => (
-                          <label key={a.key} className="flex cursor-pointer items-center justify-between gap-3">
+                        {ARTWORK_KINDS.map(a => {
+                          // A fanart.tv-only kind with no key can't produce anything,
+                          // so show it OFF + disabled (not its default-on state — that
+                          // read as "on but greyed", which looks active yet does nothing).
+                          const blocked = !!a.fanartOnly && !fanartKeySet;
+                          return (
+                          <label key={a.key} className={`flex items-center justify-between gap-3 ${blocked ? 'cursor-default opacity-60' : 'cursor-pointer'}`}>
                             <span className="text-[13px] text-ink">
                               {a.label}
                               {a.hint ? <span className="ml-1.5 text-[11px] text-ink-soft">{a.hint}</span> : null}
-                              {a.fanartOnly && !fanartKeySet ? <span className="ml-1.5 text-[11px] text-conf-mid">needs key</span> : null}
+                              {blocked ? <span className="ml-1.5 text-[11px] text-conf-mid">needs key</span> : null}
                             </span>
                             <Toggle
-                              isSelected={artworkKindOn(a.key)}
+                              isSelected={artworkKindOn(a.key) && !blocked}
+                              isDisabled={blocked}
                               onChange={() => toggleArtworkKind(a.key)}
                               aria-label={`Download ${a.label}`}
                             />
                           </label>
-                        ))}
+                          );
+                        })}
                       </div>
                       </fieldset>
                       <div className={`mt-3 border-t pt-3 text-[11px] leading-relaxed text-ink-soft ${SETTINGS_DIVIDER}`}>
@@ -709,24 +996,27 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                   )}
                 </div>
               </SectionCard>
-              </SettingsGrid>
 
-              {/* Subtitles — sidecar output written next to each renamed file,
-                  so it belongs with the other sidecars (NFO / artwork) rather
-                  than under Integrations. */}
-              <SubtitlesCard rawSettings={rawSettings} saveKey={saveKey} />
+              {/* Subtitles promoted to its own top-level section (Output band). */}
+              </div>
+              </div>
+            </SettingsLayout>
+          )}
 
-              {/* Folder cleanup breadcrumb — full settings live in their own section. */}
-              <SectionCard
-                icon={<IcTrash />}
-                title="Folder cleanup"
-                desc="Empty-folder removal, the Plex / Jellyfin / Kodi artifact sweep, and the deleted-pattern list live in their own section."
-                action={(
-                  <Button color="secondary" size="sm" iconTrailing={<IcArrowRight className="size-3.5" />} onClick={() => setSection('cleanup')}>
-                    Open
-                  </Button>
-                )}
-              />
+          {section === 'subtitles' && (
+            <SettingsLayout
+              wide
+              header={(
+                <SectionHeader
+                  accent
+                  icon={<IcCaption />}
+                  title="Subtitles"
+                  purpose="Find and write subtitle sidecars next to each renamed file — sources, languages, scoring floors, and upgrades over time. Applies to new scans and backfill."
+                  filter={<SettingsFilter value={filter} onChange={setFilter} />}
+                />
+              )}
+            >
+              <SubtitlesCard rawSettings={rawSettings} saveKey={saveKey} goToConnections={() => setSection('connections')} />
             </SettingsLayout>
           )}
 
@@ -753,12 +1043,33 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
             const trashOn = rawSettings['rename.cleanup_trash'] === true;
             const trashDir = strSetting(rawSettings, 'rename.trash_dir');
             const libRoot = (strSetting(rawSettings, 'paths.library_root') || '/media').replace(/[\\/]+$/, '');
+            // User-extendable sweep lists + the aggressive "delete non-video" mode.
+            const asStrList = (v: unknown): string[] => Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+            const extraNames = asStrList(rawSettings['rename.cleanup_extra_filenames']);
+            const extraExts = asStrList(rawSettings['rename.cleanup_extra_extensions']);
+            const nonvideoMode = (() => {
+              const v = rawSettings['rename.cleanup_nonvideo'];
+              const s = typeof v === 'string' ? v : (v && typeof v === 'object' && 'value' in v ? String((v as { value: unknown }).value) : 'off');
+              return (['off', 'keep_subs', 'all'] as const).includes(s as 'off') ? s : 'off';
+            })();
             return (
-              <SettingsLayout intro={(
-                <>When Kira moves a file into your library the source folder is left behind — often with leftover{' '}
-                  <span className="font-mono text-ink">poster.jpg</span> / <span className="font-mono text-ink">tvshow.nfo</span>{' '}
-                  files that Plex / Jellyfin / Kodi wrote. Control whether Kira tidies those up.</>
-              )}>
+              <SettingsLayout
+                header={(
+                  <SectionHeader
+                    icon={<IcTrash />}
+                    title="Folder cleanup"
+                    purpose={(
+                      <>When Kira moves a file into your library the source folder is left behind — often with leftover{' '}
+                        <span className="font-mono text-ink">poster.jpg</span> / <span className="font-mono text-ink">tvshow.nfo</span>{' '}
+                        files that Plex / Jellyfin / Kodi wrote. Control whether Kira tidies those up.</>
+                    )}
+                    status={<StatusPill tone={masterOn ? (trashOn ? 'connected' : 'warning') : 'neutral'}>{masterOn ? (trashOn ? 'On · recycle' : sweepOn ? 'On · delete' : 'Empty only') : 'Off'}</StatusPill>}
+                  />
+                )}
+              >
+                {/* Toggles left, transparency disclosure right — side by side
+                    so the section's two cards share the width. */}
+                <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
                 {/* Cleanup toggles */}
                 <SectionCard
                   icon={<IcTrash />}
@@ -784,6 +1095,78 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                       </SettingRow>
                     </NestedBox>
 
+                    {/* Sub-options of the artifact sweep: user-defined names /
+                        extensions, and the aggressive "delete non-video" mode. */}
+                    <NestedBox dimmed={!masterOn || !sweepOn}>
+                      <div className="flex flex-col gap-4">
+                        <div>
+                          <div className="text-[13px] font-medium text-ink">Also delete these filenames</div>
+                          <div className="mt-0.5 mb-2 text-[12px] leading-relaxed text-ink-muted">
+                            Extra exact filenames to sweep on top of the built-in list — e.g. <span className="font-mono text-ink">backdrop.jpg</span>, <span className="font-mono text-ink">cover.jpg</span>, <span className="font-mono text-ink">.DS_Store</span>. Comma-separated, case-insensitive.
+                          </div>
+                          <CommaListField
+                            value={extraNames}
+                            placeholder="backdrop.jpg, theme.mp3, .DS_Store"
+                            disabled={!masterOn || !sweepOn}
+                            onSave={v => setRawSettings(s => ({ ...s, 'rename.cleanup_extra_filenames': v }))}
+                          />
+                        </div>
+                        <div>
+                          <div className="text-[13px] font-medium text-ink">Also delete these extensions</div>
+                          <div className="mt-0.5 mb-2 text-[12px] leading-relaxed text-ink-muted">
+                            Any file with one of these extensions is swept regardless of name — e.g. <span className="font-mono text-ink">.txt</span>, <span className="font-mono text-ink">.url</span>, <span className="font-mono text-ink">.nzb</span>. Comma-separated.
+                          </div>
+                          <CommaListField
+                            value={extraExts}
+                            placeholder=".txt, .url, .nzb"
+                            disabled={!masterOn || !sweepOn}
+                            onSave={v => setRawSettings(s => ({ ...s, 'rename.cleanup_extra_extensions': v }))}
+                          />
+                        </div>
+                        <div className={`border-t pt-3.5 ${SETTINGS_DIVIDER}`}>
+                          <div className="text-[13px] font-medium text-ink">Delete non-video leftovers</div>
+                          <div className="mt-0.5 mb-2.5 text-[12px] leading-relaxed text-ink-muted">
+                            When a source folder has <strong className="text-ink">no video files left</strong> after a Move, also remove the other files so the folder can go. Never touches a folder that still holds a video, and never deletes a video.
+                          </div>
+                          <SegmentedControl
+                            fullWidth
+                            value={nonvideoMode}
+                            onChange={v => {
+                              // Arm-gate the irreversible case: "Everything" deletes ALL
+                              // non-video files (subtitles included) from any folder a Move
+                              // empties of video. With Trash OFF that's a permanent mass
+                              // delete of the user's own files — make them confirm before it
+                              // even lands in the draft. (Controlled control reverts on cancel
+                              // since we skip the saveKey.)
+                              if (v === 'all' && !trashOn) {
+                                const ok = window.confirm(
+                                  'Delete EVERYTHING non-video?\n\n'
+                                  + 'With "Move to trash" OFF, this PERMANENTLY deletes every non-video file '
+                                  + '(subtitles included) from any folder a Move empties of video. It cannot be undone.\n\n'
+                                  + 'Tip: turn on "Move to trash" below first to make it recoverable.\n\nProceed anyway?'
+                                );
+                                if (!ok) return;
+                              }
+                              saveKey('rename.cleanup_nonvideo')(v);
+                            }}
+                            options={[
+                              { value: 'off', label: 'Off' },
+                              { value: 'keep_subs', label: 'Keep subtitles' },
+                              { value: 'all', label: 'Everything' },
+                            ]}
+                          />
+                          {nonvideoMode !== 'off' ? (
+                            <div className="mt-2 text-[11.5px] leading-relaxed text-conf-mid">
+                              {nonvideoMode === 'all'
+                                ? <>Deletes <strong className="text-ink">every</strong> non-video file — subtitles included.</>
+                                : <>Deletes non-video files but <strong className="text-ink">keeps subtitle sidecars</strong> (.srt / .ass / …).</>}{' '}
+                              {trashOn ? 'Recoverable from your Trash folder.' : <><strong className="text-ink">Permanent</strong> — turn on “Move to trash” below to make it recoverable.</>}
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                    </NestedBox>
+
                     {/* Sub-toggle — recycle to a trash folder instead of hard
                         delete. Only meaningful when the artifact sweep is on
                         (emptying a folder via rmdir is never data loss). */}
@@ -796,15 +1179,14 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                       </SettingRow>
                       {trashOn ? (
                         <div className="mt-3">
-                          <Input
-                            mono
-                            spellCheck={false}
+                          <TrashDirField
                             value={trashDir}
                             placeholder={`${libRoot}/.kira-trash  (default)`}
-                            onChange={e => saveKey('rename.trash_dir')(e.target.value)}
+                            initialBrowse={libRoot}
+                            onSave={v => saveKey('rename.trash_dir')(v)}
                           />
                           <div className="mt-1.5 text-[11px] leading-relaxed text-ink-soft">
-                            Leave blank to use the default. Sweep old items yourself whenever you're sure you don't need them.
+                            Leave blank to use the default. Browse and restore items in the Trash bin below.
                           </div>
                         </div>
                       ) : null}
@@ -833,7 +1215,7 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                     <div>
                       <div className="mb-1.5 text-[12px] font-semibold text-ink">Deleted — pattern matches</div>
                       <div className="font-mono text-[11.5px] leading-relaxed text-ink-soft">
-                        season01-poster.jpg · season-specials-banner.jpg · Show.S01E01-thumb.jpg · Movie (2023)-poster.jpg · Album-fanart.png · Show.S01E01-fanart-2.jpg · *.tbn (Kodi binary thumbnails)
+                        season01-poster.jpg · season-specials-banner.jpg · Show.S01E01-thumb.jpg · Movie (2023)-poster.jpg · Album-fanart.png · Show.S01E01-fanart-2.jpg · *.tbn (Kodi binary thumbnails) · *.nfo (only once every video has left the folder — an NFO without its video is orphaned metadata)
                       </div>
                     </div>
                     <div>
@@ -850,12 +1232,121 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                     </div>
                   </div>
                 </details>
+                </div>
+
+                {/* Trash bin — browse / restore what the sweep recycled. */}
+                <TrashBinCard rawSettings={rawSettings} saveKey={saveKey} pushToast={pushToast} />
               </SettingsLayout>
             );
           })()}
 
-          {section === 'confidence' && (
-            <SettingsLayout intro="Tune how confident a match must be before Kira trusts it.">
+          {section === 'matching' && (() => {
+            // Experimental-boost flags folded in from the old Labs section.
+            const mediaInfoOn = rawSettings['parsing.read_mediainfo'] === true;
+            const boostOn = rawSettings['labs.episode_title_boost'] === true;
+            const runtimeOn = rawSettings['labs.runtime_corroboration'] === true;
+            return (
+            <SettingsLayout
+              header={(
+                <SectionHeader
+                  icon={<IcShieldCheck />}
+                  title="Matching"
+                  purpose="Which sources identify each kind of title, how confident a match must be before Kira trusts it, and the experimental boosts for close calls. Applies to new scans."
+                  status={<StatusPill tone={autoApprove ? 'accent' : 'neutral'}>{autoApprove ? `Auto ≥ ${autoThreshold}%` : 'Manual review'}</StatusPill>}
+                />
+              )}
+            >
+              {/* Provider preference — moved here from Connections so the whole
+                  of matching (sources + confidence + boosts) lives in one home. */}
+              <SectionCard
+                icon={<IcLink />}
+                title="Preferred metadata source"
+                desc="Which provider identifies each kind of title. Kira tries your pick first and only falls back to the others if it has no confident match. Applies to new scans — re-identify a show or rescan to change matches you already have."
+              >
+                <div className="grid gap-5 md:grid-cols-3">
+                  {[
+                    { mt: 'movie', label: 'Movies',
+                      hint: 'TMDB carries the richest movie data; TheTVDB is the fallback. Reorder to taste.' },
+                    { mt: 'tv', label: 'TV shows',
+                      hint: 'TheTVDB leads for TV seasons; TMDB is the fallback. Reorder to taste.' },
+                    { mt: 'anime', label: 'Anime',
+                      hint: (<><strong className="text-ink">AniDB</strong> — richest anime metadata + original titles, but splits each cour into its own card. <strong className="text-ink">TheTVDB</strong> — one unified series with seasons, best Plex / Jellyfin match. <strong className="text-ink">TMDB</strong> — broad English coverage.</>) },
+                  ].map(row => {
+                    const order = providerOrder(row.mt);
+                    const primary = order[0];
+                    const primaryInfo = providers[primary];
+                    const primaryNeedsKey = !!primaryInfo && !primaryInfo.configured && !primaryInfo.keyless;
+                    return (
+                      <div key={row.mt} className="flex flex-col gap-2">
+                        <div className="text-[13px] font-semibold text-ink">{row.label}</div>
+                        {/* Reorderable provider list — top = preferred. Kira
+                            tries them in this order and keeps any provider you
+                            push down as a trailing fallback, so it's a preference,
+                            never a hard exclude. */}
+                        <ol className="flex flex-col gap-1.5">
+                          {order.map((k, i) => {
+                            const info = providers[k];
+                            const needsKey = !!info && !info.configured && !info.keyless;
+                            return (
+                              <li key={k} className="flex items-center gap-2 rounded-lg border border-line bg-surface-1 px-2.5 py-1.5">
+                                <span className="grid size-5 shrink-0 place-items-center rounded-md bg-surface-2 text-[11px] font-semibold tabular-nums text-ink-muted">{i + 1}</span>
+                                <span className="min-w-0 flex-1 truncate text-[13px] text-ink">
+                                  {provName(k)}
+                                  {i === 0 ? <span className="ml-1.5 text-[11px] font-medium text-accent">primary</span> : null}
+                                  {needsKey ? <span className="ml-1.5 text-[11px] text-conf-mid">needs key</span> : null}
+                                </span>
+                                <span className="flex shrink-0 items-center gap-0.5">
+                                  <button
+                                    type="button" aria-label={`Move ${provName(k)} up`} disabled={i === 0}
+                                    onClick={() => moveProvider(row.mt, i, -1)}
+                                    className="grid size-6 place-items-center rounded-md text-ink-soft transition hover:bg-surface-2 hover:text-ink disabled:pointer-events-none disabled:opacity-25"
+                                  ><IcChevDown className="size-3.5 rotate-180" /></button>
+                                  <button
+                                    type="button" aria-label={`Move ${provName(k)} down`} disabled={i === order.length - 1}
+                                    onClick={() => moveProvider(row.mt, i, 1)}
+                                    className="grid size-6 place-items-center rounded-md text-ink-soft transition hover:bg-surface-2 hover:text-ink disabled:pointer-events-none disabled:opacity-25"
+                                  ><IcChevDown className="size-3.5" /></button>
+                                </span>
+                              </li>
+                            );
+                          })}
+                        </ol>
+                        <div className="text-[12px] leading-relaxed text-ink-muted">{row.hint}</div>
+                        {primaryNeedsKey && (
+                          <div className="text-[12px] leading-relaxed text-conf-mid">
+                            {provName(primary)} isn't configured yet — add its API key in Connections, or Kira falls back to the next source automatically.
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Anime enrichment source — AniDB identifies anime but carries
+                    sparse episode titles + no cast/studio data. Kira fills those
+                    in from this cross-ref source; the other is tried if this one
+                    has no Fribb mapping. */}
+                <div className="mt-5 flex flex-col gap-2 border-t border-line pt-4">
+                  <div className="text-[13px] font-semibold text-ink">Anime episode titles &amp; metadata</div>
+                  <div className="max-w-xs">
+                    <SegmentedControl
+                      fullWidth
+                      value={animeCrossref()}
+                      onChange={setAnimeCrossref}
+                      options={[
+                        { value: 'tvdb', label: 'TheTVDB' },
+                        { value: 'tmdb', label: 'TMDB' },
+                      ]}
+                    />
+                  </div>
+                  <div className="text-[12px] leading-relaxed text-ink-muted">
+                    When a title is matched on AniDB, Kira pulls episode names and cast / studio data from this source via the cross-reference. The other is tried automatically if this one has no mapping.
+                  </div>
+                </div>
+              </SectionCard>
+
+              {/* Confidence — auto-approve + where the badge cutoffs sit. */}
+              <div className="mt-5 mb-1 text-[13px] font-semibold text-ink">Confidence</div>
               <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
               {/* Auto-approve */}
               <SectionCard
@@ -920,43 +1411,36 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
                 </div>
               </SectionCard>
               </div>
-            </SettingsLayout>
-          )}
 
-          {section === 'labs' && (() => {
-            const mediaInfoOn = rawSettings['parsing.read_mediainfo'] === true;
-            const boostOn = rawSettings['labs.episode_title_boost'] === true;
-            const runtimeOn = rawSettings['labs.runtime_corroboration'] === true;
-            return (
-              <SettingsLayout intro="Experimental and cost-bearing options — all off by default. Each note says exactly what it trades, so you can turn on only what's worth it for your setup.">
-                <SectionCard
-                  icon={<IcSettings />}
-                  title="Labs"
-                  desc="These touch scan speed or matching accuracy. Changes apply to the next scan / match."
-                >
-                  <div className="flex flex-col gap-5">
-                    <SettingRow
-                      label={<span className="flex items-center gap-2">Episode-title series boost <LabsChip>Experimental</LabsChip></span>}
-                      desc="When two same-titled shows tie, prefer the one whose episode list contains the filename's episode title. Bounded and TVDB / TMDB-only (never the rate-limited AniDB), so it can't stall scans. Mainly helps western TV with name collisions."
-                    >
-                      <Toggle isSelected={boostOn} onChange={() => saveKey('labs.episode_title_boost')(!boostOn)} aria-label="Episode-title series boost" />
-                    </SettingRow>
+              {/* Experimental boosts — folded in from the old Labs section. All
+                  off by default; each note says exactly what it trades. */}
+              <div className="mt-5 border-t border-line pt-4">
+                <div className="mb-3 flex items-center gap-2 text-[13px] font-semibold text-ink">
+                  Experimental boosts <LabsChip>Off by default</LabsChip>
+                </div>
+                <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
+                  <SectionCard
+                    icon={<IcSearch />}
+                    title={<span className="flex items-center gap-2">Episode-title series boost <LabsChip>Experimental</LabsChip></span>}
+                    desc="When two same-titled shows tie, prefer the one whose episode list contains the filename's episode title. Bounded and TVDB / TMDB-only (never the rate-limited AniDB), so it can't stall scans. Mainly helps western TV with name collisions."
+                    headerExtra={<Toggle isSelected={boostOn} onChange={() => saveKey('labs.episode_title_boost')(!boostOn)} className="mt-0.5" aria-label="Episode-title series boost" />}
+                  />
 
-                    <SettingRow
-                      label={<span className="flex items-center gap-2">Runtime corroboration <LabsChip>Needs MediaInfo</LabsChip></span>}
-                      desc={<>Nudge confidence up when the file's real duration matches the episode / movie runtime. Small effect, and only does anything once <strong className="text-ink">Read file metadata</strong> is enabled in <button type="button" onClick={() => setSection('advanced')} className="font-medium text-info underline underline-offset-2 transition-colors hover:text-ink">Advanced</button> (it needs the file's duration).</>}
-                    >
-                      <Toggle isSelected={runtimeOn} onChange={() => saveKey('labs.runtime_corroboration')(!runtimeOn)} aria-label="Runtime corroboration" />
-                    </SettingRow>
-
-                    {!mediaInfoOn && runtimeOn ? (
+                  <SectionCard
+                    icon={<IcHistory />}
+                    title={<span className="flex items-center gap-2">Runtime corroboration <LabsChip>Needs MediaInfo</LabsChip></span>}
+                    desc={<>Nudge confidence up when the file's real duration matches the episode / movie runtime. Small effect, and only does anything once <strong className="text-ink">Read file metadata</strong> is enabled in <button type="button" onClick={() => setSection('advanced')} className="font-medium text-info underline underline-offset-2 transition-colors hover:text-ink">Advanced</button> (it needs the file's duration).</>}
+                    headerExtra={<Toggle isSelected={runtimeOn} isDisabled={!mediaInfoOn} onChange={() => saveKey('labs.runtime_corroboration')(!runtimeOn)} className="mt-0.5" aria-label="Runtime corroboration" />}
+                  >
+                    {!mediaInfoOn ? (
                       <div className="text-[12px] leading-relaxed text-conf-mid">
-                        Runtime corroboration is on but file metadata isn't being read — enable <strong className="text-ink">Read file metadata</strong> in Advanced for this to have any effect.
+                        Needs <strong className="text-ink">Read file metadata</strong> (Advanced) — this boost reads the file's real duration. Enable it there to use this.
                       </div>
                     ) : null}
-                  </div>
-                </SectionCard>
-              </SettingsLayout>
+                  </SectionCard>
+                </div>
+              </div>
+            </SettingsLayout>
             );
           })()}
 
@@ -964,6 +1448,28 @@ export function SettingsPage({ pushToast, section, setSection }: Props) {
             <AdvancedSection rawSettings={rawSettings} saveKey={saveKey} pushToast={pushToast} />
           )}
       </div>
+
+      {/* Unsaved-changes bar — nothing on this page persists until Save. Floats
+          bottom-centre, above the content, out of the way of the sidebar. */}
+      {dirty ? (
+        <div className="pointer-events-none fixed inset-x-0 bottom-5 z-40 flex justify-center px-4">
+          <div
+            role="region"
+            aria-label="Unsaved settings"
+            className="anim-pop pointer-events-auto flex items-center gap-3 rounded-2xl border border-white/[0.12] bg-[rgba(12,13,17,0.92)] px-4 py-3 shadow-[0_18px_60px_rgba(0,0,0,0.55)] backdrop-blur-2xl"
+          >
+            <span className="text-[13px] text-ink-muted">
+              <span className="font-semibold text-ink">{dirtyKeys.length}</span> unsaved {dirtyKeys.length === 1 ? 'change' : 'changes'}
+            </span>
+            <Button color="secondary" size="sm" onClick={discard} isDisabled={saveStatus === 'saving'}>
+              Cancel
+            </Button>
+            <Button color="primary" size="sm" onClick={commit} isDisabled={saveStatus === 'saving'}>
+              {saveStatus === 'saving' ? 'Saving…' : 'Save changes'}
+            </Button>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1046,3 +1552,250 @@ function FileOpExplainer({ op }: { op: string }) {
   );
 }
 
+
+// ─────────────────────────────────────────────────────────────────────
+// Trash bin — browse / restore / empty Kira's managed trash folder.
+// Own component (not inline in the cleanup section) because that section
+// renders via an IIFE, which can't hold hooks.
+// ─────────────────────────────────────────────────────────────────────
+
+type TrashItem = {
+  name: string; is_dir: boolean; size_bytes: number;
+  trashed_at: string | null; mtime: number; original: string | null;
+};
+
+function fmtBytes(b: number): string {
+  if (b >= 1 << 30) return `${(b / (1 << 30)).toFixed(1)} GB`;
+  if (b >= 1 << 20) return `${(b / (1 << 20)).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(b / 1024))} KB`;
+}
+
+function fmtAge(item: TrashItem): string {
+  const t = item.trashed_at ? Date.parse(item.trashed_at) : item.mtime * 1000;
+  if (!Number.isFinite(t) || t <= 0) return '';
+  const d = Math.floor((Date.now() - t) / 86_400_000);
+  if (d <= 0) return 'today';
+  if (d === 1) return 'yesterday';
+  return `${d}d ago`;
+}
+
+// Trash-folder path input with an in-field Browse button — the same
+// affordance every other path field has. Own component because the cleanup
+// section renders via an IIFE, which can't hold the picker's state.
+// Comma-separated editor for an array setting (cleanup custom filenames /
+// extensions). Holds an in-progress text buffer so typing commas doesn't fight
+// the array round-trip; commits the parsed, de-duped list on blur / Enter.
+function CommaListField({ value, placeholder, disabled, onSave }: {
+  value: string[];
+  placeholder?: string;
+  disabled?: boolean;
+  onSave: (next: string[]) => void;
+}) {
+  const [text, setText] = useState<string | null>(null);
+  const commit = () => {
+    if (text === null) return;
+    onSave(Array.from(new Set(text.split(',').map(s => s.trim()).filter(Boolean))));
+    setText(null);
+  };
+  return (
+    <Input
+      mono
+      spellCheck={false}
+      value={text ?? value.join(', ')}
+      placeholder={placeholder}
+      disabled={disabled}
+      onChange={e => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={e => { if (e.key === 'Enter') commit(); }}
+    />
+  );
+}
+
+function TrashDirField({ value, placeholder, initialBrowse, onSave }: {
+  value: string;
+  placeholder: string;
+  initialBrowse: string;
+  onSave: (v: string) => void;
+}) {
+  const [picking, setPicking] = useState(false);
+  return (
+    <>
+      <Input
+        mono
+        spellCheck={false}
+        value={value}
+        placeholder={placeholder}
+        onChange={e => onSave(e.target.value)}
+        trailing={
+          <button
+            type="button"
+            title="Browse for folder"
+            onClick={() => setPicking(true)}
+            className="grid size-7 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink [&_svg]:size-[14px]"
+          >
+            <IcFolder />
+          </button>
+        }
+      />
+      {picking ? (
+        <FolderPickerModal
+          initialPath={value || initialBrowse}
+          onPick={path => onSave(path)}
+          onClose={() => setPicking(false)}
+        />
+      ) : null}
+    </>
+  );
+}
+
+export function TrashBinCard({ rawSettings, saveKey, pushToast }: {
+  rawSettings: Record<string, unknown>;
+  saveKey: (key: string) => (value: string | number | boolean) => void;
+  pushToast: (t: Omit<ToastData, 'id'>) => void;
+}) {
+  const [items, setItems] = useState<TrashItem[]>([]);
+  const [totalBytes, setTotalBytes] = useState(0);
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [armEmpty, setArmEmpty] = useState(false);
+  const [emptying, setEmptying] = useState(false);
+
+  const retentionRaw = rawSettings['rename.trash_retention_days'];
+  const retention = typeof retentionRaw === 'number' ? String(retentionRaw)
+    : typeof retentionRaw === 'string' && retentionRaw !== '' ? retentionRaw : '0';
+
+  const load = async () => {
+    try {
+      const r = await api.listTrash();
+      setItems(r.items);
+      setTotalBytes(r.total_bytes);
+    } catch { /* backend offline — card shows empty */ }
+    setLoaded(true);
+  };
+  useEffect(() => { void load(); }, []);
+
+  const doRestore = async (name: string) => {
+    setBusy(name);
+    try {
+      const r = await api.restoreTrashItem(name);
+      pushToast({ title: 'Restored', sub: r.to, kind: 'success' });
+      await load();
+    } catch (e) {
+      pushToast({ title: 'Restore failed', sub: (e as Error).message, kind: 'error' });
+    }
+    setBusy(null);
+  };
+
+  const doDelete = async (name: string) => {
+    setBusy(name);
+    try {
+      await api.deleteTrashItem(name);
+      await load();
+    } catch (e) {
+      pushToast({ title: 'Delete failed', sub: (e as Error).message, kind: 'error' });
+    }
+    setBusy(null);
+  };
+
+  const doEmpty = async () => {
+    if (!armEmpty) { setArmEmpty(true); setTimeout(() => setArmEmpty(false), 4000); return; }
+    setArmEmpty(false);
+    setEmptying(true);
+    try {
+      const r = await api.emptyTrash();
+      pushToast({ title: `Trash emptied`, sub: `${r.deleted} item${r.deleted === 1 ? '' : 's'} permanently deleted.`, kind: 'success' });
+      await load();
+    } catch (e) {
+      pushToast({ title: 'Empty failed', sub: (e as Error).message, kind: 'error' });
+    }
+    setEmptying(false);
+  };
+
+  return (
+    <SectionCard
+      icon={<IcTrash />}
+      title="Trash bin"
+      desc={items.length > 0
+        ? <>{items.length} item{items.length === 1 ? '' : 's'} · {fmtBytes(totalBytes)} — swept artifacts wait here until you restore or remove them.</>
+        : 'Items the cleanup sweep recycles land here, ready to restore.'}
+      action={items.length > 0 ? (
+        <Button
+          color={armEmpty ? 'primary-destructive' : 'secondary-destructive'}
+          size="sm"
+          iconLeading={emptying ? undefined : IcTrash}
+          isLoading={emptying}
+          isDisabled={emptying}
+          showTextWhileLoading
+          onClick={() => void doEmpty()}
+        >
+          {emptying ? 'Emptying…' : armEmpty ? 'Click again to confirm' : 'Empty trash'}
+        </Button>
+      ) : undefined}
+    >
+      <div className="flex flex-col gap-3">
+        {loaded && items.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-white/[0.12] px-3 py-2.5 text-xs text-ink-muted">
+            Trash is empty.
+          </div>
+        ) : null}
+        {items.length > 0 ? (
+          <div className="flex max-h-[340px] flex-col gap-1.5 overflow-y-auto pr-1 [scrollbar-width:thin]">
+            {/* Render cap — a big sweep can trash hundreds of artifacts; the
+                full list lives on disk, the UI shows the newest slice. */}
+            {items.slice(0, 200).map(it => (
+              <div key={it.name} className={`flex items-center gap-2.5 px-3 py-2 ${SETTINGS_NESTED}`}>
+                <IcFolder style={{ width: 14, height: 14 }} className={`shrink-0 ${it.is_dir ? 'text-ink-soft' : 'text-ink-faint'}`} />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate font-mono text-[12px] text-ink-muted" title={it.name}>{it.name}</div>
+                  <div className="truncate text-[10.5px] text-ink-faint" title={it.original ?? undefined}>
+                    {fmtBytes(it.size_bytes)} · {fmtAge(it)}{it.original ? <> · from <span className="font-mono">{it.original}</span></> : ' · original location unknown'}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  title={it.original ? `Restore to ${it.original}` : 'Original location unknown — restore by hand from the trash folder'}
+                  disabled={!it.original || busy === it.name}
+                  onClick={() => void doRestore(it.name)}
+                  className="grid size-7 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-glass-2 hover:text-conf-high disabled:cursor-not-allowed disabled:opacity-35 [&_svg]:size-[13px]"
+                >
+                  {busy === it.name ? <IcSpin className="animate-spin" /> : <IcUndo />}
+                </button>
+                <button
+                  type="button"
+                  title="Delete permanently"
+                  disabled={busy === it.name}
+                  onClick={() => void doDelete(it.name)}
+                  className="grid size-7 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-[var(--conf-low-bg)] hover:text-conf-low disabled:opacity-35 [&_svg]:size-[13px]"
+                >
+                  {busy === it.name ? <IcSpin className="animate-spin" /> : <IcTrash />}
+                </button>
+              </div>
+            ))}
+            {items.length > 200 ? (
+              <div className="px-3 py-2 text-center text-[11px] text-ink-soft">
+                …and {items.length - 200} more (newest 200 shown — Empty trash and Auto-purge apply to everything).
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        <SettingRow
+          label="Auto-purge"
+          desc="Permanently remove trashed items after this long. Checked at startup."
+        >
+          <div className="w-[160px]">
+            <Select<string>
+              value={retention}
+              onChange={v => saveKey('rename.trash_retention_days')(parseInt(v, 10) || 0)}
+              options={[
+                { value: '0', label: 'Keep forever' },
+                { value: '7', label: '7 days' },
+                { value: '30', label: '30 days' },
+                { value: '90', label: '90 days' },
+              ]}
+            />
+          </div>
+        </SettingRow>
+      </div>
+    </SectionCard>
+  );
+}

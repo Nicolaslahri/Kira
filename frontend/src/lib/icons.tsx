@@ -86,6 +86,10 @@ export const IcChevDown = icon(
   <polyline points="6 9 12 15 18 9"/>
 );
 
+export const IcChevLeft = icon(
+  <polyline points="15 18 9 12 15 6"/>
+);
+
 export const IcMenu = icon(<>
   <line x1="3" y1="6" x2="21" y2="6"/>
   <line x1="3" y1="12" x2="21" y2="12"/>
@@ -193,6 +197,13 @@ export const IcWaveform = icon(
 export const IcTag = icon(<>
   <path d="M20.59 13.41 13.42 20.58a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/>
   <line x1="7" y1="7" x2="7.01" y2="7"/>
+</>);
+
+/** Closed-captions / subtitles glyph — coverage badges + chips. */
+export const IcCaption = icon(<>
+  <rect x="2" y="4" width="20" height="16" rx="2.5"/>
+  <line x1="6" y1="12" x2="11" y2="12"/><line x1="14" y1="12" x2="18" y2="12"/>
+  <line x1="6" y1="16" x2="9" y2="16"/><line x1="12" y1="16" x2="18" y2="16"/>
 </>);
 
 export const IcPlus = icon(<>

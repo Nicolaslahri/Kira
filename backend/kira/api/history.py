@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import asyncio
 import csv
 import io
@@ -31,6 +33,14 @@ from kira.database import get_session
 from kira.models import Match, MediaFile, Notification, RenameHistory
 from kira.renamer.operations import FileOp, undo_op
 from kira.schemas import UtcDateTime
+
+# Subtitle sidecar extensions whose deletion is recoverable via the subtitle
+# reuse-cache. Lowercased, leading dot. A subset of the renamer's _SIDECAR_EXTS
+# — only the text-subtitle formats the subcache (and OpenSubtitles fetch) deal
+# in; the binary blobs (.sub/.idx/.sup) still take the trash/delete path.
+_CACHEABLE_SUB_EXTS = frozenset({".srt", ".ass", ".ssa", ".vtt"})
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/history", tags=["history"])
 
@@ -79,6 +89,13 @@ class HistoryOut(BaseModel):
     # missing attribute.
     episode_title: str | None = None
     poster_url: str | None
+    # Provider identity of the linked Match. AniDB matches carry NO
+    # poster_url (the title dump has no images) — the frontend resolves
+    # their covers lazily via /search/anidb/picture/{aid}, exactly like
+    # the library grid, and needs the aid to do it. Defaults None for the
+    # same bare-ORM-row reason as episode_title.
+    provider: str | None = None
+    provider_id: str | None = None
     created_at: UtcDateTime
     undone_at: UtcDateTime | None
 
@@ -145,6 +162,8 @@ async def list_history(
             title=r.title,
             episode_title=match.episode_title if match is not None else None,
             poster_url=effective_poster,
+            provider=match.provider if match is not None else None,
+            provider_id=match.provider_id if match is not None else None,
             created_at=r.created_at,
             undone_at=r.undone_at,
         ))
@@ -156,12 +175,16 @@ async def history_counts(session: AsyncSession = Depends(get_session)) -> dict[s
     """Counts for the filter pills — today, week, all."""
     today_cutoff = _utcnow_naive().replace(hour=0, minute=0, second=0, microsecond=0)
     week_cutoff = _utcnow_naive() - timedelta(days=7)
-    all_rows = list(await session.scalars(select(RenameHistory)))
-    return {
-        "today": sum(1 for r in all_rows if r.created_at and r.created_at >= today_cutoff),
-        "week":  sum(1 for r in all_rows if r.created_at and r.created_at >= week_cutoff),
-        "all":   len(all_rows),
-    }
+    # COUNT in SQLite — don't materialize the entire rename_history table (every
+    # column, incl. the created_assets JSON) into RAM just to count 3 buckets on
+    # a hot poll. `>= cutoff` excludes NULL created_at exactly like the old
+    # `r.created_at and …` did; `all` counts every row.
+    from sqlalchemy import func
+    base = select(func.count()).select_from(RenameHistory)
+    today = await session.scalar(base.where(RenameHistory.created_at >= today_cutoff))
+    week = await session.scalar(base.where(RenameHistory.created_at >= week_cutoff))
+    total = await session.scalar(base)
+    return {"today": today or 0, "week": week or 0, "all": total or 0}
 
 
 async def _sync_media_file_after_undo(
@@ -244,7 +267,7 @@ async def _undo_sidecar_children(
         except Exception as e:
             # A sidecar undo failure should NOT block the parent's undo
             # from being recorded. Log + count + continue.
-            print(f"history: sidecar undo failed for entry {child.id}: {e!r}")
+            logger.warning(f"history: sidecar undo failed for entry {child.id}: {e!r}")
             failed += 1
     return succeeded, failed
 
@@ -301,17 +324,218 @@ async def _remove_orphaned_assets(video_new_path: str, roots: list[str]) -> int:
             await asyncio.to_thread(t.unlink)
             removed += 1
         except Exception as e:
-            print(f"_remove_orphaned_assets: {t} (non-fatal): {e!r}")
+            logger.warning(f"_remove_orphaned_assets: {t} (non-fatal): {e!r}")
     return removed
 
 
-async def _remove_recorded_assets(paths: list[str], roots: list[str]) -> int:
-    """Delete an EXPLICITLY recorded set of asset paths (RenameHistory.created_assets
-    — the NFO/artwork the rename actually wrote). Authoritative: no deriving names
-    from a stem, so it can't drift from the writer. Best-effort + safe — removes
-    only files that exist and sit under a managed library root. Never raises."""
+def _verify_row_undoable_sync(
+    new_path: str,
+    old_path: str,
+    provider: str | None,
+    provider_id: str | None,
+) -> tuple[bool, str]:
+    """The pure, BLOCKING half of the undo-viability check (stat + xattr reads).
+    Callers wrap it in `asyncio.to_thread` so the event loop stays responsive.
+
+    Returns `(undoable, reason)`. `reason` is one of the exact strings the UI
+    surfaces on the disabled Undo button — keep them in sync with the frontend
+    (api.verifyUndoable / HistoryPage). Mirrors `undo_op`'s physical guards so
+    a single, replaced, or relocated file is caught BEFORE any move happens.
+
+    Checks, in order:
+      • new_path missing                  → "Target missing"
+      • new_path's Kira id-stamp present but mismatched → "File changed on disk"
+      • old_path occupied by a DIFFERENT file        → "Original location occupied"
+      • otherwise                          → undoable
+    """
+    from pathlib import Path as _P
+    from kira import xattr_store
+    from kira.renamer.operations import _same_inode
+
+    new_p = _P(new_path)
+    if not new_p.exists():
+        return False, "Target missing"
+
+    # Identity stamp: the rename stamped the destination with the resolved
+    # provider id (`xattr_store.write_ids(target, {provider: provider_id})`).
+    # If the file the user is about to undo no longer carries the SAME id, it's
+    # been edited/replaced on disk (or is a different file at the same path) —
+    # refuse so undo can't move the wrong bytes back.
+    #
+    # `write_ids` only persists the _PERSISTABLE provider keys (tmdb/tvdb/
+    # anidb/imdb), only when `rename.stamp_ids` is on, and only when the FS /
+    # index can hold metadata. So:
+    #   • a stamp that EXISTS but doesn't carry our provider id → changed.
+    #   • a stamp that EXISTS and matches → genuine, proceed.
+    #   • NO stamp at all → only suspicious when a stamp WOULD have been written
+    #     (stamping enabled AND persistable provider AND this FS can stamp); a
+    #     non-persistable provider, stamping-disabled, or an xattr-incapable FS
+    #     can't be distinguished from "edited", so we DON'T false-flag.
+    stamped = xattr_store.read_ids(new_path)
+    # Only a PRESENT-but-mismatched stamp proves the file was REPLACED. An ABSENT
+    # stamp is indistinguishable from a legitimately-unstamped file (renamed
+    # before stamping shipped, renamed while `rename.stamp_ids` was off, or a
+    # stamp stripped by a copy/restore), so refusing on it would block REAL undos
+    # on exactly the filesystems that CAN stamp (ext4 / Docker) — as bad as the
+    # bug this guards against. The physical undo_op guards (target-exists +
+    # occupied-source) already prevent the data-loss case for unstamped files.
+    if stamped and not (provider and provider_id and stamped.get(provider) == str(provider_id)):
+        return False, "File changed on disk"
+
+    # Original location now holding a DIFFERENT file → undo would clobber it
+    # (same data-loss guard as undo_op's MOVE branch). Same-inode means it's
+    # literally the same file (already restored / hardlink) → fine.
+    old_p = _P(old_path)
+    try:
+        if old_p.exists() and not _same_inode(old_p, new_p):
+            return False, "Original location occupied"
+    except OSError:
+        # stat hiccup (NAS blip) — be conservative and allow; undo_op re-checks.
+        pass
+    return True, ""
+
+
+async def _verify_row_undoable(
+    session: AsyncSession, entry: RenameHistory,
+) -> tuple[bool, str]:
+    """Async wrapper around `_verify_row_undoable_sync` that resolves the row's
+    provider identity (from its linked Match) + the `rename.stamp_ids` setting,
+    then off-loads the disk I/O to a worker thread. Already-undone / FK-less rows
+    short-circuit to a clear reason without touching the disk. READ-ONLY — never
+    mutates the DB or filesystem."""
+    if entry.undone_at is not None:
+        return False, "Already undone"
+    provider: str | None = None
+    provider_id: str | None = None
+    if entry.match_id is not None:
+        match = await session.get(Match, entry.match_id)
+        if match is not None:
+            provider, provider_id = match.provider, match.provider_id
+    return await asyncio.to_thread(
+        _verify_row_undoable_sync,
+        entry.new_path, entry.old_path, provider, provider_id,
+    )
+
+
+async def _drop_subtitle_asset(
+    session: AsyncSession, entry: RenameHistory, sub_path: str,
+) -> None:
+    """Mark the `subtitle_assets` ledger row that points at `sub_path` inactive,
+    so the Subtitles history doesn't keep showing a sidecar that undo just
+    removed / moved to the reuse-cache. Matched on the row's MediaFile (the
+    sidecar's parent video) + the on-disk path, falling back to the language
+    token parsed from the filename. Best-effort — never fatal to the undo."""
+    from kira.models import SubtitleAsset
+    from kira.api.webhooks import _norm
+
+    # The sidecar's MediaFile is the PARENT video. A sidecar history row carries
+    # its own media_file_id (== the parent's); a primary row carries its own.
+    media_file_id = entry.media_file_id
+    if not media_file_id:
+        return
+    try:
+        rows = list(await session.scalars(
+            select(SubtitleAsset).where(
+                SubtitleAsset.media_file_id == media_file_id,
+                SubtitleAsset.active.is_(True),
+            )
+        ))
+        if not rows:
+            return
+        want_path = _norm(sub_path)
+        want_lang = _lang_from_sub_name(sub_path)
+        matched = [r for r in rows if r.path and _norm(r.path) == want_path]
+        if not matched:
+            # Path didn't line up (the ledger stored a different spelling) —
+            # fall back to the language token so we still retire the right row.
+            matched = [r for r in rows if (r.language or "").lower() == want_lang]
+        for r in matched:
+            r.active = False
+            r.path = None
+    except Exception as e:
+        logger.warning(f"_drop_subtitle_asset: {sub_path} (non-fatal): {e!r}")
+
+
+def _lang_from_sub_name(path: str) -> str:
+    """Pull the language token from a `<stem>.<lang>.<ext>` subtitle sidecar
+    name. Returns "und" when the file is a bare `<stem>.<ext>` (no language
+    segment) so callers never crash on a missing token. Pure."""
+    from pathlib import Path as _P
+    p = _P(path)
+    # `Movie (2010).eng.srt` → stem "Movie (2010).eng", suffixes [".eng", ".srt"].
+    # The language is the LAST dotted segment before the extension. A plain
+    # `Movie (2010).srt` has only the extension → no language → "und".
+    # Skip trailing forced/SDH/HI/CC markers AND numeric tokens (years) so
+    # `<stem>.en.forced.srt` reads the LANGUAGE ("en"), not "forced" — otherwise
+    # the sub caches under the wrong key and a later fetch (wanting "en") misses
+    # it and re-downloads. `Movie.2010.srt` → "und" (no language segment).
+    _MARKERS = {"forced", "sdh", "hi", "cc"}
+    parts = [s.lstrip(".").strip().lower() for s in p.suffixes[:-1]]  # drop the extension
+    for tok in reversed(parts):
+        if not tok or tok.isdigit() or tok in _MARKERS:
+            continue
+        return tok
+    return "und"
+
+
+async def _try_cache_subtitle(sub_path: str, video_path: str) -> bool:
+    """Move a subtitle sidecar into the reuse-cache instead of deleting it, so a
+    later re-rename can reuse it without re-downloading. Returns True only when
+    the file actually landed in the cache (and is therefore gone from its old
+    spot). Any import / runtime failure returns False so the caller falls back to
+    the trash/delete path. Never raises."""
+    if not video_path:
+        return False
+    try:
+        from kira.subtitles import subcache
+    except Exception:
+        return False
+    lang = _lang_from_sub_name(sub_path)
+    try:
+        cached = await subcache.cache_subtitle(sub_path, video_path=video_path, language=lang)
+    except Exception as e:
+        logger.warning(f"_try_cache_subtitle: {sub_path} (non-fatal): {e!r}")
+        return False
+    return bool(cached)
+
+
+async def _remove_recorded_assets(
+    paths: list[str],
+    roots: list[str],
+    *,
+    trash_root: "Path | None" = None,
+    session: AsyncSession | None = None,
+    entry: RenameHistory | None = None,
+    video_path: str | None = None,
+) -> int:
+    """Remove an EXPLICITLY recorded set of asset paths (RenameHistory.created_assets
+    — the NFO/artwork/subtitle sidecars the rename actually wrote). Authoritative:
+    no deriving names from a stem, so it can't drift from the writer. Best-effort
+    + safe — only touches files that exist and sit under a managed library root.
+    Never raises.
+
+    Deletions are made RECOVERABLE (no more hard `unlink` of everything):
+      • A subtitle sidecar (`.srt`/`.ass`/`.ssa`/`.sub`/`.vtt`) is MOVED into the
+        subtitle reuse-cache (`subtitles.subcache.cache_subtitle`, keyed by the
+        video's content hash + parsed language) so a later re-rename reuses it
+        instead of burning OpenSubtitles quota. On cache failure it falls through
+        to the trash/delete path below.
+      • Everything else (and the subtitle fallback): MOVED to Kira's managed
+        trash via the same mechanism the folder sweep uses (`_move_to_trash`)
+        when `rename.cleanup_trash` is on (signalled by a non-None `trash_root`);
+        otherwise hard-unlinked exactly as before.
+
+    `session` + `entry` (when provided) let a removed/cached `.srt` also retire
+    its `subtitle_assets` ledger row so the Subtitles view doesn't show a gone
+    file. `video_path` is the row's new_path — the subtitle cache key is derived
+    from it (when absent, falls back to the entry's new_path).
+
+    Counts an asset as "removed" whether it was cached, trashed, or unlinked."""
     from pathlib import Path as _P
     from kira.api.webhooks import path_under_roots
+    from kira.renamer.operations import _move_to_trash
+
+    vid = video_path or (entry.new_path if entry is not None else "")
 
     removed = 0
     for ps in paths or []:
@@ -319,21 +543,67 @@ async def _remove_recorded_assets(paths: list[str], roots: list[str]) -> int:
             if roots and not path_under_roots(ps, roots):
                 continue  # never delete outside a configured library root
             p = _P(ps)
-            if await asyncio.to_thread(p.is_file):
+            if not await asyncio.to_thread(p.is_file):
+                continue
+
+            is_sub = p.suffix.lower() in _CACHEABLE_SUB_EXTS
+
+            # ── Subtitle sidecar → reuse-cache (recoverable, quota-saving) ──
+            if is_sub and await _try_cache_subtitle(ps, vid):
+                removed += 1
+                if session is not None and entry is not None:
+                    await _drop_subtitle_asset(session, entry, ps)
+                continue
+            # (a subtitle that couldn't be cached — no video_path / cache
+            #  failure — falls through to the trash/delete path below.)
+
+            # ── Everything else (and subtitle fallback): trash when enabled,
+            #    else hard-unlink ──
+            done = False
+            if trash_root is not None:
+                if await asyncio.to_thread(_move_to_trash, p, trash_root):
+                    removed += 1
+                    done = True
+                # trash move failed (permission / cross-device) — fall through
+                # to a plain unlink so the asset is still cleaned up.
+            if not done:
                 await asyncio.to_thread(p.unlink)
                 removed += 1
+            # A trashed/deleted subtitle still desyncs the ledger — retire it.
+            if is_sub and session is not None and entry is not None:
+                await _drop_subtitle_asset(session, entry, ps)
         except Exception as e:
-            print(f"_remove_recorded_assets: {ps} (non-fatal): {e!r}")
+            logger.warning(f"_remove_recorded_assets: {ps} (non-fatal): {e!r}")
     return removed
 
 
-async def _cleanup_entry_assets(entry: RenameHistory, roots: list[str]) -> int:
-    """Remove the artwork/NFO a rename created, for undo. Prefers the AUTHORITATIVE
-    list recorded on the row (`created_assets`); falls back to the stem-derived
-    sweep for legacy rows written before that column existed."""
+async def _cleanup_entry_assets(
+    entry: RenameHistory,
+    roots: list[str],
+    *,
+    trash_root: "Path | None" = None,
+    session: AsyncSession | None = None,
+) -> int:
+    """Remove the artwork/NFO/subtitle sidecars a rename created, for undo. Prefers
+    the AUTHORITATIVE list recorded on the row (`created_assets`); falls back to the
+    stem-derived sweep for legacy rows written before that column existed.
+
+    `trash_root` (when set — i.e. `rename.cleanup_trash` is on) routes deletions
+    through Kira's recoverable trash; `session` lets a removed `.srt` retire its
+    `subtitle_assets` ledger row. Both default to the legacy hard-delete behavior
+    so older 2-arg callers (and tests) are unaffected. The legacy stem-derived
+    fallback (`_remove_orphaned_assets`) keeps its plain unlink — it only ever
+    matched image + bare `.nfo` files, never subtitles, and is the cold path."""
     recorded = getattr(entry, "created_assets", None)
     if recorded:
-        return await _remove_recorded_assets(recorded, roots)
+        return await _remove_recorded_assets(
+            recorded, roots,
+            trash_root=trash_root, session=session, entry=entry,
+            # By cleanup time the video is back at old_path (undo moved it) or
+            # gone (cleanup-orphans) — hash THAT for the sub-cache key; new_path
+            # is empty on disk and would force an unreusable name-only key.
+            video_path=entry.old_path,
+        )
     return await _remove_orphaned_assets(entry.new_path, roots)
 
 
@@ -378,11 +648,15 @@ async def _cleanup_undo_vacated_folders(session: AsyncSession, entry: RenameHist
     try:
         from pathlib import Path as _P
         from kira.api.cleanup import _resolve_trash_root
-        from kira.api.files import _managed_roots
+        from kira.api.files import _managed_roots_aliased
         from kira.api.webhooks import _norm
         from kira.renamer.operations import _cleanup_empty_source_parents
 
-        roots = await _managed_roots(session)
+        # Alias-aware: the vacated path is stored RESOLVED (UNC on a mapped
+        # drive) while a root may be the drive-letter form — without the alias
+        # the root-match below fails, `stop_at` stays None, and we bail (the
+        # leftover Season/Show folder is never swept).
+        roots = await _managed_roots_aliased(session)
         vacated = _P(entry.new_path).parent
         # Find the managed root that contains the vacated path — the stop boundary
         # so the walk can never rmdir the library root itself or anything above it.
@@ -403,7 +677,7 @@ async def _cleanup_undo_vacated_folders(session: AsyncSession, entry: RenameHist
             sweep_artifacts=True, trash_root=trash_root,
         )
     except Exception as e:
-        print(f"_cleanup_undo_vacated_folders: {e!r} (non-fatal)")
+        logger.warning(f"_cleanup_undo_vacated_folders: {e!r} (non-fatal)")
         return 0
 
 
@@ -414,6 +688,16 @@ async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)
         raise HTTPException(404, "History entry not found")
     if entry.undone_at is not None:
         raise HTTPException(400, "Already undone")
+    # ── Identity gate (read-only) ──────────────────────────────────────
+    # Before touching the disk, confirm the renamed file is still the SAME
+    # file we renamed: target present, Kira id-stamp intact, original slot
+    # free. A file the user edited/replaced/relocated must NOT be silently
+    # moved back over the (different) bytes now at the old path. This is the
+    # same logic /verify-undoable reports; the physical undo_op guards below
+    # remain as defense-in-depth.
+    undoable, reason = await _verify_row_undoable(session, entry)
+    if not undoable:
+        raise HTTPException(409, reason or "Cannot undo")
     op = FileOp(entry.operation)
     try:
         # ── Autopsy 13: offload blocking disk I/O to a worker thread.
@@ -447,8 +731,20 @@ async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)
     assets_removed = 0
     folders_removed = 0
     if entry.parent_id is None:
-        from kira.api.files import _managed_roots
-        assets_removed = await _cleanup_entry_assets(entry, await _managed_roots(session))
+        from kira.api.cleanup import _resolve_trash_root
+        from kira.api.files import _managed_roots_aliased
+        # Alias-aware roots: created_assets are persisted RESOLVED (UNC on a
+        # mapped drive), so a drive-letter-only root set made path_under_roots
+        # reject every recorded asset → undo orphaned the NFO/artwork/subs.
+        cleanup_roots = await _managed_roots_aliased(session)
+        # Recoverable deletes: when `rename.cleanup_trash` is on, the NFO/artwork
+        # go to Kira's trash and any `.srt` goes to the subtitle reuse-cache;
+        # otherwise we hard-delete as before. `session` lets a removed sub retire
+        # its subtitle_assets ledger row so the Subtitles view stays in sync.
+        trash_root = await _resolve_trash_root(session, cleanup_roots)
+        assets_removed = await _cleanup_entry_assets(
+            entry, cleanup_roots, trash_root=trash_root, session=session,
+        )
         # Remove the now-empty Show/Season folders Kira created for this rename.
         folders_removed = await _cleanup_undo_vacated_folders(session, entry)
     body = f"Restored to {entry.old_path}"
@@ -474,17 +770,47 @@ async def undo_bulk(
     payload: dict[str, list[int]],
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, int]:
-    ids = payload.get("ids", [])
+    raw_ids = payload.get("ids", [])
+    if not isinstance(raw_ids, list):
+        raise HTTPException(400, "'ids' must be a list of history entry ids.")
+    # Dedup + cap the batch: each id triggers a stat + a potential cross-drive
+    # shutil.move (offloaded per-id), so an unbounded list — a client POSTing
+    # tens of thousands of ids — would grind one request for minutes. 2000 is far
+    # above any real bulk-undo selection; a truncated batch simply re-runs.
+    seen: set[int] = set()
+    ids: list[int] = []
+    for _i in raw_ids:
+        if isinstance(_i, int) and _i not in seen:
+            seen.add(_i)
+            ids.append(_i)
+    if len(ids) > 2000:
+        logger.warning("undo_bulk: capping %d ids to 2000", len(ids))
+        ids = ids[:2000]
     succeeded = 0
     failed = 0
     sidecar_succeeded = 0
     sidecar_failed = 0
     assets_removed = 0
-    from kira.api.files import _managed_roots
-    bulk_roots = await _managed_roots(session)
+    from kira.api.cleanup import _resolve_trash_root
+    from kira.api.files import _managed_roots_aliased
+    # Alias-aware (drive-letter ↔ UNC) — same as single undo (undo_entry). Without
+    # this, bulk undo skips created_assets stored under the RESOLVED spelling (the
+    # `Z:\` ↔ `\\nas\share` case), leaving the NFO/poster/subs orphaned exactly the
+    # way single undo did before the alias fix.
+    bulk_roots = await _managed_roots_aliased(session)
+    # Recoverable deletes for every entry's asset teardown — resolved once.
+    bulk_trash_root = await _resolve_trash_root(session, bulk_roots)
     for entry_id in ids:
         entry = await session.get(RenameHistory, entry_id)
         if entry is None or entry.undone_at is not None:
+            failed += 1
+            continue
+        # Identity gate (read-only), per entry: a row whose file was edited /
+        # replaced / whose original slot is now occupied is counted as failed
+        # and SKIPPED — never moved back over different bytes. The batch keeps
+        # going for the rest (best-effort, like the rest of bulk undo).
+        undoable, _reason = await _verify_row_undoable(session, entry)
+        if not undoable:
             failed += 1
             continue
         try:
@@ -517,9 +843,13 @@ async def undo_bulk(
             sidecar_succeeded += ok_subs
             sidecar_failed += failed_subs
             # Clean the artwork/NFO this rename wrote (primary video rows only) +
-            # the now-empty Show/Season folders Kira created for it.
+            # the now-empty Show/Season folders Kira created for it. Trash-aware
+            # + session-threaded so `.srt` removals cache + retire their ledger
+            # row, exactly like single undo.
             if entry.parent_id is None:
-                assets_removed += await _cleanup_entry_assets(entry, bulk_roots)
+                assets_removed += await _cleanup_entry_assets(
+                    entry, bulk_roots, trash_root=bulk_trash_root, session=session,
+                )
                 await _cleanup_undo_vacated_folders(session, entry)
         except Exception:
             failed += 1
@@ -530,6 +860,83 @@ async def undo_bulk(
         out["sidecars_failed"] = sidecar_failed
     if assets_removed:
         out["assets_removed"] = assets_removed
+    return out
+
+
+@router.post("/cleanup-orphans", response_model=dict[str, int])
+async def cleanup_orphans(session: AsyncSession = Depends(get_session)) -> dict[str, int]:
+    """Sweep leftover assets that an OLD undo orphaned. For every UNDONE primary
+    row (`undone_at IS NOT NULL`, `parent_id IS NULL`) that recorded assets
+    (`created_assets`), delete any of those recorded files still present on disk.
+
+    Authoritative + safe: reuses the exact `_cleanup_entry_assets` /
+    `_remove_recorded_assets` path the undo flow uses — so it's containment-guarded
+    (`path_under_roots`), alias-aware (drive-letter ↔ UNC), routes a `.srt` to the
+    reuse-cache + retires its `subtitle_assets` row, and honors `rename.cleanup_trash`
+    (NFO/artwork to trash) — never a hand-rolled unlink. Returns the total count
+    removed. Undo already cleans these inline; this is the backstop for files an
+    older Kira (before that inline cleanup) left behind."""
+    from kira.api.cleanup import _resolve_trash_root
+    from kira.api.files import _managed_roots_aliased
+
+    rows = list(await session.scalars(
+        select(RenameHistory).where(
+            RenameHistory.undone_at.is_not(None),
+            RenameHistory.parent_id.is_(None),
+        )
+    ))
+    roots = await _managed_roots_aliased(session)
+    trash_root = await _resolve_trash_root(session, roots)
+    removed = 0
+    for r in rows:
+        if not getattr(r, "created_assets", None):
+            continue
+        removed += await _cleanup_entry_assets(
+            r, roots, trash_root=trash_root, session=session,
+        )
+    await session.commit()
+    return {"removed": removed}
+
+
+class VerifyUndoableIn(BaseModel):
+    # Cap the batch so a pathological client can't ask us to stat tens of
+    # thousands of paths in one request (the History page only ever sends the
+    # visible-and-not-yet-undone rows). 500 comfortably covers the default
+    # 500-row history page.
+    ids: list[int]
+
+
+@router.post("/verify-undoable", response_model=dict[str, dict])
+async def verify_undoable(
+    payload: VerifyUndoableIn,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, dict]:
+    """READ-ONLY undo-viability probe. For each history id, report whether the
+    rename can still be safely undone — WITHOUT touching the disk beyond a stat +
+    xattr read (off-loaded to a worker thread). The History page calls this for
+    the visible not-yet-undone rows and disables the Undo button (with the
+    `reason`) when a row comes back not-undoable.
+
+    Response shape (keyed by the id as a STRING, mirroring /files/verify-exist):
+        {"<id>": {"undoable": <bool>, "reason": "<str>"}}
+
+    `reason` is one of the exact strings the UI renders:
+      • ""                            — undoable
+      • "Target missing"              — the renamed file is gone
+      • "File changed on disk"        — the file was edited/replaced (id-stamp
+                                        absent-where-expected or mismatched)
+      • "Original location occupied"  — a DIFFERENT file now sits at old_path
+      • "Already undone"              — already undone, or no such row
+    """
+    ids = list(dict.fromkeys(payload.ids or []))[:500]   # dedup + cap at 500
+    out: dict[str, dict] = {}
+    for entry_id in ids:
+        entry = await session.get(RenameHistory, entry_id)
+        if entry is None:
+            out[str(entry_id)] = {"undoable": False, "reason": "Already undone"}
+            continue
+        undoable, reason = await _verify_row_undoable(session, entry)
+        out[str(entry_id)] = {"undoable": undoable, "reason": reason}
     return out
 
 

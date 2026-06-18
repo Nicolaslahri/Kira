@@ -97,7 +97,10 @@ def build_provider(
         return provider
     if key == "tvdb":
         from kira.providers.tvdb import TVDBProvider
-        return TVDBProvider(base_url=base_url, auth=auth, client=client)
+        provider = TVDBProvider(base_url=base_url, auth=auth, client=client)
+        if config.tvdb_language:
+            provider.language = config.tvdb_language
+        return provider
     if key == "anidb":
         from kira.providers.anidb import AniDBProvider
         return AniDBProvider(base_url=base_url, auth=auth, client=client)

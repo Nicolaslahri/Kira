@@ -139,6 +139,68 @@ async def test_extract_prefers_non_forced_then_falls_back(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_extract_forced_only_prefers_forced_track(monkeypatch, tmp_path):
+    """`forced=only` flips the choice — the signs/songs track wins over the full
+    one. (The bug: this path used to always hand back the non-forced track.)"""
+    video = str(tmp_path / "Movie.mkv")
+    monkeypatch.setattr(embedded, "available", lambda: True)
+    monkeypatch.setattr(embedded, "list_text_tracks", lambda p: [
+        {"sindex": 0, "lang": "en", "ext": "srt", "title": "Signs", "forced": True},
+        {"sindex": 1, "lang": "en", "ext": "srt", "title": "Full", "forced": False},
+    ])
+    picked: list[int] = []
+
+    async def _fake_ffmpeg(vp, sindex, dest):
+        picked.append(sindex)
+        return True
+    monkeypatch.setattr(embedded, "_ffmpeg_extract", _fake_ffmpeg)
+
+    await embedded.extract(video, ["en"], forced="only")
+    assert picked == [0]     # the forced signs track, as asked
+
+
+@pytest.mark.asyncio
+async def test_extract_forced_only_falls_back_to_full(monkeypatch, tmp_path):
+    """`forced=only` with no forced track present still saves the full one
+    (soft fallback — better a sub than none, mirroring the external path)."""
+    video = str(tmp_path / "Movie.mkv")
+    monkeypatch.setattr(embedded, "available", lambda: True)
+    monkeypatch.setattr(embedded, "list_text_tracks", lambda p: [
+        {"sindex": 1, "lang": "en", "ext": "srt", "title": "Full", "forced": False},
+    ])
+    picked: list[int] = []
+
+    async def _fake_ffmpeg(vp, sindex, dest):
+        picked.append(sindex)
+        return True
+    monkeypatch.setattr(embedded, "_ffmpeg_extract", _fake_ffmpeg)
+
+    await embedded.extract(video, ["en"], forced="only")
+    assert picked == [1]
+
+
+@pytest.mark.asyncio
+async def test_extract_forced_exclude_never_emits_forced(monkeypatch, tmp_path):
+    """`forced=exclude` must not hand back a forced track even when it's the
+    ONLY one for the language — it saves nothing rather than the signs track."""
+    video = str(tmp_path / "Movie.mkv")
+    monkeypatch.setattr(embedded, "available", lambda: True)
+    monkeypatch.setattr(embedded, "list_text_tracks", lambda p: [
+        {"sindex": 0, "lang": "en", "ext": "srt", "title": "Signs", "forced": True},
+    ])
+    called = False
+
+    async def _fake_ffmpeg(vp, sindex, dest):
+        nonlocal called
+        called = True
+        return True
+    monkeypatch.setattr(embedded, "_ffmpeg_extract", _fake_ffmpeg)
+
+    saved = await embedded.extract(video, ["en"], forced="exclude")
+    assert saved == [] and called is False
+
+
+@pytest.mark.asyncio
 async def test_extract_noop_when_unavailable(monkeypatch):
     monkeypatch.setattr(embedded, "available", lambda: False)
     assert await embedded.extract("x.mkv", ["en"]) == []

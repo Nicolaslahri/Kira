@@ -41,3 +41,20 @@ def spawn_tracked(coro, label: str = "") -> asyncio.Task:
 
     task.add_done_callback(_done)
     return task
+
+
+async def drain_background_tasks() -> None:
+    """Await every in-flight tracked task to completion.
+
+    Two callers: (1) tests that schedule fire-and-forget work (e.g. the
+    post-rename subtitle/refresh/Sonarr hooks) and then need to assert its
+    effects deterministically; (2) graceful shutdown, to let short hooks
+    finish rather than being cancelled mid-write. Exceptions are swallowed
+    here — each task already logs its own via the done-callback above.
+
+    Loops until the set drains, so a task that itself spawns another tracked
+    task is still awaited. Snapshots the set each pass because the
+    done-callback mutates it as tasks finish.
+    """
+    while _BACKGROUND_TASKS:
+        await asyncio.gather(*list(_BACKGROUND_TASKS), return_exceptions=True)

@@ -36,9 +36,13 @@ next restart, or immediately via ``format_stripper.reload_rules()``.
 """
 from __future__ import annotations
 
+import logging
+
 import json
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache"
 
@@ -59,7 +63,7 @@ def load_rules() -> dict:
             if isinstance(data, dict):
                 return data
     except Exception as e:  # never let a bad user file break parsing
-        print(f"scene_rules: ignoring unreadable {p}: {e!r}")
+        logger.info(f"scene_rules: ignoring unreadable {p}: {e!r}")
     return {}
 
 

@@ -42,6 +42,11 @@ const PROVIDER_SLUG: Record<ProviderKey, string> = {
   MusicBrainz: 'musicbrainz',
   AcoustID: 'acoustid',
   'fanart.tv': 'fanarttv',
+  // Subtitle providers — not metadata-search providers, so these slugs only
+  // satisfy the exhaustive Record (never passed to api.search / pickDefault).
+  OpenSubtitles: 'opensubtitles',
+  SubDL: 'subdl',
+  SubSource: 'subsource',
 };
 
 // Preference order per media type — picks the first one that's actually

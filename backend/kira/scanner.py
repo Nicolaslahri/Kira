@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+
 import os
 import re
 import threading
 from collections.abc import Iterator
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {
     ".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".flv", ".webm",
@@ -18,7 +22,13 @@ AUDIO_EXTENSIONS = {
 MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 
 
-_IGNORED_PREFIXES = (".", "@", "$", "__MACOSX", "#recycle")
+# NOTE: NOT a bare "@" — that over-excluded legit user folders like "@Animes"
+# / "@Movies" / "@4K" (a common sort-to-top prefix). We list only the actual
+# Synology/QNAP system dirs (`@eaDir`, `@__thumb`, `@Recycle`, snapshot dirs).
+_IGNORED_PREFIXES = (
+    ".", "$", "__MACOSX", "#recycle",
+    "@eaDir", "@__", "@Recycle", "@Recently-Snapshot", "@SynoFinder", "@sharesnap",
+)
 # Exact-match dirs we always skip — common NAS thumbnail/trash folders
 # whose names don't share a single prefix character.
 _IGNORED_NAMES = frozenset({"System Volume Information", "Thumbs.db", "lost+found"})
@@ -84,7 +94,7 @@ def _walk_onerror(err: OSError) -> None:
     raise a UI notification telling the user which paths were missed.
     """
     filename = getattr(err, "filename", "<unknown>") or "<unknown>"
-    print(f"[SCAN] walk OSError on {filename!r}: {err!r}")
+    logger.warning(f"[SCAN] walk OSError on {filename!r}: {err!r}")
     if not hasattr(_walk_errors, "paths"):
         _walk_errors.paths = []
     _walk_errors.paths.append(str(filename))
@@ -229,7 +239,7 @@ def walk(root: str | Path) -> Iterator[Path]:
             # rename engine) crashes. Silent-skip would be invisible —
             # log + skip so the user knows a file was passed over.
             if "\x00" in fn or any(ord(c) < 0x20 and c != "\t" for c in fn):
-                print(f"[SCAN] Skipping file with control chars in name: {fn!r} (in {dp})")
+                logger.warning(f"[SCAN] Skipping file with control chars in name: {fn!r} (in {dp})")
                 continue
             p = dp / fn
             # PERF: filter by EXTENSION first — a pure string check, no
@@ -244,9 +254,40 @@ def walk(root: str | Path) -> Iterator[Path]:
             # Phase 19: drop scene samples / trailers / extras so a 30 MB
             # sample never gets renamed as the real episode/movie.
             if _is_sample_or_extra(p):
-                print(f"[SCAN] Skipping sample/extra: {p}")
+                logger.warning(f"[SCAN] Skipping sample/extra: {p}")
+                continue
+            # User-defined ignore globs (Settings → Paths). Checked after the
+            # built-in rules so they only ever EXCLUDE more, never less.
+            if _matches_user_ignore(p):
+                logger.info(f"[SCAN] Skipping user-ignored: {p}")
                 continue
             yield p
+
+
+# ── User-defined ignore globs ────────────────────────────────────────
+# Set per-scan by the scan worker from the `scanning.ignore_patterns`
+# setting (module state, like `_walk_errors` — the recursive walk makes
+# parameter-threading awkward). Each pattern is an fnmatch glob tested
+# case-insensitively against the FILENAME and every folder name on the
+# file's path, so both `*.partial.mkv` and `Anime Music Videos` work.
+_USER_IGNORES: list[str] = []
+
+
+def set_user_ignores(patterns: list[str] | None) -> None:
+    global _USER_IGNORES
+    _USER_IGNORES = [p.strip().lower() for p in (patterns or []) if p and p.strip()]
+
+
+def _matches_user_ignore(p: Path) -> bool:
+    if not _USER_IGNORES:
+        return False
+    import fnmatch
+    parts = [p.name.lower(), *(seg.lower() for seg in p.parent.parts)]
+    return any(
+        fnmatch.fnmatch(part, pat)
+        for pat in _USER_IGNORES
+        for part in parts
+    )
 
 
 def media_type_hint(path: Path) -> str:

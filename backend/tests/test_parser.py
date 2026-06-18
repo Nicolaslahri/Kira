@@ -41,6 +41,17 @@ CASES: list[tuple[str, dict]] = [
     ("Severance.S01E01-E03.1080p.mkv",
      {"media_type": "tv", "season": 1, "episode": 1, "episode_end": 3}),
 
+    # Multi-episode range as the LAST token (no quality/group suffix): "-E03"
+    # must NOT be eaten as a release group — both episodes survive.
+    ("Severance.S01E01-E03.mkv",
+     {"media_type": "tv", "season": 1, "episode": 1, "episode_end": 3,
+      "release_group": None}),
+
+    # Glued 3-parter: must parse (the trailing \b used to fail between two
+    # glued E-tokens, dropping the file to unmatchable). Group 4 = last episode.
+    ("Show.S01E01E02E03.1080p.mkv",
+     {"media_type": "tv", "season": 1, "episode": 1, "episode_end": 3}),
+
     # ── Anime ─────────────────────────────────────────────────────────────
     ("[SubsPlease] Frieren - Beyond Journey's End - 28 (1080p) [F2A7B3D9].mkv",
      {"media_type": "anime", "release_group": "SubsPlease",
@@ -167,6 +178,16 @@ def test_anime_trailing_digits_not_release_group() -> None:
     pf = parse_filename("[Lazier] Bleach Thousand-Year Blood War-38 [1080p].mkv")
     assert pf.release_group == "Lazier"
     assert pf.absolute_episode == 38
+
+
+def test_season_zero_parent_folder_is_kept() -> None:
+    """A `Season 0` / `Season 00` folder is the Plex/Jellyfin Specials
+    convention — the season hint must survive (the `1 <=` floor dropped 0)."""
+    from kira.parser.parser import _season_from_parent
+    assert _season_from_parent("/tv/Show/Season 0") == 0
+    assert _season_from_parent("/tv/Show/Season 00") == 0
+    assert _season_from_parent("/tv/Show/Season 3") == 3       # regression
+    assert _season_from_parent("/tv/Show") is None             # no Season folder
 
 
 def test_compressed_3digit_rejects_years() -> None:

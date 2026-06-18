@@ -19,7 +19,11 @@ count cache on disk. No provider HTTP, safe during AniDB IP-ban.
 
 from __future__ import annotations
 
+import logging
+
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 async def build_cour_routing_table(
@@ -145,7 +149,7 @@ async def build_cour_routing_table(
                 # object — no on-disk re-read needed.
                 count_cache[sib_aid] = len(eps)
             except Exception as e:
-                print(f"cour_routing: dynamic fetch for AID {sib_aid} failed: {e!r}")
+                logger.warning(f"cour_routing: dynamic fetch for AID {sib_aid} failed: {e!r}")
                 return None
 
     table: list[tuple[int, int, int, int]] = []

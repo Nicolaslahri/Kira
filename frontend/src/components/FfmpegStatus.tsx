@@ -1,0 +1,72 @@
+import { useEffect, useState } from 'react';
+import { api, type ApiFfmpegStatus } from '../lib/api';
+import { IcCheck, IcDownload, IcAlertTri } from '../lib/icons';
+import { Button } from './base/buttons/button';
+
+/**
+ * ffmpeg health row — shared by Settings → Subtitles and Onboarding.
+ *
+ * ffmpeg powers embedded subtitle extraction (the best subtitle source for
+ * anime: free, offline, no quota). Docker ships it; on bare installs this row
+ * shows the live status and offers the ONE-CLICK managed install: Kira
+ * downloads a static build into its own tools dir — no PATH edits, nothing
+ * asked of the user. Progress narrates in the activity pill; the row
+ * re-checks itself when the install job finishes (`kira:ffmpeg-changed`).
+ */
+export function FfmpegStatusRow({ compact = false }: { compact?: boolean }) {
+  const [status, setStatus] = useState<ApiFfmpegStatus | null>(null);
+  const [requesting, setRequesting] = useState(false);
+
+  const refresh = () => { void api.ffmpegStatus().then(setStatus).catch(() => {}); };
+  useEffect(() => {
+    refresh();
+    window.addEventListener('kira:ffmpeg-changed', refresh);
+    return () => window.removeEventListener('kira:ffmpeg-changed', refresh);
+  }, []);
+
+  if (!status) return null;
+
+  const install = async () => {
+    if (requesting) return;
+    setRequesting(true);
+    try {
+      const s = await api.installFfmpeg();
+      setStatus(s);
+      window.dispatchEvent(new Event('kira:activity-refresh')); // pill narrates
+    } catch {
+      /* the pill/bell carry the error */
+    } finally {
+      setRequesting(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span className={compact ? 'text-[12.5px] text-ink' : 'text-[13px] text-ink'}>
+        ffmpeg
+        <span className="ml-1.5 text-[11px] text-ink-soft">
+          {status.available
+            ? (status.source === 'managed' ? 'installed by Kira' : 'found on this system')
+            : 'powers embedded subtitle extraction'}
+        </span>
+      </span>
+      {status.available ? (
+        <span className="inline-flex items-center gap-1.5 text-[12px] font-medium text-[var(--conf-high)] [&_svg]:size-3.5">
+          <IcCheck /> Ready
+        </span>
+      ) : status.installing ? (
+        <span className="inline-flex items-center gap-1.5 text-[12px] text-ink-muted">
+          Installing… <span className="text-ink-soft">(see activity)</span>
+        </span>
+      ) : status.installable ? (
+        <Button color="secondary" size="sm" iconLeading={IcDownload} isLoading={requesting} onClick={() => void install()}>
+          Install for me
+        </Button>
+      ) : (
+        <span className="inline-flex items-center gap-1.5 text-[12px] text-[var(--conf-mid)] [&_svg]:size-3.5">
+          <IcAlertTri /> Install from ffmpeg.org
+        </span>
+      )}
+    </div>
+  );
+}

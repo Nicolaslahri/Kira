@@ -77,9 +77,10 @@ _ARTIFACT_FILENAMES = frozenset({
     "poster.jpg", "poster.png", "poster.jpeg",
     # Banner art
     "banner.jpg", "banner.png", "banner.jpeg",
-    # Background fanart
+    # Background fanart (Kodi `fanart`, Emby `background`, Jellyfin/TMDB `backdrop`)
     "fanart.jpg", "fanart.png", "fanart.jpeg",
     "background.jpg", "background.png",
+    "backdrop.jpg", "backdrop.png", "backdrop.jpeg",
     # Clear art / logo (transparent PNG overlays)
     "clearart.jpg", "clearart.png",
     "clearlogo.jpg", "clearlogo.png",
@@ -153,8 +154,20 @@ _PER_FILE_ARTIFACT_RE = re.compile(
 # as a media-server artifact regardless of basename. `.tbn` is Kodi's
 # binary thumbnail format — there's no other legitimate use of `.tbn`
 # in media libraries.
+#
+# `.nfo` is safe as a catchall HERE (and only here) because artifact
+# classification is exclusively consulted behind the `_is_artifacts_only`
+# gate — i.e. for folders whose every video has already moved out. A
+# per-episode/movie NFO without its video is orphaned metadata (and Kira
+# rewrites NFOs at the destination when that output is enabled). Without
+# this, Kira's OWN previous NFO output blocked the cleanup walk: a
+# season folder left with `<episode>.nfo` + `-poster.jpg` + `-thumb.jpg`
+# failed the artifacts-only check on the NFO alone and survived forever.
+# (Exact names like tvshow.nfo in _ARTIFACT_FILENAMES are now redundant
+# but kept for documentation value.)
 _ARTIFACT_EXTENSIONS = frozenset({
     ".tbn",   # Kodi legacy binary thumbnail
+    ".nfo",   # orphaned episode/movie/scene metadata — see note above
 })
 
 # Exact directory names that are pure media-server caches. These are
@@ -171,19 +184,24 @@ _ARTIFACT_DIRNAMES = frozenset({
 })
 
 
-def _is_artifact_file(name: str) -> bool:
+def _is_artifact_file(name: str, extra_names: frozenset[str] = frozenset(),
+                      extra_exts: frozenset[str] = frozenset()) -> bool:
     """True if `name` is a filename we recognize as a media-server
     artifact safe to delete during empty-folder cleanup.
 
     Case-insensitive on every check (Plex on Windows happily creates
-    `Poster.jpg`, `POSTER.JPG`, etc.). Three families:
-      1. Exact-name match (`poster.jpg`, `tvshow.nfo`, …)
+    `Poster.jpg`, `POSTER.JPG`, etc.). Families:
+      1. Exact-name match (`poster.jpg`, `tvshow.nfo`, …) + user `extra_names`
       2. Season-numbered artwork (`season01-poster.jpg`, …)
       3. Per-file artwork suffix (`<stem>-thumb.jpg`, `<stem>-fanart-2.png`, …)
-      4. Extension catchall (`.tbn` — Kodi binary thumbs)
+      4. Extension catchall (`.tbn` — Kodi binary thumbs) + user `extra_exts`
+
+    `extra_names` (lowercased filenames) and `extra_exts` (lowercased, dot-led
+    extensions) come from the user's `rename.cleanup_extra_filenames` /
+    `rename.cleanup_extra_extensions` settings — "delete these too".
     """
     lower = name.lower()
-    if lower in _ARTIFACT_FILENAMES:
+    if lower in _ARTIFACT_FILENAMES or lower in extra_names:
         return True
     if _ARTIFACT_FILENAME_RE.match(lower):
         return True
@@ -195,7 +213,160 @@ def _is_artifact_file(name: str) -> bool:
     for ext in _ARTIFACT_EXTENSIONS:
         if lower.endswith(ext):
             return True
+    for ext in extra_exts:
+        if ext and lower.endswith(ext):
+            return True
     return False
+
+
+# Subtitle sidecars — kept by the `keep_subs` aggressive-cleanup mode (a user
+# might still want them even when nuking other non-video leftovers).
+_SUBTITLE_EXTENSIONS = frozenset({
+    ".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt", ".smi", ".sami", ".pgs", ".sup",
+})
+
+
+def _is_media_file(name: str) -> bool:
+    """True for a real media file — video OR audio. Cleanup must NEVER delete
+    one of these: it's the library's actual content. (Audio matters because the
+    cleanup walk runs for music libraries too — an un-renamed album track must
+    survive aggressive cleanup, not just video.)"""
+    from kira.scanner import MEDIA_EXTENSIONS  # lazy — avoid import cycle; video|audio
+    lower = name.lower()
+    return any(lower.endswith(ext) for ext in MEDIA_EXTENSIONS)
+
+
+def _is_subtitle_file(name: str) -> bool:
+    lower = name.lower()
+    return any(lower.endswith(ext) for ext in _SUBTITLE_EXTENSIONS)
+
+
+def _is_removable_file(name: str, *, mode: str, extra_names: frozenset[str],
+                       extra_exts: frozenset[str]) -> bool:
+    """Whether a FILE should be deleted during source-folder cleanup, per the
+    aggressive-cleanup `mode`:
+      'off'       → recognized artifacts only (built-in list + user extras).
+      'keep_subs' → any non-media, non-subtitle file (artifacts included).
+      'all'       → any non-media file (artifacts + subtitles + everything else).
+
+    A real MEDIA file (video OR audio) is NEVER removable, in ANY mode — and
+    this guard runs FIRST, so even a user who puts a media extension/name in the
+    custom 'delete' lists can't cause the content itself to be deleted."""
+    if _is_media_file(name):
+        return False
+    if _is_artifact_file(name, extra_names, extra_exts):
+        return True
+    if mode == "all":
+        return True
+    if mode == "keep_subs":
+        return not _is_subtitle_file(name)
+    return False
+
+
+def _norm_path_key(p: str) -> str:
+    """Case/separator-normalized absolute-path key for set membership. Matches
+    two spellings of the SAME file within one batch (the rename writes targets
+    and we read them back via iterdir, so they share a spelling)."""
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
+def _user_listed(name: str, extra_names: frozenset[str], extra_exts: frozenset[str]) -> bool:
+    """True iff the user EXPLICITLY put this filename or extension on their
+    custom delete lists — their stated intent overrides the 'protect Kira's own
+    artwork/NFO output names' rule in the in-place sweep below."""
+    lower = name.lower()
+    if lower in extra_names:
+        return True
+    return any(ext and lower.endswith(ext) for ext in extra_exts)
+
+
+def sweep_destination_junk(
+    folder: Path,
+    *,
+    mode: str = "off",
+    extra_names: frozenset[str] = frozenset(),
+    extra_exts: frozenset[str] = frozenset(),
+    trash_root: Path | None = None,
+    protected: frozenset[str] = frozenset(),
+) -> int:
+    """Sweep leftover junk from a folder a rename just wrote INTO — the in-place
+    / same-folder case the source-walk (`_cleanup_empty_source_parents`) can't
+    reach, because it only ever REMOVES vacated folders and bails the instant a
+    folder still holds media. Here the folder keeps its media; we only strip the
+    junk beside it. Deletes per the aggressive `mode` + the user's custom lists,
+    but NEVER:
+
+      * a media file (video/audio) — `_is_removable_file` guards this first;
+      * anything in `protected` (case/separator-normalized abs paths) — the
+        renamed videos + every sidecar/NFO/artwork Kira wrote THIS batch, so we
+        can't delete our own fresh output;
+      * a file whose NAME matches a built-in media-server artifact (poster.jpg,
+        tvshow.nfo, `<stem>-thumb.jpg`, `*.nfo`, season art, …) — those are
+        EXACTLY what Kira emits, so a PRIOR run's poster/NFO that isn't in this
+        batch's `protected` set is still spared — UNLESS the user explicitly put
+        that name/extension on their custom delete list.
+
+    Never removes `folder` itself (it holds the media) and never recurses into
+    subdirectories (user content: Subs/, Extras/, Season NN/). Honors Trash.
+    Best-effort: every OSError on an entry is skipped. Returns the count deleted.
+    """
+    if not folder.exists() or not folder.is_dir():
+        return 0
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return 0
+    prot = {_norm_path_key(p) for p in protected}
+    # Media STILL in this folder — the renamed file(s) AND any pre-existing,
+    # un-renamed episode sharing the folder. A non-media file is treated as a
+    # SIDECAR of that media when the media's stem prefixes it (`ep02.en.srt` for
+    # `ep02.mkv`) and is then spared, so an aggressive 'all'/'keep_subs' sweep
+    # strips only LOOSE junk (matching no media stem) and never collateral-
+    # deletes a neighbouring episode's subtitle / NFO. (The custom delete lists +
+    # aggressive modes are for release junk, not other content's sidecars.)
+    media_stems = [
+        e.stem.lower() for e in entries
+        if (e.is_file() or e.is_symlink()) and _is_media_file(e.name) and e.stem
+    ]
+    removed = 0
+    for entry in entries:
+        try:
+            # Files (and broken/symlinked files) only — directories are user
+            # content here and are never touched by the in-place sweep.
+            if entry.is_dir() and not entry.is_symlink():
+                continue
+            if not (entry.is_file() or entry.is_symlink()):
+                continue
+            name = entry.name
+            try:
+                if _norm_path_key(str(entry)) in prot:
+                    continue  # our own fresh output / the renamed media
+            except OSError:
+                continue       # can't resolve a key → never risk deleting
+            if not _is_removable_file(name, mode=mode, extra_names=extra_names, extra_exts=extra_exts):
+                continue       # media, or not removable in this mode
+            # A built-in artifact NAME is Kira's own output shape → protect it,
+            # unless the user explicitly targeted that name/extension.
+            if _is_artifact_file(name, frozenset(), frozenset()) and not _user_listed(name, extra_names, extra_exts):
+                continue
+            # A sidecar of media still present (its stem prefixes this name)
+            # belongs to that content — never collateral-delete a neighbouring
+            # un-renamed episode's .srt/.nfo. Absolute (not user-list-overridable).
+            _cand = name.lower()
+            if any(_cand.startswith(stem + ".") for stem in media_stems):
+                continue
+            if trash_root is not None:
+                if _move_to_trash(entry, trash_root):
+                    removed += 1
+                continue
+            try:
+                entry.unlink()
+                removed += 1
+            except OSError:
+                pass           # locked / permission denied — skip silently
+        except OSError:
+            continue
+    return removed
 
 
 def _is_artifact_dir(name: str) -> bool:
@@ -323,6 +494,54 @@ def compute_sidecar_target(
     return video_dst.parent / f"{dst_stem}{tail}"
 
 
+# Free-space margin over the file size — covers FS metadata/rounding so a copy
+# that lands the volume at exactly 0 free doesn't wedge the destination drive.
+_SPACE_MARGIN = 16 * 1024 * 1024   # 16 MiB
+
+
+def _ensure_space(src: Path, dst: Path) -> None:
+    """Refuse a full-bytes copy that can't fit on the destination volume BEFORE
+    writing a byte — so a too-small drive fails clean (clear error, nothing
+    written) instead of crashing mid-write with ENOSPC and leaving a multi-GB
+    partial for the user to hand-delete. Best-effort: if src/dst can't be
+    stat'd we skip the check and let the write itself surface any error."""
+    try:
+        need = src.stat().st_size
+        free = shutil.disk_usage(dst.parent).free
+    except OSError:
+        return
+    if need + _SPACE_MARGIN > free:
+        raise OSError(
+            f"Not enough space to copy {src.name}: needs {need // (1<<20)} MiB "
+            f"(+margin), only {free // (1<<20)} MiB free at {dst.parent}")
+
+
+class RenameSkipped(Exception):
+    """Raised by execute_op when `on_conflict='skip'` and a DIFFERENT file
+    already occupies the destination. The caller treats it as a deliberate
+    no-op (leave both files untouched), not an error."""
+
+
+def _apply_permissions(path: Path, perms: dict, *, is_dir: bool) -> None:
+    """Best-effort post-rename chmod/chown for Docker / NAS deployments —
+    applies the octal `dir_mode`/`file_mode` + `uid`/`gid` from the resolved
+    `rename.set_permissions` spec. NEVER raises: a perms failure (no privilege,
+    FAT/exFAT, Windows, a symlink) must not fail the rename itself."""
+    mode = perms.get("dir_mode") if is_dir else perms.get("file_mode")
+    if mode:
+        try:
+            os.chmod(str(path), int(str(mode), 8))
+        except (OSError, ValueError):
+            pass
+    uid, gid = perms.get("uid"), perms.get("gid")
+    if (uid is not None or gid is not None) and hasattr(os, "chown"):
+        try:
+            os.chown(str(path), uid if uid is not None else -1,  # type: ignore[attr-defined]
+                     gid if gid is not None else -1)
+        except OSError:
+            pass
+
+
 def execute_op(
     op: FileOp,
     src: Path,
@@ -334,6 +553,12 @@ def execute_op(
     cleanup_max_levels: int = 2,
     cleanup_artifacts: bool = True,
     cleanup_trash_dir: Path | None = None,
+    cleanup_nonvideo: str = "off",
+    cleanup_extra_names: frozenset[str] = frozenset(),
+    cleanup_extra_exts: frozenset[str] = frozenset(),
+    symlink_relative: bool = False,
+    permissions: dict | None = None,
+    on_conflict: str = "error",
 ) -> int:
     """Run the requested operation. Idempotent for already-correct hardlinks.
 
@@ -424,17 +649,32 @@ def execute_op(
                             src.parent, cleanup_stop_at, cleanup_max_levels,
                             sweep_artifacts=cleanup_artifacts,
                             trash_root=cleanup_trash_dir,
+                            mode=cleanup_nonvideo,
+                            extra_names=cleanup_extra_names,
+                            extra_exts=cleanup_extra_exts,
                         )
                     return artifacts_cleaned
                 # SYMLINK + dst is already a symlink to src: idempotent success.
                 if op == FileOp.SYMLINK:
                     try:
-                        if dst.is_symlink() and Path(os.readlink(str(dst))).resolve() == src.resolve():
+                        if dst.is_symlink() and (dst.parent / os.readlink(str(dst))).resolve() == src.resolve():
                             return artifacts_cleaned
                     except OSError:
                         pass
+                # Genuine conflict — a DIFFERENT file occupies dst (all
+                # idempotent no-op cases already returned above). Honor the
+                # user's on_conflict policy. "overwrite" never reaches here
+                # (the caller passes overwrite=True for it); "skip" raises a
+                # distinct signal the caller treats as a no-op; default errors.
+                if on_conflict == "skip":
+                    raise RenameSkipped(f"a different file already exists at {dst}")
                 raise FileExistsError(f"Destination already exists: {dst}")
-            dst.unlink()
+            # COPY does its own atomic temp-file + os.replace below, so it must
+            # NOT pre-delete the (good) destination here — otherwise a mid-write
+            # copy failure would leave neither the original nor a complete copy.
+            # The other ops (rename/symlink/hardlink) need the slot freed first.
+            if op != FileOp.COPY:
+                dst.unlink()
 
         if op == FileOp.MOVE:
             src_parent_before = src.parent
@@ -455,15 +695,48 @@ def execute_op(
                     src_parent_before, cleanup_stop_at, cleanup_max_levels,
                     sweep_artifacts=cleanup_artifacts,
                     trash_root=cleanup_trash_dir,
+                    mode=cleanup_nonvideo,
+                    extra_names=cleanup_extra_names,
+                    extra_exts=cleanup_extra_exts,
                 )
         elif op == FileOp.COPY:
-            shutil.copy2(str(src), str(dst))
+            _ensure_space(src, dst)          # refuse BEFORE writing if it won't fit
+            # Atomic copy: write to a temp sibling, then os.replace into place.
+            # A partial/failed copy never overwrites a good destination — on any
+            # error we delete the temp and the original dst is left untouched.
+            # (`os.replace` is an atomic same-dir rename, so there's no window
+            # where dst is missing or half-written.)
+            tmp = dst.with_name(dst.name + ".kira-copy-tmp")
+            try:
+                shutil.copy2(str(src), str(tmp))
+                os.replace(str(tmp), str(dst))
+            except Exception:
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except OSError:
+                    pass
+                raise
         elif op == FileOp.SYMLINK:
-            os.symlink(str(src), str(dst))
+            # Relative target (portable across remounts / changed bind-mount
+            # paths) when enabled; absolute otherwise. Computed from dst's
+            # directory so the link resolves correctly in place.
+            link_target = os.path.relpath(str(src), str(dst.parent)) if symlink_relative else str(src)
+            os.symlink(link_target, str(dst))
         elif op == FileOp.HARDLINK:
             os.link(str(src), str(dst))
         else:
             raise ValueError(f"Unknown FileOp: {op}")
+
+        # Best-effort post-op ownership/mode (Docker/NAS): apply the chmod/chown
+        # spec to the renamed file + any dirs we created. SYMLINK skips the dst
+        # (chmod-ing a link affects its target, not the link). Swallows errors
+        # inside the helper so a perms failure never fails the rename.
+        if permissions:
+            if op != FileOp.SYMLINK:
+                _apply_permissions(dst, permissions, is_dir=False)
+            for _perm_dir in created_dirs:
+                _apply_permissions(_perm_dir, permissions, is_dir=True)
     except Exception:
         # Operation failed AFTER we created destination dirs — roll them
         # back so the target volume doesn't accumulate orphan skeletons.
@@ -500,6 +773,11 @@ def _mkdir_tracked(dst_parent: Path) -> list[Path]:
     return created
 
 
+# Provenance log inside the trash root: one JSON line per trashed item
+# ({name, original, at}), consumed by the trash API's list/restore endpoints.
+TRASH_MANIFEST = ".kira-trash-manifest.jsonl"
+
+
 def _move_to_trash(entry: Path, trash_root: Path) -> bool:
     """Move `entry` into Kira's managed trash folder instead of deleting it, so
     a cleanup sweep is recoverable from the user's file browser. Returns True on
@@ -519,13 +797,34 @@ def _move_to_trash(entry: Path, trash_root: Path) -> bool:
         while target.exists():
             target = trash_root / f"{base}.{n}"
             n += 1
+        original = str(entry)
         shutil.move(str(entry), str(target))
+        # Provenance manifest — one JSON line per trashed item. The trashed
+        # NAME is flattened (`<parent>__<name>`), so without this the original
+        # location is lost and the trash UI can't offer "Restore". Best-effort:
+        # a manifest write failure never fails the trash move itself (the item
+        # is still recoverable by hand).
+        try:
+            import json as _json
+            from datetime import datetime, timezone
+            line = _json.dumps({
+                "name": target.name,
+                "original": original,
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }, separators=(",", ":"))
+            with open(trash_root / TRASH_MANIFEST, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
         return True
     except OSError:
         return False
 
 
-def _cleanup_media_server_artifacts(parent: Path, *, trash_root: Path | None = None) -> int:
+def _cleanup_media_server_artifacts(parent: Path, *, mode: str = "off",
+                                    extra_names: frozenset[str] = frozenset(),
+                                    extra_exts: frozenset[str] = frozenset(),
+                                    trash_root: Path | None = None) -> int:
     """Delete known-safe Plex/Jellyfin/Kodi media-server artifacts from
     `parent` so the now-source-empty directory can actually be rmdir'd.
 
@@ -579,7 +878,7 @@ def _cleanup_media_server_artifacts(parent: Path, *, trash_root: Path | None = N
                         removed += 1
                 continue
             if entry.is_file() or entry.is_symlink():
-                if _is_artifact_file(entry.name):
+                if _is_removable_file(entry.name, mode=mode, extra_names=extra_names, extra_exts=extra_exts):
                     if trash_root is not None:
                         if _move_to_trash(entry, trash_root):
                             removed += 1
@@ -596,18 +895,25 @@ def _cleanup_media_server_artifacts(parent: Path, *, trash_root: Path | None = N
     return removed
 
 
-def _is_artifacts_only(parent: Path) -> bool:
-    """True iff `parent` contains NOTHING but recognized media-server
-    artifacts (or is already empty).
+def _folder_cleanable(parent: Path, *, mode: str = "off",
+                      extra_names: frozenset[str] = frozenset(),
+                      extra_exts: frozenset[str] = frozenset()) -> bool:
+    """Data-loss guard: may the cleanup TOUCH this folder at all?
 
-    This is the data-loss guard for cleanup: we only ever delete artifacts
-    from a folder that is otherwise empty and therefore about to be removed.
-    A folder that still holds real user content (a video, a sub, a folder
-    that isn't a known cache dir, anything we can't classify) returns False,
-    so the caller deletes NOTHING there — its `poster.jpg`, hand-authored
-    `tvshow.nfo`, or album `cover.jpg` stay put. Previously the sweep ran
-    unconditionally before the rmdir check, stripping artifacts even from
-    folders that survived."""
+    A subdirectory that isn't a known cache dir (Subs/, Extras/, Featurettes/…)
+    ALWAYS blocks cleanup — we never recurse into or delete user content dirs.
+
+    For files the bar depends on the aggressive-cleanup `mode`:
+      'off'       → every file must be a recognized artifact (+ user extras),
+                    i.e. the folder is purely media-server garbage (the strict,
+                    safe default — a stray user file keeps the whole folder).
+      'keep_subs'/'all' → only a VIDEO file blocks. The folder is fair game as
+                    long as no video remains; the per-file delete decision
+                    (`_is_removable_file`) then honors the mode (keep_subs leaves
+                    subtitle sidecars, so the folder may survive the rmdir with
+                    just subs in it — but its junk is still swept).
+
+    Returns False on any inspection error → keep the folder (never delete on doubt)."""
     try:
         entries = list(parent.iterdir())
     except OSError:
@@ -618,13 +924,23 @@ def _is_artifacts_only(parent: Path) -> bool:
                 if not _is_artifact_dir(entry.name):
                     return False
             elif entry.is_file() or entry.is_symlink():
-                if not _is_artifact_file(entry.name):
-                    return False
+                if mode == "off":
+                    if not _is_artifact_file(entry.name, extra_names, extra_exts):
+                        return False
+                elif _is_media_file(entry.name):
+                    return False  # never strip a folder that still holds content (video OR audio)
             else:
                 return False  # unknown entry type → treat as content
         except OSError:
             return False  # classification failed → keep the folder
     return True
+
+
+def _is_artifacts_only(parent: Path) -> bool:
+    """Back-compat shim: the strict 'off'-mode form of `_folder_cleanable`
+    (folder is nothing but recognized artifacts). Retained for external callers
+    / tests that predate the mode-aware version."""
+    return _folder_cleanable(parent, mode="off")
 
 
 def _cleanup_empty_source_parents(
@@ -634,6 +950,9 @@ def _cleanup_empty_source_parents(
     *,
     sweep_artifacts: bool = True,
     trash_root: Path | None = None,
+    mode: str = "off",
+    extra_names: frozenset[str] = frozenset(),
+    extra_exts: frozenset[str] = frozenset(),
 ) -> int:
     """User-requested: after a Move, walk UP the source's parent chain
     and rmdir each ancestor that's now empty. Saves the user from manually
@@ -713,14 +1032,16 @@ def _cleanup_empty_source_parents(
         # (rmdir failed) had already lost its artifacts. Computing
         # removability first means a deletion only ever happens for a folder
         # that is about to disappear.
-        if not _is_artifacts_only(current):
+        if not _folder_cleanable(current, mode=mode, extra_names=extra_names, extra_exts=extra_exts):
             return total_artifacts_deleted
-        # Folder is artifacts-only (or empty). Now it's safe to clear the
-        # cache files so the rmdir can succeed. With sweep disabled, we skip
-        # the delete; the folder then still contains artifacts, rmdir fails,
-        # and we stop — preserving the strict "only genuinely-empty" semantics.
+        # Folder is cleanable (artifacts-only in 'off' mode, or no-video-left in
+        # the aggressive modes). Now it's safe to clear the removable files so
+        # the rmdir can succeed. With sweep disabled, we skip the delete; the
+        # folder then still contains files, rmdir fails, and we stop — preserving
+        # the strict "only genuinely-empty" semantics.
         if sweep_artifacts:
-            total_artifacts_deleted += _cleanup_media_server_artifacts(current, trash_root=trash_root)
+            total_artifacts_deleted += _cleanup_media_server_artifacts(
+                current, mode=mode, extra_names=extra_names, extra_exts=extra_exts, trash_root=trash_root)
         try:
             current.rmdir()
         except OSError:
@@ -797,6 +1118,7 @@ def _atomic_move(src: Path, dst: Path) -> None:
     # and the source remains the canonical copy.
     import hashlib
     _CHUNK = 8 * 1024 * 1024
+    _ensure_space(src, dst)          # cross-device move duplicates bytes — refuse if it won't fit
     try:
         h_src = hashlib.blake2b()
         with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
@@ -845,8 +1167,23 @@ def undo_op(op: FileOp, src: Path, dst: Path) -> None:
     if op == FileOp.MOVE:
         if not dst.exists():
             raise FileNotFoundError(f"Cannot undo move — {dst} no longer exists")
+        # Refuse if the original location is now OCCUPIED by a DIFFERENT file. The
+        # cross-device copy path below opens `src` (old_path) with "wb" (truncate),
+        # and same-FS `os.rename` overwrites on POSIX — so without this guard, undo
+        # would SILENTLY destroy whatever the user placed at the old name after the
+        # rename. Same-inode ⇒ it's literally the same file (hard link / already
+        # restored) → safe to proceed.
+        if src.exists() and not _same_inode(src, dst):
+            raise FileExistsError(
+                f"Cannot undo move — original location {src} is now occupied by a "
+                f"different file; move or remove it first."
+            )
         src.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(dst), str(src))
+        # Use the SAME hardened move as the forward path: same-FS os.rename, else
+        # cross-device copy → fsync → hash-verify → unlink, with rollback. Undo
+        # runs on the ONLY remaining copy, so a plain shutil.move (unverified
+        # copy+delete across the SMB boundary) could destroy it on a short read.
+        _atomic_move(dst, src)
     elif op in (FileOp.COPY, FileOp.SYMLINK, FileOp.HARDLINK):
         if dst.exists() or dst.is_symlink():
             dst.unlink()

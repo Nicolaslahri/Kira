@@ -7,6 +7,7 @@ import { LibraryGrid } from '../components/LibraryGrid';
 import { CoverPopup } from '../components/CoverPopup';
 import { ManualSearchModal } from '../components/modals';
 import { buildLibraryItems } from '../lib/adapters';
+import { confLevel, getConfBands } from '../lib/confBands';
 
 interface Props {
   state: AppState;
@@ -64,10 +65,12 @@ export function ReviewPage({
     if (conf !== 'all') {
       xs = xs.filter(f => {
         // no_match files have confidence 0 — surface them in "Low" so
-        // users filtering by confidence can find them too.
-        if (conf === 'high') return f.confidence >= 85 && f.status !== 'no_match';
-        if (conf === 'mid')  return f.confidence >= 50 && f.confidence < 85 && f.status !== 'no_match';
-        if (conf === 'low')  return f.confidence < 50 || f.status === 'no_match';
+        // users filtering by confidence can find them too. Bands come from
+        // the user's Confidence sliders via confLevel(), not hardcoded 85/50.
+        const lvl = confLevel(f.confidence);
+        if (conf === 'high') return lvl === 'high' && f.status !== 'no_match';
+        if (conf === 'mid')  return lvl === 'mid' && f.status !== 'no_match';
+        if (conf === 'low')  return lvl === 'low' || f.status === 'no_match';
         return true;
       });
     }
@@ -180,9 +183,9 @@ export function ReviewPage({
     });
     return {
       all: inStatus.length,
-      high: inStatus.filter(f => f.confidence >= 85 && f.status !== 'no_match').length,
-      mid:  inStatus.filter(f => f.confidence >= 50 && f.confidence < 85 && f.status !== 'no_match').length,
-      low:  inStatus.filter(f => f.confidence < 50 || f.status === 'no_match').length,
+      high: inStatus.filter(f => confLevel(f.confidence) === 'high' && f.status !== 'no_match').length,
+      mid:  inStatus.filter(f => confLevel(f.confidence) === 'mid' && f.status !== 'no_match').length,
+      low:  inStatus.filter(f => confLevel(f.confidence) === 'low' || f.status === 'no_match').length,
       movie: inStatus.filter(f => f.mediaType === 'movie').length,
       tv:    inStatus.filter(f => f.mediaType === 'tv').length,
       anime: inStatus.filter(f => f.mediaType === 'anime').length,
@@ -232,7 +235,7 @@ export function ReviewPage({
     const next = new Set<string>();
     items
       .filter(it => !it.noMatch && !it.matchingState && it.files.every(f => f.status === 'pending') &&
-                    it.files.reduce((s, f) => s + f.confidence, 0) / it.files.length >= 85)
+                    it.files.reduce((s, f) => s + f.confidence, 0) / it.files.length >= getConfBands().high)
       .forEach(it => next.add(it.id));
     setSelected(next);
   };

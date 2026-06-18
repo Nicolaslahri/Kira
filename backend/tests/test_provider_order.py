@@ -9,7 +9,11 @@ preferred source lacks it.
 
 from __future__ import annotations
 
-from kira.matcher.engine import PROVIDER_PREFERENCE, resolve_provider_order
+from kira.matcher.engine import (
+    PROVIDER_PREFERENCE,
+    resolve_anime_crossref_order,
+    resolve_provider_order,
+)
 
 
 def test_unset_returns_default():
@@ -67,3 +71,32 @@ def test_music_default_empty():
     assert resolve_provider_order("music", None) == []
     assert resolve_provider_order("music", {"matching.provider_order.music": ["tmdb"]}) \
         == ["tmdb"]  # honored if the user somehow sets it; no defaults to append
+
+
+# ── anime cross-ref order (episode titles + NFO metadata enrichment) ─────────
+def test_crossref_default_tvdb_first():
+    assert resolve_anime_crossref_order(None) == ["tvdb", "tmdb"]
+    assert resolve_anime_crossref_order({}) == ["tvdb", "tmdb"]
+
+
+def test_crossref_flip_to_tmdb():
+    # A single pick soft-appends the omitted source (always tries both).
+    assert resolve_anime_crossref_order({"matching.anime_crossref_order": ["tmdb"]}) \
+        == ["tmdb", "tvdb"]
+    assert resolve_anime_crossref_order({"matching.anime_crossref_order": ["tmdb", "tvdb"]}) \
+        == ["tmdb", "tvdb"]
+
+
+def test_crossref_drops_non_crossref_keys():
+    # "anidb" is the SOURCE, not a cross-ref target → dropped; junk too.
+    assert resolve_anime_crossref_order({"matching.anime_crossref_order": ["anidb", "tmdb"]}) \
+        == ["tmdb", "tvdb"]
+    assert resolve_anime_crossref_order({"matching.anime_crossref_order": ["nope"]}) \
+        == ["tvdb", "tmdb"]
+
+
+def test_crossref_wrapper_and_non_list_tolerated():
+    assert resolve_anime_crossref_order({"matching.anime_crossref_order": {"value": ["tmdb"]}}) \
+        == ["tmdb", "tvdb"]
+    assert resolve_anime_crossref_order({"matching.anime_crossref_order": "tmdb"}) \
+        == ["tvdb", "tmdb"]

@@ -39,7 +39,9 @@ def test_is_artifact_file_known_names() -> None:
     Windows happily writes 'Poster.jpg' with title-case."""
     yes = [
         "poster.jpg", "Poster.jpg", "POSTER.JPG",
-        "banner.png", "fanart.jpeg", "clearart.png", "clearlogo.png",
+        "banner.png", "fanart.jpeg", "background.jpg",
+        "backdrop.jpg", "Backdrop.JPG", "backdrop.png", "backdrop.jpeg",
+        "clearart.png", "clearlogo.png",
         "landscape.jpg", "thumb.png", "logo.jpg",
         "disc.jpg", "keyart.png", "characterart.jpg",
         "folder.jpg", "cover.png",
@@ -56,16 +58,12 @@ def test_is_artifact_file_known_names() -> None:
 
 def test_is_artifact_file_keeps_user_content() -> None:
     """User content should never be on the artifact list — these are
-    the false positives we'd be most worried about. The episode .nfo
-    case is deliberately NOT on the list (those arguably travel with
-    the video as sidecars in a future iteration)."""
+    the false positives we'd be most worried about."""
     no = [
         # Generic media
         "Show.S01E01.mkv", "Movie.mkv", "audio.flac",
         # Subtitle sidecars (Kira already handles these separately)
         "Show.S01E01.srt", "Show.S01E01.eng.ass",
-        # Per-episode NFO (different semantic from show-level tvshow.nfo)
-        "Show.S01E01.nfo",
         # Random user files
         "readme.txt", "notes.md", "playlist.m3u",
         # Anything that LOOKS like a poster but isn't on the list
@@ -76,6 +74,26 @@ def test_is_artifact_file_keeps_user_content() -> None:
     ]
     for name in no:
         assert not _is_artifact_file(name), f"should not be artifact: {name}"
+
+
+def test_is_artifact_file_nfo_catchall() -> None:
+    """ALL .nfo files classify as artifacts — including per-episode ones.
+    Safe because classification is only consulted behind the
+    `_is_artifacts_only` gate (every video already moved out), where any
+    remaining NFO is orphaned metadata. This flipped from the earlier
+    "episode NFOs are user content" stance after Kira's OWN NFO output
+    blocked the cleanup walk: renaming a season out of a folder left
+    `<episode>.nfo` + `-poster.jpg` + `-thumb.jpg` behind, and the lone
+    NFO kept the dead folder alive forever."""
+    yes = [
+        "Show.S01E01.nfo",
+        "Attack on Titan - S05E60 - The Other Side of the Sea.nfo",
+        "Movie (2023).NFO",       # case-insensitive
+        "release-group.nfo",      # scene NFO junk
+    ]
+    for name in yes:
+        assert _is_artifact_file(name), f"expected .nfo artifact: {name}"
+    assert not _is_artifact_file("Show.S01E01.nfo.bak")
 
 
 def test_is_artifact_dir_known_caches() -> None:
@@ -295,6 +313,39 @@ def test_cleanup_per_episode_thumbs_real_scenario(tmp_path: Path) -> None:
     assert count == 7
     for fn in real_filenames:
         assert not (folder / fn).exists(), f"should have been deleted: {fn}"
+
+
+def test_cleanup_kira_own_sidecar_output_real_scenario(tmp_path: Path) -> None:
+    """The user's actual problem (round 2): renaming a synthetic-season
+    library (Season 05/06/07 → proper S01–S04) left the OLD season
+    folders full of Kira's OWN previous sidecar output — per-episode
+    `<title>.nfo` + `-poster.jpg` + `-thumb.jpg`. The images matched the
+    per-file artwork pattern, but the episode NFO matched nothing, so
+    `_is_artifacts_only` failed and the dead folders survived with ALL
+    their debris. Exact filenames from the user's library."""
+    library = tmp_path / "media"
+    show = library / "anime" / "Attack on Titan"
+    season = show / "Season 05"
+    for fn in [
+        "Attack on Titan - S05E60 - The Other Side of the Sea-poster.jpg",
+        "Attack on Titan - S05E60 - The Other Side of the Sea-thumb.jpg",
+        "Attack on Titan - S05E60 - The Other Side of the Sea.nfo",
+        "Attack on Titan - S05E61 - Midnight Train-poster.jpg",
+        "Attack on Titan - S05E61 - Midnight Train.nfo",
+    ]:
+        _touch(season / fn)
+    # The show root keeps OTHER season folders that still hold videos —
+    # so the walk must remove Season 05 but leave the show root alone.
+    survivor = _touch(show / "Season 04" / "Attack on Titan - S04E01.mkv")
+
+    count = _cleanup_empty_source_parents(
+        season, stop_at=library, max_levels=2,
+    )
+
+    assert count == 5
+    assert not season.exists()
+    assert show.exists()          # still holds Season 04
+    assert survivor.exists()
 
 
 def test_parent_walk_unwinds_through_artifacts(tmp_path: Path) -> None:
@@ -585,7 +636,18 @@ def test_cleanup_trash_collision_gets_suffix(tmp_path: Path) -> None:
     _cleanup_media_server_artifacts(a, trash_root=trash)
     _cleanup_media_server_artifacts(b, trash_root=trash)
 
-    files = sorted(p.name for p in trash.iterdir())
+    # Exclude the provenance manifest the trash now writes per item.
+    from kira.renamer.operations import TRASH_MANIFEST
+    files = sorted(p.name for p in trash.iterdir() if p.name != TRASH_MANIFEST)
     assert len(files) == 2  # both preserved
     contents = sorted((trash / f).read_text() for f in files)
     assert contents == ["one", "two"]
+    # And the manifest recorded BOTH originals for per-item restore.
+    # (parse the JSON lines — raw substring checks fail on Windows where
+    # json escapes the path backslashes)
+    import json
+    originals = {
+        json.loads(line)["original"]
+        for line in (trash / TRASH_MANIFEST).read_text().splitlines()
+    }
+    assert originals == {str(a / "poster.jpg"), str(b / "poster.jpg")}

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import Field
@@ -18,6 +20,8 @@ from kira.parser import ParsedFile
 from kira.providers.opensubtitles import identify_file_by_hash
 from kira.schemas import ManualMatch, MediaFileOut
 from kira.settings_store import unwrap_str as _unwrap_setting  # canonical settings-value unwrap
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["matches"])
 
@@ -173,7 +177,7 @@ async def _rematch_one(
                             ):
                                 _, local_ep_for_enrich = routed
                     except Exception as e:
-                        print(f"_rematch_one enrichment: cour route build failed for {media_file.id}: {e!r}")
+                        logger.warning(f"_rematch_one enrichment: cour route build failed for {media_file.id}: {e!r}")
 
                 manual_sel.episode_title = _lookup_episode_title(
                     ep_dict,
@@ -195,7 +199,7 @@ async def _rematch_one(
                 ):
                     manual_sel.episode_number = local_ep_for_enrich
             except Exception as e:
-                print(f"_rematch_one enrichment: episode fetch failed for {media_file.id}: {e!r}")
+                logger.warning(f"_rematch_one enrichment: episode fetch failed for {media_file.id}: {e!r}")
 
         # 2) Rich metadata blob + overview.
         if manual_sel.metadata_blob is None:
@@ -211,7 +215,7 @@ async def _rematch_one(
                     if not manual_sel.overview:
                         manual_sel.overview = top_meta.get("overview")
             except Exception as e:
-                print(f"_rematch_one enrichment: metadata fetch failed for {media_file.id}: {e!r}")
+                logger.warning(f"_rematch_one enrichment: metadata fetch failed for {media_file.id}: {e!r}")
 
         # 3) Poster fill — only when the row currently has none. Never
         # clobber an existing URL with a transient provider miss. The
@@ -253,7 +257,7 @@ async def _rematch_one(
                     if fetched_url:
                         manual_sel.poster_url = fetched_url
                 except Exception as e:
-                    print(f"_rematch_one enrichment: poster fetch failed for {media_file.id}: {e!r}")
+                    logger.warning(f"_rematch_one enrichment: poster fetch failed for {media_file.id}: {e!r}")
 
         # Reflect that the file is now matched, in case bulk-select left
         # the MediaFile status as `no_match` / `discovered` / `matching`.
@@ -301,7 +305,7 @@ async def _rematch_one(
     try:
         scored = await engine.match(parsed, limit=5)
     except Exception as e:
-        print(f"_rematch_one: matcher raised for file {media_file.id}: {e!r}")
+        logger.info(f"_rematch_one: matcher raised for file {media_file.id}: {e!r}")
         return 0  # leave existing rows untouched
 
     # Fetch the episode list for the top match (TV/anime only) FIRST — cour
@@ -329,7 +333,7 @@ async def _rematch_one(
                 if _abs is not None and ep.episode is not None:
                     abs_to_local[_abs] = ep.episode
         except Exception as e:
-            print(f"_rematch_one: get_episodes failed: {e!r}")
+            logger.warning(f"_rematch_one: get_episodes failed: {e!r}")
 
     # Flat-umbrella detection (mirrors _match_cluster): a single AniDB AID that
     # numbers the whole long-runner absolutely (One Piece 69 → tvdb_season None).
@@ -345,7 +349,7 @@ async def _rematch_one(
         except (ValueError, TypeError):
             is_flat_umbrella = False
         except Exception as e:
-            print(f"_rematch_one: flat-umbrella check failed: {e!r}")
+            logger.warning(f"_rematch_one: flat-umbrella check failed: {e!r}")
             is_flat_umbrella = False
     local_to_abs: dict[int, int] = {loc: ab for ab, loc in abs_to_local.items()}
 
@@ -392,10 +396,10 @@ async def _rematch_one(
                             parsed.season, engine.registry,
                         ))
                     except Exception as e:
-                        print(f"_rematch_one: routed cour {routed_aid} episode fetch failed: {e!r}")
+                        logger.warning(f"_rematch_one: routed cour {routed_aid} episode fetch failed: {e!r}")
                         routed_eps = []
         except Exception as e:
-            print(f"_rematch_one: cour routing build failed: {e!r}")
+            logger.warning(f"_rematch_one: cour routing build failed: {e!r}")
 
     # Snapshot manual rows BEFORE the delete so we can preserve them
     # across the rematch. Without this, /rematch-all + auto-heal silently
@@ -493,7 +497,7 @@ async def _rematch_one(
                     if season_url:
                         top.poster_url = season_url
             except Exception as e:
-                print(f"_rematch_one: per-season poster fetch failed: {e!r}")
+                logger.warning(f"_rematch_one: per-season poster fetch failed: {e!r}")
 
     # AniDB search never returns an overview; the cross-ref via Fribb
     # populates `overview` on the metadata blob. Promote it onto the
@@ -984,11 +988,11 @@ async def bulk_select_manual_match(
                     if _abs is not None and _ep.episode is not None:
                         abs_to_local[_abs] = _ep.episode
     except Exception as e:
-        print(f"bulk_select_manual_match: cour routing build failed: {e!r}")
+        logger.warning(f"bulk_select_manual_match: cour routing build failed: {e!r}")
         cour_table = None
     local_to_abs: dict[int, int] = {loc: ab for ab, loc in abs_to_local.items()}
     if cour_table:
-        print(
+        logger.info(
             f"bulk_select_manual_match: routing across {len(cour_table)} cours "
             f"for {payload.provider}/{payload.provider_id} s={rep_season}"
         )
@@ -2083,15 +2087,15 @@ async def _auto_heal_stale_matches() -> None:
                 # title.
                 mismatched = await _heal_title_mismatch_matches(session)
                 if mismatched:
-                    print(f"auto_heal: nuked {mismatched} title-mismatched anime matches (now no_match).")
+                    logger.info(f"auto_heal: nuked {mismatched} title-mismatched anime matches (now no_match).")
                 fixed = await _heal_anime_fribb_misroutes(session)
                 if fixed:
-                    print(f"auto_heal: Fribb-corrected {fixed} misrouted anime AIDs in-place.")
+                    logger.info(f"auto_heal: Fribb-corrected {fixed} misrouted anime AIDs in-place.")
                 # v4 cleanup: NULL stale titles + drop duplicate match rows
                 # left behind by earlier in-place flips.
                 cleanup = await _cleanup_post_migration_cruft(session)
                 if cleanup["titles_nulled"] or cleanup["dupes_deleted"]:
-                    print(
+                    logger.info(
                         f"auto_heal: cleaned {cleanup['titles_nulled']} stale anime titles "
                         f"and removed {cleanup['dupes_deleted']} duplicate match rows."
                     )
@@ -2103,26 +2107,26 @@ async def _auto_heal_stale_matches() -> None:
                 # canonical English-preferred display title instantly.
                 refilled = await _refill_anidb_titles_from_cache(session)
                 if refilled:
-                    print(f"auto_heal: refilled {refilled} AniDB titles from in-memory cache.")
+                    logger.info(f"auto_heal: refilled {refilled} AniDB titles from in-memory cache.")
                 # v6: NULL metadata blobs that pre-date the overview-in-details
                 # change. Heal loop refills them with the now-fixed payload.
                 nulled_blobs = await _null_stale_metadata_blobs(session)
                 if nulled_blobs:
-                    print(f"auto_heal: nulled {nulled_blobs} stale metadata blobs for overview refill.")
+                    logger.warning(f"auto_heal: nulled {nulled_blobs} stale metadata blobs for overview refill.")
                 # v7: trigger rematch for all anime so the Fribb franchise
                 # guard + no-match floor + cross-provider anime filter
                 # apply to existing rows. Without this, files matched
                 # before v7 stay wrong forever.
                 rematch_n = await _trigger_anime_rematch(session)
                 if rematch_n:
-                    print(f"auto_heal: queued {rematch_n} anime matches for rematch with new logic.")
+                    logger.info(f"auto_heal: queued {rematch_n} anime matches for rematch with new logic.")
                 # v9: re-parse TV/anime files whose old parsed_data has
                 # no episode number — picks up new parser patterns (e.g.
                 # YEAR-EE `[aL].Show.2023-01.WEB`) so orphan-on-popup
                 # files get their episode assigned next heal pass.
                 reparsed_n = await _reparse_missing_episodes(session)
                 if reparsed_n:
-                    print(f"auto_heal: re-parsed {reparsed_n} files that now have an episode number.")
+                    logger.info(f"auto_heal: re-parsed {reparsed_n} files that now have an episode number.")
                 # v11: queue TVDB/TMDB TV matches for rematch so they
                 # fetch per-season poster art via the new matcher hook.
                 # Existing rows are otherwise stuck on series-level
@@ -2130,7 +2134,7 @@ async def _auto_heal_stale_matches() -> None:
                 # up looking identical until this fires.
                 season_poster_n = await _trigger_tvdb_tmdb_season_rematch(session)
                 if season_poster_n:
-                    print(f"auto_heal: queued {season_poster_n} TVDB/TMDB matches for per-season poster refresh.")
+                    logger.info(f"auto_heal: queued {season_poster_n} TVDB/TMDB matches for per-season poster refresh.")
                 # v12 (EE-5): recompute series_key for every TV/anime/music
                 # row using the new year/parent-folder disambiguator.
                 # Without this, libraries that pre-date the fix keep
@@ -2140,30 +2144,30 @@ async def _auto_heal_stale_matches() -> None:
                 # when the disambig component is empty.
                 series_key_n = await _recompute_series_keys(session)
                 if series_key_n:
-                    print(f"auto_heal: recomputed series_key for {series_key_n} files with year/parent disambiguator.")
+                    logger.info(f"auto_heal: recomputed series_key for {series_key_n} files with year/parent disambiguator.")
                 # v24: re-match files whose stored episode_number drifted away
                 # from the file's parsed episode (the One Piece stale-match
                 # class). Pure in-memory detection; arms the BATCH loop to do
                 # the real, ban-aware rematch below.
                 drift_n = await _heal_episode_number_drift(session)
                 if drift_n:
-                    print(f"auto_heal: flagged {drift_n} episode-drifted matches for rematch.")
+                    logger.info(f"auto_heal: flagged {drift_n} episode-drifted matches for rematch.")
                 # v25: AniDB-matched files that the parser typed non-anime get
                 # corrected to media_type=anime so they leave the TV Series group.
                 mt_n = await _heal_media_type_from_provider(session)
                 if mt_n:
-                    print(f"auto_heal: corrected media_type=anime for {mt_n} AniDB-matched file(s).")
+                    logger.info(f"auto_heal: corrected media_type=anime for {mt_n} AniDB-matched file(s).")
                 # v25: re-match movies whose stored year != parsed year (stale
                 # fallback to the wrong-year film, e.g. Nobody 2 → Nobody 2021).
                 myr_n = await _heal_movie_year_mismatch(session)
                 if myr_n:
-                    print(f"auto_heal: flagged {myr_n} year-mismatched movie(s) for rematch.")
+                    logger.info(f"auto_heal: flagged {myr_n} year-mismatched movie(s) for rematch.")
                 await session.commit()
             except Exception as e:
                 # R2-H2 caveat: the CAS already bumped the version row, so
                 # on retry next boot the cleanup won't fire even if we
                 # rolled back the data work. Rollback the version too.
-                print(f"auto_heal: heal pass failed: {e!r}")
+                logger.warning(f"auto_heal: heal pass failed: {e!r}")
                 await session.rollback()
                 try:
                     await session.execute(
@@ -2264,7 +2268,7 @@ async def _auto_heal_stale_matches() -> None:
                 # Continue the loop to look past the skipped IDs.
                 continue
 
-            print(f"auto_heal: rematching {len(processable)} stale matches…")
+            logger.warning(f"auto_heal: rematching {len(processable)} stale matches…")
             for fid, prov in processable:
                 # Per-iteration ban check covers the case where AniDB bans
                 # us mid-sweep on a TVDB-rematch that nevertheless triggered
@@ -2296,11 +2300,11 @@ async def _auto_heal_stale_matches() -> None:
                     total_healed += 1
                     activity.progress("heal", total_healed)
                 except Exception as e:
-                    print(f"auto_heal: file {fid} failed: {e!r}")
+                    logger.warning(f"auto_heal: file {fid} failed: {e!r}")
                     await session.rollback()
             # Yield between batches so request handlers stay responsive.
             await asyncio.sleep(1.0)
-        print("auto_heal: done.")
+        logger.info("auto_heal: done.")
         activity.end("heal")
         if total_healed > 0:
             try:
@@ -2348,7 +2352,7 @@ async def _bulk_rematch_worker(fids: list[int], force: bool = False) -> None:
                     await session.commit()
                     done += 1
             except Exception as e:
-                print(f"bulk_rematch: file {fid} failed: {e!r}")
+                logger.warning(f"bulk_rematch: file {fid} failed: {e!r}")
                 await session.rollback()
                 failed += 1
             if AniDBProvider._http_call_count - last_call_mark >= CALL_YIELD:

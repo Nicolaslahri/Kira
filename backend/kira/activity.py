@@ -49,10 +49,34 @@ def progress(name: str, done: int, total: int | None = None) -> None:
     job["updated_at"] = time.time()
 
 
-def end(name: str) -> None:
+def set_label(name: str, label: str) -> None:
+    """Update a running job's human label WITHOUT touching its done/total —
+    for live per-item narration (e.g. 'Show S01E07 · downloading EN'). Keeps
+    the job marked active + fresh so it isn't reported stale mid-step."""
+    job = _jobs.get(name)
+    if job is None:
+        begin(name, label)
+        return
+    job["label"] = label
+    job["active"] = True
+    job["updated_at"] = time.time()
+
+
+def end(name: str, *, ok: bool = True, detail: str | None = None) -> None:
+    """Finish a job with a FINAL state the UI can render after the spinner:
+    `ok=True` → a green "done" beat with `detail` as the summary line;
+    `ok=False` → a sticky red error card with `detail` as the explanation.
+
+    The final state matters because a job can fail in under a poll interval
+    (e.g. a rejected API key kills a subtitle batch on file 1) — without it
+    the frontend never even sees the job, and the user learns nothing.
+    `snapshot()` keeps finished jobs visible for a grace window."""
     job = _jobs.get(name)
     if job is not None:
         job["active"] = False
+        job["state"] = "done" if ok else "error"
+        job["detail"] = detail
+        job["ended_at"] = time.time()
         job["updated_at"] = time.time()
 
 
@@ -64,17 +88,37 @@ def set_boot_recovery(scans: int, files: int) -> None:
     _boot["at"] = time.time()
 
 
+# How long a FINISHED job stays in the snapshot, so a poll that missed the
+# active phase still sees the outcome. Errors linger much longer than the
+# green "done" beat — the user must get a chance to read what went wrong.
+_DONE_LINGER = 15.0
+_ERROR_LINGER = 600.0
+
+
 def snapshot(*, stale_after: float = 120.0) -> dict[str, Any]:
     """Current activity. Jobs not updated within ``stale_after`` seconds are
-    reported inactive even if a crash left their ``active`` flag set."""
+    reported inactive even if a crash left their ``active`` flag set.
+    Finished jobs ride along (state done/error + detail) for a linger window
+    so even a sub-second failure reaches the UI."""
     now = time.time()
     jobs: list[dict[str, Any]] = []
     for name, job in _jobs.items():
         active = bool(job["active"]) and (now - job["updated_at"] < stale_after)
+        state = "running" if active else job.get("state")
+        if not active:
+            ended = job.get("ended_at")
+            if state not in ("done", "error") or ended is None:
+                continue  # stale-crashed or pre-final-state legacy job — hide
+            linger = _ERROR_LINGER if state == "error" else _DONE_LINGER
+            if now - ended > linger:
+                continue
         jobs.append({
             "name": name,
             "label": job["label"],
             "active": active,
+            "state": state,
+            "detail": job.get("detail"),
+            "ended_at": job.get("ended_at"),
             "done": job["done"],
             "total": job["total"],
         })

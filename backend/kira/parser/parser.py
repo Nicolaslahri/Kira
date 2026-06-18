@@ -93,6 +93,19 @@ class ParsedFile:
     # corroboration metric — a 22-min file plausibly an episode, a 2h file a
     # movie. None when MediaInfo is unavailable or wasn't read for this file.
     duration: int | None = None
+    # MediaInfo read cache. `mi_raw` is the raw container dict exactly as
+    # read_media_info returned it; `mi_stamp` is the [size, mtime] the file had
+    # at read time. Together they let the background tech-tag pass skip the
+    # NAS parse entirely for unchanged files AND re-apply fallback/authoritative
+    # merging on a settings flip with zero I/O. None until the first read.
+    mi_raw: dict[str, Any] | None = None
+    mi_stamp: list[int] | None = None
+    # Languages of subtitle SIDECARS sitting beside the video on disk (2-letter
+    # codes), distinct from `sub_langs` (embedded tracks). Cached by the
+    # MediaInfo enrich pass and refreshed after a subtitle fetch so the coverage
+    # chip flips without a rescan. None until first inspected; [] means "looked,
+    # found no tagged sidecars".
+    sub_sidecars: list[str] | None = None
     # Parser's own confidence in the extraction (0-1)
     confidence: float = 0.0
 
@@ -642,7 +655,10 @@ def _season_from_parent(parent_path: str) -> int | None:
     if not m:
         return None
     n = int(m.group(1))
-    return n if 1 <= n <= 50 else None
+    # 0 is valid: a `Season 0` / `Season 00` folder is the Plex/Jellyfin
+    # Specials convention, and Phase 2 routes specials to season 0 as real
+    # content — the `1 <=` floor used to silently drop that hint.
+    return n if 0 <= n <= 50 else None
 
 
 def _cour_from_parent(parent_path: str) -> int | None:

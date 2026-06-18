@@ -18,6 +18,8 @@ https://github.com/Fribb/anime-lists
 
 from __future__ import annotations
 
+import logging
+
 import asyncio
 import json
 import time
@@ -27,6 +29,8 @@ from typing import Any, ClassVar
 import httpx
 
 from kira.providers.base import KIRA_USER_AGENT
+
+logger = logging.getLogger(__name__)
 
 _CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache"
 _MAPPING_FILE = _CACHE_DIR / "anime-mappings.json"
@@ -123,7 +127,7 @@ class AnimeMappings:
                 try:
                     await cls._download(client)
                 except Exception as e:
-                    print(f"anime_mappings: download failed ({e!r}); falling back to cache.")
+                    logger.warning(f"anime_mappings: download failed ({e!r}); falling back to cache.")
                     if not _MAPPING_FILE.exists():
                         cls._set_map({})
                         return
@@ -142,7 +146,7 @@ class AnimeMappings:
                 # library until the next 7-day refresh cycle. We rename
                 # the bad file aside so a manual user inspection is
                 # possible without re-downloading.
-                print(f"anime_mappings: parse failed ({e!r}); preserving in-memory cache.")
+                logger.warning(f"anime_mappings: parse failed ({e!r}); preserving in-memory cache.")
                 try:
                     bad = _MAPPING_FILE.with_suffix(".bad")
                     if _MAPPING_FILE.exists():
@@ -161,7 +165,7 @@ class AnimeMappings:
             # structurally valid but semantically empty (maintenance page
             # disguised as JSON, etc.). Keep the previous in-memory copy.
             if len(parsed) < 100:
-                print(f"anime_mappings: parsed only {len(parsed)} entries (suspect); keeping previous cache.")
+                logger.info(f"anime_mappings: parsed only {len(parsed)} entries (suspect); keeping previous cache.")
                 if cls._by_aid is None:
                     cls._set_map(parsed)  # take what we got; better than nothing
                 return

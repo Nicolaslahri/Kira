@@ -1,4 +1,4 @@
-import type { RefObject } from 'react';
+import { useState, type RefObject } from 'react';
 import type { LibraryItem, MediaType } from '../../lib/types';
 import { libraryStats, confTier } from '../LibraryGrid';
 import { MediaTypeIcon } from '../ui';
@@ -18,6 +18,14 @@ interface HeroProps {
 }
 
 export function Hero({ item, stats, tint, shape, heroSlotRef, settled, posterUrl }: HeroProps) {
+  // Overview clamp/expand. Collapsed to ~4 lines (CSS line-clamp) so the
+  // rail fits on a typical desktop without scrolling; "More" reveals the
+  // rest in place. Only show the toggle when the overview is long enough
+  // to plausibly clip (cheap char heuristic — avoids a layout-measuring
+  // effect for a purely cosmetic affordance).
+  const [overviewExpanded, setOverviewExpanded] = useState(false);
+  const overviewLong = (item.overview?.length ?? 0) > 220;
+
   return (
     <div className={`cx-hero variant-side shape-${shape}`}>
       <div
@@ -106,7 +114,23 @@ export function Hero({ item, stats, tint, shape, heroSlotRef, settled, posterUrl
           ) : null}
         </div>
 
-        {item.overview ? <p className="cx-hero-overview">{item.overview}</p> : null}
+        {item.overview ? (
+          <>
+            <p className={`cx-hero-overview ${overviewLong && !overviewExpanded ? 'clamp' : ''}`}>
+              {item.overview}
+            </p>
+            {overviewLong ? (
+              <button
+                type="button"
+                className="cx-hero-overview-more"
+                onClick={() => setOverviewExpanded(v => !v)}
+                aria-expanded={overviewExpanded}
+              >
+                {overviewExpanded ? 'Show less' : 'More'}
+              </button>
+            ) : null}
+          </>
+        ) : null}
 
         <div className="cx-hero-details">
           {item.studio || item.label ? (
@@ -144,7 +168,7 @@ export function Hero({ item, stats, tint, shape, heroSlotRef, settled, posterUrl
             </div>
           ) : null}
           {item.genres?.length ? (
-            <div className="cx-hero-detail">
+            <div className="cx-hero-detail span2">
               <span className="cx-hero-detail-label">Genres</span>
               <span className="cx-hero-detail-value wrap">{item.genres.join(' · ')}</span>
             </div>

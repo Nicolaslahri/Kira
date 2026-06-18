@@ -51,7 +51,7 @@ export function ForceImportConfirmModal({
 
   // Portal to document.body so the modal escapes the DownloadProgressRow's
   // stacking context. The row sits deep inside cx-shell → cx-main →
-  // cx-body → cx-col → cx-row; the popup's transform on cx-shell creates
+  // cx-list → cx-list-body → cx-pair; the popup's transform on cx-shell creates
   // a stacking context that traps any descendant regardless of z-index.
   // Portaling to body lets the modal stack above the entire popup like
   // the Dupes / Delete modals do (those are rendered at the popup root

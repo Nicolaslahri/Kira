@@ -56,7 +56,11 @@ def _apply_connection_pragmas(dbapi_connection) -> None:
     - journal_mode=WAL: readers never block the single writer (and vice-versa),
       so the Review page keeps rendering while a scan writes. Persistent (lives
       in the DB header) — a cheap no-op on every connection after the first.
-    - busy_timeout: wait up to 5s for a held lock instead of erroring instantly.
+    - busy_timeout: wait up to 15s for a held lock instead of erroring instantly.
+      Raised from 5s: a scan that overlaps the boot-time auto-heal sweep — both
+      commit to SQLite's single writer — used to time out at 5s → "database is
+      locked", which poisoned the scan session and surfaced as a failed scan.
+      15s lets the scan ride out heal's brief, gap-separated per-file commits.
     - synchronous=NORMAL: the recommended durability level under WAL — crash-safe
       for app crashes, only risks the last transaction on OS/power loss, and is
       markedly faster than FULL for our write-bursty backfills.
@@ -65,7 +69,7 @@ def _apply_connection_pragmas(dbapi_connection) -> None:
     try:
         cursor.execute("PRAGMA foreign_keys = ON")
         cursor.execute("PRAGMA journal_mode = WAL")
-        cursor.execute("PRAGMA busy_timeout = 5000")
+        cursor.execute("PRAGMA busy_timeout = 15000")
         cursor.execute("PRAGMA synchronous = NORMAL")
     finally:
         cursor.close()
@@ -87,6 +91,7 @@ if "sqlite" in settings.database_url:
 # is intentionally conservative for self-hosted single-user workload.
 _SLOW_QUERY_MS = float(__import__("os").environ.get("KIRA_SLOW_QUERY_MS", "50"))
 _query_log = logging.getLogger("kira.db.slow")
+logger = logging.getLogger(__name__)
 
 
 def _install_slow_query_hook() -> None:
@@ -142,6 +147,61 @@ _MIGRATION_COLUMNS: list[tuple[str, str, str]] = [
 ]
 
 
+# The first Alembic revision — captures the complete 0.5.0 schema. Pre-Alembic
+# databases (which create_all + the ensure-column list already brought current)
+# are adopted by stamping this revision, so only LATER revisions ever run on
+# them. Keep in sync with migrations/versions/ when re-baselining (never).
+_ALEMBIC_BASELINE = "7500d72e9360"
+
+
+def _run_alembic_sync(async_url: str) -> None:
+    """Bring the schema under Alembic and run pending revisions. Sync — call
+    via asyncio.to_thread.
+
+    Decision tree:
+      - fresh DB (no tables)            → `upgrade head` builds everything
+      - pre-Alembic DB (tables, no
+        alembic_version)                → `stamp baseline`, then `upgrade head`
+        (adopt: the legacy create_all + ensure-column path already matches the
+        baseline, so only post-baseline revisions apply)
+      - already stamped                 → `upgrade head`
+
+    Runs BEFORE create_all so a future revision's CREATE TABLE can't collide
+    with one create_all already made. Uses the LIVE engine's URL (not config)
+    so tests with monkeypatched engines migrate their own temp databases.
+    """
+    from pathlib import Path
+
+    import sqlalchemy as sa
+    from alembic import command
+    from alembic.config import Config
+
+    sync_url = async_url.replace("+aiosqlite", "")
+    backend_dir = Path(__file__).resolve().parent.parent
+    cfg = Config(str(backend_dir / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend_dir / "migrations"))
+    cfg.set_main_option("sqlalchemy.url", sync_url)
+
+    probe = sa.create_engine(sync_url)
+    try:
+        insp = sa.inspect(probe)
+        has_alembic = insp.has_table("alembic_version")
+        # ANY of our tables present = an existing (pre-Alembic) database that
+        # must be ADOPTED, not built — running the baseline's CREATE TABLEs
+        # against it would collide. Checking several tables (not just
+        # media_files) keeps partial/hand-built DBs (tests, salvage) on the
+        # adopt path too.
+        has_core = any(insp.has_table(t) for t in (
+            "media_files", "matches", "settings", "rename_history", "scans",
+        ))
+    finally:
+        probe.dispose()
+
+    if not has_alembic and has_core:
+        command.stamp(cfg, _ALEMBIC_BASELINE)
+    command.upgrade(cfg, "head")
+
+
 async def init_db() -> None:
     """Create tables + apply idempotent in-place migrations on startup.
 
@@ -156,6 +216,17 @@ async def init_db() -> None:
     """
     from kira import models  # noqa: F401 — register mappers
 
+    # ── 0) Alembic — adopt / upgrade BEFORE create_all so future revisions'
+    #        DDL can't collide with tables create_all already made. Non-fatal:
+    #        a migration failure logs loudly but the legacy create_all +
+    #        ensure-column path below still brings a DB to a bootable state.
+    try:
+        import asyncio as _asyncio
+        url = engine.url.render_as_string(hide_password=False)
+        await _asyncio.to_thread(_run_alembic_sync, url)
+    except Exception as e:  # noqa: BLE001 — never let a migration crash boot
+        logging.getLogger(__name__).error("init_db: alembic upgrade failed (continuing on legacy path): %r", e)
+
     # ── 1) Tables ────────────────────────────────────────────────────────
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -167,7 +238,7 @@ async def init_db() -> None:
             async with engine.begin() as conn:
                 await _ensure_column(conn, table, column, ddl)
         except Exception as e:  # noqa: BLE001 — never let a migration crash boot
-            print(f"init_db: ensure_column {table}.{column} failed (non-fatal): {e!r}")
+            logger.warning(f"init_db: ensure_column {table}.{column} failed (non-fatal): {e!r}")
 
     # ── 3) Data backfills + one-shot data migrations — EACH isolated and
     #        NON-FATAL. A failure here logs and is skipped; the schema above
@@ -186,7 +257,7 @@ async def init_db() -> None:
             async with engine.begin() as conn:
                 await fn(conn)
         except Exception as e:  # noqa: BLE001
-            print(f"init_db: {name} failed (non-fatal): {e!r}")
+            logger.warning(f"init_db: {name} failed (non-fatal): {e!r}")
 
 
 async def _ensure_scan_lock_row(conn) -> None:

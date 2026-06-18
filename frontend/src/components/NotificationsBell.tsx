@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import { api, ApiError, type ApiNotification } from '../lib/api';
 import { IcBell, IcCheck, IcAlertTri } from '../lib/icons';
 import { cn } from '../lib/utils';
@@ -105,7 +106,10 @@ export function NotificationsBell() {
     <div ref={wrapRef} className="relative">
       <button
         ref={triggerRef}
-        className="relative grid size-9 shrink-0 place-items-center rounded-lg border border-primary bg-primary text-fg-quaternary shadow-xs transition hover:bg-primary_hover hover:text-fg-tertiary [&_svg]:size-[16px]"
+        className={cn(
+          'press group relative grid size-9 shrink-0 place-items-center rounded-lg border bg-[var(--surface-1)] text-fg-quaternary shadow-[var(--shadow-1)] transition hover:bg-[var(--surface-hover)] hover:text-fg-tertiary [&_svg]:size-[16px] [&_svg]:transition-transform [&_svg]:duration-300 hover:[&_svg]:-rotate-12',
+          unread > 0 ? 'border-accent-line' : 'border-[var(--border-2)]',
+        )}
         title={unread > 0 ? `Notifications (${unread} unread)` : 'Notifications'}
         aria-label={unread > 0 ? `Notifications, ${unread} unread` : 'Notifications'}
         aria-haspopup="dialog"
@@ -114,24 +118,37 @@ export function NotificationsBell() {
         onClick={() => setOpen(o => !o)}
       >
         <IcBell />
-        {unread > 0 ? (
-          <span
-            aria-hidden="true"
-            className="absolute -right-1 -top-1 grid h-4 min-w-4 place-items-center rounded-full bg-conf-low px-1 text-[9px] font-bold leading-none text-white"
-          >
-            {unread > 99 ? '99+' : unread}
-          </span>
-        ) : null}
+        <AnimatePresence>
+          {unread > 0 ? (
+            <motion.span
+              key="unread-badge"
+              aria-hidden="true"
+              initial={{ scale: 0, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0, opacity: 0 }}
+              transition={{ type: 'spring', stiffness: 600, damping: 22 }}
+              className="absolute -right-1 -top-1 grid h-4 min-w-4 place-items-center rounded-full bg-conf-low px-1 text-[9px] font-bold leading-none text-white shadow-[0_0_0_3px_rgba(255,91,110,0.25)]"
+            >
+              {unread > 99 ? '99+' : unread}
+            </motion.span>
+          ) : null}
+        </AnimatePresence>
       </button>
 
+      <AnimatePresence>
       {open ? (
-        <div
+        <motion.div
           ref={panelRef}
           id="notifications-panel"
           role="dialog"
           aria-label="Notifications"
           tabIndex={-1}
-          className="absolute right-0 top-[calc(100%+8px)] z-50 w-[360px] overflow-hidden rounded-2xl border border-white/[0.12] bg-[rgba(20,19,28,0.96)] shadow-[0_18px_60px_rgba(0,0,0,0.55)] backdrop-blur-xl outline-none"
+          initial={{ opacity: 0, y: -8, scale: 0.97 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: -6, scale: 0.98 }}
+          transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+          style={{ transformOrigin: 'top right' }}
+          className="absolute right-0 top-[calc(100%+8px)] z-50 w-[360px] overflow-hidden rounded-2xl border border-[var(--border-3)] bg-[rgba(14,14,18,0.96)] shadow-[var(--shadow-3)] backdrop-blur-xl outline-none"
         >
           <div className="flex items-center justify-between border-b border-white/[0.1] px-4 py-3">
             <div className="text-[13px] font-semibold text-ink">Notifications</div>
@@ -165,7 +182,9 @@ export function NotificationsBell() {
                   <FeaturedIcon size="sm" color={kindColor(n.kind)} icon={kindIcon(n.kind)} />
                   <div className="min-w-0 flex-1">
                     <div className="text-[13px] font-medium text-ink">{n.title}</div>
-                    {n.body ? <div className="mt-0.5 text-[12px] leading-relaxed text-ink-muted">{n.body}</div> : null}
+                    {/* whitespace-pre-line: multi-line bodies (e.g. the subtitle
+                        summary's bulleted "To fix" list) keep their line breaks. */}
+                    {n.body ? <div className="mt-0.5 whitespace-pre-line text-[12px] leading-relaxed text-ink-muted">{n.body}</div> : null}
                     <div className="mt-1 text-[11px] text-ink-faint">{relativeTime(n.created_at)}</div>
                   </div>
                   {!n.read ? <span className="mt-1.5 size-2 shrink-0 rounded-full bg-accent" /> : null}
@@ -173,8 +192,9 @@ export function NotificationsBell() {
               ))}
             </div>
           )}
-        </div>
+        </motion.div>
       ) : null}
+      </AnimatePresence>
     </div>
   );
 }

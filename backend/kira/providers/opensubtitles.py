@@ -23,6 +23,35 @@ import httpx
 from kira.download_guard import fetch_capped, looks_like_error_page
 
 from kira.providers.base import KIRA_USER_AGENT
+from kira.subtitles.errors import AuthRejected, QuotaExceeded
+
+# OpenSubtitles signals a spent daily download allowance with 406 Not
+# Acceptable and rate-limits with 429 Too Many Requests. Both mean "stop the
+# batch" rather than "this one file failed".
+_QUOTA_STATUSES = (406, 429)
+
+
+def _maybe_quota(exc: Exception) -> None:
+    """Re-raise as QuotaExceeded / AuthRejected when an httpx error carries a
+    batch-stopping status; otherwise return (caller logs + degrades). Pulls
+    the `remaining` / `reset_time` hint from the JSON body when present."""
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None) if resp is not None else None
+    if status in (401, 403):
+        # A rejected key fails EVERY request identically — stop the batch.
+        raise AuthRejected(f"OpenSubtitles rejected the API key (HTTP {status})")
+    if resp is None or status not in _QUOTA_STATUSES:
+        return
+    remaining = None
+    reset_hint = None
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            remaining = body.get("remaining")
+            reset_hint = body.get("reset_time") or body.get("reset_time_utc")
+    except Exception:
+        pass
+    raise QuotaExceeded(remaining=remaining, reset_hint=reset_hint)
 
 _log = logging.getLogger("kira.opensubtitles")
 
@@ -126,6 +155,8 @@ def parse_subtitle_candidates(payload: dict[str, Any], languages: list[str] | No
             "moviehash_match": attrs.get("moviehash_match") is True,
             "downloads": _safe_int(attrs.get("download_count")) or 0,
             "release": attrs.get("release") or "",
+            "hearing_impaired": attrs.get("hearing_impaired") is True,
+            "forced": attrs.get("foreign_parts_only") is True,
         })
     out.sort(key=lambda c: (c["moviehash_match"], c["downloads"]), reverse=True)
     return out
@@ -242,7 +273,8 @@ class OpenSubtitlesClient:
     async def search(self, *, moviehash: str | None = None, moviebytesize: int | None = None,
                      tmdb_id: int | None = None, imdb_id: int | None = None,
                      query: str | None = None, season: int | None = None,
-                     episode: int | None = None, languages: list[str] | None = None
+                     episode: int | None = None, languages: list[str] | None = None,
+                     hearing_impaired: str | None = None, forced: str | None = None,
                      ) -> list[dict[str, Any]]:
         """Search `/subtitles`. Hash-first when a moviehash is given, with
         id/name params layered on so the API can fall back. Returns ranked
@@ -259,25 +291,43 @@ class OpenSubtitlesClient:
         if imdb_id:
             params["imdb_id"] = str(imdb_id)
         if query:
-            params["query"] = query
+            # OpenSubtitles requires lowercase parameter values (and 301s
+            # non-canonical requests — see the sort below).
+            params["query"] = query.lower()
         if season is not None:
             params["season_number"] = str(season)
         if episode is not None:
             params["episode_number"] = str(episode)
         if languages:
             params["languages"] = ",".join(sorted(l.lower() for l in languages))
+        # Variant preferences (Settings → Naming → Subtitles). The API accepts
+        # include / exclude / only for both; anything else is left unset so the
+        # server default ("include") applies.
+        if hearing_impaired in ("include", "exclude", "only"):
+            params["hearing_impaired"] = hearing_impaired
+        if forced in ("include", "exclude", "only"):
+            params["foreign_parts_only"] = forced
         if not params:
             return []
+        # The API 301-redirects any request whose params aren't in canonical
+        # (alphabetical) order, and httpx doesn't follow redirects by default —
+        # so a non-canonical search silently returned nothing. Sort the params
+        # AND follow the redirect as belt-and-braces.
+        params = dict(sorted(params.items()))
         try:
             r = await self.client.get(
                 f"{_BASE_URL}/subtitles", params=params,
                 headers={"Api-Key": self.api_key, "User-Agent": self.app_name,
                          "Accept": "application/json"},
                 timeout=20.0,
+                follow_redirects=True,
             )
             r.raise_for_status()
             return parse_subtitle_candidates(r.json(), languages)
+        except QuotaExceeded:
+            raise
         except Exception as e:
+            _maybe_quota(e)  # rate-limited search → stop the batch
             _log.warning("search failed: %r", e)
             return []
 
@@ -293,7 +343,10 @@ class OpenSubtitlesClient:
             )
             r.raise_for_status()
             return parse_download_link(r.json())
+        except QuotaExceeded:
+            raise
         except Exception as e:
+            _maybe_quota(e)  # spent daily allowance → stop the batch
             _log.warning("download_link failed: %r", e)
             return None
 
@@ -310,6 +363,10 @@ async def fetch_and_save_subtitles(
     imdb_id: int | None = None,
     season: int | None = None,
     episode: int | None = None,
+    query: str | None = None,
+    hearing_impaired: str | None = None,
+    forced: str | None = None,
+    on_status=None,
 ) -> list[str]:
     """End-to-end subtitle fetch for one video. Hash-first search (falls back to
     tmdb/imdb id + season/episode), best candidate per language, download, write
@@ -341,6 +398,13 @@ async def fetch_and_save_subtitles(
     if not languages:
         return []
 
+    def _say(msg: str) -> None:
+        if on_status is not None:
+            try:
+                on_status(msg)
+            except Exception:
+                pass
+
     os_client = OpenSubtitlesClient(api_key, client)
 
     moviehash = None
@@ -352,21 +416,30 @@ async def fetch_and_save_subtitles(
     except Exception:
         pass
 
+    _say("searching OpenSubtitles")
     candidates = await os_client.search(
         moviehash=moviehash, moviebytesize=bytesize,
         tmdb_id=tmdb_id, imdb_id=imdb_id, season=season, episode=episode,
+        # Title-query fallback: AniDB matches carry no TMDB/IMDb id, and a
+        # file hash rarely matches fansub releases — without `query` those
+        # files searched on hash alone and found NOTHING.
+        query=query if not (tmdb_id or imdb_id) else None,
         languages=languages,
+        hearing_impaired=hearing_impaired, forced=forced,
     )
     if not candidates:
+        _say("no candidates found")
         return []
     best = pick_best_per_language(candidates, languages)
     if not best:
         return []
+    _say(f"found {len(candidates)} · picking best of {len(best)} language(s)")
 
     token = await os_client.login(username, password) if (username and password) else None
 
     saved: list[str] = []
     for lang, cand in best.items():
+        _say(f"downloading {lang.upper()} subtitles")
         link = await os_client.download_link(cand["file_id"], token)
         if not link:
             continue
@@ -406,6 +479,69 @@ async def fetch_and_save_subtitles(
         except Exception as e:
             _log.warning("save %s failed: %r", lang, e)
     return saved
+
+
+async def search(client: httpx.AsyncClient, ctx) -> list:
+    """Structured search → SubtitleCandidate list (no download). Hash-first."""
+    from kira.subtitles.model import SubtitleCandidate
+    if not ctx.os_api_key:
+        return []
+    osc = OpenSubtitlesClient(ctx.os_api_key, client)
+    moviehash = bytesize = None
+    try:
+        from kira.providers._osdbhash import compute_osdb_hash
+        moviehash = compute_osdb_hash(ctx.video_path)
+        bytesize = os.path.getsize(ctx.video_path)
+    except Exception:
+        pass
+    tmdb_id = ctx.tmdb_id
+    raw = await osc.search(
+        moviehash=moviehash, moviebytesize=bytesize,
+        tmdb_id=tmdb_id, imdb_id=ctx.imdb_id,
+        season=ctx.season, episode=ctx.episode,
+        query=ctx.query if not (tmdb_id or ctx.imdb_id) else None,
+        languages=ctx.languages,
+        hearing_impaired=ctx.hearing_impaired or None,
+        forced=ctx.forced or None,
+    )
+    out = []
+    for c in raw:
+        out.append(SubtitleCandidate(
+            provider="opensubtitles", language=c["language"],
+            release_name=c.get("release") or "", download_ref=c["file_id"],
+            downloads=c.get("downloads") or 0, hash_match=c.get("moviehash_match", False),
+            hearing_impaired=c.get("hearing_impaired", False), forced=c.get("forced", False),
+        ))
+    return out
+
+
+# Login token cached per (api_key, user) for the life of one backfill batch.
+_token_cache: dict = {}
+
+
+async def download(client: httpx.AsyncClient, cand, ctx) -> bytes | None:
+    """Download one OpenSubtitles candidate → raw bytes (the aggregator saves)."""
+    if not ctx.os_api_key:
+        return None
+    osc = OpenSubtitlesClient(ctx.os_api_key, client)
+    token = None
+    if ctx.os_user and ctx.os_pw:
+        ck = (ctx.os_api_key, ctx.os_user)
+        token = _token_cache.get(ck)
+        if token is None:
+            token = await osc.login(ctx.os_user, ctx.os_pw)
+            if token:
+                _token_cache[ck] = token
+    link = await osc.download_link(cand.download_ref, token)
+    if not link:
+        return None
+    fetched = await fetch_capped(client, link, max_bytes=_MAX_SUB_BYTES, timeout=30.0)
+    if not fetched:
+        return None
+    content, ct = fetched
+    if looks_like_error_page(content, ct):
+        return None
+    return content
 
 
 async def identify_file_by_hash(

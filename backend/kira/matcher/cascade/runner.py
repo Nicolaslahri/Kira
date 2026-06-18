@@ -163,11 +163,20 @@ class Cascade:
         # similarity metrics don't double-count overlapping signals.
         tier_2_max = max((r.score for r in tier_2_results), default=0.0)
         tier_3_max = max((r.score for r in tier_3_results), default=0.0)
-        if tier_2_max > 0 or tier_3_max > 0:
-            # Weights chosen so a perfect tier-2 + perfect tier-3 land
-            # exactly at the top of tier-2's band (≈0.85), preserving
-            # the "tier-2 can't beat tier-1" guarantee.
-            weighted = (0.7 * tier_2_max + 0.3 * tier_3_max) if tier_3_max > 0 else tier_2_max
+        if tier_2_max > 0 and tier_3_max > 0:
+            # Both fired: blend (tier-2 0.7, tier-3 0.3). Weights chosen so a
+            # perfect tier-2 + perfect tier-3 land exactly at the top of
+            # tier-2's band (≈0.85), preserving "tier-2 can't beat tier-1".
+            weighted = 0.7 * tier_2_max + 0.3 * tier_3_max
+        elif tier_2_max > 0:
+            weighted = tier_2_max
+        elif tier_3_max > 0:
+            # ONLY corroboration fired — keep it INSIDE the tier-3 band
+            # [0.20, 0.50). Scaling a lone tier-3 by 0.3 (the old code) pushed
+            # it below the band floor, so the result reported a misleading 0%
+            # tier-confidence and broke the documented band invariant. (Still
+            # under MIN_CONFIDENCE, so auto-match behaviour is unchanged.)
+            weighted = tier_3_max
         else:
             weighted = 0.0
 

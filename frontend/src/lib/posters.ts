@@ -12,7 +12,7 @@
  * The backend ALSO caches to disk, so the worst case is a 4-second wait
  * the first time an AID is ever seen, then instant forever after.
  */
-import { api } from './api';
+import { api, posterSrc } from './api';
 
 const cache = new Map<string, string | null>();
 const inflight = new Map<string, Promise<string | null>>();
@@ -27,9 +27,12 @@ export function fetchAnidbPoster(aid: string): Promise<string | null> {
   if (existing) return existing;
   const p = api.anidbPicture(aid)
     .then(({ picture_url }) => {
-      cache.set(aid, picture_url);
+      // Route AniDB's slow CDN through Kira's image proxy/cache (fast hosts
+      // pass through untouched).
+      const proxied = posterSrc(picture_url);
+      cache.set(aid, proxied);
       inflight.delete(aid);
-      return picture_url;
+      return proxied;
     })
     .catch(() => {
       inflight.delete(aid);

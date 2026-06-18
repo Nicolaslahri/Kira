@@ -110,3 +110,26 @@ def test_absolute_pass_skipped_when_number_within_local_range():
     # to the ep whose absolute_number==5, which is local 1).
     out = assign_files_to_episodes([(600, _pf(2, 5, abs_ep=None))], eps)
     assert out[600].episode_number == 5
+
+
+# ── Season-0 isolation (Specials/OVAs must not hijack main episodes) ──────────
+def test_season0_special_not_paired_to_main_episode():
+    # 3-file anime cluster; one is a Special (S00E05). The provider list has
+    # ONLY main-run episodes (season 1, eps 1..13) — no Season-0 entry. The
+    # special must NOT be season-agnostically paired to main episode 5.
+    files = [(1, _pf(1, 4)), (2, _pf(1, 6)), (3, _pf(0, 5))]
+    eps = [_ep(1, e, f"Ep {e}") for e in range(1, 14)]
+    out = assign_files_to_episodes(files, eps)
+    assert out[1].matched_via == "exact" and out[1].episode_number == 4
+    assert out[2].matched_via == "exact" and out[2].episode_number == 6
+    assert out[3].matched_via == "unpaired" and out[3].episode_number is None
+
+
+def test_season0_special_pairs_to_real_season0_entry():
+    # When the provider DOES carry the special as a Season-0 entry, the exact
+    # (0, 5) pass pairs it (requires _ep_key preserving season 0).
+    files = [(1, _pf(1, 4)), (2, _pf(1, 6)), (3, _pf(0, 5))]
+    eps = [_ep(1, e, f"Ep {e}") for e in range(1, 14)] + [_ep(0, 5, "OVA 5")]
+    out = assign_files_to_episodes(files, eps)
+    assert out[3].matched_via == "exact"
+    assert out[3].episode_season == 0 and out[3].episode_number == 5

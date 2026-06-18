@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +51,7 @@ for _two, *_aliases in [
     ("ar", "ara", "arabic"), ("nl", "dut", "nld", "dutch"),
     ("pl", "pol", "polish"), ("tr", "tur", "turkish"),
     ("sv", "swe", "swedish"), ("hu", "hun", "hungarian"),
+    ("hi", "hin", "hindi"),
 ]:
     _LANG_TO_2[_two] = _two
     for _a in _aliases:
@@ -85,9 +85,11 @@ def codec_to_ext(fmt: str | None) -> str | None:
 
 
 def available() -> bool:
-    """True only when BOTH pieces exist: pymediainfo (to find tracks) AND
-    ffmpeg on PATH (to extract). Either missing → no-op."""
-    return _MI_AVAILABLE and shutil.which("ffmpeg") is not None
+    """True only when BOTH pieces exist: pymediainfo (to find tracks) AND an
+    ffmpeg binary (system PATH or Kira's own managed copy). Either missing →
+    no-op."""
+    from kira.ffmpeg_setup import resolve_ffmpeg
+    return _MI_AVAILABLE and resolve_ffmpeg() is not None
 
 
 def list_text_tracks(path: str) -> list[dict[str, Any]]:
@@ -122,14 +124,17 @@ def list_text_tracks(path: str) -> list[dict[str, Any]]:
     return out
 
 
-async def extract(video_path: str, languages: list[str]) -> list[str]:
+async def extract(video_path: str, languages: list[str], forced: str = "") -> list[str]:
     """Extract embedded text subs for the wanted `languages` → sidecars.
 
-    For each wanted language, pick the first matching non-forced text track
-    (forced tracks are usually signs/songs-only — preferred only if nothing
-    else matches), skip if a sidecar already exists, and `ffmpeg -map 0:s:<n>
-    -c copy` it out. Returns saved sidecar paths. Best-effort: any failure on a
-    single track is logged and skipped; never raises."""
+    Track choice honors the user's forced preference (`forced` — same
+    vocabulary as the external-search path: '' | include | exclude | only):
+      • only    → prefer the forced (signs/songs) track, fall back to the full one
+      • exclude → only the full non-forced track, never a forced one
+      • '' / include → prefer the full track, fall back to forced
+    Skips a language whose sidecar already exists, then `ffmpeg -map 0:s:<n>
+    -c copy` extracts it. Returns saved sidecar paths. Best-effort: any failure
+    on a single track is logged and skipped; never raises."""
     if not languages or not available():
         return []
     # `list_text_tracks` does a blocking MediaInfo container parse (a full
@@ -151,11 +156,17 @@ async def extract(video_path: str, languages: list[str]) -> list[str]:
             for e in _exts
         ):
             continue
-        # Prefer a non-forced track (forced = signs/songs only); fall back to any.
-        match = (
-            next((t for t in tracks if t["lang"] == want and not t["forced"]), None)
-            or next((t for t in tracks if t["lang"] == want), None)
-        )
+        # Pick a track honoring the user's forced preference. Without this the
+        # embedded path always preferred non-forced, so a `forced=only` user got
+        # the full-dialogue sub instead of the signs/songs track they asked for.
+        forced_t = next((t for t in tracks if t["lang"] == want and t["forced"]), None)
+        plain_t = next((t for t in tracks if t["lang"] == want and not t["forced"]), None)
+        if forced == "only":
+            match = forced_t or plain_t      # want forced; soft fallback to full
+        elif forced == "exclude":
+            match = plain_t                  # never emit a forced (signs-only) track
+        else:                                 # '' | include → main dialogue preferred
+            match = plain_t or forced_t
         if match is None:
             continue
         # Keep the track's native extension (ASS styling would be lost to SRT).
@@ -171,9 +182,13 @@ async def _ffmpeg_extract(video_path: str, sub_index: int, dest: str) -> bool:
     """Run `ffmpeg -map 0:s:<sub_index> -c copy <dest>` off the event loop.
     Writes to a `.part` temp then renames (atomic — a crash never leaves a
     half-written sidecar). Returns True on success."""
+    from kira.ffmpeg_setup import resolve_ffmpeg
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        return False
     tmp = dest + ".part"
     cmd = [
-        "ffmpeg", "-y", "-v", "error",
+        ffmpeg, "-y", "-v", "error",
         "-i", video_path,
         "-map", f"0:s:{sub_index}",
         "-c", "copy",

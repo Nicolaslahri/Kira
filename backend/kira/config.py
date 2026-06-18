@@ -17,10 +17,14 @@ class Settings(BaseSettings):
     tmdb_api_key: str | None = Field(default=None)
     tvdb_api_key: str | None = Field(default=None)
 
-    # CORS origins for the React dev server.
+    # CORS origins for the React dev server (5173) and the secondary
+    # dev/preview server (5181), so a second Vite instance can talk to the
+    # same backend during development.
     cors_origins: list[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5181",
+        "http://127.0.0.1:5181",
     ]
 
     # Optional HTTP Basic auth on the API. OFF by default (both unset) so

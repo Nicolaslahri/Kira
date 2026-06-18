@@ -106,6 +106,7 @@ export function DupesResolverModal({ item, episode, files, onClose, onRequestDel
           <button
             onClick={onClose}
             title="Close (Esc)"
+            aria-label="Close"
             style={{
               appearance: 'none', border: 'none', background: 'transparent',
               color: 'var(--ink-3)', cursor: 'pointer', padding: 4,

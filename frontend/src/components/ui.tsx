@@ -1,13 +1,15 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'motion/react';
 import type { PosterData, ToastData, Page, MediaType } from '../lib/types';
 import type { SettingsSection } from '../App';
 import {
   IcDashboard, IcReview, IcHistory, IcSettings, IcSearch,
   IcCheck, IcX, IcAlertTri, IcKeyboard, IcScan, IcSpin,
-  IcLogoMark, IcFilm, IcTv, IcAnime, IcMusic, IcChevDown, IcMenu,
+  IcLogoMark, IcFilm, IcTv, IcAnime, IcMusic, IcChevDown, IcMenu, IcChevLeft,
 } from '../lib/icons';
 import { NotificationsBell } from './NotificationsBell';
+import { api, hasStoredAuth, clearStoredAuth } from '../lib/api';
 import { cn } from '../lib/utils';
 import { confLevel } from '../lib/confBands';
 import { Button } from './base/buttons/button';
@@ -126,42 +128,151 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
     { key: 'settings', label: 'Settings', icon: <IcSettings /> },
   ];
   // Sub-settings revealed when Settings is the active page (nested nav).
-  const settingsSub: { key: SettingsSection; label: string }[] = [
-    { key: 'connections', label: 'Connections' },
-    { key: 'paths', label: 'Paths & folders' },
+  // Grouped into bands (a `group` label is rendered above the first item of
+  // each band). Identification gets its own "Matching" home; Subtitles is now
+  // a top-level Output section instead of a card buried under Naming.
+  const settingsSub: { key: SettingsSection; label: string; group?: string }[] = [
+    { key: 'connections', label: 'Connections', group: 'Sources & library' },
+    { key: 'paths', label: 'Library & paths' },
     { key: 'integrations', label: 'Integrations' },
-    { key: 'naming', label: 'Naming & format' },
+    { key: 'matching', label: 'Matching', group: 'Identification' },
+    { key: 'naming', label: 'Naming & format', group: 'Output' },
+    { key: 'subtitles', label: 'Subtitles' },
     { key: 'cleanup', label: 'Folder cleanup' },
-    { key: 'confidence', label: 'Confidence' },
-    { key: 'labs', label: 'Labs' },
-    { key: 'advanced', label: 'Advanced' },
+    { key: 'advanced', label: 'Advanced', group: 'System' },
   ];
   const statusColor = backendOk === false ? 'var(--conf-low)'
     : scanRunning ? 'var(--conf-mid)' : 'var(--conf-high)';
   const statusLabel = backendOk === false ? 'Backend disconnected'
     : scanRunning ? 'Scanning…' : backendOk === null ? 'Connecting…' : 'Idle';
+  const statusLive = scanRunning || backendOk === null;
+
+  // Collapsible rail (desktop only). Persisted so it survives reloads, and
+  // mirrored onto the document root's --side-w so App.tsx's grid track
+  // (grid-cols-[var(--side-w)_1fr]) reflows automatically — no App.tsx state
+  // change needed. Purely presentational; never affects mobile drawer width.
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    try { return localStorage.getItem('kira.sidebar.collapsed') === '1'; } catch { return false; }
+  });
+  // Track the desktop breakpoint reactively — the collapse feature is desktop-
+  // only, so on mobile the drawer always renders full (labels + sub-nav) at
+  // 240px regardless of the persisted collapse flag.
+  const [isDesktop, setIsDesktop] = useState<boolean>(() => {
+    try { return window.matchMedia('(min-width: 1024px)').matches; } catch { return true; }
+  });
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1024px)');
+    const onChange = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+
+  // Live app version — /health is the single source (backend truth), the
+  // hardcoded fallback only covers "backend unreachable". Plus a gentle
+  // update notice from GitHub releases, gated by `advanced.update_check`
+  // (default on; flip it off in Settings → Advanced). No releases published
+  // / offline / rate-limited all degrade to silence.
+  const [version, setVersion] = useState<string | null>(null);
+  const [updateTo, setUpdateTo] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const newer = (a: string, b: string) => {
+      const pa = a.replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+      const pb = b.replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+      for (let i = 0; i < 3; i++) {
+        if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) > (pb[i] ?? 0);
+      }
+      return false;
+    };
+    void (async () => {
+      try {
+        const h = await api.health();
+        if (cancelled || !h.version) return;
+        setVersion(h.version);
+        const s = await api.getSettings();
+        if (cancelled || s['advanced.update_check'] === false) return;
+        const r = await fetch('https://api.github.com/repos/Nicolaslahri/Kira/releases/latest');
+        if (!r.ok) return;
+        const j = await r.json() as { tag_name?: string };
+        const latest = (j.tag_name || '').trim();
+        if (!cancelled && latest && newer(latest, h.version)) setUpdateTo(latest.replace(/^v/i, ''));
+      } catch { /* informational only */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // `rail` is the effective icon-only mode: collapsed AND on desktop.
+  const rail = collapsed && isDesktop;
+  useEffect(() => {
+    const root = document.documentElement;
+    // The mobile drawer is always full --side-w; only collapse the desktop rail.
+    root.style.setProperty('--side-w', rail ? '76px' : '240px');
+    return () => { root.style.setProperty('--side-w', '240px'); };
+  }, [rail]);
+  useEffect(() => {
+    try { localStorage.setItem('kira.sidebar.collapsed', collapsed ? '1' : '0'); } catch { /* private mode */ }
+  }, [collapsed]);
 
   return (
     <aside className={cn(
-      'fixed inset-y-0 left-0 z-50 flex h-screen w-[var(--side-w)] flex-col gap-8 border-r border-secondary bg-secondary px-4 py-6 transition-transform duration-300 ease-out lg:sticky lg:top-0 lg:z-20 lg:translate-x-0',
+      'kira-sidebar fixed inset-y-0 left-0 z-50 flex h-screen w-[var(--side-w)] flex-col gap-6 px-3 py-5 transition-transform duration-300 ease-[var(--ease-out)] lg:sticky lg:top-0 lg:z-20 lg:translate-x-0',
       mobileOpen ? 'translate-x-0' : '-translate-x-full',
+      rail && 'lg:items-center',
     )}>
       {/* Brand */}
-      <div className="flex items-center gap-3 px-2">
-        <div className="grid size-9 place-items-center rounded-xl bg-brand-solid text-white [&_svg]:size-5">
+      <div className={cn('flex items-center gap-3 px-2', rail && 'lg:justify-center lg:px-0')}>
+        <div className="kira-brandmark press grid size-9 shrink-0 place-items-center rounded-xl text-white [&_svg]:size-5">
           <IcLogoMark />
         </div>
-        <div className="leading-tight">
-          <div className="text-[15px] font-bold tracking-tight text-primary">Kira</div>
-          <div className="text-[11px] text-quaternary">v0.5.0</div>
-        </div>
+        {!rail ? (
+          <div className="leading-tight">
+            <div className="text-[15px] font-bold tracking-tight text-primary">Kira</div>
+            <div className="text-[11px] text-quaternary">
+              v{version ?? '0.5.0'}
+              {updateTo ? (
+                <a
+                  href="https://github.com/Nicolaslahri/Kira/releases"
+                  target="_blank" rel="noreferrer"
+                  className="ml-1.5 font-medium text-info hover:underline"
+                  title={`Version ${updateTo} is available on GitHub`}
+                >
+                  · v{updateTo} out
+                </a>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+        {/* Desktop rail toggle — sits top-right of the brand row when expanded. */}
+        <button
+          onClick={() => setCollapsed(c => !c)}
+          className={cn(
+            'press ml-auto hidden size-7 shrink-0 place-items-center rounded-lg text-fg-quaternary transition hover:bg-[var(--surface-hover)] hover:text-fg-tertiary lg:grid [&_svg]:size-4',
+            rail && 'lg:hidden',
+          )}
+          title="Collapse sidebar"
+          aria-label="Collapse sidebar"
+        >
+          <IcChevLeft />
+        </button>
       </div>
 
       {/* Nav */}
-      <nav className="flex flex-col gap-1">
-        <div className="px-3 pb-1.5 pt-3 text-[10px] font-semibold uppercase tracking-[0.08em] text-quaternary">
-          Workspace
-        </div>
+      <nav className="flex flex-1 flex-col gap-1">
+        {!rail ? (
+          <div className="px-3 pb-1.5 pt-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-quaternary">
+            Workspace
+          </div>
+        ) : (
+          // Rail mode: a thin expand affordance replaces the section label.
+          <button
+            onClick={() => setCollapsed(false)}
+            className="press mb-1 hidden size-9 place-items-center self-center rounded-lg text-fg-quaternary transition hover:bg-[var(--surface-hover)] hover:text-fg-tertiary lg:grid [&_svg]:size-4 [&_svg]:rotate-180"
+            title="Expand sidebar"
+            aria-label="Expand sidebar"
+          >
+            <IcChevLeft />
+          </button>
+        )}
         {items.map(it => {
           const isActive = active === it.key;
           const isSettings = it.key === 'settings';
@@ -169,58 +280,104 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
             <div key={it.key}>
               <button
                 onClick={() => { setActive(it.key); if (it.key !== 'settings') onClose?.(); }}
+                title={rail ? it.label : undefined}
+                aria-current={isActive ? 'page' : undefined}
                 className={cn(
-                  'group relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-semibold transition duration-100 ease-linear',
-                  isActive ? 'bg-active text-secondary' : 'text-tertiary hover:bg-primary_hover hover:text-secondary',
+                  'kira-nav-item group press relative flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-semibold',
+                  rail && 'lg:justify-center lg:px-0',
+                  isActive ? 'text-primary' : 'text-tertiary hover:text-secondary',
                 )}
               >
-                <span className={cn('inline-flex size-5 shrink-0 [&_svg]:size-5', isActive ? 'text-fg-brand-primary' : 'text-fg-quaternary')}>
+                {/* Morphing active indicator — a springy brand-gradient pill that
+                    slides between items via a shared layoutId. Sits behind the
+                    label/icon (z-0); content is z-10. */}
+                {isActive ? (
+                  <motion.span
+                    layoutId="nav-active"
+                    className="kira-nav-active absolute inset-0 rounded-xl"
+                    transition={{ type: 'spring', stiffness: 520, damping: 38 }}
+                  />
+                ) : null}
+                <span className={cn(
+                  'relative z-10 inline-flex size-5 shrink-0 transition-transform duration-200 ease-[var(--ease-back)] [&_svg]:size-5',
+                  'group-hover:scale-110 group-active:scale-95',
+                  isActive ? 'text-white' : 'text-fg-quaternary group-hover:text-fg-tertiary',
+                )}>
                   {it.icon}
                 </span>
-                <span className="flex-1 text-left">{it.label}</span>
+                {!rail ? <span className="relative z-10 flex-1 text-left">{it.label}</span> : null}
                 {it.count != null && it.count > 0 ? (
-                  <span className="rounded-full bg-primary px-1.5 py-0.5 text-[11px] font-semibold tabular-nums text-tertiary ring-1 ring-secondary ring-inset">
-                    {it.count}
-                  </span>
+                  rail ? (
+                    // Rail mode: a tiny dot on the icon corner signals "items waiting".
+                    <span className="absolute right-2 top-1.5 z-10 size-1.5 rounded-full bg-conf-mid lg:right-3" aria-hidden="true" />
+                  ) : (
+                    <span className={cn(
+                      'relative z-10 rounded-full px-1.5 py-0.5 text-[11px] font-semibold tabular-nums ring-1 ring-inset transition-colors',
+                      isActive ? 'bg-white/20 text-white ring-white/20' : 'bg-[var(--surface-2)] text-tertiary ring-[var(--border-2)]',
+                    )}>
+                      {it.count}
+                    </span>
+                  )
                 ) : null}
                 {/* Settings gets a chevron that rotates when expanded */}
-                {isSettings ? (
+                {isSettings && !rail ? (
                   <IcChevDown
                     style={{ width: 14, height: 14 }}
-                    className={cn('shrink-0 transition-transform duration-200', isActive ? 'rotate-180 text-fg-tertiary' : 'text-fg-quaternary')}
+                    className={cn('relative z-10 shrink-0 transition-transform duration-200', isActive ? 'rotate-180 text-white/80' : 'text-fg-quaternary')}
                   />
                 ) : null}
               </button>
 
-              {/* Nested sub-settings — expand when Settings is active */}
-              {isSettings ? (
+              {/* Nested sub-settings — expand when Settings is active. Hidden in
+                  rail mode (no room); expanding the rail reveals them again. */}
+              {isSettings && !rail ? (
                 <AnimatePresence initial={false}>
                   {isActive ? (
                     <motion.div
                       initial={{ height: 0, opacity: 0 }}
                       animate={{ height: 'auto', opacity: 1 }}
                       exit={{ height: 0, opacity: 0 }}
-                      transition={{ duration: 0.22, ease: 'easeOut' }}
+                      transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
                       className="overflow-hidden"
                     >
-                      <div className="relative ml-[22px] mt-1 flex flex-col gap-0.5 border-l border-secondary pl-3">
-                        {settingsSub.map(s => {
+                      <div className="relative ml-[22px] mt-1 flex flex-col gap-0.5 border-l border-[var(--border-2)] pl-3">
+                        {settingsSub.flatMap(s => {
                           const subActive = settingsSection === s.key;
-                          return (
+                          // A band label sits above the first item of each group.
+                          // flatMap keeps both the label and the button as direct
+                          // flex children, so buttons still stretch full width.
+                          const out: React.ReactNode[] = [];
+                          if (s.group) {
+                            out.push(
+                              <div
+                                key={`grp-${s.key}`}
+                                className="px-2.5 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-[0.09em] text-fg-quaternary first:pt-1"
+                              >
+                                {s.group}
+                              </div>,
+                            );
+                          }
+                          out.push(
                             <button
                               key={s.key}
                               onClick={() => { setSettingsSection(s.key); onClose?.(); }}
                               className={cn(
                                 'relative rounded-lg px-2.5 py-1.5 text-left text-[13px] transition duration-100 ease-linear',
-                                subActive ? 'font-semibold text-secondary' : 'text-tertiary hover:text-secondary',
+                                subActive ? 'font-semibold text-secondary' : 'text-tertiary hover:text-secondary hover:bg-[var(--surface-hover)]',
                               )}
                             >
                               {subActive ? (
-                                <span className="absolute -left-[13px] top-1/2 h-4 w-[2px] -translate-y-1/2 rounded-full bg-brand-solid" />
+                                <motion.span
+                                  layoutId="settings-sub-active"
+                                  className="absolute -left-[13px] top-1/2 h-4 w-[2px] -translate-y-1/2 rounded-full"
+                                  style={{ background: 'var(--brand-grad)' }}
+                                  transition={{ type: 'spring', stiffness: 600, damping: 40 }}
+                                />
                               ) : null}
                               {s.label}
-                            </button>
+                            </button>,
                           );
+                          return out;
                         })}
                       </div>
                     </motion.div>
@@ -233,10 +390,28 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
       </nav>
 
       {/* Status footer */}
-      <div className="mt-auto rounded-xl border border-secondary bg-primary px-3 py-2.5">
-        <div className="flex items-center gap-2 text-xs text-tertiary">
-          <span className="size-[7px] shrink-0 rounded-full" style={{ background: statusColor, boxShadow: `0 0 0 3px ${statusColor}2e` }} />
-          <span>{statusLabel}</span>
+      <div className={cn(
+        'mt-auto rounded-xl border border-[var(--border-2)] bg-[var(--surface-1)] shadow-[var(--shadow-1)]',
+        rail ? 'lg:grid lg:size-9 lg:place-items-center lg:self-center lg:p-0' : 'px-3 py-2.5',
+      )}>
+        <div className={cn('flex items-center gap-2 text-xs text-tertiary', rail && 'lg:gap-0')}>
+          <span
+            className={cn('size-[7px] shrink-0 rounded-full', statusLive && 'breathe')}
+            style={{ background: statusColor, boxShadow: `0 0 0 3px ${statusColor}2e` }}
+          />
+          {!rail ? <span>{statusLabel}</span> : null}
+          {/* Sign out — only meaningful when this tab holds credentials
+              (i.e. the server has auth enabled and we're signed in). */}
+          {!rail && hasStoredAuth() ? (
+            <button
+              type="button"
+              onClick={() => clearStoredAuth()}
+              className="ml-auto shrink-0 text-[11px] text-fg-quaternary transition-colors hover:text-fg-secondary"
+              title="Sign out of this tab"
+            >
+              Sign out
+            </button>
+          ) : null}
         </div>
       </div>
     </aside>
@@ -261,29 +436,38 @@ export function Topbar({ active, onScan, scanRunning, onShortcuts, searchQuery, 
   };
   const trail = titles[active];
   return (
-    <header className="sticky top-0 z-30 flex h-[60px] items-center gap-3 border-b border-secondary bg-primary/80 px-4 backdrop-blur-xl lg:gap-4 lg:px-7">
+    <header className="topbar-glass sticky top-0 z-30 flex h-[62px] items-center gap-3 border-b border-[var(--border-2)] px-4 lg:gap-4 lg:px-7">
       <button
-        className="grid size-9 shrink-0 place-items-center rounded-lg text-fg-quaternary transition hover:bg-primary_hover hover:text-fg-tertiary lg:hidden [&_svg]:size-5"
+        className="press grid size-9 shrink-0 place-items-center rounded-lg text-fg-quaternary transition hover:bg-[var(--surface-hover)] hover:text-fg-tertiary lg:hidden [&_svg]:size-5"
         title="Menu"
         aria-label="Open navigation"
         onClick={onMenuClick}
       >
         <IcMenu />
       </button>
+      {/* Breadcrumb — the active leaf animates in (key changes per page). */}
       <div className="flex items-center text-[13px] text-tertiary">
         {trail.map((s, i) => (
           <span key={i} className="flex items-center">
             {i > 0 ? <span className="mx-2 text-quaternary">/</span> : null}
-            {i === trail.length - 1 ? <b className="font-semibold text-secondary">{s}</b> : s}
+            {i === trail.length - 1
+              ? <motion.b
+                  key={s}
+                  initial={{ opacity: 0, y: -4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
+                  className="font-semibold text-secondary"
+                >{s}</motion.b>
+              : s}
           </span>
         ))}
       </div>
 
       <div
-        className="ml-auto flex h-9 w-full max-w-sm items-center gap-2 rounded-lg border border-primary bg-primary px-3 shadow-xs transition focus-within:ring-2 focus-within:ring-brand"
+        className="topbar-search ml-auto flex h-9 w-full max-w-sm items-center gap-2 rounded-lg border border-[var(--border-2)] bg-[var(--surface-1)] px-3 transition-[border-color,box-shadow,background] duration-200 ease-[var(--ease-out)] focus-within:border-accent-line focus-within:bg-[var(--surface-2)] focus-within:shadow-[var(--glow-accent)]"
         onClick={(e) => { (e.currentTarget.querySelector('input') as HTMLInputElement)?.focus(); }}
       >
-        <IcSearch style={{ width: 14, height: 14 }} className="text-fg-quaternary" />
+        <IcSearch style={{ width: 14, height: 14 }} className="text-fg-quaternary transition-colors" />
         <input
           className="min-w-0 flex-1 border-0 bg-transparent text-[13px] text-primary outline-none placeholder:text-placeholder"
           placeholder="Search files, titles, paths…"
@@ -292,20 +476,22 @@ export function Topbar({ active, onScan, scanRunning, onShortcuts, searchQuery, 
         />
         {searchQuery ? (
           <button
-            className="grid size-[22px] place-items-center rounded-md text-fg-quaternary transition hover:bg-primary_hover hover:text-fg-tertiary"
+            className="press grid size-[22px] place-items-center rounded-md text-fg-quaternary transition hover:bg-[var(--surface-hover)] hover:text-fg-tertiary"
             title="Clear"
+            aria-label="Clear search"
             onClick={() => onSearchChange('')}
           >
             <IcX style={{ width: 11, height: 11 }} />
           </button>
         ) : (
-          <span className="rounded border border-secondary px-1.5 py-0.5 font-mono text-[10px] text-quaternary">/</span>
+          <span className="rounded border border-[var(--border-2)] px-1.5 py-0.5 font-mono text-[10px] text-quaternary">/</span>
         )}
       </div>
 
       <button
-        className="grid size-9 shrink-0 place-items-center rounded-lg border border-primary bg-primary text-fg-quaternary shadow-xs transition hover:bg-primary_hover hover:text-fg-tertiary [&_svg]:size-[16px]"
+        className="press grid size-9 shrink-0 place-items-center rounded-lg border border-[var(--border-2)] bg-[var(--surface-1)] text-fg-quaternary shadow-[var(--shadow-1)] transition hover:bg-[var(--surface-hover)] hover:text-fg-tertiary [&_svg]:size-[16px]"
         title="Keyboard shortcuts (?)"
+        aria-label="Keyboard shortcuts"
         onClick={onShortcuts}
       >
         <IcKeyboard />
@@ -376,19 +562,24 @@ export function Toast({ toasts, onDismiss, leading }: { toasts: ToastData[]; onD
   );
 }
 
-export function Checkbox({ on, onChange, indeterminate }: {
+export function Checkbox({ on, onChange, indeterminate, disabled, title }: {
   on: boolean;
   onChange?: () => void;
   indeterminate?: boolean;
+  disabled?: boolean;
+  title?: string;
 }) {
   return (
     <button
       type="button"
       role="checkbox"
       aria-checked={indeterminate ? 'mixed' : on}
-      className={`cb ${on || indeterminate ? 'on' : ''}`}
+      aria-disabled={disabled || undefined}
+      disabled={disabled}
+      title={title}
+      className={`cb ${on || indeterminate ? 'on' : ''} ${disabled ? 'cb-disabled' : ''}`}
       style={{ padding: 0 }}
-      onClick={(e) => { e.stopPropagation(); onChange?.(); }}
+      onClick={(e) => { e.stopPropagation(); if (!disabled) onChange?.(); }}
     >
       {on ? <IcCheck /> : indeterminate ? (
         <svg viewBox="0 0 24 24" style={{ width: 12, height: 12, color: '#061814' }}>
@@ -439,6 +630,7 @@ export function Select<T>({
   style,
   buttonClassName = '',
   disabled = false,
+  'aria-label': ariaLabel,
 }: {
   options: { value: T; label: string; secondary?: string }[];
   value: T | null | undefined;
@@ -456,11 +648,44 @@ export function Select<T>({
    *  is always applied. */
   buttonClassName?: string;
   disabled?: boolean;
+  /** Accessible name for the trigger button — REQUIRED for any Select whose
+   *  visible label is a sibling element (not a wired <label>), so a screen
+   *  reader announces what the dropdown controls instead of just its value. */
+  'aria-label'?: string;
 }) {
   const [open, setOpen] = useState(false);
   // Hover/keyboard-focused index for arrow-key navigation. -1 = none.
   const [activeIdx, setActiveIdx] = useState<number>(-1);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const popupRef = useRef<HTMLDivElement | null>(null);
+  // The dropdown renders in a body-level PORTAL so it escapes any
+  // `overflow-hidden` / stacking-context ancestor (e.g. the collapsible
+  // ProviderCard, whose clip used to trap the dropdown "inside the pill").
+  // We position it `fixed` from the trigger's rect, recomputed on open and on
+  // any scroll/resize so it stays pinned to the trigger.
+  const [popPos, setPopPos] = useState<{ top: number; left: number; width: number } | null>(null);
+  const placePopup = () => {
+    const el = wrapperRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setPopPos({ top: r.bottom + 6, left: r.left, width: r.width });
+  };
+  useLayoutEffect(() => {
+    if (!open) { setPopPos(null); return; }
+    placePopup();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+  useEffect(() => {
+    if (!open) return;
+    const reflow = () => placePopup();
+    // capture-phase scroll catches scrolling in ANY ancestor, not just window
+    window.addEventListener('scroll', reflow, true);
+    window.addEventListener('resize', reflow);
+    return () => {
+      window.removeEventListener('scroll', reflow, true);
+      window.removeEventListener('resize', reflow);
+    };
+  }, [open]);
 
   // Match an option by deep-equal-ish comparison. We JSON-stringify
   // both sides so primitive values, dicts, and lists all compare
@@ -478,9 +703,12 @@ export function Select<T>({
   useEffect(() => {
     if (!open) return;
     const onDocClick = (e: MouseEvent) => {
-      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
+      const t = e.target as Node;
+      // Exclude BOTH the trigger wrapper AND the portaled popup — the popup is
+      // no longer a DOM descendant of the wrapper, so without this an option
+      // click would count as "outside" and close before its onClick fires.
+      if (wrapperRef.current?.contains(t) || popupRef.current?.contains(t)) return;
+      setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') { setOpen(false); return; }
@@ -540,16 +768,19 @@ export function Select<T>({
         disabled={disabled}
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-label={ariaLabel}
       >
         <span className={cn('flex-1 truncate text-left', mono && 'font-mono text-[12px]', !selected && 'text-ink-soft')}>
           {selected ? selected.label : (placeholder ?? '— select —')}
         </span>
         <IcChevDown className={cn('size-4 shrink-0 text-ink-soft transition-transform duration-200', open && 'rotate-180')} />
       </button>
-      {open && (
+      {open && popPos && createPortal(
         <div
+          ref={popupRef}
           role="listbox"
-          className="absolute left-0 right-0 top-[calc(100%+6px)] z-[1000] max-h-[280px] overflow-y-auto rounded-xl border border-line bg-[#0e0f14] p-1 shadow-[0_12px_32px_rgba(0,0,0,0.5),0_2px_6px_rgba(0,0,0,0.4)] [scrollbar-width:thin]"
+          style={{ position: 'fixed', top: popPos.top, left: popPos.left, width: popPos.width }}
+          className="z-[1000] max-h-[280px] overflow-y-auto rounded-xl border border-line bg-[#0e0f14] p-1 shadow-[0_12px_32px_rgba(0,0,0,0.5),0_2px_6px_rgba(0,0,0,0.4)] [scrollbar-width:thin]"
         >
           {options.length === 0 ? (
             <div className="px-2.5 py-3 text-center text-[12px] text-ink-soft">No options available.</div>
@@ -578,7 +809,8 @@ export function Select<T>({
               </button>
             );
           })}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

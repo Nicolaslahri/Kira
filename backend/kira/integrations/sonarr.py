@@ -15,12 +15,16 @@ shared with anything else.
 """
 from __future__ import annotations
 
+import logging
+
 import asyncio
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 # Sonarr's API timeout is conservatively short. Their endpoints typically
 # respond in <500ms; if they're slower than 10s the user has bigger
@@ -94,8 +98,13 @@ def _client(cfg: SonarrConfig) -> httpx.AsyncClient:
         validate_outbound_url(cfg.base_url)  # SSRF guard (LAN URLs still allowed)
     except ValueError as e:
         raise SonarrError(f"Sonarr URL rejected: {e}") from e
+    # Trailing slash is load-bearing: httpx joins a RELATIVE request path
+    # (e.g. "api/v3/system/status") onto the base_url's full path, so a
+    # reverse-proxy URL base ("/nickflix") survives. A LEADING-slash request
+    # path would be treated as absolute and discard the base path entirely
+    # (the UrlBase-302 bug). Every call site below uses the relative form.
     return httpx.AsyncClient(
-        base_url=cfg.base_url.rstrip("/"),
+        base_url=cfg.base_url.rstrip("/") + "/",
         headers={
             "X-Api-Key": cfg.api_key,
             "Accept": "application/json",
@@ -113,7 +122,7 @@ async def test_connection(cfg: SonarrConfig) -> dict[str, Any]:
     """
     async with _client(cfg) as c:
         try:
-            r = await c.get("/api/v3/system/status")
+            r = await c.get("api/v3/system/status")
         except httpx.RequestError as e:
             raise SonarrError(f"Cannot reach Sonarr at {cfg.base_url}: {e}") from e
         if r.status_code == 401:
@@ -130,12 +139,40 @@ async def test_connection(cfg: SonarrConfig) -> dict[str, Any]:
             raise SonarrError(f"Sonarr returned non-JSON on /system/status: {e}") from e
 
 
+async def rescan_series_by_tvdb(cfg: SonarrConfig, tvdb_id: int) -> bool:
+    """Post-rename hook: tell Sonarr to re-scan one series' folder NOW.
+
+    Why: when Kira renames/moves an episode file, Sonarr's next disk scan sees
+    the OLD path gone, marks the episode file deleted, and — if the episode is
+    monitored — may re-grab it. An immediate `RescanSeries` command closes that
+    window: Sonarr re-parses the renamed files and re-links them, so nothing
+    ever reads as deleted.
+
+    Best-effort by design — returns True when the rescan command was accepted,
+    False for "series not in Sonarr" or ANY error. Never raises: a Sonarr
+    hiccup must not affect the rename result this hook runs after.
+    """
+    try:
+        async with _client(cfg) as c:
+            series = await _find_series_by_tvdb(c, int(tvdb_id))
+            if not series or not series.get("id"):
+                return False  # not a Sonarr-managed show — nothing to do
+            cmd = await c.post(
+                "api/v3/command",
+                json={"name": "RescanSeries", "seriesId": series["id"]},
+            )
+            return cmd.status_code in (200, 201)
+    except Exception as e:
+        logger.warning(f"sonarr: post-rename rescan for tvdb {tvdb_id} failed (non-fatal): {e!r}")
+        return False
+
+
 async def list_quality_profiles(cfg: SonarrConfig) -> list[dict[str, Any]]:
     """Fetch the user's Sonarr quality profiles so the UI can offer a
     real dropdown (instead of having them paste a numeric id blind).
     """
     async with _client(cfg) as c:
-        r = await c.get("/api/v3/qualityprofile")
+        r = await c.get("api/v3/qualityprofile")
         if r.status_code != 200:
             raise SonarrError(
                 f"Sonarr /qualityprofile returned HTTP {r.status_code}",
@@ -153,7 +190,7 @@ async def list_root_folders(cfg: SonarrConfig) -> list[dict[str, Any]]:
     saved). Same UX rationale as quality profiles — surface real
     options instead of free-typed paths."""
     async with _client(cfg) as c:
-        r = await c.get("/api/v3/rootfolder")
+        r = await c.get("api/v3/rootfolder")
         if r.status_code != 200:
             raise SonarrError(
                 f"Sonarr /rootfolder returned HTTP {r.status_code}",
@@ -173,7 +210,7 @@ async def _find_series_by_tvdb(c: httpx.AsyncClient, tvdb_id: int) -> dict[str, 
     because there's no native filter-by-tvdb-id query param. Libraries
     of 500+ series resolve in a few KB of JSON, so this is fine.
     """
-    r = await c.get("/api/v3/series")
+    r = await c.get("api/v3/series")
     if r.status_code != 200:
         raise SonarrError(
             f"Sonarr /series returned HTTP {r.status_code}",
@@ -209,7 +246,7 @@ async def _add_series(
     those are now config-driven so the user controls them in Settings.
     """
     # Step 1: lookup
-    r = await c.get("/api/v3/series/lookup", params={"term": f"tvdb:{tvdb_id}"})
+    r = await c.get("api/v3/series/lookup", params={"term": f"tvdb:{tvdb_id}"})
     if r.status_code != 200:
         raise SonarrError(
             f"Sonarr /series/lookup returned HTTP {r.status_code}",
@@ -240,7 +277,7 @@ async def _add_series(
         "searchForCutoffUnmetEpisodes": False,
         "monitor": cfg.monitor_new_seasons,
     }
-    r2 = await c.post("/api/v3/series", json=payload)
+    r2 = await c.post("api/v3/series", json=payload)
     if r2.status_code not in (200, 201):
         raise SonarrError(
             f"Sonarr /series (add) returned HTTP {r2.status_code}",
@@ -257,7 +294,7 @@ async def _list_episodes(c: httpx.AsyncClient, series_id: int) -> list[dict[str,
     """Pull every episode Sonarr knows about for a series. We need
     Sonarr's internal episode IDs to drive the EpisodeSearch command —
     EpisodeSearch takes episode IDs, not (season, number) pairs."""
-    r = await c.get("/api/v3/episode", params={"seriesId": series_id})
+    r = await c.get("api/v3/episode", params={"seriesId": series_id})
     if r.status_code != 200:
         raise SonarrError(
             f"Sonarr /episode returned HTTP {r.status_code}",
@@ -620,7 +657,7 @@ async def send_missing_episodes(
             all_releases: list[dict[str, Any]] = []
             try:
                 rr = await c.get(
-                    "/api/v3/release",
+                    "api/v3/release",
                     params={"seriesId": series_id, "seasonNumber": season},
                     timeout=_INTERACTIVE_SEARCH_TIMEOUT,
                 )
@@ -682,7 +719,7 @@ async def send_missing_episodes(
                     continue
                 try:
                     gr = await c.post(
-                        "/api/v3/release",
+                        "api/v3/release",
                         json={"guid": guid, "indexerId": pick["indexerId"]},
                     )
                     if gr.status_code in (200, 201):
@@ -691,7 +728,7 @@ async def send_missing_episodes(
                     else:
                         skipped_no_match.append(eid_to_num.get(eid, eid))
                 except Exception as e:
-                    print(f"sonarr grab failed for ep {eid}: {e!r}")
+                    logger.warning(f"sonarr grab failed for ep {eid}: {e!r}")
                     skipped_no_match.append(eid_to_num.get(eid, eid))
 
             # Build an honest message. queued==0 is NOT an error — it usually
@@ -723,7 +760,7 @@ async def send_missing_episodes(
         # Default path: preference == "any" → Sonarr's auto-search. Its quality
         # profile / Custom Formats decide which release to grab.
         cmd = await c.post(
-            "/api/v3/command",
+            "api/v3/command",
             json={"name": "EpisodeSearch", "episodeIds": target_ids},
         )
         if cmd.status_code not in (200, 201):
@@ -881,7 +918,7 @@ async def get_queue(cfg: SonarrConfig) -> list[SonarrQueueItem]:
     """
     async with _client(cfg) as c:
         try:
-            r = await c.get("/api/v3/queue", params={
+            r = await c.get("api/v3/queue", params={
                 "pageSize": 200,
                 "includeUnknownSeriesItems": "false",
                 "includeSeries": "true",
@@ -1115,7 +1152,7 @@ async def preview_manual_import(
     """
     async with _client(cfg) as c:
         try:
-            r = await c.get("/api/v3/manualimport", params={"downloadId": download_id})
+            r = await c.get("api/v3/manualimport", params={"downloadId": download_id})
         except httpx.RequestError as e:
             raise SonarrError(f"Cannot reach Sonarr: {e}") from e
         if r.status_code != 200:
@@ -1208,7 +1245,7 @@ async def _fetch_recent_import_history(
             for ep_id in episode_ids[:10]:   # cap to avoid hammering Sonarr
                 try:
                     r = await c.get(
-                        "/api/v3/history",
+                        "api/v3/history",
                         params={
                             "episodeId": ep_id,
                             "pageSize": 5,
@@ -1273,7 +1310,7 @@ async def retry_manual_import(
     async with _client(cfg) as c:
         # Step 1: ask Sonarr what it sees in the download folder
         try:
-            r = await c.get("/api/v3/manualimport", params={"downloadId": download_id})
+            r = await c.get("api/v3/manualimport", params={"downloadId": download_id})
         except httpx.RequestError as e:
             raise SonarrError(f"Cannot reach Sonarr: {e}") from e
         if r.status_code != 200:
@@ -1361,7 +1398,7 @@ async def retry_manual_import(
         if import_mode not in ("Copy", "Move", "Hardlink", "Auto"):
             import_mode = "Copy"
         cmd = await c.post(
-            "/api/v3/command",
+            "api/v3/command",
             json={
                 "name": "ManualImport",
                 "files": importable,

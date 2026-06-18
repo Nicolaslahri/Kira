@@ -119,3 +119,33 @@ async def test_scan_only_folder_never_executes_rename(monkeypatch):
 
     await watcher.maybe_auto_rename(scan_id=1, new_file_ids=[1])
     assert calls == []
+
+
+# ── auto-APPROVE gate fails CLOSED on a DB error (audit fix) ──────────────────
+# A transient `database is locked` while a watcher scan overlaps a manual one
+# must NOT silently flip auto-approve ON — the documented default is DISABLED
+# (the user expects to review). The except branch used to return (True, 0.95).
+@pytest.mark.asyncio
+async def test_auto_approve_fails_closed_on_db_error():
+    from kira.api.scans import _read_auto_approve_setting
+
+    class _BoomSession:
+        async def get(self, *a, **k):
+            raise RuntimeError("database is locked")
+
+    enabled, threshold = await _read_auto_approve_setting(_BoomSession())
+    assert enabled is False          # never auto-approve on an error
+    assert threshold == 0.95
+
+
+@pytest.mark.asyncio
+async def test_auto_approve_default_disabled_when_unset():
+    from kira.api.scans import _read_auto_approve_setting
+
+    class _NullSession:
+        async def get(self, *a, **k):
+            return None              # no Setting rows → documented defaults
+
+    enabled, threshold = await _read_auto_approve_setting(_NullSession())
+    assert enabled is False
+    assert threshold == 0.95

@@ -20,6 +20,8 @@ handles persistence.
 """
 from __future__ import annotations
 
+import logging
+
 import asyncio
 import time
 from dataclasses import asdict
@@ -44,6 +46,8 @@ from kira.integrations.sonarr import (
 )
 from kira.models import Match, Setting
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/integrations", tags=["integrations"])
 
 
@@ -62,10 +66,10 @@ async def _resolve_setting(session: AsyncSession, key: str) -> Any:
     row = await session.get(Setting, key)
     if row is None:
         return None
-    v = row.value
-    if isinstance(v, dict) and "value" in v and len(v) == 1:
-        return v["value"]
-    return v
+    # Single source of truth for the {"value": …} shape (kira.settings_store) —
+    # the old `len(v) == 1` guard diverged from it for dicts carrying a sibling key.
+    from kira.settings_store import unwrap
+    return unwrap(row.value)
 
 
 async def _load_sonarr_config(
@@ -93,6 +97,15 @@ async def _load_sonarr_config(
         raise HTTPException(400, "Sonarr URL isn't configured.")
     if not isinstance(api_key, str) or not api_key.strip():
         raise HTTPException(400, "Sonarr API key isn't configured.")
+    # Validate it's a sane http(s) endpoint before it becomes the base URL for
+    # every Sonarr call — a garbage scheme (file://, javascript:) or a hostless
+    # value fails loudly here ("invalid URL" in the UI) instead of surfacing as a
+    # cryptic connection error deep in the integration. (Outbound subtitle/artwork
+    # URLs already go through url_guard; the integration base never did.)
+    from urllib.parse import urlparse
+    _parsed = urlparse(url.strip())
+    if _parsed.scheme not in ("http", "https") or not _parsed.netloc:
+        raise HTTPException(400, "Sonarr URL must be a valid http(s):// address.")
 
     section = "anime" if is_anime else "tv"
     # Try section-specific first, then legacy un-prefixed for back-compat.
@@ -150,6 +163,34 @@ async def _load_sonarr_config(
         monitor_new_seasons=mns,
         audio_preference=audio_pref,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# /health — background connection-health snapshot
+# ─────────────────────────────────────────────────────────────────────
+#
+# Driven by the background `HealthMonitor` loop (kira.integrations.
+# health_monitor), which probes each CONFIGURED integration every ~5 min
+# with its existing connection test. This endpoint just SERVES the latest
+# snapshot — it does NOT trigger a probe, so the Settings page can poll it
+# every ~60s without generating any outbound HTTP to Sonarr/Plex/Jellyfin.
+#
+# Shape: { "<key>": {"ok": bool, "detail": str, "checked_at": iso} } for
+# integrations that have been observed at least once. Configured-but-not-
+# yet-checked (the first ~10s after boot) and unconfigured integrations are
+# simply absent — the frontend renders a grey "unknown" dot for those.
+
+
+@router.get("/health")
+async def integrations_health() -> dict[str, dict[str, Any]]:
+    """Latest background health-check results for configured integrations.
+
+    Returns the in-memory snapshot the `HealthMonitor` maintains — no network
+    I/O happens here, so it's safe to poll frequently. Keys present: whichever
+    of sonarr / plex / jellyfin have been probed since boot. Absent key = either
+    unconfigured or not yet checked; the UI treats both as "unknown" (grey)."""
+    from kira.integrations.health_monitor import monitor
+    return monitor.snapshot()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -829,7 +870,10 @@ async def sonarr_heal_unmatched(
     from kira.integrations.sonarr import _client as _sonarr_client
     try:
         async with _sonarr_client(cfg) as c:
-            r = await c.get("/api/v3/series")
+            # Relative path (no leading slash) so the client's base_url URL
+            # base — e.g. "/nickflix" for reverse-proxy users — is preserved.
+            # A leading slash would be treated as absolute and drop it.
+            r = await c.get("api/v3/series")
             if r.status_code != 200:
                 return SonarrHealResponse(
                     ok=False,
@@ -1005,7 +1049,7 @@ async def sonarr_heal_unmatched(
             # continue with the rest. Common cause: cour-routing-table
             # build failure for AniDB AID; the bulk function handles
             # it gracefully but might still raise on edge cases.
-            print(f"sonarr heal: failed to pin {len(file_ids)} files to {provider}:{provider_id}: {e!r}")
+            logger.warning(f"sonarr heal: failed to pin {len(file_ids)} files to {provider}:{provider_id}: {e!r}")
             continue
 
     return SonarrHealResponse(

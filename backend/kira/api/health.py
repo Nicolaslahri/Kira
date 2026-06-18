@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from kira import __version__ as _kira_version
 from kira.config import settings
 from kira.database import get_session
 
@@ -86,6 +87,6 @@ async def health(session: AsyncSession = Depends(get_session)) -> dict:
         "force_ipv4": force_ipv4,
         "tmdb_families": tmdb_families,
         "uptime_sec": int(time.monotonic() - _START_TIME),
-        "version": getattr(settings, "version", "0.0.0"),
+        "version": _kira_version,
         "latency_ms": int((time.monotonic() - started) * 1000),
     }

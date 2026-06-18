@@ -41,6 +41,13 @@ dependencies = [
     # (awatch) with a poll fallback for NAS/SMB mounts. Drives the opt-in
     # auto-scan in kira/watcher.py.
     "watchfiles>=0.21",
+    # Subtitle season-pack extraction beyond stdlib zip. py7zr is a PURE-PYTHON
+    # 7z reader (no external tool). rarfile reads RAR3/RAR5 but delegates
+    # decompression to a backend tool (unrar / unar / 7z / bsdtar) since RAR's
+    # algorithm is proprietary — on Windows the built-in System32\tar.exe
+    # (bsdtar/libarchive) serves as that backend with zero install.
+    "py7zr>=0.21",
+    "rarfile>=4.2",
 ]
 
 [project.optional-dependencies]

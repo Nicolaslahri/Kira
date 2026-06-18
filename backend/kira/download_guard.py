@@ -9,10 +9,13 @@ write-if-absent, it's never retried. Validate the body before it touches disk.
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # httpx only needed for the type hint; keep the module light
     import httpx
+
+_log = logging.getLogger("kira.download_guard")
 
 
 async def fetch_capped(
@@ -23,6 +26,8 @@ async def fetch_capped(
     timeout: float = 30.0,
     headers: dict | None = None,
     guard: bool = True,
+    follow_redirects: bool = False,
+    revalidate_redirects: bool = False,
 ) -> tuple[bytes, str] | None:
     """GET `url`, STREAMING the body and aborting the moment it exceeds
     `max_bytes`, and (by default) validating the URL through the SSRF guard
@@ -33,29 +38,60 @@ async def fetch_capped(
     responses (subtitle files, artwork images): those URLs are attacker-
     influenceable, so they must pass the outbound-URL guard, and their bodies
     must be bounded so a malicious/oversized payload can't exhaust memory or
-    fill the disk."""
-    if guard:
-        from kira.url_guard import is_safe_outbound_url
+    fill the disk.
 
-        ok, _ = is_safe_outbound_url(url)
-        if not ok:
-            return None
-    try:
-        # Deliberately do NOT follow redirects: we validated THIS host, and a
-        # redirect could bounce to an internal/metadata target the guard never
-        # saw (SSRF-via-redirect). Only ever connect to the URL we checked.
-        async with client.stream("GET", url, timeout=timeout, headers=headers or {}) as resp:
-            if resp.status_code != 200:
+    `follow_redirects` is opt-in for providers whose download endpoint legitimately
+    302s to a file host (SubSource, some CDNs). The INITIAL host is still SSRF-
+    validated; following the provider's own redirect chain is an accepted
+    tradeoff for those (same fail-open posture as the rest of the outbound guard)."""
+    from kira.url_guard import is_safe_outbound_url
+
+    # Loop only matters when `revalidate_redirects` is set — otherwise this runs
+    # exactly once (identical to the old straight-through behaviour).
+    current = url
+    hops = 0
+    while True:
+        if guard:
+            ok, _ = is_safe_outbound_url(current)
+            if not ok:
                 return None
-            ct = resp.headers.get("content-type", "")
-            buf = bytearray()
-            async for chunk in resp.aiter_bytes():
-                buf += chunk
-                if len(buf) > max_bytes:
-                    return None  # over cap → reject (unbounded-download guard)
-            return bytes(buf), ct
-    except Exception:
-        return None
+        try:
+            # By default do NOT follow redirects: we validated THIS host, and a
+            # redirect could bounce to an internal/metadata target the guard
+            # never saw (SSRF-via-redirect). Providers that redirect to a file
+            # host opt in via `follow_redirects`.
+            #
+            # `revalidate_redirects` is the stricter mode for the auth-exempt,
+            # fully caller-controlled /img proxy: we follow redirects MANUALLY,
+            # one hop at a time, so the SSRF guard above re-runs against EVERY
+            # hop (httpx's own follow_redirects would jump straight to the
+            # redirect target without the guard ever seeing it).
+            _follow = follow_redirects and not revalidate_redirects
+            async with client.stream("GET", current, timeout=timeout,
+                                     headers=headers or {}, follow_redirects=_follow) as resp:
+                if revalidate_redirects and resp.is_redirect:
+                    loc = resp.headers.get("location")
+                    hops += 1
+                    if not loc or hops > 5:
+                        _log.info("fetch_capped: %s → redirect refused (loc=%r, hops=%d)",
+                                  current, loc, hops)
+                        return None
+                    current = str(resp.url.join(loc))  # re-validated at loop top
+                    continue
+                if resp.status_code != 200:
+                    _log.info("fetch_capped: %s → HTTP %s (not 200)", current, resp.status_code)
+                    return None
+                ct = resp.headers.get("content-type", "")
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf += chunk
+                    if len(buf) > max_bytes:
+                        _log.info("fetch_capped: %s exceeded %d bytes — rejected", current, max_bytes)
+                        return None  # over cap → reject (unbounded-download guard)
+                return bytes(buf), ct
+        except Exception as e:
+            _log.info("fetch_capped: %s failed: %r", current, e)
+            return None
 
 # Magic-byte signatures for the image formats artwork hosts actually serve.
 _IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
