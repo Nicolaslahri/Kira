@@ -21,7 +21,7 @@ import { SettingsPage } from './pages/SettingsPage';
 
 // Settings sub-sections — now first-class routes (#/settings/<section>) so
 // the sidebar's nested Settings nav drives them and refresh/back/forward work.
-const SETTINGS_SECTIONS = ['connections', 'paths', 'integrations', 'matching', 'naming', 'subtitles', 'cleanup', 'advanced'] as const;
+const SETTINGS_SECTIONS = ['connections', 'paths', 'integrations', 'packs', 'matching', 'naming', 'subtitles', 'cleanup', 'advanced'] as const;
 export type SettingsSection = (typeof SETTINGS_SECTIONS)[number];
 
 // A boolean setting may arrive as a bare `true`/`false` or wrapped as `{value}`
@@ -282,6 +282,25 @@ export default function App() {
   // so polling survives page changes. Returns the running job OR the most
   // recent finished one (green summary / sticky red error) for the pill.
   const { job: activeJob, dismissJob } = useActivity(pushToast);
+  // Toast stack must clear the activity panel (ScanProgress / ActivityPill) that
+  // shares the bottom-right corner. The old fixed 112px offset was SHORTER than
+  // ScanProgress → overlap. Measure the panel's REAL height instead and lift the
+  // toasts to exactly clear it; the lift is CSS-transitioned (index.css,
+  // [data-sonner-toaster]) so toasts glide up when the panel appears and settle
+  // back when it goes — never overlapping, never snapping.
+  const activityVisible = state.scanRunning || !!activeJob;
+  const activityRef = useRef<HTMLDivElement | null>(null);
+  const [activityH, setActivityH] = useState(0);
+  useEffect(() => {
+    const el = activityRef.current;
+    if (!el) return;
+    const measure = () => setActivityH(el.offsetHeight);
+    measure();
+    const ro = new ResizeObserver(measure);  // catches ScanProgress → ActivityPill height changes too
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [activityVisible]);
+  const toastOffset = activityVisible ? activityH + 36 : 24;   // panel height + bottom-6 + a gap
 
   const [focusedId, setFocusedId] = useState(state.files[0]?.id ?? '');
 
@@ -1414,7 +1433,7 @@ export default function App() {
       {/* Persistent activity indicator (scan progress / background job) — fixed
           in the bottom-right corner; the Sonner toast stack lifts above it. */}
       {(state.scanRunning || activeJob) ? (
-        <div className="fixed bottom-6 right-6 z-[9998]">
+        <div ref={activityRef} className="fixed bottom-6 right-6 z-[9998]">
           {state.scanRunning ? (
             <ScanProgress
               phase={state.scanPhase}
@@ -1429,9 +1448,9 @@ export default function App() {
         </div>
       ) : null}
 
-      {/* Untitled UI notifications (Sonner). Offset lifts the stack above the
-          activity pill when one is showing so a toast never covers it. */}
-      <NotificationToaster offset={(state.scanRunning || activeJob) ? 112 : 24} />
+      {/* Untitled UI notifications (Sonner). Offset is the MEASURED activity-panel
+          height so the stack always clears it (CSS-transitioned — see App above). */}
+      <NotificationToaster offset={toastOffset} />
 
       {/* Manual subtitle browse-and-pick — opens on any "No EN" chip click. */}
       <SubtitleBrowseModal pushToast={pushToast} />

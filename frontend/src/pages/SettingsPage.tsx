@@ -12,11 +12,12 @@ import { Input } from '../components/base/input/input';
 import { IcShieldCheck, IcChevDown, IcLink, IcSearch, IcHistory, IcUndo, IcFolder, IcSpin, IcCaption } from '../lib/icons';
 import { Select } from '../components/ui';
 import { api, type ApiProvider } from '../lib/api';
-import { strSetting, isValidHttpUrl, humanizeSettingKey } from './settings/helpers';
+import { strSetting, isValidHttpUrl, humanizeSettingKey, maskValue } from './settings/helpers';
 import { AdvancedSection } from './settings/AdvancedSection';
 import { PathsSection } from './settings/PathsSection';
 import { SubtitlesCard } from './settings/SubtitlesCard';
 import { IntegrationsSection } from './settings/IntegrationsSection';
+import { PacksSection } from './settings/PacksSection';
 import { FolderPickerModal } from '../components/FolderPickerModal';
 
 // Optional NFO fields the user can include/exclude (Settings → Naming).
@@ -313,15 +314,12 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
     const next = { ...artworkTypes, [key]: !artworkKindOn(key) };
     setRawSettings(s => ({ ...s, 'naming.artwork_types': next }));
   };
-  // fanart.tv key is masked in GET /settings ({masked,set,tail}); the raw value
-  // is a string only right after the user types it. `fanartKeySet` drives the
-  // Connections-card status, its placeholder, and the "needs key" hints on the
-  // fanart-only artwork types in Naming. The key INPUT itself lives in the
-  // Connections tab (with the other provider credentials).
-  const fanartKeyRaw = rawSettings['providers.fanarttv.api_key'];
-  const fanartKeySet =
-    (!!fanartKeyRaw && typeof fanartKeyRaw === 'object' && (fanartKeyRaw as { set?: boolean }).set === true)
-    || (typeof fanartKeyRaw === 'string' && fanartKeyRaw.length > 0);
+  // fanart.tv works out of the box — Kira ships a project (api) key — so the
+  // fanart-only artwork kinds (clear logo / art, banner, disc, character art) are
+  // available by default, the Connections card reads "connected", and Naming
+  // doesn't gate those kinds behind a key. A user's own PERSONAL key is optional
+  // (the `client_key` field) and sent IN ADDITION to bypass the 7-day image limit.
+  const fanartKeySet = true;
 
   // OpenSubtitles — subtitle provider. Same masked-secret semantics as
   // fanart: the server doesn't echo saved keys back, so "set" is the signal.
@@ -724,6 +722,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                   // "key already saved" indicator so the user knows not
                   // to retype.
                   { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.tmdb.api_key'),
+                    lockedDisplay: maskValue(rawSettings, 'providers.tmdb.api_key'),
                     placeholder: providers['tmdb']?.configured && !strSetting(rawSettings, 'providers.tmdb.api_key')
                       ? '••••••••••••••••  (key saved — enter a new one to replace)'
                       : 'paste 32-char key from themoviedb.org',
@@ -741,6 +740,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                 providerKey="TVDB" status={deriveProviderStatus(providers['tvdb'], 'tvdb')}
                 fields={[
                   { kind: 'text', label: 'API key (v4)', value: strSetting(rawSettings, 'providers.tvdb.api_key'),
+                    lockedDisplay: maskValue(rawSettings, 'providers.tvdb.api_key'),
                     placeholder: providers['tvdb']?.configured && !strSetting(rawSettings, 'providers.tvdb.api_key')
                       ? '••••••••••••••••  (key saved — enter a new one to replace)'
                       : 'paste your TVDB v4 API key',
@@ -768,6 +768,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                     placeholder: 'only needed for mylist features (future)',
                     onSave: saveKey('providers.anidb.username') },
                   { kind: 'password', label: 'Password (optional)', value: strSetting(rawSettings, 'providers.anidb.password'),
+                    lockedDisplay: maskValue(rawSettings, 'providers.anidb.password'),
                     placeholder: '••••••••',
                     onSave: saveKey('providers.anidb.password') },
                 ]}
@@ -798,6 +799,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                 providerKey="AcoustID" status={deriveProviderStatus(providers['acoustid'], 'acoustid')}
                 fields={[
                   { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.acoustid.api_key'),
+                    lockedDisplay: maskValue(rawSettings, 'providers.acoustid.api_key'),
                     placeholder: keyIsSet('providers.acoustid.api_key')
                       ? '••••••••••••••••  (key saved — enter a new one to replace)'
                       : 'paste your acoustid.org API key', mono: true,
@@ -825,18 +827,18 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                 providerKey="fanart.tv"
                 status={fanartKeySet ? 'connected' : 'not-configured'}
                 fields={[
-                  { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.fanarttv.api_key'),
-                    placeholder: fanartKeySet
-                      ? '••••••••••••••••  (key saved — enter a new one to replace)'
-                      : 'paste your personal API key from fanart.tv',
+                  { kind: 'text', label: 'Personal key (optional)', value: strSetting(rawSettings, 'providers.fanarttv.client_key'),
+                    lockedDisplay: maskValue(rawSettings, 'providers.fanarttv.client_key'),
+                    placeholder: 'paste your personal key from fanart.tv → API',
                     mono: true,
-                    desc: 'Artwork only — clear logos, clear art, banners, disc & character art for the “Download artwork” option (Naming). Free personal key at fanart.tv → log in → API. Anime resolves its artwork via the TheTVDB cross-reference.',
-                    onSave: saveKey('providers.fanarttv.api_key') },
-                  { kind: 'text', label: 'Client key (optional)', value: strSetting(rawSettings, 'providers.fanarttv.client_key'),
-                    placeholder: 'project client key — higher rate limits',
-                    mono: true,
-                    desc: 'A registered project key on top of the personal key lifts the fanart.tv rate limits and surfaces new artwork sooner. Leave blank to use the personal key alone.',
+                    desc: 'Your OWN fanart.tv key, sent in addition to the one Kira ships — it bypasses the 7-day image-update limit so fresh artwork appears sooner. Optional. Free at fanart.tv → log in → API.',
                     onSave: saveKey('providers.fanarttv.client_key') },
+                  { kind: 'text', label: 'Project key (advanced)', value: strSetting(rawSettings, 'providers.fanarttv.api_key'),
+                    lockedDisplay: maskValue(rawSettings, 'providers.fanarttv.api_key'),
+                    placeholder: 'using the shared key Kira ships — override only with your own',
+                    mono: true,
+                    desc: 'Kira ships a shared fanart.tv project key, so artwork (clear logos, clear art, banners, disc & character art for the “Download artwork” option in Naming) works out of the box. Leave blank unless you have your own project key to use instead. Anime resolves its artwork via the TheTVDB cross-reference.',
+                    onSave: saveKey('providers.fanarttv.api_key') },
                 ]}
                 onTest={makeTester('fanarttv', pushToast, 'fanart.tv')}
               />
@@ -846,6 +848,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                 status={osKeySet ? 'connected' : 'not-configured'}
                 fields={[
                   { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.opensubtitles.api_key'),
+                    lockedDisplay: maskValue(rawSettings, 'providers.opensubtitles.api_key'),
                     placeholder: osKeySet
                       ? '••••••••••••••••  (key saved — enter a new one to replace)'
                       : 'paste the 32-char key from opensubtitles.com → API consumers',
@@ -857,6 +860,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                     desc: 'Downloads count against your account quota — without a login, search works but nothing can be saved.',
                     onSave: saveKey('providers.opensubtitles.username') },
                   { kind: 'password', label: 'Password', value: strSetting(rawSettings, 'providers.opensubtitles.password'),
+                    lockedDisplay: maskValue(rawSettings, 'providers.opensubtitles.password'),
                     placeholder: '••••••••',
                     onSave: saveKey('providers.opensubtitles.password') },
                 ]}
@@ -868,6 +872,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                 status={subdlKeySet ? 'connected' : 'not-configured'}
                 fields={[
                   { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.subdl.api_key'),
+                    lockedDisplay: maskValue(rawSettings, 'providers.subdl.api_key'),
                     placeholder: subdlKeySet
                       ? '••••••••••••••••  (key saved — enter a new one to replace)'
                       : 'paste your SubDL API key',
@@ -883,6 +888,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                 status={subsourceKeySet ? 'connected' : 'not-configured'}
                 fields={[
                   { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.subsource.api_key'),
+                    lockedDisplay: maskValue(rawSettings, 'providers.subsource.api_key'),
                     placeholder: subsourceKeySet
                       ? '••••••••••••••••  (key saved — enter a new one to replace)'
                       : 'paste your SubSource API key',
@@ -893,6 +899,35 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                 onTest={makeTester('subsource', pushToast, 'SubSource')}
               />
               </div>
+              </div>
+
+              {/* ── DATA & ARTWORK SOURCES — attribution. fanart.tv's terms require
+                  informing users it's used + the images; TMDB requires the verbatim
+                  "not endorsed or certified" disclaimer. ── */}
+              <div className="rounded-2xl bg-secondary px-5 py-4 shadow-xs ring-1 ring-inset ring-secondary">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Data &amp; artwork sources</div>
+                <p className="mt-2 text-[12px] leading-relaxed text-tertiary">
+                  Kira identifies and enriches your library using these community services — please consider supporting them.
+                </p>
+                <div className="mt-2.5 flex flex-wrap gap-x-4 gap-y-1.5 text-[12px]">
+                  {([
+                    ['TMDB', 'https://www.themoviedb.org'],
+                    ['TheTVDB', 'https://thetvdb.com'],
+                    ['AniDB', 'https://anidb.net'],
+                    ['fanart.tv', 'https://fanart.tv'],
+                    ['OpenSubtitles', 'https://www.opensubtitles.com'],
+                    ['SubDL', 'https://subdl.com'],
+                    ['SubSource', 'https://subsource.net'],
+                  ] as const).map(([label, href]) => (
+                    <a key={label} href={href} target="_blank" rel="noreferrer"
+                       className="text-tertiary underline-offset-2 transition-colors hover:text-primary hover:underline">{label} ↗</a>
+                  ))}
+                </div>
+                <p className="mt-3 text-[11px] leading-relaxed text-quaternary">
+                  Artwork (clear logos, clear art, banners, disc &amp; character art) is provided by{' '}
+                  <a href="https://fanart.tv" target="_blank" rel="noreferrer" className="underline-offset-2 transition-colors hover:text-primary hover:underline">fanart.tv</a>.
+                  This product uses the TMDB API but is not endorsed or certified by TMDB.
+                </p>
               </div>
               </div>
             </SettingsLayout>
@@ -905,6 +940,10 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
 
           {section === 'integrations' && (
             <IntegrationsSection rawSettings={rawSettings} setRawSettings={setRawSettings} saveKey={saveKey} pushToast={pushToast} />
+          )}
+
+          {section === 'packs' && (
+            <PacksSection pushToast={pushToast} />
           )}
 
           {section === 'naming' && (

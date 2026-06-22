@@ -110,10 +110,19 @@ async def search(client: httpx.AsyncClient, ctx) -> list:
         params["type"] = "tv"
     elif ctx.media_type == "movie":
         params["type"] = "movie"
-    if ctx.season is not None:
-        params["season_number"] = str(ctx.season)
-    if ctx.episode is not None:
-        params["episode_number"] = str(ctx.episode)
+    # Anime is usually indexed by ABSOLUTE episode (One Piece #1080), not the
+    # cour-local SxxEyy that AniDB carries — searching by the cour number misses
+    # the sub entirely. When we have an absolute number for anime, search by it
+    # and drop the (wrong) season. Guarded by `absolute` presence, which the
+    # parser only sets for genuinely absolute-numbered files, so seasonal shows
+    # fall through to the normal season/episode path untouched.
+    if ctx.media_type == "anime" and ctx.absolute is not None:
+        params["episode_number"] = str(ctx.absolute)
+    else:
+        if ctx.season is not None:
+            params["season_number"] = str(ctx.season)
+        if ctx.episode is not None:
+            params["episode_number"] = str(ctx.episode)
     if ctx.hearing_impaired == "only":
         params["hi"] = "1"
     try:

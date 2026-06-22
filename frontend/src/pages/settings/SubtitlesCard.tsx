@@ -149,6 +149,9 @@ export function SubtitlesCard({
   const subMinScore = numSetting('subtitles.min_score', 0);
   const subUpgrade = rawSettings['subtitles.upgrade'] === true;
   const subUpgradeBelow = numSetting('subtitles.upgrade_below', 80);
+  // Thorough search defaults ON (matches the backend) — so it's enabled unless
+  // the user has explicitly turned it off.
+  const subThorough = rawSettings['subtitles.thorough_search'] !== false;
   // Per-type overrides stored as comma lists; empty = inherit the global value.
   // Read as code/key arrays for the chip pickers.
   const _csv = (key: string): string[] =>
@@ -426,6 +429,13 @@ export function SubtitlesCard({
                 </div>
               ))}
             </div>
+          </div>
+
+          {/* Thorough search — query every numbering we know, then merge/dedupe. */}
+          <div className="flex flex-col gap-3 border-t border-secondary pt-4">
+            <Row name="Thorough search" hint="query providers by absolute + season/episode and merge — better recall, anime especially (searches only, no extra downloads)">
+              <Toggle isSelected={subThorough} onChange={() => saveKey('subtitles.thorough_search')(!subThorough)} aria-label="Thorough subtitle search" />
+            </Row>
           </div>
 
           {/* Upgrade-over-time — re-check weak picks for a better release later. */}

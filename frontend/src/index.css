@@ -386,6 +386,14 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 }
 
 /* ── Micro-interactions ── */
+/* The Sonner toast stack shares the bottom-right corner with the activity panel
+   (ScanProgress / ActivityPill); App.tsx measures that panel and sets Sonner's
+   `offset` to clear it. Animate the lift (the container's `bottom`, driven by
+   --offset-bottom) so the stack GLIDES up when the panel appears / resizes and
+   settles back when it leaves — never overlapping, never snapping. The per-toast
+   enter/exit transforms live on the child <li>s, so this only moves the stack. */
+[data-sonner-toaster] { transition: bottom var(--dur-3) var(--ease-out); }
+
 /* Springy tap: scale down on press, release with overshoot. */
 .press { transition: transform var(--dur-1) var(--ease-spring); }
 .press:active { transform: scale(0.96); }

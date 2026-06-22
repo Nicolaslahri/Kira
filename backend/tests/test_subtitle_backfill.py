@@ -267,3 +267,65 @@ async def test_backfill_no_source_enabled(tmp_path, monkeypatch):
     async with sm() as s:
         notes = list(await s.scalars(select(Notification)))
         assert any("No subtitle source" in n.title for n in notes)
+
+
+@pytest.mark.asyncio
+async def test_harvest_redownloads_pack_when_cache_cold(tmp_path, monkeypatch):
+    # "Fill the rest of the season" must still work after the in-memory pack
+    # byte cache goes cold — re-fetch the pack ONCE and harvest the siblings,
+    # instead of silently returning 0.
+    import io
+    import zipfile
+    from sqlalchemy.orm import selectinload
+    from kira.subtitles import aggregate, pack as _pack
+
+    sm, fid = await _seed(tmp_path, monkeypatch)
+    # A sibling episode S01E02 in the same series (cluster by series_group_id —
+    # the primary sibling path), still missing EN.
+    async with sm() as s:
+        src_match = (await s.scalars(select(Match).where(Match.media_file_id == fid))).first()
+        src_match.series_group_id = "anidb:1"
+        sib = MediaFile(
+            file_path=str(tmp_path / "Show.S01E02.mkv"), media_type="anime", status="renamed",
+            parsed_data={"title": "Show", "media_type": "anime", "season": 1, "episode": 2,
+                         "mi_stamp": [1, 2], "sub_langs": ["jpn"]})
+        s.add(sib)
+        await s.flush()
+        s.add(Match(media_file_id=sib.id, provider="anidb", provider_id="1",
+                    match_type="tv_episode", confidence=0.9, title="Show",
+                    season_number=1, episode_number=2, is_selected=True,
+                    series_group_id="anidb:1"))
+        await s.commit()
+
+    # A 2-episode pack that we deliberately DON'T put in the cache (cold).
+    buf = io.BytesIO()
+    cue = "1\n00:00:01,000 --> 00:21:30,000\nhi\n"
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("[X] Show - 01 [1080p].srt", cue)
+        z.writestr("[X] Show - 02 [1080p].srt", cue)
+    pack_bytes = buf.getvalue()
+    _pack._CACHE.clear()
+
+    calls = {"n": 0}
+
+    async def fake_dl(client, cand, ctx):
+        calls["n"] += 1
+        return pack_bytes
+    monkeypatch.setattr(aggregate, "download_raw", fake_dl)
+
+    async with sm() as s:
+        src = (await s.scalars(select(MediaFile).options(selectinload(MediaFile.matches))
+                               .where(MediaFile.id == fid))).first()
+        saved = await bf.harvest_from_cached_pack(
+            s, src, "subsource", "coldref99", "en", client=object())
+
+    assert calls["n"] == 1                                   # cold cache → re-downloaded ONCE
+    assert saved == 1                                        # …and the sibling E02 got its sidecar
+    assert _pack.get_cached_pack("subsource", "coldref99") == pack_bytes   # re-cached (warm now)
+
+    # Backward-compat: with NO client a cold cache still no-ops gracefully (0).
+    _pack._CACHE.clear()
+    async with sm() as s:
+        src = (await s.scalars(select(MediaFile).options(selectinload(MediaFile.matches))
+                               .where(MediaFile.id == fid))).first()
+        assert await bf.harvest_from_cached_pack(s, src, "subsource", "coldref99", "en") == 0

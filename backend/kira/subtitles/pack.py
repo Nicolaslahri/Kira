@@ -124,6 +124,7 @@ class PackEntry:
     reasons: list[str] = field(default_factory=list)
     guessed_episode: int | None = None
     other_episode: int | None = None   # an explicit DIFFERENT episode in the name
+    matched: bool = False              # EXPLICITLY matched the wanted episode (SxE / token / absolute)
 
     def public(self) -> dict:
         return {
@@ -198,15 +199,87 @@ def _explicit_sxe(low: str) -> tuple[int, int] | None:
 
 
 def _explicit_episode_token(low: str) -> int | None:
-    """An episode number stated with a marker (E06 / ep 6 / " - 06 - " / #06),
-    season-less. Returns the number or None. Distinct from a bare number so a
-    title coincidence ('Show 6 Feet Under') doesn't read as episode 6."""
+    """An episode number stated with a marker (E06 / ep 6 / " - 06 - " / #06 /
+    the "[Group] Title - 06 [tags]" fansub form), season-less. Returns the number
+    or None. Distinct from a bare number so a title coincidence ('Show 6 Feet
+    Under') doesn't read as episode 6."""
     m = (re.search(r"\be(\d{1,3})\b", low)
          or re.search(r"\bep\.?\s*(\d{1,3})\b", low)
          or re.search(r"\bepisode\s*(\d{1,3})\b", low)
          or re.search(r"[\s._-]-[\s._]*(\d{1,3})[\s._]*-", low)   # " - 06 - "
+         # Anime fansub form "[Erai-raws] Title - 06 [1080p]" / "Title - 06" /
+         # "Title - 06v2": the number after " - " before a bracket / version /
+         # end-of-name. The "- 06 -" form above required a TRAILING dash and so
+         # missed the (far more common) bracketed-tag releases entirely.
+         or re.search(r"[\s._]-[\s._]+(\d{1,3})(?=[\s._]*[\[(]|[\s._]*v\d|[\s._]*\.[a-z]{2,4}|[\s._]*$)", low)
          or re.search(r"#(\d{1,3})\b", low))
     return int(m.group(1)) if m else None
+
+
+def episode_match(name: str, *, season: int | None, episode: int | None,
+                  absolute: int | None) -> str:
+    """Classify ONE subtitle's RELEASE NAME against the wanted episode, matching
+    BOTH a cour-local SxxEyy and an anime ABSOLUTE number (we may know either or
+    both). Returns:
+      "match"    — the name advertises the requested episode,
+      "mismatch" — it explicitly advertises a DIFFERENT episode (reliably-
+                   numbered TV only),
+      "unknown"  — no usable single-episode signal, a season/batch pack, or an
+                   absolute-numbered show whose S/E token we can't trust.
+
+    Conservative by design: it only buries a candidate ("mismatch") when an
+    explicit S/E or episode token clearly names a different episode AND no
+    absolute number is in play (cour numbering on absolute shows is unreliable —
+    AniDB's single-AID quirk — so there we only ever boost a positive match,
+    never bury). Reuses the pack ranker's denoise + parsers. Pure."""
+    if not name or (episode is None and absolute is None):
+        return "unknown"
+    raw_low = _denoise(_basename(name).lower())
+    # A range / batch / whole-season archive names no single episode — leave it
+    # to the pack ranker; never judge it as a wrong single episode.
+    if (re.search(r"\b\d{1,4}\s*[-~]\s*\d{1,4}\b", raw_low)
+            or re.search(r"\b(batch|complete|season)\b", raw_low)
+            or re.search(r"\bs\d{1,2}\s*-\s*s\d{1,2}\b", raw_low)):
+        return "unknown"
+
+    sxe = _explicit_sxe(raw_low)
+    tok = _explicit_episode_token(raw_low)
+
+    # Positive matches — any one wins (absolute is the strongest anime signal;
+    # zero-padding tolerated so 09 / 007 still hit absolute 9 / 7).
+    if absolute is not None and re.search(rf"(?<!\d)0*{absolute}(?!\d)", raw_low):
+        return "match"
+    if episode is not None and sxe is not None \
+            and sxe[1] == episode and (season is None or sxe[0] == season):
+        return "match"
+    if episode is not None and tok is not None and tok == episode:
+        return "match"
+
+    # Mismatch — only for reliably-numbered TV (no absolute in play) where the
+    # name explicitly advertises a different episode/season.
+    if absolute is None and episode is not None:
+        if sxe is not None and (sxe[1] != episode or (season is not None and sxe[0] != season)):
+            return "mismatch"
+        if sxe is None and tok is not None and tok != episode:
+            return "mismatch"
+    return "unknown"
+
+
+def is_likely_pack(name: str, file_count: int = 1) -> bool:
+    """Whether a provider result is a SEASON PACK (multiple episodes) rather than
+    a single episode — judged from the release NAME first (reliable), and from
+    the provider's file-count only for an ambiguous name. A single fansub release
+    often bundles srt+ass+fonts, so `file_count > 1` does NOT mean a pack — the
+    old `files > 1` rule mislabeled every such release ("[Erai-raws] Show - 04")
+    as a season pack. Pure."""
+    low = _denoise(_basename(name).lower())
+    if _explicit_sxe(low) is not None or _explicit_episode_token(low) is not None:
+        return False                                       # names ONE episode → not a pack
+    if re.search(r"\b\d{1,4}\s*[-~]\s*\d{1,4}\b", low):     # a range: 01-12 / 01~24
+        return True
+    if re.search(r"\b(batch|complete|season)\b", low):
+        return True
+    return file_count > 1                                   # ambiguous name → trust the count
 
 
 def score_entry(
@@ -306,6 +379,7 @@ def score_entry(
             e.reasons = [f"is episode {advertised}, not {wanted}"]
 
     e.score = max(0, min(100, score))
+    e.matched = matched_explicit
     return e
 
 
@@ -443,6 +517,14 @@ def rank_entries(
     is_pack = len(entries) > 1
     if not is_pack:
         confident = True
+    elif best.matched and best.score >= _CONFIDENT_FLOOR:
+        # The best entry EXPLICITLY matches the wanted episode → it IS the right
+        # episode. A close runner-up here is just another COPY/variant of the SAME
+        # episode (a "[Erai-raws] Gachiakuta - 04" archive that bundles full +
+        # signs + an alt encode — all episode 4), NOT a competing different
+        # episode (those are zeroed by the wrong-episode guard). Don't force the
+        # user to choose between equally-correct files; take the best.
+        confident = True
     else:
         runner_up = entries[1].score
         confident = best.score >= _CONFIDENT_FLOOR and (best.score - runner_up) >= _CONFIDENT_MARGIN
@@ -485,8 +567,8 @@ def extract_entry(content: bytes, name: str) -> tuple[bytes, str] | None:
 
 # ── bounded byte cache (inspect → extract without re-downloading) ──────────────
 _CACHE: dict[str, tuple[float, bytes]] = {}
-_CACHE_TTL = 15 * 60          # 15 minutes
-_CACHE_MAX_ITEMS = 4
+_CACHE_TTL = 30 * 60          # 30 minutes — span a longer "pick → fill the season"
+_CACHE_MAX_ITEMS = 12         # several shows in flight before one evicts (was 4)
 _CACHE_MAX_BYTES = 200 * 1024 * 1024
 
 

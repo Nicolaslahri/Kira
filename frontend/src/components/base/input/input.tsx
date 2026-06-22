@@ -20,6 +20,12 @@ export interface InputProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 
      *  URL bar that's just sitting in Settings. Click Edit → editable + focused;
      *  blur re-locks. Opt-in: default behavior is unchanged. */
     editGate?: boolean;
+    /** When the field is LOCKED (editGate + not editing) and the value is empty,
+     *  show this read-only text in place of the blank input — e.g. masked bullets
+     *  for a SAVED secret, so it reads as "set" instead of looking empty. Clicking
+     *  it (or Edit) unlocks to an empty editable input. Display-only — never the
+     *  field's value, so it can't be saved. */
+    lockedDisplay?: string;
 }
 
 /**
@@ -28,13 +34,15 @@ export interface InputProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 
  */
 export const Input = ({
     mono, invalid, icon: Icon, trailing, wrapperClassName, className,
-    editGate, readOnly, onBlur, onClick, ...props
+    editGate, lockedDisplay, readOnly, onBlur, onClick, ...props
 }: InputProps) => {
     const [editing, setEditing] = useState(false);
     const ref = useRef<HTMLInputElement>(null);
     // Locked = gated AND not currently editing → read-only, browser leaves it
     // alone. Focus the field once it unlocks so Edit jumps straight to typing.
     const locked = !!editGate && !editing;
+    // Show the masked "saved" display only when locked AND nothing's been typed.
+    const showLockedDisplay = locked && !!lockedDisplay && !props.value;
     useEffect(() => { if (editing) ref.current?.focus(); }, [editing]);
     return (
         <div
@@ -46,19 +54,31 @@ export const Input = ({
         >
             {isValidElement(Icon) && Icon}
             {isReactComponent(Icon) && <Icon className="size-4 shrink-0 text-ink-soft" />}
-            <input
-                ref={ref}
-                readOnly={locked || readOnly}
-                onBlur={(e) => { if (editGate) setEditing(false); onBlur?.(e); }}
-                onClick={(e) => { if (locked) setEditing(true); onClick?.(e); }}
-                className={cx(
-                    "min-w-0 flex-1 border-0 bg-transparent text-[13px] text-ink outline-none placeholder:text-ink-faint",
-                    mono && "font-mono text-[12.5px]",
-                    locked && "cursor-pointer",
-                    className,
-                )}
-                {...props}
-            />
+            {showLockedDisplay ? (
+                <span
+                    onClick={() => setEditing(true)}
+                    className={cx(
+                        "min-w-0 flex-1 cursor-pointer truncate text-[13px] text-ink select-none",
+                        mono && "font-mono text-[12.5px] tracking-[0.12em]",
+                    )}
+                >
+                    {lockedDisplay}
+                </span>
+            ) : (
+                <input
+                    ref={ref}
+                    readOnly={locked || readOnly}
+                    onBlur={(e) => { if (editGate) setEditing(false); onBlur?.(e); }}
+                    onClick={(e) => { if (locked) setEditing(true); onClick?.(e); }}
+                    className={cx(
+                        "min-w-0 flex-1 border-0 bg-transparent text-[13px] text-ink outline-none placeholder:text-ink-faint",
+                        mono && "font-mono text-[12.5px]",
+                        locked && "cursor-pointer",
+                        className,
+                    )}
+                    {...props}
+                />
+            )}
             {locked && (
                 <button
                     type="button"

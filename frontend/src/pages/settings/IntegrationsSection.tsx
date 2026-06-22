@@ -9,7 +9,7 @@ import { Toggle } from '../../components/base/toggle/toggle';
 import { Alert } from '../../components/base/alert/alert';
 import { FeaturedIcon } from '../../components/base/featured-icons/featured-icon';
 import { api } from '../../lib/api';
-import { strSetting, isValidHttpUrl, secretSet, maskHint, type SaveKeyFn, type PushToast } from './helpers';
+import { strSetting, isValidHttpUrl, secretSet, maskHint, maskValue, type SaveKeyFn, type PushToast } from './helpers';
 
 /**
  * onChange wrapper for a server-masked secret input. The editable value is
@@ -177,20 +177,6 @@ export function IntegrationsSection({
   const tvSeriesType = readSeriesType('tv');
   const animeSeriesType = readSeriesType('anime');
 
-  // Per-flavor audio preference for grabs. On Sonarr v4 sub-vs-dub is decided
-  // by Custom Formats in the quality profile; when the user picks sub/dub here
-  // Kira instead does an interactive search and grabs the matching release,
-  // skipping the opposite audio. Default 'any' = Sonarr's normal auto-search
-  // (matches the backend default, so the UI never lies about behavior).
-  const readAudio = (sect: 'tv' | 'anime'): string => {
-    const v = rawSettings[`integrations.sonarr.${sect}.audio_preference`]
-      ?? rawSettings['integrations.sonarr.audio_preference'];
-    if (v === 'sub' || v === 'dub' || v === 'any') return v;
-    return 'any';
-  };
-  const tvAudio = readAudio('tv');
-  const animeAudio = readAudio('anime');
-
   // Global Sonarr behaviours (apply to every series we add).
   const seasonFolders = (() => {
     const v = rawSettings['integrations.sonarr.season_folders'];
@@ -336,15 +322,6 @@ export function IntegrationsSection({
     { value: 'daily', label: 'Daily (yyyy-mm-dd)' },
   ];
 
-  // Audio-preference options for the per-flavor card. "any" defers to
-  // Sonarr's normal auto-search; "sub"/"dub" make Kira run an interactive
-  // release search and grab the matching audio, skipping the opposite.
-  const audioOptions = [
-    { value: 'any', label: 'Any (Sonarr decides)' },
-    { value: 'sub', label: 'Prefer subbed (skip dubs)' },
-    { value: 'dub', label: 'Prefer dubbed (skip subs)' },
-  ];
-
   const sonarrConfigured = !!sonarrUrl && sonarrKeySet;
   const plexConfigured = !!plexUrl && (!!plexToken || secretSet(rawSettings, 'integrations.plex.token'));
   const jellyfinConfigured = !!jellyfinUrl && (!!jellyfinKey || secretSet(rawSettings, 'integrations.jellyfin.api_key'));
@@ -383,11 +360,9 @@ export function IntegrationsSection({
     qpId: number | undefined,
     folder: string,
     sType: string,
-    audioPref: string,
     qpKey: string,
     folderKey: string,
     sTypeKey: string,
-    audioKey: string,
   ) => (
     <div className={`p-3.5 ${SETTINGS_NESTED}`}>
       <div className="mb-3 flex items-baseline justify-between gap-2">
@@ -402,10 +377,6 @@ export function IntegrationsSection({
         <div className="flex items-center gap-3">
           <span className="w-16 shrink-0 text-[12px] font-medium text-ink-muted">Quality</span>
           <Select<number> style={{ flex: 1, minWidth: 0 }} value={qpId} onChange={v => saveKey(qpKey)(v)} placeholder="— pick a quality profile —" options={profiles.map(p => ({ value: p.id, label: p.name }))} aria-label={`${title} quality profile`} />
-        </div>
-        <div className="flex items-center gap-3">
-          <span className="w-16 shrink-0 text-[12px] font-medium text-ink-muted">Audio</span>
-          <Select<string> style={{ flex: 1, minWidth: 0 }} value={audioPref} onChange={v => saveKey(audioKey)(v)} options={audioOptions} aria-label={`${title} audio preference`} />
         </div>
         <div className="flex items-center gap-3">
           <span className="w-16 shrink-0 text-[12px] font-medium text-ink-muted">Folder</span>
@@ -501,6 +472,7 @@ export function IntegrationsSection({
               editGate
               type={showApiKey ? 'text' : 'password'}
               value={sonarrApiKey}
+              lockedDisplay={maskValue(rawSettings, 'integrations.sonarr.api_key')}
               placeholder={maskHint(rawSettings, 'integrations.sonarr.api_key') ?? "from Sonarr's General → Security page"}
               autoComplete="off"
               onChange={e => saveSecret(saveKey('integrations.sonarr.api_key'))(e.target.value)}
@@ -539,20 +511,18 @@ export function IntegrationsSection({
               {renderFlavor(
                 'TV Shows',
                 'matched via TVDB',
-                tvQpId, tvRoot, tvSeriesType, tvAudio,
+                tvQpId, tvRoot, tvSeriesType,
                 'integrations.sonarr.tv.quality_profile_id',
                 'integrations.sonarr.tv.root_folder_path',
                 'integrations.sonarr.tv.series_type',
-                'integrations.sonarr.tv.audio_preference',
               )}
               {renderFlavor(
                 'Anime',
                 'matched via AniDB',
-                animeQpId, animeRoot, animeSeriesType, animeAudio,
+                animeQpId, animeRoot, animeSeriesType,
                 'integrations.sonarr.anime.quality_profile_id',
                 'integrations.sonarr.anime.root_folder_path',
                 'integrations.sonarr.anime.series_type',
-                'integrations.sonarr.anime.audio_preference',
               )}
             </div>
 
@@ -601,7 +571,7 @@ export function IntegrationsSection({
       >
         <div className="flex flex-col gap-3">
           {fieldRow('Token',
-            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={webhookToken} placeholder={maskHint(rawSettings, 'integrations.webhook.token') ?? 'a shared secret you choose'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.webhook.token'))(e.target.value)} trailing={secretEye} />
+            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={webhookToken} lockedDisplay={maskValue(rawSettings, 'integrations.webhook.token')} placeholder={maskHint(rawSettings, 'integrations.webhook.token') ?? 'a shared secret you choose'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.webhook.token'))(e.target.value)} trailing={secretEye} />
           )}
           {webhookSet ? (
             <NestedBox className="px-3 py-2.5">
@@ -650,14 +620,14 @@ export function IntegrationsSection({
             <Input wrapperClassName="flex-1" mono editGate value={plexUrl} placeholder="http://plex:32400" invalid={!isValidHttpUrl(plexUrl)} aria-invalid={!isValidHttpUrl(plexUrl)} title={!isValidHttpUrl(plexUrl) ? 'Enter a full http(s) URL, e.g. http://plex:32400' : undefined} onChange={e => saveKey('integrations.plex.url')(e.target.value)} />
           )}
           {fieldRow('Token',
-            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={plexToken} placeholder={maskHint(rawSettings, 'integrations.plex.token') ?? 'X-Plex-Token'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.plex.token'))(e.target.value)} trailing={secretEye} />
+            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={plexToken} lockedDisplay={maskValue(rawSettings, 'integrations.plex.token')} placeholder={maskHint(rawSettings, 'integrations.plex.token') ?? 'X-Plex-Token'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.plex.token'))(e.target.value)} trailing={secretEye} />
           )}
           <div className="mt-1 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-muted">Jellyfin<StatusDot state={jellyfinHealth} label="Jellyfin" detail={health['jellyfin']?.detail} checkedAt={health['jellyfin']?.checked_at} /></div>
           {fieldRow('URL',
             <Input wrapperClassName="flex-1" mono editGate value={jellyfinUrl} placeholder="http://jellyfin:8096" invalid={!isValidHttpUrl(jellyfinUrl)} aria-invalid={!isValidHttpUrl(jellyfinUrl)} title={!isValidHttpUrl(jellyfinUrl) ? 'Enter a full http(s) URL, e.g. http://jellyfin:8096' : undefined} onChange={e => saveKey('integrations.jellyfin.url')(e.target.value)} />
           )}
           {fieldRow('API key',
-            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={jellyfinKey} placeholder={maskHint(rawSettings, 'integrations.jellyfin.api_key') ?? 'Dashboard → API Keys'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.jellyfin.api_key'))(e.target.value)} trailing={secretEye} />
+            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={jellyfinKey} lockedDisplay={maskValue(rawSettings, 'integrations.jellyfin.api_key')} placeholder={maskHint(rawSettings, 'integrations.jellyfin.api_key') ?? 'Dashboard → API Keys'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.jellyfin.api_key'))(e.target.value)} trailing={secretEye} />
           )}
         </div>
       </IntegrationCard>

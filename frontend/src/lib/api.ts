@@ -729,6 +729,9 @@ export const api = {
       series_was_added: boolean;
       sonarr_series_title: string | null;
       skipped_episodes: number[] | null;
+      // True = the search runs in the background; the result arrives via the
+      // activity pill, not this response.
+      started?: boolean;
     }>('/integrations/sonarr/send-missing', {
       method: 'POST',
       body: JSON.stringify(body),
@@ -967,7 +970,57 @@ export const api = {
     request<{ updated: number }>('/notifications/read-all', { method: 'POST' }),
 
   getProviders: () => request<ApiProvider[]>('/providers'),
+
+  // ── Kira Packs ────────────────────────────────────────────────────────────
+  /** Installed packs + their resolved summaries (for Settings → Packs). */
+  listPacks: () => request<{ packs: ApiPack[] }>('/packs'),
+  /** Dry-run a URL WITHOUT installing: preview + "would rescue N files". */
+  validatePack: (url: string, scope_paths: string[] = []) =>
+    request<ApiPackValidate>('/packs/validate', {
+      method: 'POST', body: JSON.stringify({ url, scope_paths }),
+    }),
+  /** Install a pack from a URL. authority='override' requires non-empty scope_paths. */
+  addPack: (body: { url: string; authority?: 'fallback' | 'override'; scope_paths?: string[]; subtitles?: boolean }) =>
+    request<ApiPack>('/packs', { method: 'POST', body: JSON.stringify(body) }),
+  updatePack: (key: string, body: { enabled?: boolean; authority?: 'fallback' | 'override'; scope_paths?: string[]; subtitles?: boolean }) =>
+    request<ApiPack>(`/packs/${key}`, { method: 'PUT', body: JSON.stringify(body) }),
+  deletePack: (key: string) =>
+    request<{ ok: boolean; removed: string }>(`/packs/${key}`, { method: 'DELETE' }),
+  refreshPack: (key: string) =>
+    request<ApiPack>(`/packs/${key}/refresh`, { method: 'POST' }),
+  /** Apply enabled packs to current no_match files (rescue without a full re-scan). */
+  rescanPacks: () =>
+    request<{ ok: boolean; rescued: number }>('/packs/rescan', { method: 'POST' }),
 };
+
+export interface ApiPack {
+  key: string;
+  url: string;
+  id: string;
+  name: string;
+  enabled: boolean;
+  authority: 'fallback' | 'override';
+  subtitles: boolean;
+  scope_paths: string[];
+  last_fetched: string | null;
+  last_error: string | null;
+  resolved: boolean;
+  // present when resolved
+  title?: string;
+  media_type?: string;
+  poster_url?: string | null;
+  year?: number | null;
+  episode_count?: number;
+  season_count?: number;
+  sub_count?: number;
+}
+
+export interface ApiPackValidate extends ApiPack {
+  ok: boolean;
+  error?: string | null;
+  would_rescue?: number;
+  sample_files?: string[];
+}
 
 export interface ApiHistoryEntry {
   id: number;

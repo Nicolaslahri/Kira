@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from kira.subtitles.model import SubtitleCandidate
-from kira.subtitles.scoring import ReleaseInfo, rank, score_candidate
+from kira.subtitles.scoring import ReleaseInfo, identity_match, rank, score_candidate
 
 
 def _video():
@@ -25,7 +25,7 @@ def test_hash_match_is_guaranteed_and_high():
                           release_name="whatever")
     score_candidate(c, _video())
     assert c.sync == "guaranteed"
-    assert c.score >= 70
+    assert c.score >= 90            # a hash match is near-perfect, not a B-minus
     assert any("hash" in r for r in c.reasons)
 
 
@@ -33,7 +33,21 @@ def test_embedded_is_guaranteed():
     c = SubtitleCandidate(provider="embedded", language="en", from_embedded=True)
     score_candidate(c, _video())
     assert c.sync == "guaranteed"
-    assert c.score >= 70
+    assert c.score == 100          # the file's own track is perfect
+
+
+def test_correct_sub_not_punished_for_different_release():
+    # The 'too harsh' fix: a right-language sub that simply isn't your exact
+    # release is still a legitimate pick — it must not score like garbage.
+    diff = SubtitleCandidate(provider="subdl", language="en",
+                             release_name="Attack.on.Titan.S01E01.WEBRip.480p-NOBODY")
+    score_candidate(diff, _video())
+    assert diff.score >= 45            # the generous correctness floor, not ~30
+    # a hash match still clearly beats it — guaranteed sync over a mere candidate
+    hashed = SubtitleCandidate(provider="opensubtitles", language="en",
+                               hash_match=True, release_name="random")
+    score_candidate(hashed, _video())
+    assert hashed.score >= diff.score + 30
 
 
 def test_release_group_match_is_likely_sync():
@@ -92,3 +106,27 @@ def test_rank_orders_best_first_hash_beats_release():
     ranked = rank(cands, _video())
     assert ranked[0].provider == "opensubtitles"   # hash wins
     assert ranked[-1].provider == "podnapisi"        # title-only loses
+
+
+# ── identity_match: catch a wrong FILM (Ballerina 2023 vs 2025) ──────
+def test_identity_match_imdb_and_tmdb():
+    c = SubtitleCandidate(provider="opensubtitles", language="en", imdb_id=1375666)
+    # imdb is strongest; tt-prefix + int compare equal
+    assert identity_match(c, imdb_id="tt1375666") == "match"
+    assert identity_match(c, imdb_id="tt9999999") == "mismatch"
+    # tmdb used when no imdb on one side
+    t = SubtitleCandidate(provider="opensubtitles", language="en", tmdb_id=27205)
+    assert identity_match(t, tmdb_id=27205) == "match"
+    assert identity_match(t, tmdb_id=603) == "mismatch"
+
+
+def test_identity_match_year_and_unknown():
+    # The Ballerina case: same title, year tells them apart (±1 tolerance).
+    b2025 = SubtitleCandidate(provider="opensubtitles", language="en", year=2025)
+    assert identity_match(b2025, year=2025) == "match"
+    assert identity_match(b2025, year=2024) == "match"        # within tolerance
+    assert identity_match(b2025, year=2023) == "mismatch"     # the wrong Ballerina
+    # No identity on the candidate, or nothing wanted → never judged.
+    bare = SubtitleCandidate(provider="subsource", language="en", release_name="x")
+    assert identity_match(bare, imdb_id="tt1375666", year=2025) == "unknown"
+    assert identity_match(b2025) == "unknown"

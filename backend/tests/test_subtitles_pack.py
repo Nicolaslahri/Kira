@@ -148,11 +148,16 @@ def test_not_confident_when_no_signal():
     assert len(choice.entries) == 3
 
 
-def test_not_confident_on_tie():
-    # Two entries both weakly carry the number 6 → margin 0 → ask.
-    z = _zip({"A - 06.srt": "x", "B - 06.srt": "x"})
+def test_confident_when_variants_of_the_wanted_episode():
+    # Two entries that BOTH explicitly carry the wanted episode (different groups
+    # / a full + signs variant) are EACH correct — take the best, never make the
+    # user choose between equally-right files. (Previously this "tied" and asked,
+    # which is exactly the spurious "choose Episode N" dialog on a single-episode
+    # archive that bundles multiple subtitle files.)
+    z = _zip({"[A] Show - 06.srt": "x", "[B] Show - 06.srt": "x"})
     choice = pack.choose_from_pack(z, season=1, episode=6)
-    assert choice and not choice.confident
+    assert choice and choice.confident
+    assert choice.best.matched
 
 
 def test_single_entry_is_always_confident():
@@ -260,3 +265,63 @@ def test_choose_confident_with_runtime_plus_number():
     choice = pack.choose_from_pack(z, season=1, episode=6, target_seconds=1420)
     assert choice and choice.confident
     assert "06" in choice.best.name
+
+
+# ── episode_match: candidate-level episode matching (both S/E + absolute) ──
+def test_episode_match_absolute_anime():
+    # Absolute-numbered anime: the right number matches; the resolution "1080p"
+    # is denoised so it can't masquerade as episode 1080.
+    m = lambda n, **k: pack.episode_match(n, season=k.get("s"), episode=k.get("e"), absolute=k.get("a"))
+    assert m("[SubsPlease] One Piece - 1080 (1080p) [F00D].srt", a=1080, e=8, s=21) == "match"
+    assert m("[Erai-raws] Show - 09 [720p].srt", a=9) == "match"          # zero-pad
+    # A different absolute we can't read as a small token → not buried (unknown),
+    # but the right one still wins via its boost.
+    assert m("[SubsPlease] One Piece - 1079.srt", a=1080, e=8, s=21) == "unknown"
+
+
+def test_episode_match_tv_sxe_and_mismatch():
+    m = lambda n, **k: pack.episode_match(n, season=k.get("s"), episode=k.get("e"), absolute=k.get("a"))
+    assert m("Show.S02E05.1080p.WEB-DL.srt", s=2, e=5) == "match"
+    assert m("Show.S02E06.1080p.srt", s=2, e=5) == "mismatch"        # explicit wrong ep
+    assert m("Show.S03E05.srt", s=2, e=5) == "mismatch"             # wrong season
+    assert m("Show - 05 - The Title.srt", s=1, e=5) == "match"      # "- 05 -" token
+    assert m("Show - 06 - Other.srt", s=1, e=5) == "mismatch"
+
+
+def test_episode_match_conservative_cases():
+    m = lambda n, **k: pack.episode_match(n, season=k.get("s"), episode=k.get("e"), absolute=k.get("a"))
+    # CRC32 hash must NOT read as an absolute episode (the C47E → "47" trap).
+    assert m("[RaX]Nana_-_33_-_[D383C47E].srt", a=47) == "unknown"
+    assert m("[RaX]Nana_-_33_-_[D383C47E].srt", a=33) == "match"
+    # Season pack / range names no single episode → never a mismatch.
+    assert m("One Piece 1075-1100 [batch].srt", a=1080, e=8) == "unknown"
+    assert m("Attack on Titan Season 2 Complete.srt", s=2, e=5) == "unknown"
+    # On an absolute show we don't trust a stray S/E token → never bury it.
+    assert m("Show S05E12 random.srt", a=1080, e=8, s=21) == "unknown"
+    # No episode info at all, and no signal we can use.
+    assert m("Random.Movie.2025.1080p.srt", s=None, e=None, a=None) == "unknown"
+
+
+def test_episode_match_fansub_format():
+    # The "[Group] Title - NN [tags]" anime release form — the common case the
+    # old parser missed entirely (every Gachiakuta row scored an identical 49).
+    m = lambda n, **k: pack.episode_match(n, season=k.get("s"), episode=k.get("e"), absolute=k.get("a"))
+    assert m("[Erai-raws] Gachiakuta - 04 [1080p CR WEBRip HEVC AAC]", e=4, s=1) == "match"
+    assert m("[Erai-raws] Gachiakuta - 06 [1080p CR WEBRip HEVC AAC]", e=4, s=1) == "mismatch"  # TV → buried
+    # anime (absolute in play) → boost the right one, don't bury the rest
+    assert m("[Erai-raws] Gachiakuta - 04 [1080p]", e=4, s=1, a=4) == "match"
+    assert m("[Erai-raws] Gachiakuta - 06 [1080p]", e=4, s=1, a=4) == "unknown"
+
+
+def test_is_likely_pack():
+    # A single fansub episode (file-count > 1 from a bundled srt+ass) is NOT a
+    # pack — the old `files > 1` rule flagged every one as a "SEASON PACK".
+    assert pack.is_likely_pack("[Erai-raws] Gachiakuta - 04 [1080p CR WEBRip HEVC AAC]", 3) is False
+    assert pack.is_likely_pack("Gachiakuta.S01E04.WEB-DL", 1) is False
+    # Genuine packs — range, batch, complete, season.
+    assert pack.is_likely_pack("[Erai-raws] Gachiakuta 01-12 [batch]", 12) is True
+    assert pack.is_likely_pack("Attack on Titan Season 2 Complete", 25) is True
+    assert pack.is_likely_pack("Nana (Complete Series)", 47) is True
+    # Ambiguous name → fall back to the provider's file count.
+    assert pack.is_likely_pack("Gachiakuta", 8) is True
+    assert pack.is_likely_pack("Gachiakuta", 1) is False

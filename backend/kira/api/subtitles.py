@@ -396,12 +396,15 @@ async def extract_pack_entry(body: PackExtractBody, session: AsyncSession = Depe
 @router.post("/pack/harvest", response_model=dict)
 async def harvest_pack(body: PackHarvestBody, session: AsyncSession = Depends(get_session)) -> dict:
     """User OPTED IN to fill the rest of the season from the pack they just
-    downloaded — extract every sibling episode's subtitle from the cached pack
-    (no re-download). Returns how many were saved. Coverage chips clear for all
-    of them. If the pack already aged out of cache, returns 0 (re-pick to warm
-    it). Never mass-patches without this explicit call."""
+    downloaded — extract every sibling episode's subtitle from the pack. Reuses
+    the cached archive when warm; if it has aged out of the short-lived cache it
+    is re-fetched ONCE (one download still covers the whole season). Returns how
+    many were saved; coverage chips clear for all of them. Never mass-patches
+    without this explicit call."""
+    from kira import net
     from kira.subtitles.backfill import harvest_from_cached_pack
     mf = await _file_with_matches(session, body.file_id)
     saved = await harvest_from_cached_pack(
-        session, mf, body.provider, body.ref, body.language.lower())
+        session, mf, body.provider, body.ref, body.language.lower(),
+        client=net.shared_client())
     return {"harvested": saved}

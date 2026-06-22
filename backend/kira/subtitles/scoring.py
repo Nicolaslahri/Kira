@@ -2,20 +2,26 @@
 sync-confidence verdict, so the picker chooses the BEST (not the first) and the
 UI can explain why. Pure + deterministic; the whole point is transparency.
 
-The model, roughly (Bazarr-informed):
-  base 30
-  + hash match (OpenSubtitles moviehash) ......... +40   → sync GUARANTEED
-  + embedded (the file's own track) .............. +40   → sync GUARANTEED
-  + exact episode (not guessed from a pack) ...... +10
-  + release-group match ([Moozzi2] == [Moozzi2]) . +12   → sync LIKELY
-  + source match (BluRay / WEB-DL / …) ........... +8
-  + resolution match (1080p / 2160p / …) ......... +6
+The model. The base is deliberately generous: a right-language candidate from a
+real provider is a legitimate pick, so CORRECTNESS sets a healthy floor and
+release-affinity only REFINES it (matching the exact release is a SYNC hint, not
+a correctness signal — a different-release sub is still the right subtitle). The
+aggregator layers episode/film confirmation on top and buries CONFIRMED-wrong
+content; here we just rank a plausible candidate by how perfectly it'll line up.
+  base 45
+  + embedded (the file's own track) .............. +55   → 100, sync GUARANTEED
+  + hash match (OpenSubtitles moviehash) ......... +50   → ~95, sync GUARANTEED
+  + release-group match ([Moozzi2] == [Moozzi2]) . +9          → sync LIKELY
+  + source match (BluRay / WEB-DL / …) ........... +5
+  + resolution match (1080p / 2160p / …) ......... +4
   + codec match (x265 / x264 / …) ................ +2
-  + community downloads (log-scaled) ............. up to +8
-  + community rating ............................. up to +6
+  − season pack (needs extraction; prefer a single) −6
+  + community downloads (log-scaled) ............. up to +7
+  + community rating ............................. up to +5
   + matches your hearing-impaired preference ..... +4 / -3 mismatch
   + matches your forced preference ............... +4 / -3 mismatch
-  capped at 100.
+  capped 0–100. The episode-match (+16 / −50) and movie-identity (+12 / −60)
+  passes live in aggregate.gather_candidates — they need the wanted ids/episode.
 
 `sync`:
   guaranteed — hash match or embedded track
@@ -126,23 +132,23 @@ def score_candidate(
 ) -> SubtitleCandidate:
     """Score `cand` against `video` + prefs. Mutates and returns it (sets
     score/reasons/sync)."""
-    score = 30
+    score = 45
     reasons: list[str] = []
     sync = "unknown"
 
     if cand.from_embedded:
-        score += 40
+        score += 55   # the file's own track is definitionally perfect → 100
         sync = "guaranteed"
         reasons.append("embedded track (perfect sync)")
     elif cand.hash_match:
-        score += 40
+        score += 50   # made for THIS exact file → guaranteed sync, ~95
         sync = "guaranteed"
         reasons.append("hash-matched (perfect sync)")
 
     rel = cand.release_name or ""
     if rel and not cand.from_embedded:
         if video.group and _group(rel) == video.group:
-            score += 12
+            score += 9
             reasons.append(f"release group [{video.group}]")
             if sync == "unknown":
                 sync = "likely"
@@ -151,10 +157,10 @@ def score_candidate(
         _res_m = _RES_RE.search(rel)
         res_match = bool(video.resolution and _res_m and _res_m.group(1).lower() == video.resolution)
         if src_match:
-            score += 8
+            score += 5
             reasons.append(f"source {video.source}")
         if res_match:
-            score += 6
+            score += 4
             reasons.append(video.resolution)
         if src_match and res_match and sync == "unknown":
             sync = "likely"
@@ -163,19 +169,22 @@ def score_candidate(
             score += 2
             reasons.append(video.codec)
 
+    # A pack is a valid candidate (it CONTAINS the episode — the pack ranker
+    # extracts it), just less direct than a single-episode sub, so a mild nudge
+    # rather than the old flat "+10 = this episode" (which fired for ANY non-pack,
+    # right episode or not — the episode-match pass now does that honestly).
     if cand.is_pack:
+        score -= 6
         reasons.append("from season pack")
-    elif not cand.from_embedded:
-        score += 10  # an entry that's explicitly this episode
 
     if cand.downloads > 0:
-        # log-scaled: ~1k downloads ≈ +6, 10k ≈ +8 (capped)
-        bonus = min(8, int(math.log10(cand.downloads + 1) * 2))
+        # log-scaled trust tiebreaker: ~1k downloads ≈ +5, 10k ≈ +7 (capped)
+        bonus = min(7, int(math.log10(cand.downloads + 1) * 1.75))
         if bonus:
             score += bonus
             reasons.append(f"{cand.downloads:,} downloads")
     if cand.rating is not None and cand.rating > 0:
-        bonus = int(round(cand.rating * 6))
+        bonus = int(round(cand.rating * 5))
         if bonus:
             score += bonus
             reasons.append(f"rated {int(round(cand.rating * 100))}%")
@@ -197,6 +206,32 @@ def score_candidate(
     cand.reasons = reasons
     cand.sync = sync
     return cand
+
+
+def _digits(v) -> str | None:
+    """The bare numeric core of an id ('tt1375666' / 1375666 / 'tt0133093' →
+    '1375666' / '133093') for robust cross-provider comparison. Pure."""
+    if v is None:
+        return None
+    s = "".join(ch for ch in str(v) if ch.isdigit()).lstrip("0")
+    return s or None
+
+
+def identity_match(cand: SubtitleCandidate, *, imdb_id=None, tmdb_id=None,
+                   year: int | None = None) -> str:
+    """Compare a candidate's provider-reported FILM identity to the wanted movie.
+    Returns "mismatch" (a confirmed WRONG film — id or year clearly differs),
+    "match" (confirmed same film), or "unknown" (can't tell). Conservative: it
+    only judges on a signal BOTH sides carry, strongest-first (imdb > tmdb >
+    year), so a candidate with no identity is never penalized. Pure."""
+    want_i, cand_i = _digits(imdb_id), _digits(getattr(cand, "imdb_id", None))
+    if want_i and cand_i:
+        return "match" if want_i == cand_i else "mismatch"
+    if tmdb_id and getattr(cand, "tmdb_id", None):
+        return "match" if int(tmdb_id) == int(cand.tmdb_id) else "mismatch"
+    if year and getattr(cand, "year", None):
+        return "match" if abs(int(cand.year) - int(year)) <= 1 else "mismatch"
+    return "unknown"
 
 
 def rank(candidates: list[SubtitleCandidate], video: ReleaseInfo, **prefs) -> list[SubtitleCandidate]:

@@ -34,6 +34,15 @@ _log = logging.getLogger("kira.fanarttv")
 _BASE = "https://webservice.fanart.tv/v3"
 _UA = KIRA_USER_AGENT
 
+# Kira ships with this fanart.tv PROJECT key so artwork works out of the box.
+# It is a project-level key (semi-public by design — it travels in every Kira
+# distribution), DISTINCT from a user's PERSONAL key. Per fanart.tv's terms a
+# personal key is sent IN ADDITION (as `client_key`) to bypass the 7-day image
+# cache; users add theirs in Settings → Connections, and a power user can also
+# override this project key there. fanart.tv may revoke a project key that's
+# abused, so the caller caches one request per series id across a batch.
+PROJECT_KEY = "65ea71306d2991c9e9efe3ee87526930"
+
 # Local-asset extension per kind. Logos / clear art / disc / character art carry
 # transparency → PNG (Kodi/Jellyfin convention); flat images → JPG.
 EXT_FOR_KIND: dict[str, str] = {

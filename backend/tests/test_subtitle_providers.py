@@ -72,6 +72,26 @@ def test_subsource_movie_id_prefers_imdb_then_season():
     assert parse_movie_id({"data": [{"movieId": 7}]}, imdb_id=None, season=None) == 7
 
 
+def test_subsource_movie_id_year_disambiguates_same_title():
+    # A text search for "Ballerina" returns BOTH the 2023 Korean film and the
+    # 2025 John Wick spinoff. The release YEAR must pick the right one instead of
+    # silently taking rows[0] (which was the wrong-movie bug).
+    payload = {"data": [
+        {"movieId": 23, "imdbId": None, "season": None, "releaseYear": 2023},
+        {"movieId": 25, "imdbId": None, "season": None, "releaseYear": 2025},
+    ]}
+    assert parse_movie_id(payload, imdb_id=None, season=None, year=2025) == 25
+    assert parse_movie_id(payload, imdb_id=None, season=None, year=2023) == 23
+    # no year supplied → legacy fall-through to the first row (back-compat)
+    assert parse_movie_id(payload, imdb_id=None, season=None) == 23
+    # an exact IMDb match still outranks the year tiebreaker
+    p2 = {"data": [
+        {"movieId": 1, "imdbId": "tt0001", "releaseYear": 2025},
+        {"movieId": 2, "imdbId": "tt0002", "releaseYear": 2023},
+    ]}
+    assert parse_movie_id(p2, imdb_id="tt0002", season=None, year=2025) == 2
+
+
 def test_subsource_parse_subtitles_filters_and_maps_fullname_langs():
     payload = {"data": [
         {"subtitleId": 1, "language": "english", "releaseInfo": ["X.S01E05"]},

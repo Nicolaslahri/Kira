@@ -1,0 +1,68 @@
+{
+  "kira_pack": 1,
+  "id": "one-pace",
+  "name": "One Pace",
+  "media_type": "anime",
+  "show": {
+    "title": "One Pace",
+    "aliases": ["One Pace (One Piece fan edit)"],
+    "year": 1999,
+    "poster_url": "https://example.com/one-pace/poster.jpg",
+    "season_posters": {
+      "1": "https://example.com/one-pace/season01-poster.jpg",
+      "2": "https://example.com/one-pace/season02-poster.jpg"
+    },
+    "overview": "A fan re-edit of One Piece that paces out the story by trimming filler and recap."
+  },
+  "match": {
+    "titles": ["One Pace"],
+    "release_groups": ["One Pace"],
+    "filename_regex": "(?i)\\bone[ ._-]?pace\\b"
+  },
+  "episodes": [
+    {
+      "season": 1,
+      "episode": 1,
+      "title": "Romance Dawn 01",
+      "overview": "Luffy sets out to become King of the Pirates.",
+      "match": {
+        "crc32": "a1b2c3d4",
+        "regex": "Romance Dawn 0?1\\b",
+        "release": "[One Pace][Romance Dawn 01]",
+        "arc": "Romance Dawn",
+        "arc_episode": 1
+      },
+      "subs": [
+        {
+          "lang": "en",
+          "url": "https://example.com/one-pace/romance-dawn-01.en.ass",
+          "format": "ass",
+          "sync": "guaranteed",
+          "hi": false,
+          "forced": false
+        }
+      ]
+    },
+    {
+      "season": 1,
+      "episode": 2,
+      "title": "Romance Dawn 02",
+      "match": {
+        "crc32": "deadbeef",
+        "regex": "Romance Dawn 0?2\\b",
+        "arc": "Romance Dawn",
+        "arc_episode": 2
+      }
+    },
+    {
+      "season": 2,
+      "episode": 1,
+      "title": "Orange Town 01",
+      "match": {
+        "regex": "Orange Town 0?1\\b",
+        "arc": "Orange Town",
+        "arc_episode": 1
+      }
+    }
+  ]
+}

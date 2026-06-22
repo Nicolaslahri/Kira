@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -29,6 +30,7 @@ import httpx
 from kira.providers import opensubtitles as _opensubtitles
 from kira.subtitles import _common
 from kira.subtitles import pack as _pack
+from kira.subtitles import searchcache as _searchcache
 from kira.subtitles import subcache as _subcache
 from kira.subtitles import animetosho as _animetosho
 from kira.subtitles import embedded as _embedded
@@ -38,7 +40,7 @@ from kira.subtitles import subsource as _subsource
 from kira.subtitles import yifysubtitles as _yify
 from kira.subtitles.errors import AuthRejected, PackEpisodeMissing, QuotaExceeded
 from kira.subtitles.model import SearchContext, SubtitleCandidate, SubtitleFetchResult
-from kira.subtitles.scoring import ReleaseInfo, score_candidate
+from kira.subtitles.scoring import ReleaseInfo, identity_match, score_candidate
 
 _log = logging.getLogger("kira.subtitles.aggregate")
 
@@ -73,17 +75,45 @@ def _embedded_langs(parsed) -> list[str]:
     return [str(x) for x in val] if isinstance(val, (list, tuple)) else []
 
 
+async def _cached_search(name: str, mod, client: httpx.AsyncClient,
+                         ctx: SearchContext) -> list:
+    """One provider search, served from the short-lived result cache when the
+    same query ran recently (a backfill loops a whole season; the browse modal
+    reopens). A miss runs the live search and stores it. Errors PROPAGATE to the
+    caller — so a Quota/Auth stop still halts the batch — and are never cached."""
+    key = _searchcache.signature(name, ctx)
+    cached = _searchcache.get(key)
+    if cached is not None:
+        return cached
+    result = await mod.search(client, ctx)
+    _searchcache.put(key, result)
+    return result
+
+
 async def gather_candidates(
     client: httpx.AsyncClient, ctx: SearchContext, enabled: dict[str, bool],
 ) -> list[SubtitleCandidate]:
     """Search every enabled external provider concurrently and return all
     candidates, SCORED against the video. Pure-ish (network only); used by both
-    the auto-pick flow and the manual browse-and-pick endpoint."""
+    the auto-pick flow and the manual browse-and-pick endpoint. Provider calls go
+    through a short-lived result cache, so repeated queries (backfill loop,
+    reopened browse modal) don't re-hit the network."""
+    # Query variants. THOROUGH mode adds a second search by the cour-local S/E
+    # for ambiguous anime (we know an absolute number AND a different cour
+    # episode), so we catch subs a provider filed under EITHER numbering — the
+    # absolute=None twin forces the providers' season/episode path. The merge +
+    # dedupe + episode_match passes below (run on the ORIGINAL ctx) reconcile the
+    # two result sets.
+    query_ctxs = [ctx]
+    if (ctx.thorough and ctx.media_type == "anime" and ctx.absolute is not None
+            and ctx.episode is not None and ctx.episode != ctx.absolute):
+        query_ctxs.append(replace(ctx, absolute=None))
     tasks = []
     for name, mod in _EXTERNAL:
         if not enabled.get(name):
             continue
-        tasks.append(mod.search(client, ctx))
+        for qctx in query_ctxs:
+            tasks.append(_cached_search(name, mod, client, qctx))
     if not tasks:
         return []
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -101,8 +131,57 @@ async def gather_candidates(
     video = ReleaseInfo.from_video(os.path.basename(ctx.video_path), ctx.parsed)
     for c in cands:
         score_candidate(c, video, want_hi=ctx.hearing_impaired, want_forced=ctx.forced)
+    # Episode-match pass — the scorer ranks on release pedigree but never checks
+    # the EPISODE NUMBER, and some providers (SubSource) return the whole season
+    # unfiltered. Read EVERY candidate's release name and match it against BOTH
+    # the cour-local S/E and the anime absolute number — boost the right episode,
+    # bury a clearly-wrong one. Run it on packs too: a genuine multi-episode pack
+    # name (range / complete / season) yields "unknown" via episode_match's own
+    # guard so it stays neutral, while a single-episode result a provider
+    # MISLABELED as a pack ("[Erai-raws] Show - 04") still ranks correctly.
+    if ctx.episode is not None or ctx.absolute is not None:
+        for c in cands:
+            verdict = _pack.episode_match(
+                c.release_name, season=ctx.season, episode=ctx.episode, absolute=ctx.absolute)
+            if verdict == "match":
+                c.score = min(100, c.score + 16)
+                c.reasons.append("matches the requested episode")
+                if c.sync == "unknown":
+                    c.sync = "likely"
+            elif verdict == "mismatch":
+                c.score = max(0, c.score - 50)
+                c.reasons.append("names a different episode")
+    # Movie identity gate — a candidate whose provider-reported FILM identity
+    # (imdb/tmdb id, or year) clearly differs from the title we matched is the
+    # WRONG MOVIE (Ballerina 2023 vs 2025), however good its release looks. Only
+    # OpenSubtitles reports this today; fires only on a KNOWN mismatch. Movies
+    # only — for episodes the feature id is the episode's (not the series'), and
+    # the episode-match pass already covers TV/anime.
+    if ctx.media_type == "movie":
+        for c in cands:
+            verdict = identity_match(c, imdb_id=ctx.imdb_id, tmdb_id=ctx.tmdb_id, year=ctx.year)
+            if verdict == "mismatch":
+                c.score = max(0, c.score - 60)
+                c.reasons.append("different film")
+            elif verdict == "match":
+                c.score = min(100, c.score + 12)
+                c.reasons.append("confirmed title")
     cands.sort(key=lambda c: c.score, reverse=True)
-    return cands
+    # Dedupe near-identical candidates surfaced by multiple providers (same
+    # language + same release string), keeping the highest-scored — a shorter,
+    # cleaner pick menu. Candidates with NO release string can't be compared, so
+    # they're all kept (never collapse distinct subs that merely lack a name).
+    seen: set = set()
+    deduped: list[SubtitleCandidate] = []
+    for c in cands:
+        rel = " ".join((c.release_name or "").lower().split())
+        if rel:
+            key = (c.language, rel)
+            if key in seen:
+                continue
+            seen.add(key)
+        deduped.append(c)
+    return deduped
 
 
 async def fetch_subtitles(

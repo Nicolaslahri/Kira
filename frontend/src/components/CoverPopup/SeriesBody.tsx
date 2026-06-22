@@ -20,6 +20,9 @@ interface SeriesBodyProps {
   recentlyImported?: Map<number, number>;
   /** Toast handler threaded down to DownloadProgressRow's "Force import". */
   pushToast?: (toast: { title: string; sub?: string; kind?: 'success' | 'error' }) => void;
+  /** Request a single missing episode from Sonarr (background search) — set
+   *  only for Sonarr-eligible series; threaded to each missing-episode row. */
+  onRequestEpisode?: (episode: number) => void;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -38,7 +41,7 @@ interface SeriesBodyProps {
 // ─────────────────────────────────────────────────────────────────────
 export function SeriesBody({
   item, rows, updateFile, onManualSearch, onOpenDupeModal,
-  episodesLoading, queueByEpisode, recentlyImported, pushToast,
+  episodesLoading, queueByEpisode, recentlyImported, pushToast, onRequestEpisode,
 }: SeriesBodyProps) {
   // ── Adaptive missing-episode collapse (the One Piece "1090 blank rows") ──
   // A "blank" row is an episode with no file. For a normal season that's a
@@ -189,6 +192,7 @@ export function SeriesBody({
         queueEntry={qEntry}
         justImported={justImported}
         pushToast={pushToast}
+        onRequestEpisode={onRequestEpisode}
         staggerIndex={i}
       />,
     );

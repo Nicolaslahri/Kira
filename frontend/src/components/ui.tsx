@@ -145,6 +145,7 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
     { key: 'connections', label: 'Connections', group: 'Sources & library' },
     { key: 'paths', label: 'Library & paths' },
     { key: 'integrations', label: 'Integrations' },
+    { key: 'packs', label: 'Packs' },
     { key: 'matching', label: 'Matching', group: 'Identification' },
     { key: 'naming', label: 'Naming & format', group: 'Output' },
     { key: 'subtitles', label: 'Subtitles' },

@@ -1020,9 +1020,18 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
       } else if (members.every(m => hasYear(m.title || ''))) {
         for (const m of members) titleById.set(m.id, m.title || base);
       } else {
-        [...members]
-          .sort((a, b) => titleYear(a.title || '') - titleYear(b.title || ''))
-          .forEach((m, i) => titleById.set(m.id, `${base} Part ${i + 1}`));
+        // Same title, DISTINCT seasons (a pack's arcs, or a multi-season show
+        // all titled identically) → label by the real SEASON number, which is
+        // meaningful and stable. Only fall back to a chronological "Part N" when
+        // seasons collide or are missing (AniDB split-season cours).
+        const seasons = members.map(m => (typeof m.season === 'number' ? m.season : null));
+        if (seasons.every(s => s != null) && new Set(seasons).size === members.length) {
+          for (const m of members) titleById.set(m.id, `${base} Season ${m.season}`);
+        } else {
+          [...members]
+            .sort((a, b) => titleYear(a.title || '') - titleYear(b.title || ''))
+            .forEach((m, i) => titleById.set(m.id, `${base} Part ${i + 1}`));
+        }
       }
     }
     const displayTitleFor = (it: LibraryItem): string =>

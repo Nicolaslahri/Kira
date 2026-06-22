@@ -32,6 +32,22 @@ def test_candidates_language_filter() -> None:
     assert [c["file_id"] for c in cands] == [333]
 
 
+def test_candidates_carry_feature_identity() -> None:
+    # feature_details (imdb/tmdb/year) must survive onto the candidate so the
+    # aggregator's movie-identity gate can reject a wrong film.
+    payload = {"data": [{"attributes": {
+        "language": "en", "files": [{"file_id": 7}], "release": "WEB",
+        "feature_details": {"feature_type": "Movie", "imdb_id": 1375666,
+                            "tmdb_id": 27205, "year": 2010},
+    }}]}
+    c = osub.parse_subtitle_candidates(payload)[0]
+    assert c["imdb_id"] == 1375666 and c["tmdb_id"] == 27205 and c["year"] == 2010
+    # Missing feature_details degrades gracefully (no identity, not a crash).
+    bare = {"data": [{"attributes": {"language": "en", "files": [{"file_id": 8}]}}]}
+    cb = osub.parse_subtitle_candidates(bare)[0]
+    assert cb["imdb_id"] is None and cb["tmdb_id"] is None and cb["year"] is None
+
+
 def test_candidates_skip_entries_without_files() -> None:
     payload = {"data": [{"attributes": {"language": "en", "files": []}}]}
     assert osub.parse_subtitle_candidates(payload) == []

@@ -73,6 +73,10 @@ Thumbs.db
 *.bak
 .ui-design/
 
+# ── Vendored UI reference (a third-party Next.js starter kept locally for
+#    design reference; not part of Kira and not for the repo) ────────────
+untitledui-nextjs-starter-kit/
+
 # ── Recovered planning journal (local working notes; not for the repo) ──
 PLAN.md
 
@@ -81,3 +85,8 @@ PLAN.md
 #  keep them; they're tiny and useful for `pytest`. If you ever add
 #  REAL media files there, uncomment the next line.)
 # test-media/
+
+# ── Full generated One Pace pack (the canonical copy is hosted at
+#    github.com/Nicolaslahri/one-pace-for-kira; only the minimal
+#    one-pace.example.json belongs in this repo) ───────────────────────
+docs/examples/one-pace.json

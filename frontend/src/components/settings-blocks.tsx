@@ -451,6 +451,9 @@ export interface ProviderFieldProps {
   label: string;
   value?: string;
   placeholder?: string;
+  /** Filled-looking masked display for a SAVED secret, shown while the field is
+   *  locked so a configured key reads as "set" instead of blank. */
+  lockedDisplay?: string;
   options?: string[];
   mono?: boolean;
   desc?: string;
@@ -462,7 +465,7 @@ export interface ProviderFieldProps {
   disabledReason?: string;
 }
 
-export function ProviderField({ kind = 'text', label, value, placeholder, options, mono, desc, onSave, disabled = false, disabledReason }: ProviderFieldProps) {
+export function ProviderField({ kind = 'text', label, value, placeholder, lockedDisplay, options, mono, desc, onSave, disabled = false, disabledReason }: ProviderFieldProps) {
   const [text, setText] = useState(value ?? '');
   const [on, setOn] = useState(value !== 'false');
   const [show, setShow] = useState(false);
@@ -525,6 +528,7 @@ export function ProviderField({ kind = 'text', label, value, placeholder, option
         editGate
         type={isPassword && !show ? 'password' : 'text'}
         value={text}
+        lockedDisplay={lockedDisplay}
         aria-label={label}
         disabled={disabled}
         onChange={e => setText(e.target.value)}

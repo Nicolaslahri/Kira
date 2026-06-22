@@ -248,3 +248,26 @@ describe('buildLibraryItems — grid clustering', () => {
     expect(items[0].files[0].missingSubs).toEqual(['en']);
   });
 });
+
+describe('buildLibraryItems — pack clustering (One Pace)', () => {
+  const packEp = (id: number, season: number, ep: number) => epFile(
+    { id, media_type: 'anime', file_path: `/m/One Pace/s${season}e${ep}.mp4` },
+    { provider: 'pack', provider_id: `one-pace:${season}:${ep}`,   // per-EPISODE provider_id
+      series_group_id: 'pack:one-pace:abc', season_number: season, episode_number: ep, title: 'One Pace' },
+  );
+
+  it('groups one arc into ONE card despite the per-episode provider_id', () => {
+    // Romance Dawn = 4 files, same series_group_id + season → ONE card with 4
+    // episodes (the bug made 4 "One Pace Part N" cards).
+    const items = buildLibraryItems([1, 2, 3, 4].map(ep => packEp(ep, 1, ep)));
+    expect(items).toHaveLength(1);
+    expect(items[0].episodes).toHaveLength(4);
+    expect(items[0].season).toBe(1);
+  });
+
+  it('still gives each distinct arc its own card', () => {
+    const items = buildLibraryItems([packEp(1, 1, 1), packEp(2, 1, 2), packEp(3, 2, 1)]);
+    expect(items).toHaveLength(2);                                  // S1 (2 eps) + S2 (1 ep)
+    expect(items.map(i => i.episodes.length).sort()).toEqual([1, 2]);
+  });
+});

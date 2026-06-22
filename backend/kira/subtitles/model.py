@@ -26,8 +26,10 @@ class SearchContext:
     tmdb_id: int | None = None
     imdb_id: Any = None
     anidb_id: int | None = None
+    year: int | None = None               # release year — disambiguates same-title films (Ballerina 2023 vs 2025)
     season: int | None = None
     episode: int | None = None
+    absolute: int | None = None           # anime absolute episode number (for absolute-numbered shows)
     # The matched provider's episode TITLE ("The Rains of Castamere") — used to
     # pull the right entry out of a season pack by name when the number is
     # absent/ambiguous inside the archive.
@@ -47,6 +49,10 @@ class SearchContext:
     # Minimum acceptable score (0 = no floor). A best candidate below this is
     # NOT saved — better no sub than a likely-wrong one.
     min_score: int = 0
+    # Thorough search: also query the cour-local S/E (in addition to absolute)
+    # for ambiguous anime, so we find subs filed under EITHER numbering. The
+    # aggregator's merge/dedupe/episode_match reconcile the two result sets.
+    thorough: bool = True
 
 
 @dataclass
@@ -67,6 +73,13 @@ class SubtitleCandidate:
     is_pack: bool = False          # season pack → exact episode was guessed
     from_embedded: bool = False    # the file's OWN track — perfect sync
 
+    # Provider-reported FILM identity (OpenSubtitles `feature_details`) — lets the
+    # aggregator catch a WRONG-MOVIE candidate (Ballerina 2023 vs 2025). Absent
+    # for providers that don't return structured identity.
+    imdb_id: Any = None
+    tmdb_id: int | None = None
+    year: int | None = None
+
     # Filled by the scorer:
     score: int = 0
     reasons: list[str] = field(default_factory=list)
@@ -85,6 +98,7 @@ class SubtitleCandidate:
             "forced": self.forced,
             "is_pack": self.is_pack,
             "from_embedded": self.from_embedded,
+            "year": self.year,
             "score": self.score,
             "reasons": self.reasons,
             "sync": self.sync,

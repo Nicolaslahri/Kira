@@ -70,6 +70,22 @@ export function maskHint(s: Record<string, unknown>, key: string): string | unde
 }
 
 /**
+ * A filled-looking masked display for a SAVED secret, shown in place of the
+ * empty input while the field is locked (not being edited) — so a configured
+ * key reads as "set" (like the URL field shows its value) instead of looking
+ * blank: e.g. `•••• •••• •••• b2d2`. The bullets are DISPLAY-only (never the
+ * editable value), so the no-bullets-in-value rule that keeps saving working is
+ * untouched. Returns undefined when nothing is saved, or when the value is a
+ * just-typed plaintext string (which renders normally on its own).
+ */
+export function maskValue(s: Record<string, unknown>, key: string): string | undefined {
+  if (!isMasked(s, key) || !secretSet(s, key)) return undefined;
+  // Passwords: never surface the last-4 (more sensitive than an API-key tail).
+  const tail = /password|passwd/i.test(key) ? '' : maskTail(s, key);
+  return tail ? `•••• •••• •••• ${tail}` : '•••• •••• •••• ••••';
+}
+
+/**
  * Best-effort human label for a dotted settings key. Used as the unsaved-changes
  * bar's fallback for controls that aren't a {@link SettingRow} (sliders,
  * comma-lists) and so can't have their real label harvested from the DOM.

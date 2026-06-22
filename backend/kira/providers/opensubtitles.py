@@ -149,6 +149,11 @@ def parse_subtitle_candidates(payload: dict[str, Any], languages: list[str] | No
         fid = files[0].get("file_id") if isinstance(files[0], dict) else None
         if fid is None:
             continue
+        # Film identity, so the aggregator can reject a wrong-movie match. For a
+        # movie feature these are the film's own ids/year; episodes carry the
+        # episode's (the gate is movies-only, so that's fine).
+        feat = attrs.get("feature_details")
+        feat = feat if isinstance(feat, dict) else {}
         out.append({
             "file_id": fid,
             "language": lang or "en",
@@ -157,6 +162,9 @@ def parse_subtitle_candidates(payload: dict[str, Any], languages: list[str] | No
             "release": attrs.get("release") or "",
             "hearing_impaired": attrs.get("hearing_impaired") is True,
             "forced": attrs.get("foreign_parts_only") is True,
+            "imdb_id": feat.get("imdb_id"),
+            "tmdb_id": _safe_int(feat.get("tmdb_id")),
+            "year": _safe_int(feat.get("year")),
         })
     out.sort(key=lambda c: (c["moviehash_match"], c["downloads"]), reverse=True)
     return out
@@ -495,10 +503,20 @@ async def search(client: httpx.AsyncClient, ctx) -> list:
     except Exception:
         pass
     tmdb_id = ctx.tmdb_id
+    # Anime is usually indexed by ABSOLUTE episode (One Piece #1080), not the
+    # cour-local SxxEyy AniDB carries — searching by the cour number misses. When
+    # we have an absolute number for anime, query by it with no season. Guarded
+    # by `absolute` presence (set only for genuinely absolute-numbered files), so
+    # seasonal shows keep the normal season/episode path. (The moviehash search
+    # still runs first and wins on an exact match regardless.)
+    if ctx.media_type == "anime" and ctx.absolute is not None:
+        os_season, os_episode = None, ctx.absolute
+    else:
+        os_season, os_episode = ctx.season, ctx.episode
     raw = await osc.search(
         moviehash=moviehash, moviebytesize=bytesize,
         tmdb_id=tmdb_id, imdb_id=ctx.imdb_id,
-        season=ctx.season, episode=ctx.episode,
+        season=os_season, episode=os_episode,
         query=ctx.query if not (tmdb_id or ctx.imdb_id) else None,
         languages=ctx.languages,
         hearing_impaired=ctx.hearing_impaired or None,
@@ -511,6 +529,7 @@ async def search(client: httpx.AsyncClient, ctx) -> list:
             release_name=c.get("release") or "", download_ref=c["file_id"],
             downloads=c.get("downloads") or 0, hash_match=c.get("moviehash_match", False),
             hearing_impaired=c.get("hearing_impaired", False), forced=c.get("forced", False),
+            imdb_id=c.get("imdb_id"), tmdb_id=c.get("tmdb_id"), year=c.get("year"),
         ))
     return out
 

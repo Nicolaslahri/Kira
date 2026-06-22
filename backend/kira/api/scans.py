@@ -1817,6 +1817,31 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
         bucket = mf.series_key if mf.series_key else fid
         clusters[bucket].append(fid)
 
+    # ── Kira Packs: OVERRIDE pre-pass ───────────────────────────────────────
+    # A folder-scoped `override` pack may win over the providers, so it runs
+    # BEFORE matching. Claimed files get their pack Match written here and are
+    # excluded from provider dispatch (otherwise the dispatcher's
+    # detach_and_delete_matches would wipe the pack row we just wrote). Skipped
+    # entirely when no override pack is installed (the common case). The far
+    # more common FALLBACK path runs later, only for files that ended no_match.
+    overridden: set[int] = set()
+    try:
+        from kira.packs.apply import any_override_bindings, try_pack_override
+        if await any_override_bindings(session):
+            for fid in fids:
+                mf = await session.get(MediaFile, fid)
+                if mf is None or not mf.parsed_data:
+                    continue
+                try:
+                    if await try_pack_override(session, fid, mf):
+                        overridden.add(fid)
+                except Exception as e:
+                    logger.warning(f"_match_phase: pack override failed for {fid}: {e!r}")
+            if overridden:
+                await session.commit()
+    except Exception as e:
+        logger.warning(f"_match_phase: pack override pre-pass failed (non-fatal): {e!r}")
+
     # NOTE: tech-tag MediaInfo enrichment does NOT run here anymore. Reading a
     # file's container headers is a slow NAS round-trip per file; doing it on the
     # match critical path made matching crawl whenever `parsing.read_mediainfo`
@@ -1844,10 +1869,14 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
         await session.commit()
         await asyncio.sleep(0)
 
-        if isinstance(bucket_key, str) and len(cfids) >= 2:
-            await _match_cluster(session, engine, cfids)
-        else:
-            await _match_singleton(session, engine, cfids[0])
+        # Files an override pack already claimed are NOT re-dispatched — the
+        # dispatcher clears matches first, which would discard the pack row.
+        dispatch_fids = [f for f in cfids if f not in overridden] if overridden else cfids
+        if dispatch_fids:
+            if isinstance(bucket_key, str) and len(dispatch_fids) >= 2:
+                await _match_cluster(session, engine, dispatch_fids)
+            else:
+                await _match_singleton(session, engine, dispatch_fids[0])
 
         # Resolve "which files got a match" and "their selected provider" in
         # TWO grouped queries for the whole cluster, instead of 1-2 SELECTs per
@@ -1908,7 +1937,27 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
                             mf.media_type = "anime"  # at least fix the grouping
                             logger.warning(f"_match_phase: media_type correction key recompute failed for {fid}: {e!r}")
             elif mf and mf.status == "matching":
-                mf.status = "no_match"
+                # ── Kira Packs: FALLBACK rescue ─────────────────────────────
+                # Last chance before no_match: a community pack (One Pace, etc.)
+                # may claim this file the providers couldn't place. This is the
+                # ONLY seam where a pack touches matching — so a pack can never
+                # alter a title the providers already matched (isolation).
+                rescued = False
+                try:
+                    from kira.packs.apply import try_pack_match
+                    rescued = await try_pack_match(session, fid, mf)
+                except Exception as e:
+                    logger.warning(f"_match_phase: pack fallback failed for {fid}: {e!r}")
+                if rescued:
+                    matched += 1
+                    # Pack matches are authoritative (confidence 1.0): respect
+                    # the same auto-approve threshold as a provider match.
+                    if auto_enabled and 1.0 >= auto_th:
+                        mf.status = "approved"
+                    else:
+                        mf.status = "matched"
+                else:
+                    mf.status = "no_match"
 
         scan = await session.get(Scan, scan_id)
         if scan:

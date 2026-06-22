@@ -191,15 +191,22 @@ async def build_context(session, mf, prefs, languages: list[str]) -> SearchConte
         episode = sel.episode_number
     query = _title_query(sel.title) if sel and sel.title else None
     episode_title = sel.episode_title if sel else None
+    year = sel.year if sel else None
+    absolute = parsed.get("absolute_episode")
+    # An AniDB match is ANIME even if the file was scanned into a `tv` library —
+    # this drives absolute-episode search + the anime fallback chain (a tv-typed
+    # AniDB file otherwise misses absolute-numbered subs entirely).
+    media_type = "anime" if (sel and sel.provider == "anidb") else mf.media_type
     return SearchContext(
-        video_path=mf.file_path, languages=languages, media_type=mf.media_type,
-        query=query, tmdb_id=tmdb_id, imdb_id=imdb_id, anidb_id=anidb_id,
-        season=season, episode=episode, episode_title=episode_title, parsed=parsed,
+        video_path=mf.file_path, languages=languages, media_type=media_type,
+        query=query, tmdb_id=tmdb_id, imdb_id=imdb_id, anidb_id=anidb_id, year=year,
+        season=season, episode=episode, absolute=absolute, episode_title=episode_title, parsed=parsed,
         os_api_key=prefs.api_key, os_user=prefs.username, os_pw=prefs.password,
         subdl_api_key=prefs.subdl_api_key, subsource_api_key=prefs.subsource_api_key,
         hearing_impaired=prefs.hearing_impaired or "", forced=prefs.forced or "",
         blacklist=await _store.load_blacklist(session, mf.id),
         min_score=prefs.min_score_for(mf.media_type),
+        thorough=prefs.thorough_search,
     )
 
 
@@ -246,20 +253,47 @@ async def count_missing_siblings(session, source_mf, language: str) -> int:
     return n
 
 
-async def harvest_from_cached_pack(session, source_mf, provider: str, ref: str, language: str) -> int:
+async def _redownload_pack(session, source_mf, provider: str, ref, language: str, client) -> bytes | None:
+    """Re-fetch a season pack we no longer have in the (short-lived, in-memory)
+    byte cache, so a user-requested harvest still runs instead of silently
+    no-op'ing. Rebuilds the minimal candidate + context from the source file and
+    re-caches on success. Best-effort → None on any failure."""
+    from kira.subtitles.aggregate import download_raw
+    from kira.subtitles.model import SubtitleCandidate
+    from kira.subtitles import pack as _pack
+    try:
+        prefs = await load_subtitle_prefs(session)
+        ctx = await build_context(session, source_mf, prefs, [language])
+        cand = SubtitleCandidate(provider=provider, language=language, download_ref=ref)
+        raw = await download_raw(client, cand, ctx)
+        if raw and _pack.archive_kind(raw):
+            _pack.cache_pack(provider, str(ref), raw)
+            return raw
+    except Exception as e:
+        logger.warning("pack harvest re-download failed (%s:%s): %r", provider, ref, e)
+    return None
+
+
+async def harvest_from_cached_pack(session, source_mf, provider: str, ref: str, language: str,
+                                   *, client=None) -> int:
     """A season pack we downloaded for ONE episode holds subs for the WHOLE
     season — so don't throw the other 23 away. Decompress the cached pack once
     and, for every sibling episode in the same series that's still MISSING this
     language, find its matching entry (same ranker: S/E, absolute, title,
     runtime, group) and save it. One download → the whole season covered, and
     the per-episode coverage chips clear so we never re-query/re-download for
-    them. Best-effort; returns how many extra sidecars it saved. Never raises."""
+    them. If the pack has aged out of the in-memory cache (and a `client` is
+    given), it is re-fetched ONCE — one download still covers the whole season,
+    far cheaper than re-querying per episode. Best-effort; returns how many extra
+    sidecars it saved. Never raises."""
     from kira.subtitles import _common, pack as _pack
     from kira.subtitles.model import SubtitleFetchResult
 
-    lang = (language or "").lower()
+    lang = normalize_lang(language) or (language or "").lower()
     try:
         raw = _pack.get_cached_pack(provider, str(ref))
+        if not raw and client is not None:
+            raw = await _redownload_pack(session, source_mf, provider, ref, lang, client)
         if not raw:
             return 0
         # Decompressing the archive (zip/7z/rar) and scanning every SRT's last
@@ -460,7 +494,9 @@ async def run_subtitle_backfill(file_ids: list[int], *, language_override: list[
                     # sweep then find their sidecar already on disk and skip.
                     for r in results:
                         if r.ref:
-                            extra = await harvest_from_cached_pack(session, mf, r.provider, r.ref, r.language)
+                            extra = await harvest_from_cached_pack(
+                                session, mf, r.provider, r.ref, r.language,
+                                client=net.shared_client())
                             if extra:
                                 summary["saved"] += extra
                 else:

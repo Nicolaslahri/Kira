@@ -692,6 +692,19 @@ export function CoverPopup({
         season,
         episode_numbers: episodeNumbers,
       });
+      if (r.started) {
+        // The Sonarr search now runs in the BACKGROUND (an interactive sub/dub
+        // search hits every indexer and can take ~2 min). Pop the activity pill
+        // immediately — it narrates the outcome, survives closing the popup, and
+        // means the button no longer hangs on "Sending…" or times out as an error.
+        try { window.dispatchEvent(new Event('kira:activity-refresh')); } catch { /* no window */ }
+        notify(
+          'Searching Sonarr…',
+          r.detail ?? 'Watch the activity indicator for the result.',
+          'success',
+        );
+        return;
+      }
       const addedNote = r.series_was_added && r.sonarr_series_title
         ? ` "${r.sonarr_series_title}" added to Sonarr.`
         : '';
@@ -729,6 +742,21 @@ export function CoverPopup({
       setSonarrSending(false);
     }
   }, [sonarrSending, pushToast]);
+
+  // Per-episode Sonarr request — the same gate as the footer "Get missing"
+  // button (series + TVDB/AniDB + a Match id + the provider episode list
+  // loaded), bound to this cluster's match + season. Undefined → the missing-
+  // episode rows keep the plain "—" placeholder (no per-episode Sonarr button).
+  const sonarrRequestEpisode = useMemo<((episode: number) => void) | undefined>(() => {
+    if (clusterIsDead) return undefined;
+    if (item.kind !== 'series') return undefined;
+    if (!(providerKey === 'tvdb' || providerKey === 'anidb')) return undefined;
+    const matchId = item.files.find(f => f.matchId != null)?.matchId;
+    if (matchId == null) return undefined;
+    if (!providerEpisodes || providerEpisodes.length === 0) return undefined;
+    const seasonNum = providerEpisodes[0]?.season ?? 1;
+    return (episode: number) => void handleSonarrSendMissing(matchId, seasonNum, [episode]);
+  }, [clusterIsDead, item.kind, item.files, providerKey, providerEpisodes, handleSonarrSendMissing]);
 
   // Delete-confirmation modal state. null = no modal open.
   const [pendingDelete, setPendingDelete] = useState<LibFile | null>(null);
@@ -1345,6 +1373,7 @@ export function CoverPopup({
                 updateFile={updateFile}
                 onManualSearch={onManualSearch}
                 onOpenDupeModal={(episode, files) => setDupeModal({ episode, files })}
+                onRequestEpisode={sonarrRequestEpisode}
                 // PB-2: skeleton placeholder while the authoritative
                 // episode list is fetching. Without this, the right
                 // column is blank for ~3s on first popup open after

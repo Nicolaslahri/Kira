@@ -482,6 +482,14 @@ export function buildLibraryItems(files: MediaFile[]): LibraryItem[] {
     // of the franchise. (Otherwise all the Marvel movies would collapse.)
     if (f.mediaType === 'movie') {
       key = `__solo_${f.id}`;
+    } else if (f.match?.provider === 'pack' && f.match.seriesGroupId) {
+      // A pack's provider_id is per-EPISODE ("<pack>:<season>:<episode>"), so the
+      // generic `match|provider|providerId|season` key below would give every
+      // episode its own card (76 "One Pace Part N" cards). Cluster by the
+      // SERIES-level group id + season instead, so each arc (a pack "season")
+      // collapses to ONE card with its episodes — Romance Dawn = one card, not 4.
+      const seasonPart = f.match.season != null ? `|s${f.match.season}` : '';
+      key = `pack|${f.match.seriesGroupId}${seasonPart}`;
     } else if (f.match?.provider && f.match.providerId) {
       // Per-season clustering: include the season number so Euphoria
       // S01 / S02 / S03 (all sharing TVDB id 360261) render as 3 cards

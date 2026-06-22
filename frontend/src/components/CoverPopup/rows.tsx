@@ -115,6 +115,10 @@ interface RowCellProps {
   justImported?: boolean;
   /** Toast surface for the stuck-import "Force import" retry button. */
   pushToast?: (toast: { title: string; sub?: string; kind?: 'success' | 'error' }) => void;
+  /** Request THIS missing episode from Sonarr (background search). Set by the
+   *  parent only for Sonarr-eligible series; absent → the row shows the plain
+   *  "—" placeholder instead of a per-episode request button. */
+  onRequestEpisode?: (episode: number) => void;
   /** First-paint stagger index — drives the CSS entrance delay. Only the
    *  first ~24 rows stagger; the rest mount flat (cheap). */
   staggerIndex?: number;
@@ -212,7 +216,7 @@ function badgeContent(
 
 function PairRowCellImpl({
   row, item, updateFile, onManualSearch, onOpenDupeModal,
-  queueEntry, justImported, pushToast, staggerIndex,
+  queueEntry, justImported, pushToast, onRequestEpisode, staggerIndex,
 }: RowCellProps) {
   const { episode: ep, file } = row;
   const fileIdx = file ? item.files.indexOf(file) : -1;
@@ -259,7 +263,19 @@ function PairRowCellImpl({
           <div className="text-[11px] text-quaternary">No file for this {isAlbum ? 'track' : 'episode'}</div>
         </div>
         <div className="flex shrink-0 items-center">
-          <span className="inline-flex items-center rounded-md bg-white/[0.04] px-2 py-0.5 text-[11px] font-medium text-quaternary ring-1 ring-secondary ring-inset">—</span>
+          {onRequestEpisode && typeof ep.episode === 'number' ? (
+            <button
+              type="button"
+              onClick={() => onRequestEpisode(ep.episode)}
+              title="Search Sonarr for just this episode"
+              className="press inline-flex items-center gap-1 rounded-md bg-[var(--accent-8)] px-2 py-1 text-[11px] font-medium text-[var(--accent-bright)] ring-1 ring-inset ring-[var(--accent-line)] transition-colors hover:bg-[var(--accent-12)] [&_svg]:size-3"
+            >
+              <IcDownload />
+              Sonarr
+            </button>
+          ) : (
+            <span className="inline-flex items-center rounded-md bg-white/[0.04] px-2 py-0.5 text-[11px] font-medium text-quaternary ring-1 ring-secondary ring-inset">—</span>
+          )}
         </div>
       </div>
     );

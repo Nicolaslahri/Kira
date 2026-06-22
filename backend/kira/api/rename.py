@@ -1301,7 +1301,11 @@ async def perform_rename(
     # enabled kinds + key ONCE; `_artwork_cache` dedupes the fanart.tv call to one
     # request per series id across a whole season's worth of files.
     artwork_kinds = await _resolve_artwork_kinds(session) if download_artwork else set()
-    fanart_key = await _resolve_str_setting(session, "providers.fanarttv.api_key", "") if download_artwork else ""
+    # The api_key (fanart.tv PROJECT key) defaults to the one Kira ships with, so
+    # artwork works out of the box; a user can override it, and their optional
+    # PERSONAL key (client_key) is sent in addition.
+    from kira.providers import fanarttv as _fanarttv
+    fanart_key = await _resolve_str_setting(session, "providers.fanarttv.api_key", _fanarttv.PROJECT_KEY) if download_artwork else ""
     fanart_client_key = await _resolve_str_setting(session, "providers.fanarttv.client_key", "") if download_artwork else ""
     # Language preference for artwork (logos/posters): reuse the subtitle
     # languages as the "my language" hint, falling back to English.
@@ -1513,6 +1517,22 @@ async def perform_rename(
         # a partial/out-of-order download can't corrupt the numbering). Absolute
         # numbering flattens via {{absx}} below instead, so skip there. Render-only:
         # mutate the local `parsed`, never the stored row.
+        # ── Kira Packs: the pack's numbers are authoritative ─────────────────
+        # A pack claims fan-edits the providers can't place, and its
+        # season/episode ARE the pack author's arc layout — never something to
+        # re-derive through ScudLee (which is AniDB-only and would mangle them).
+        # Pin parsed.episode + season_override to the stored pack values so the
+        # {{s2}}/{{e2}} tokens render exactly what the pack declares. The AniDB
+        # blocks below are gated on provider == "anidb", so they already skip a
+        # pack row; this branch just makes the intent explicit and correct.
+        if (selected.provider or "").lower() == "pack":
+            if selected.season_number is not None:
+                season_override_val = selected.season_number
+            if selected.episode_number is not None:
+                if parsed.episode_end is not None and parsed.episode is not None:
+                    parsed.episode_end = selected.episode_number + (parsed.episode_end - parsed.episode)
+                parsed.episode = selected.episode_number
+
         if (anime_numbering != "absolute"
                 and (selected.provider or "").lower() == "anidb"
                 and selected.provider_id

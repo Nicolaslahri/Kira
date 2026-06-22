@@ -32,6 +32,7 @@ import httpx
 from kira.download_guard import fetch_capped, looks_like_error_page
 from kira.subtitles import _common
 from kira.subtitles.embedded import normalize_lang
+from kira.subtitles.pack import is_likely_pack as _is_likely_pack
 
 _log = logging.getLogger("kira.subtitles.subsource")
 
@@ -68,9 +69,12 @@ def _name_to_2(name: Any) -> str | None:
     return _FROM_NAME.get(key) or normalize_lang(key)
 
 
-def parse_movie_id(payload: Any, *, imdb_id: str | None, season: int | None) -> int | None:
+def parse_movie_id(payload: Any, *, imdb_id: str | None, season: int | None,
+                   year: int | None = None) -> int | None:
     """Pick the best movieId from a /movies/search response. Prefer an exact
-    IMDb match; for TV prefer the row whose `season` matches. Pure."""
+    IMDb match; for TV the row whose `season` matches; then the release YEAR
+    (disambiguates same-title films, e.g. Ballerina 2023 vs 2025); only then the
+    first row. Pure."""
     rows = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(rows, list) or not rows:
         return None
@@ -85,6 +89,13 @@ def parse_movie_id(payload: Any, *, imdb_id: str | None, season: int | None) -> 
     if season is not None:
         for r in rows:
             if r.get("season") == season and r.get("movieId"):
+                return int(r["movieId"])
+    # release-year disambiguation — never silently take a wrong-year same-title
+    # film when a text search returns several "Ballerina"s.
+    if year is not None:
+        for r in rows:
+            ry = r.get("releaseYear")
+            if ry and str(ry).strip() == str(year) and r.get("movieId"):
                 return int(r["movieId"])
     first = rows[0]
     return int(first["movieId"]) if first.get("movieId") else None
@@ -116,7 +127,7 @@ def parse_subtitles(payload: Any, wanted: set[str], *, episode: int | None) -> l
             "downloads": int(r.get("downloads") or 0), "rating": rating,
             "hearing_impaired": bool(r.get("hearingImpaired")),
             "forced": bool(r.get("foreignParts")),
-            "is_pack": (r.get("files") or 1) > 1,
+            "is_pack": _is_likely_pack(release, int(r.get("files") or 1)),
         })
     return out
 
@@ -164,7 +175,7 @@ async def search(client: httpx.AsyncClient, ctx) -> list:
         sr = await client.get(f"{_BASE}/movies/search", params=params,
                               headers=H, timeout=20.0, follow_redirects=True)
         sr.raise_for_status()
-        movie_id = parse_movie_id(sr.json(), imdb_id=ttid, season=ctx.season)
+        movie_id = parse_movie_id(sr.json(), imdb_id=ttid, season=ctx.season, year=ctx.year)
     except Exception as e:
         _log.warning("subsource movie search failed for %s: %r", ctx.video_path, e)
         return []

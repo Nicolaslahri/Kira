@@ -25,6 +25,7 @@ from kira.api import history as history_api
 from kira.api import images as images_api
 from kira.api import integrations as integrations_api
 from kira.api import matches as matches_api
+from kira.api import packs as packs_api
 from kira.api import providers as providers_api
 from kira.api import trash as trash_api
 from kira.api import auth as auth_api
@@ -435,6 +436,7 @@ app.include_router(integrations_api.router, prefix="/api/v1")
 app.include_router(webhooks_api.router, prefix="/api/v1")
 app.include_router(subtitles_api.router, prefix="/api/v1")
 app.include_router(images_api.router, prefix="/api/v1")
+app.include_router(packs_api.router, prefix="/api/v1")
 
 
 # ─────────────────────────────────────────────────────────────────────

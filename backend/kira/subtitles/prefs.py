@@ -91,6 +91,12 @@ class SubtitlePrefs:
     subsource: bool
     subsource_api_key: str | None
     animetosho: bool
+    # Cast a wider net at search time: query providers by EVERY numbering we know
+    # (absolute + season/episode) and merge the results — better recall, anime
+    # especially. Search-only (no extra downloads), and the result cache absorbs
+    # the extra calls, so it's ON by default. Defaulted (last field) so direct
+    # SubtitlePrefs(**base) construction in tests stays valid.
+    thorough_search: bool = True
 
     @property
     def has_key(self) -> bool:
@@ -219,4 +225,5 @@ async def load_subtitle_prefs(session: AsyncSession) -> SubtitlePrefs:
         subsource=_bool(await _val("subtitles.subsource"), False),
         subsource_api_key=await _api_key("providers.subsource.api_key"),
         animetosho=_bool(await _val("subtitles.animetosho"), False),
+        thorough_search=_bool(await _val("subtitles.thorough_search"), True),
     )

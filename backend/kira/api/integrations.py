@@ -125,15 +125,6 @@ async def _load_sonarr_config(
     if not isinstance(series_type, str) or not series_type:
         series_type = "anime" if is_anime else "standard"
 
-    # Audio preference for grabs (sub / dub / any). Section-specific first, then
-    # global fallback. Drives whether send_missing does an interactive
-    # release-pick (sub/dub) or Sonarr's default auto-search (any).
-    audio_pref = await _resolve_setting(session, f"integrations.sonarr.{section}.audio_preference")
-    if audio_pref is None:
-        audio_pref = await _resolve_setting(session, "integrations.sonarr.audio_preference")
-    if audio_pref not in ("sub", "dub", "any"):
-        audio_pref = "any"
-
     # Global Sonarr behaviors (not per-flavor) — apply to every series
     # we add regardless of how it was matched.
     sf = await _resolve_setting(session, "integrations.sonarr.season_folders")
@@ -161,7 +152,6 @@ async def _load_sonarr_config(
         series_type=series_type,
         season_folders=season_folders,
         monitor_new_seasons=mns,
-        audio_preference=audio_pref,
     )
 
 
@@ -298,6 +288,40 @@ class SendMissingResponse(BaseModel):
     series_was_added: bool = False
     sonarr_series_title: str | None = None
     skipped_episodes: list[int] | None = None
+    # True when the Sonarr search was handed to a BACKGROUND task — the result
+    # (queued / nothing / couldn't-reach) arrives via the activity pill, not in
+    # this response. EpisodeSearch is normally quick, but a slow or unreachable
+    # Sonarr would otherwise hang the request, so we never block on it.
+    started: bool = False
+
+
+async def _send_missing_bg(
+    cfg: SonarrConfig, *, tvdb_id: int, season: int,
+    episode_numbers: list[int], series_label: str,
+) -> None:
+    """Run the Sonarr search OFF the request thread, narrating via the activity
+    pill. EpisodeSearch is normally quick, but a slow or unreachable Sonarr would
+    block the HTTP request — which used to hang the button on "Sending…" and
+    surface the timeout as a hard failure. The activity job is `begin()`-ed by
+    the endpoint before this is scheduled."""
+    from kira import activity
+    n = len(episode_numbers)
+    try:
+        result = await send_missing_episodes(
+            cfg, tvdb_id=tvdb_id, season=season, episode_numbers=episode_numbers)
+        if result.queued > 0:
+            detail = f"Queued {result.queued} of {n} to Sonarr"
+            if result.message:
+                detail += f" — {result.message}"
+        else:
+            detail = result.message or "Nothing to queue — already in Sonarr."
+        activity.end("sonarr_search", ok=True, detail=detail)
+    except SonarrError as e:
+        activity.end("sonarr_search", ok=False, detail=str(e))
+    except Exception as e:  # noqa: BLE001 — never let a bg task crash silently
+        logger.warning("sonarr send-missing background task failed: %r", e)
+        activity.end("sonarr_search", ok=False,
+                     detail=f"Sonarr handoff failed ({type(e).__name__}).")
 
 
 async def _resolve_tvdb_id_for_match(
@@ -406,25 +430,26 @@ async def sonarr_send_missing(
     # their Sonarr config; we mirror that split here).
     cfg = await _load_sonarr_config(session, is_anime=is_anime)
 
-    try:
-        result = await send_missing_episodes(
-            cfg,
-            tvdb_id=tvdb_id,
-            season=effective_season,
-            episode_numbers=payload.episode_numbers,
-        )
-    except SonarrError as e:
-        # Translate to a 4xx so the frontend toast says something useful
-        # rather than a generic 500.
-        raise HTTPException(400, str(e)) from e
-
+    # Hand the Sonarr search to a tracked BACKGROUND task and return now.
+    # EpisodeSearch is normally quick, but a slow or unreachable Sonarr inside
+    # the request hung the button on "Sending…" and turned an unreachable Sonarr
+    # into a hard timeout. The activity pill narrates the outcome
+    # (queued / nothing-to-do / couldn't-reach), and because that state lives in
+    # the activity system it survives closing + reopening the popup.
+    from kira import activity
+    from kira.tasks import spawn_tracked
+    series_label = match.series_name or match.title or "the series"
+    activity.begin("sonarr_search", f"Searching Sonarr — {series_label}")   # register before responding
+    spawn_tracked(
+        _send_missing_bg(
+            cfg, tvdb_id=tvdb_id, season=effective_season,
+            episode_numbers=payload.episode_numbers, series_label=series_label),
+        label="sonarr_search",
+    )
     return SendMissingResponse(
-        ok=result.ok,
-        queued=result.queued,
-        series_was_added=result.series_was_added,
-        sonarr_series_title=result.sonarr_series_title,
-        skipped_episodes=result.skipped_episodes,
-        detail=result.message,
+        ok=True, started=True, queued=0,
+        sonarr_series_title=series_label,
+        detail="Searching Sonarr in the background — watch the activity indicator.",
     )
 
 
