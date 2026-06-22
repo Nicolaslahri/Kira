@@ -136,3 +136,77 @@ async def test_match_singleton_movie_does_not_crash(monkeypatch) -> None:
     assert rows[0].match_type == "movie"
     assert rows[0].season_number is None        # movie → no season, no ScudLee
     assert rows[0].episode_number is None
+
+
+async def test_match_singleton_flat_umbrella_stores_absolute_episode(monkeypatch) -> None:
+    # Regression: a SINGLE-file scan of a flat-umbrella anime (One Piece AID 69,
+    # tvdb_season None) must store the ABSOLUTE episode (1167), NOT the TVDB-
+    # season-LOCAL one (12). Storing the local number made the seasonal rename
+    # feed "12" to ScudLee (read as absolute episode 12 → file misfiled into
+    # "Season 01") and the popup pair the file against the wrong episode,
+    # rendering it twice. Parity with _match_cluster's flat-umbrella remap.
+    from kira.models import Match
+    from kira.providers.anime_mappings import AnimeMappings
+    from sqlalchemy import select
+
+    Session = await _mem_sessionmaker()
+    monkeypatch.setattr(scans_mod, "SessionLocal", Session)
+
+    async with Session() as s:
+        mf = MediaFile(
+            file_path="/a/One Piece (1999) - S23E12 - 1167.mkv",
+            parsed_data={"original_filename": "One Piece (1999) - S23E12 - 1167.mkv",
+                         "media_type": "anime", "title": "One Piece", "year": 1999,
+                         "season": 23, "episode": 12, "absolute_episode": 1167},
+            media_type="anime", status="discovered",
+        )
+        s.add(mf)
+        await s.flush()
+        fid = mf.id
+        await s.commit()
+
+    class _Scored:
+        provider = "anidb"; provider_id = "69"; match_type = "tv_episode"
+        confidence = 1.0; title = "One Piece"; year = 1999
+        poster_url = None; overview = None; raw = None
+
+    class _Engine:
+        registry = object()
+        async def match(self, parsed, limit=5):
+            return [_Scored()]
+
+    # The cross-ref season-23 list: locals 1..11 → absolutes 1156..1166. Episode
+    # 12 / absolute 1167 is the just-aired one — deliberately absent, exactly the
+    # real lag that triggered the bug.
+    ep_dicts = [{"season": 23, "episode": i, "absolute_number": 1155 + i} for i in range(1, 12)]
+
+    async def _validate(scored, files, season, mtype, registry):
+        return scored, {}, ep_dicts
+
+    async def _flat_season(aid):
+        return None  # AID 69 is a flat umbrella
+
+    async def _season(*a, **k):
+        return 23
+
+    async def _meta(*a, **k):
+        return {}
+
+    async def _gid(*a, **k):
+        return None
+
+    monkeypatch.setattr(scans_mod, "_validate_and_rerank_by_episodes", _validate)
+    monkeypatch.setattr(scans_mod, "resolve_canonical_season", _season)
+    monkeypatch.setattr(scans_mod, "fetch_match_metadata", _meta)
+    monkeypatch.setattr(scans_mod, "compute_series_group_id", _gid)
+    monkeypatch.setattr(AnimeMappings, "tvdb_season", _flat_season)
+
+    async with Session() as s:
+        await scans_mod._match_singleton(s, _Engine(), fid)
+        await s.commit()
+
+    async with Session() as s:
+        rows = list(await s.scalars(select(Match).where(Match.media_file_id == fid)))
+    assert len(rows) == 1
+    assert rows[0].episode_number == 1167   # ABSOLUTE — not the parsed-local 12
+    assert rows[0].season_number == 23

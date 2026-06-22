@@ -385,17 +385,28 @@ function buildItem(group: MediaFile[]): LibraryItem {
   };
   const heroMeta = _readMatchMeta(repMatch);
 
-  // Library item id: must be unique across ALL items rendered in the grid.
+  // Library item id: must be unique across ALL items in the grid, and must
+  // track the CLUSTERING granularity in buildLibraryItems — one id per
+  // cluster, never two clusters sharing an id.
+  //
   // The naive `lib_<seriesKey>` collides when one series_key spans multiple
-  // provider matches — most commonly when cour-routing correctly splits a
-  // multi-cour anime (Bleach S17 across AIDs 15449/17849/18671) into
-  // distinct cards. Each split keeps the same series_key ("anime|bleach|17|
-  // bleach") but ends up on a different provider_id. Pre-fix: React warns
-  // "Encountered two children with the same key" and reconciliation may
-  // mis-attribute card state across renders. Fix: append the provider+id
-  // disambiguator when a match exists, fall back to head.id when no match.
+  // provider matches — cour-routing splits a multi-cour anime (Bleach S17
+  // across AIDs 15449/17849/18671) into distinct cards that keep the same
+  // series_key ("anime|bleach|17|bleach") on different provider_ids. So we
+  // append the provider+id. But the cluster key ALSO splits TVDB/TMDB by
+  // season, and two such clusters can re-collide when the filename-parsed
+  // season (in series_key) agrees while the matcher's canonical season
+  // disagrees — so we append the season too, mirroring the cluster key's
+  // `|s{season}` exactly. AniDB is keyed by AID alone in buildLibraryItems,
+  // so it gets no season suffix here either; the two stay in lock-step.
+  // Pre-fix: React warns "Encountered two children with the same key" and
+  // reconciliation mis-attributes card state across renders.
+  const _seasonSuffix =
+    repMatch?.provider && repMatch.provider !== 'anidb' && repMatch?.season != null
+      ? `_s${repMatch.season}`
+      : '';
   const _matchSuffix = repMatch?.provider && repMatch?.providerId
-    ? `_${repMatch.provider}_${repMatch.providerId}`
+    ? `_${repMatch.provider}_${repMatch.providerId}${_seasonSuffix}`
     : '';
   const _idStem = head.seriesKey ? `lib_${head.seriesKey}` : `lib_${head.id}`;
   return {
@@ -476,12 +487,24 @@ export function buildLibraryItems(files: MediaFile[]): LibraryItem[] {
       // S01 / S02 / S03 (all sharing TVDB id 360261) render as 3 cards
       // grouped under one "Euphoria · 3 seasons" sub-heading. The
       // franchise grouping happens downstream via `seriesGroupId`
-      // (unchanged here — still `tvdb:360261` for all three). For
-      // AniDB shows this is a no-op since each season already has its
-      // own AID. Without the season suffix, the popup's per-season
-      // episode fetch collapses to the cluster's first-listed season
-      // and every other season's files render as orphaned rows.
-      const seasonPart = f.match.season != null ? `|s${f.match.season}` : '';
+      // (unchanged here — still `tvdb:360261` for all three). Without
+      // the season suffix, the popup's per-season episode fetch collapses
+      // to the cluster's first-listed season and every other season's
+      // files render as orphaned rows.
+      //
+      // EXCEPTION — AniDB: each sequel-season gets its OWN AID, so the AID
+      // alone already IS the season identity. A single AID that spans many
+      // "seasons" is a long-running series catalogued as ONE AniDB entry
+      // (One Piece = AID 69, 1100+ episodes). Its season_number is a TVDB
+      // cross-ref derivation that can disagree file-to-file (ep 1166 came
+      // back season 1, ep 1167 season 23). Splitting on it manufactures a
+      // phantom duplicate card AND collides the React grid key (both
+      // clusters reduce to the same `lib_<series_key>_anidb_<aid>` id). Key
+      // AniDB by AID only so the whole series stays one card.
+      const seasonPart =
+        f.match.provider !== 'anidb' && f.match.season != null
+          ? `|s${f.match.season}`
+          : '';
       key = `match|${f.match.provider}|${f.match.providerId}${seasonPart}`;
     } else if (f.seriesKey) {
       key = f.seriesKey;

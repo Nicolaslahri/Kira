@@ -2,11 +2,11 @@ import type { ReactNode } from "react";
 import { cx, sortCx } from "@/utils/cx";
 
 export const dotColors = sortCx({
-    brand: "text-accent",
-    success: "text-conf-high",
-    warning: "text-conf-mid",
-    error: "text-conf-low",
-    gray: "text-ink-soft",
+    brand: "text-fg-brand-primary",
+    success: "text-fg-success-primary",
+    warning: "text-fg-warning-primary",
+    error: "text-fg-error-primary",
+    gray: "text-fg-tertiary",
 });
 
 export interface BadgeWithDotProps {
@@ -26,7 +26,7 @@ export const Badge = ({ children, className }: { children: ReactNode; className?
     return (
         <span
             className={cx(
-                "inline-flex items-center rounded-md bg-white/[0.06] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.04em] text-ink-soft",
+                "inline-flex items-center rounded-md bg-white/[0.06] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.04em] text-tertiary",
                 className,
             )}
         >
@@ -43,7 +43,7 @@ export const BadgeWithDot = ({ color = "gray", pulse, children, className }: Bad
     return (
         <span
             className={cx(
-                "inline-flex items-center gap-2 rounded-full border border-line bg-glass px-3 py-1 text-xs font-medium text-ink-muted backdrop-blur",
+                "inline-flex items-center gap-2 rounded-full border border-secondary bg-white/[0.04] px-3 py-1 text-xs font-medium text-secondary backdrop-blur",
                 className,
             )}
         >

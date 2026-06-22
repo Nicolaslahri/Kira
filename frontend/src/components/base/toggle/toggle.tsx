@@ -26,14 +26,14 @@ export const Toggle = ({ isSelected, onChange, isDisabled, className, ...rest }:
             onClick={onChange}
             className={cx(
                 "relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-                isSelected ? "border-accent-line bg-[var(--accent-soft)]" : "border-line bg-white/[0.06]",
+                isSelected ? "border-brand bg-brand-secondary" : "border-secondary bg-white/[0.06]",
                 className,
             )}
         >
             <motion.span
                 layout
                 transition={{ type: "spring", stiffness: 500, damping: 35 }}
-                className={cx("absolute size-[18px] rounded-full", isSelected ? "right-0.5 bg-accent" : "left-0.5 bg-ink-soft")}
+                className={cx("absolute size-[18px] rounded-full", isSelected ? "right-0.5 bg-[var(--color-fg-brand-primary)]" : "left-0.5 bg-[var(--color-text-tertiary)]")}
             />
         </button>
     );

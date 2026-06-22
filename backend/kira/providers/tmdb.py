@@ -222,14 +222,19 @@ class TMDBProvider(MetadataProvider):
                 timeout=15.0,
             )
             if r.status_code == 200:
-                p = r.json().get("poster_path")
+                body = r.json()
+                p = body.get("poster_path")
                 if p:
                     url = f"https://image.tmdb.org/t/p/w500{p}"
                     self._season_poster_cache[cache_key] = url
                     return url
-                # 200 with no poster — series legitimately has no art.
-                # Cache the None outcome so subsequent calls don't refetch.
-                self._season_poster_cache[cache_key] = None
+                # 200 with a REAL series object but no poster — series
+                # legitimately has no art; cache the None so we don't refetch.
+                # Guard on "id": a 200 that isn't a valid TV object (a rare
+                # {success:false} envelope) must NOT poison the cache as
+                # "no art forever".
+                if "id" in body:
+                    self._season_poster_cache[cache_key] = None
                 return None
         except Exception:
             # Transient on fallback — same logic: don't cache, let retry.

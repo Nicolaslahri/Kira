@@ -58,7 +58,7 @@ export function FolderPickerModal({
             <button className="rounded-xl border border-line bg-glass px-4 py-2 text-[13px] font-medium text-ink-muted transition-colors hover:bg-glass-2 hover:text-ink" onClick={onClose}>Cancel</button>
             <button
               className="inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-[13px] font-semibold text-white transition-transform active:translate-y-px disabled:opacity-40 [&_svg]:size-[14px]"
-              style={{ background: 'linear-gradient(135deg, var(--brand-a), var(--brand-b))', boxShadow: '0 8px 22px -10px rgba(229,75,186,0.6)' }}
+              style={{ background: 'linear-gradient(135deg, var(--brand-a), var(--brand-b))', boxShadow: '0 8px 22px -10px var(--brand-50)' }}
               disabled={!cwd}
               onClick={() => { onPick(cwd); onClose(); }}
             >
@@ -85,7 +85,7 @@ export function FolderPickerModal({
       </div>
 
       {error ? (
-        <div className="mb-3 flex items-start gap-2 rounded-xl border border-[rgba(255,91,110,0.25)] bg-[var(--conf-low-bg)] px-3 py-2.5 text-[12.5px] text-ink-muted [&_svg]:mt-0.5 [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-conf-low">
+        <div className="mb-3 flex items-start gap-2 rounded-xl border border-[var(--conf-low-24)] bg-[var(--conf-low-bg)] px-3 py-2.5 text-[12.5px] text-ink-muted [&_svg]:mt-0.5 [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-conf-low">
           <IcAlertTri /><span>{error}</span>
         </div>
       ) : null}

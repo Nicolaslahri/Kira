@@ -1,10 +1,15 @@
-import { useState, type RefObject } from 'react';
+import { useState, type ReactNode, type RefObject } from 'react';
 import type { LibraryItem, MediaType } from '../../lib/types';
 import { libraryStats, confTier } from '../LibraryGrid';
 import { MediaTypeIcon } from '../ui';
+import { Button } from '../base/buttons/button';
+import { BadgeWithDot } from '../base/badges/badges';
+import { cn } from '../../lib/utils';
 import { pluralize, prettyLanguage, prettyCountry } from '../../lib/format';
-import { confColorP } from './quality';
-import { mediaTypeLong, ProviderLink } from './format';
+import { mediaTypeLong } from './format';
+
+// Confidence tier → BadgeWithDot color.
+const CONF_DOT = { high: 'success', mid: 'warning', low: 'error' } as const;
 
 interface HeroProps {
   item: LibraryItem;
@@ -24,7 +29,19 @@ export function Hero({ item, stats, tint, shape, heroSlotRef, settled, posterUrl
   // to plausibly clip (cheap char heuristic — avoids a layout-measuring
   // effect for a purely cosmetic affordance).
   const [overviewExpanded, setOverviewExpanded] = useState(false);
-  const overviewLong = (item.overview?.length ?? 0) > 220;
+  const overviewLong = (item.overview?.length ?? 0) > 200;
+
+  // One key/value cell in the details grid (rendered only when value exists).
+  const renderDetail = (label: string, value: ReactNode, span = false) =>
+    value ? (
+      <div key={label} className={cn('flex min-w-0 flex-col gap-0.5', span && 'col-span-2')}>
+        <span className="text-[10px] font-semibold uppercase tracking-[0.06em] text-quaternary">{label}</span>
+        <span className={cn('text-[13px] text-secondary', !span && 'truncate')}>{value}</span>
+      </div>
+    ) : null;
+
+  const hasDetails = !!(item.studio || item.label || item.network || item.director || item.language || item.country || item.genres?.length);
+  const hasProviders = !!(item.providers?.tmdb || item.providers?.tvdb || item.providers?.anidb || item.providers?.musicbrainz);
 
   return (
     <div className={`cx-hero variant-side shape-${shape}`}>
@@ -57,9 +74,7 @@ export function Hero({ item, stats, tint, shape, heroSlotRef, settled, posterUrl
               // user is staring at the slot waiting for it. width/height
               // help prevent layout shift before src loads.
               decoding="async"
-              // @ts-expect-error — fetchpriority is valid HTML5 attribute
-              // but typings haven't landed in @types/react yet.
-              fetchpriority="high"
+              fetchPriority="high"
               style={{
                 position: 'absolute', inset: 0, width: '100%', height: '100%',
                 objectFit: 'cover', borderRadius: 'inherit',
@@ -69,9 +84,9 @@ export function Hero({ item, stats, tint, shape, heroSlotRef, settled, posterUrl
             <div style={{
               position: 'absolute', inset: 0, display: 'flex',
               flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-              color: '#fff', fontWeight: 700,
+              color: 'var(--ink)', fontWeight: 700,
             }}>
-              <span style={{ fontSize: 56, filter: 'drop-shadow(0 2px 8px rgba(0,0,0,0.4))' }}>
+              <span style={{ fontSize: 56, filter: 'drop-shadow(0 2px 8px var(--scrim-40))' }}>
                 {item.poster.init}
               </span>
               {item.year ? (
@@ -84,117 +99,82 @@ export function Hero({ item, stats, tint, shape, heroSlotRef, settled, posterUrl
         )}
       </div>
 
-      <div className="cx-hero-info">
-        <div className="cx-hero-meta-row">
-          <span className={`cc-mediatype ${item.mediaType}`} style={{ position: 'static' }}>
-            <MediaTypeIcon type={item.mediaType as MediaType} />{mediaTypeLong(item)}
-          </span>
-          {item.yearRange || item.year ? <span>{item.yearRange || item.year}</span> : null}
-          {item.runtime ? <><span className="dot-sep" /><span>{item.runtime} min</span></> : null}
-          {item.kind === 'series' ? <><span className="dot-sep" /><span>{pluralize(item.episodes.length, 'episode')}</span></> : null}
-          {item.kind === 'album' ? <><span className="dot-sep" /><span>{pluralize(item.episodes.length, 'track')}</span></> : null}
-        </div>
-
-        <div className="cx-hero-titleblock">
+      <div className="cx-hero-info flex-1">
+        {/* Title + alt titles + meta line */}
+        <div className="flex flex-col gap-1.5">
           {/* PB-2: id targeted by .cx-shell's aria-labelledby so screen
               readers announce the show/movie title as the dialog name. */}
-          <h2 id="cx-hero-title-id" className="cx-hero-title">
-            {item.artist ? <span style={{ color: 'var(--ink-2)', fontWeight: 600 }}>{item.artist} — </span> : null}
+          <h2 id="cx-hero-title-id" className="line-clamp-2 text-[20px] font-semibold leading-tight tracking-tight text-primary">
+            {item.artist ? <span className="font-medium text-secondary">{item.artist} — </span> : null}
             {item.title}
           </h2>
-          {/* Romaji + native-script title for anime/foreign series.
-              The user explicitly removed the "a.k.a. <Localized name>"
-              chips (Spanish/Italian/French/etc. translations) — they
-              added noise without value in a single-locale UI. */}
-          {(item.titleRomaji || item.titleNative) ? (
-            <div className="cx-hero-alt">
-              {item.titleRomaji && item.titleRomaji !== item.title ? <span>{item.titleRomaji}</span> : null}
-              {item.titleNative ? <span>{item.titleNative}</span> : null}
-            </div>
+          {(item.titleRomaji && item.titleRomaji !== item.title) || item.titleNative ? (
+            <p className="truncate text-xs italic text-tertiary">
+              {[item.titleRomaji && item.titleRomaji !== item.title ? item.titleRomaji : null, item.titleNative].filter(Boolean).join('  ·  ')}
+            </p>
           ) : null}
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-tertiary">
+            <span className="inline-flex items-center gap-1 rounded-md bg-white/[0.06] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.04em] text-secondary [&_svg]:size-3">
+              <MediaTypeIcon type={item.mediaType as MediaType} />{mediaTypeLong(item)}
+            </span>
+            {item.yearRange || item.year ? <span>{item.yearRange || item.year}</span> : null}
+            {item.runtime ? <><span className="dot-sep" /><span>{item.runtime} min</span></> : null}
+            {item.kind === 'series' ? <><span className="dot-sep" /><span>{pluralize(item.episodes.length, 'episode')}</span></> : null}
+            {item.kind === 'album' ? <><span className="dot-sep" /><span>{pluralize(item.episodes.length, 'track')}</span></> : null}
+          </div>
         </div>
 
+        {/* Overview — clamped to 3 lines, expandable in place via Show more */}
         {item.overview ? (
-          <>
-            <p className={`cx-hero-overview ${overviewLong && !overviewExpanded ? 'clamp' : ''}`}>
+          <div>
+            <p className={cn('text-[12.5px] leading-relaxed text-secondary', !overviewExpanded && 'line-clamp-3')}>
               {item.overview}
             </p>
             {overviewLong ? (
-              <button
-                type="button"
-                className="cx-hero-overview-more"
+              <Button
+                color="link-gray"
+                size="sm"
+                className="mt-1 text-[12px]"
                 onClick={() => setOverviewExpanded(v => !v)}
                 aria-expanded={overviewExpanded}
               >
-                {overviewExpanded ? 'Show less' : 'More'}
-              </button>
+                {overviewExpanded ? 'Show less' : 'Show more'}
+              </Button>
             ) : null}
-          </>
+          </div>
         ) : null}
 
-        <div className="cx-hero-details">
-          {item.studio || item.label ? (
-            <div className="cx-hero-detail">
-              <span className="cx-hero-detail-label">{item.kind === 'album' ? 'Label' : 'Studio'}</span>
-              <span className="cx-hero-detail-value">{item.studio || item.label}</span>
-            </div>
-          ) : null}
-          {item.network ? (
-            <div className="cx-hero-detail">
-              <span className="cx-hero-detail-label">Network</span>
-              <span className="cx-hero-detail-value">{item.network}</span>
-            </div>
-          ) : null}
-          {item.director ? (
-            <div className="cx-hero-detail">
-              <span className="cx-hero-detail-label">Director</span>
-              <span className="cx-hero-detail-value">{item.director}</span>
-            </div>
-          ) : null}
-          {/* F-13: humanize ISO codes for display. TVDB/TMDB return
-              3-letter codes like "eng" / "usa" which read as jargon.
-              prettyLanguage / prettyCountry map them to "English" /
-              "United States" with safe fallback to uppercased code. */}
-          {item.language ? (
-            <div className="cx-hero-detail">
-              <span className="cx-hero-detail-label">Language</span>
-              <span className="cx-hero-detail-value">{prettyLanguage(item.language)}</span>
-            </div>
-          ) : null}
-          {item.country ? (
-            <div className="cx-hero-detail">
-              <span className="cx-hero-detail-label">Country</span>
-              <span className="cx-hero-detail-value">{prettyCountry(item.country)}</span>
-            </div>
-          ) : null}
-          {item.genres?.length ? (
-            <div className="cx-hero-detail span2">
-              <span className="cx-hero-detail-label">Genres</span>
-              <span className="cx-hero-detail-value wrap">{item.genres.join(' · ')}</span>
-            </div>
-          ) : null}
-        </div>
+        {/* Details — compact 2-column key/value grid.
+            F-13: prettyLanguage / prettyCountry humanize ISO codes (eng→English). */}
+        {hasDetails ? (
+          <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 border-t border-secondary pt-3">
+            {renderDetail(item.kind === 'album' ? 'Label' : 'Studio', item.studio || item.label)}
+            {renderDetail('Network', item.network)}
+            {renderDetail('Director', item.director)}
+            {renderDetail('Language', item.language ? prettyLanguage(item.language) : null)}
+            {renderDetail('Country', item.country ? prettyCountry(item.country) : null)}
+            {item.genres?.length ? renderDetail('Genres', item.genres.join(' · '), true) : null}
+          </div>
+        ) : null}
 
-        <div className="cx-hero-statsline">
-          <div className="group">
-            {!item.noMatch ? (
-              <span className={`cx-summary-chip ${confTier(stats.avgConf)}`}>
-                <span className="swatch" style={{ background: confColorP(stats.avgConf) }} />
-                {stats.avgConf}% avg confidence
-              </span>
-            ) : null}
-            {stats.approved > 0 ? <span className="cx-summary-chip"><span className="swatch" style={{ background: 'var(--conf-high)' }} />{stats.approved} approved</span> : null}
-            {stats.pending > 0 ? <span className="cx-summary-chip"><span className="swatch" style={{ background: 'var(--conf-mid)' }} />{stats.pending} pending</span> : null}
-            {stats.rejected > 0 ? <span className="cx-summary-chip"><span className="swatch" style={{ background: 'var(--conf-low)' }} />{stats.rejected} rejected</span> : null}
-            {stats.unmatched > 0 ? <span className="cx-summary-chip"><span className="swatch" style={{ background: 'var(--ink-3)' }} />{stats.unmatched} unmatched</span> : null}
+        {/* Confidence / status (UUI BadgeWithDot) + provider links — pinned to
+            the bottom of the rail so the column uses the full vertical space. */}
+        <div className="mt-auto flex flex-col gap-2 border-t border-secondary pt-3">
+          <div className="flex flex-wrap items-center gap-1.5">
+            {!item.noMatch ? <BadgeWithDot color={CONF_DOT[confTier(stats.avgConf)]}>{stats.avgConf}% avg confidence</BadgeWithDot> : null}
+            {stats.approved > 0 ? <BadgeWithDot color="success">{stats.approved} approved</BadgeWithDot> : null}
+            {stats.pending > 0 ? <BadgeWithDot color="warning">{stats.pending} pending</BadgeWithDot> : null}
+            {stats.rejected > 0 ? <BadgeWithDot color="error">{stats.rejected} rejected</BadgeWithDot> : null}
+            {stats.unmatched > 0 ? <BadgeWithDot color="gray">{stats.unmatched} unmatched</BadgeWithDot> : null}
           </div>
-          <span className="spacer" />
-          <div className="group">
-            {item.providers?.tmdb ? <ProviderLink label="TMDB" href={`https://www.themoviedb.org/${item.mediaType === 'movie' ? 'movie' : 'tv'}/${item.providers.tmdb}`} /> : null}
-            {item.providers?.tvdb ? <ProviderLink label="TVDB" href={`https://www.thetvdb.com/?id=${item.providers.tvdb}&tab=series`} /> : null}
-            {item.providers?.anidb ? <ProviderLink label="AniDB" href={`https://anidb.net/anime/${item.providers.anidb}`} /> : null}
-            {item.providers?.musicbrainz ? <ProviderLink label="MusicBrainz" href={`https://musicbrainz.org/release/${item.providers.musicbrainz}`} /> : null}
-          </div>
+          {hasProviders ? (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] font-medium">
+              {item.providers?.tmdb ? <a href={`https://www.themoviedb.org/${item.mediaType === 'movie' ? 'movie' : 'tv'}/${item.providers.tmdb}`} target="_blank" rel="noreferrer" className="text-[var(--color-fg-brand-primary)] transition-colors hover:underline">TMDB ↗</a> : null}
+              {item.providers?.tvdb ? <a href={`https://www.thetvdb.com/?id=${item.providers.tvdb}&tab=series`} target="_blank" rel="noreferrer" className="text-[var(--color-fg-brand-primary)] transition-colors hover:underline">TVDB ↗</a> : null}
+              {item.providers?.anidb ? <a href={`https://anidb.net/anime/${item.providers.anidb}`} target="_blank" rel="noreferrer" className="text-[var(--color-fg-brand-primary)] transition-colors hover:underline">AniDB ↗</a> : null}
+              {item.providers?.musicbrainz ? <a href={`https://musicbrainz.org/release/${item.providers.musicbrainz}`} target="_blank" rel="noreferrer" className="text-[var(--color-fg-brand-primary)] transition-colors hover:underline">MusicBrainz ↗</a> : null}
+            </div>
+          ) : null}
         </div>
       </div>
     </div>

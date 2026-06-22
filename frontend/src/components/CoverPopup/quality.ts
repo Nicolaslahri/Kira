@@ -1,4 +1,5 @@
 import type { LibFile } from '../../lib/types';
+import { confLevel } from '../../lib/confBands';
 
 // ─────────────────────────────────────────────────────────────────────
 // File-quality inference + duplicate ranking + language chips.
@@ -6,10 +7,12 @@ import type { LibFile } from '../../lib/types';
 // dedupe resolver, and the hero can share them without the 4k-line file.
 // ─────────────────────────────────────────────────────────────────────
 
+/** CSS color var for a match-confidence percent. Delegates to the tunable
+ *  bands (Settings → Confidence) via confLevel, so the hero's avg-confidence
+ *  swatch tracks the user's thresholds AND agrees with the confTier() class on
+ *  the same chip — instead of the old hardcoded 85/50 that ignored the slider. */
 export function confColorP(v: number): string {
-  if (v >= 85) return 'var(--conf-high)';
-  if (v >= 50) return 'var(--conf-mid)';
-  return 'var(--conf-low)';
+  return `var(--conf-${confLevel(v)})`;
 }
 
 // 5-step dedupe ranker. Lower rank = "keep this file" in a duplicate group.

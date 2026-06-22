@@ -6,22 +6,6 @@ import { IcSearch, IcCheck, IcX, IcArrowRight, IcShieldCheck, IcUndo, IcExternal
 import { Modal, Poster, ConfidenceBadge, StatusPill, Segmented } from './ui';
 import { confLevel } from '../lib/confBands';
 
-/** Returns the fraction (0..1) of a string's letters that are plain ASCII.
- *  Used to rank provider aliases — English / romaji titles score ~1.0,
- *  Cyrillic / Korean / Chinese score 0. Non-letters (digits, punctuation)
- *  are excluded from the denominator so "Sezon 3" doesn't get penalized
- *  just for the number, and a pure-digit string falls back to 1.0. */
-export function asciiness(s: string): number {
-  let letters = 0, ascii = 0;
-  for (const ch of s) {
-    if (/\p{L}/u.test(ch)) {
-      letters++;
-      if (ch.charCodeAt(0) < 128) ascii++;
-    }
-  }
-  return letters === 0 ? 1 : ascii / letters;
-}
-
 export function highlightPath(path: string) {
   const parts = path.split('/');
   const last = parts.pop();
@@ -104,6 +88,7 @@ export function ManualSearchModal({ file, onClose, onSelect, onIdentifyByContent
   const [anidbErrorKind, setAnidbErrorKind] = useState<'banned' | 'rejected' | 'error' | null>(null);
   const [sel, setSel] = useState<ApiSearchResult | null>(null);
   const [identifying, setIdentifying] = useState(false);
+  const selectingRef = useRef(false);  // one-shot guard so button + double-click can't fire the match twice
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Pull provider catalogue once and pick the default tab from it.
@@ -207,6 +192,8 @@ export function ManualSearchModal({ file, onClose, onSelect, onIdentifyByContent
   const isMusic = provider === 'MusicBrainz';
 
   const handleSelect = (r: ApiSearchResult) => {
+    if (selectingRef.current) return;   // already submitting — ignore the repeat click/dblclick
+    selectingRef.current = true;
     // Adapt backend shape → frontend SearchResult so the rest of the app keeps
     // working with the existing onSelect contract. _providerId is the backend
     // id we'll send to POST /files/{id}/select-manual.
@@ -298,8 +285,11 @@ export function ManualSearchModal({ file, onClose, onSelect, onIdentifyByContent
           return (
             <button
               key={p}
+              type="button"
               className={`provider-tab ${provider === p ? 'on' : ''} ${unavailable ? 'disabled' : ''}`}
-              onClick={() => setProvider(p)}
+              onClick={() => { if (!unavailable) setProvider(p); }}
+              disabled={unavailable}
+              aria-disabled={unavailable || undefined}
               title={unavailable ? (info && !info.implemented ? 'Coming soon' : 'Not configured') : undefined}
             >
               <span className="provider-dot" style={{ background: PROVIDERS[p].color, opacity: unavailable ? 0.4 : 1 }} />
@@ -317,7 +307,7 @@ export function ManualSearchModal({ file, onClose, onSelect, onIdentifyByContent
       </div>
 
       {providerStatus && !providerStatus.implemented ? (
-        <div className="onboarding-state" style={{ marginBottom: 12, background: 'rgba(255,255,255,0.04)' }}>
+        <div className="onboarding-state" style={{ marginBottom: 12, background: 'var(--glass)' }}>
           <IcAlertTri /><span>
             <b>{providerStatus.name} isn't available yet.</b>{' '}
             We'll wire it up in a future release. Try another tab.
@@ -382,7 +372,7 @@ export function ManualSearchModal({ file, onClose, onSelect, onIdentifyByContent
       ) : null}
 
       {provider === 'AniDB' && anidbApiError ? (
-        <div className="onboarding-state" style={{ marginTop: 8, background: 'rgba(255,200,80,0.06)', borderColor: 'rgba(255,200,80,0.20)', alignItems: 'flex-start', gap: 12 }}>
+        <div className="onboarding-state" style={{ marginTop: 8, background: 'var(--conf-mid-4)', borderColor: 'var(--conf-mid-24)', alignItems: 'flex-start', gap: 12 }}>
           <IcAlertTri />
           <span style={{ flex: 1, fontSize: 12, lineHeight: 1.5 }}>
             {anidbErrorKind === 'banned' ? (
@@ -505,6 +495,7 @@ export function RenamePreviewModal({ files, onClose, onApply, defaultProfile = '
 }) {
   const [profile, setProfile] = useState(defaultProfile);
   const [op, setOp] = useState(defaultOp);
+  const [applying, setApplying] = useState(false);  // guard the disk-rename Apply against double-submit
 
   // A file is renameable only when it has a REAL provider match — the
   // adapter synthesises a placeholder `match` object from parsed data
@@ -559,8 +550,12 @@ export function RenamePreviewModal({ files, onClose, onApply, defaultProfile = '
           </div>
           <div className="right">
             <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-            <button className="btn btn-primary" onClick={() => onApply({ profile, op })}>
-              <IcCheck /> Apply · Rename {eligible.length} {eligible.length === 1 ? 'file' : 'files'}
+            <button className="btn btn-primary" disabled={applying} onClick={async () => {
+              if (applying) return;   // Apply triggers a real disk rename — never fire it twice
+              setApplying(true);
+              try { await onApply({ profile, op }); } finally { setApplying(false); }
+            }}>
+              <IcCheck /> {applying ? 'Applying…' : <>Apply · Rename {eligible.length} {eligible.length === 1 ? 'file' : 'files'}</>}
             </button>
           </div>
         </>
@@ -570,8 +565,8 @@ export function RenamePreviewModal({ files, onClose, onApply, defaultProfile = '
         <div style={{
           marginBottom: 14, padding: '10px 12px',
           borderRadius: 8,
-          background: 'rgba(255,177,74,0.10)',
-          border: '1px solid rgba(255,177,74,0.32)',
+          background: 'var(--media-music-12)',
+          border: '1px solid var(--media-music-32)',
           color: 'var(--ink-2)', fontSize: 12,
         }}>
           <b style={{ color: 'var(--conf-mid)' }}>{skipped}</b> selected file{skipped === 1 ? '' : 's'} ha{skipped === 1 ? 's' : 've'} no match yet and will be skipped. Match {skipped === 1 ? 'it' : 'them'} first (or pick "Match all to…" in the bulk bar) to include {skipped === 1 ? 'it' : 'them'}.

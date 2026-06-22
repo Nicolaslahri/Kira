@@ -351,7 +351,14 @@ async def _basic_auth_mw(request: Request, call_next):
             return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Kira"'})
         return await call_next(request)
     from kira.api.auth import db_auth_ok, get_db_account
-    acct = await get_db_account()
+    try:
+        acct = await get_db_account(raise_on_error=True)
+    except Exception:
+        # DB unreadable (e.g. mid-migration at boot) and an account MAY exist:
+        # fail CLOSED rather than letting an unauthenticated request through
+        # during the boot window. Cached once the first read succeeds, so this
+        # only bites a genuine DB fault, not steady-state traffic.
+        return Response(status_code=503, headers={"Retry-After": "2"})
     if acct is not None:
         if not db_auth_ok(request.headers.get("Authorization"), acct[0], acct[1]):
             return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Kira"'})

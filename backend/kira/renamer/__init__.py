@@ -3,6 +3,7 @@ from kira.renamer.templates import (
     NamingProfile,
     apply_template,
     format_target_path,
+    format_target_path_with_tokens,
 )
 from kira.renamer.operations import (
     FileOp,
@@ -22,4 +23,5 @@ __all__ = [
     "discover_sidecars",
     "execute_op",
     "format_target_path",
+    "format_target_path_with_tokens",
 ]

@@ -1,15 +1,20 @@
-import { useEffect, useState, type Dispatch, type SetStateAction } from 'react';
-import { IcX, IcFolder, IcScan, IcPlus, IcTrash, IcFilm, IcTv, IcAnime, IcMusic } from '../../lib/icons';
+import { useEffect, useState, type Dispatch, type SetStateAction, type ReactNode } from 'react';
+import { IcFilm, IcTv, IcAnime, IcMusic } from '../../lib/icons';
+import { Folder, Scan, Plus, Trash01, XClose } from '@untitledui/icons';
 import { Select } from '../../components/ui';
-import { SettingsLayout, SectionCard, NestedBox, NumberField, SETTINGS_NESTED, SectionHeader, StatusPill } from '../../components/settings-blocks';
+import { SettingsLayout, SectionHeader } from '../../components/settings-blocks';
 import { Button } from '../../components/base/buttons/button';
 import { Input } from '../../components/base/input/input';
+import { InputNumber } from '../../components/base/input/input-number';
 import { Toggle } from '../../components/base/toggle/toggle';
+import { FeaturedIcon } from '../../components/base/featured-icons/featured-icon';
+import { BadgeWithDot } from '../../components/base/badges/badges';
 import { FolderPickerModal } from '../../components/FolderPickerModal';
+import { cn } from '../../lib/utils';
 import { api } from '../../lib/api';
 import { strSetting, type SaveKeyFn } from './helpers';
 
-const PATH_ICON_BTN = 'grid size-7 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink [&_svg]:size-[14px]';
+const PATH_ICON_BTN = 'grid size-7 shrink-0 place-items-center rounded-md text-tertiary transition-colors hover:bg-white/[0.07] hover:text-primary [&_svg]:size-[14px]';
 
 // Monospace path input with an in-field Browse button (and optional Clear).
 // Declared at module scope so it keeps a stable identity across renders —
@@ -26,6 +31,7 @@ function PathField({ value, placeholder, onChange, onBrowse, onClear, browseTitl
   return (
     <Input
       mono
+      editGate
       value={value}
       placeholder={placeholder}
       spellCheck={false}
@@ -33,16 +39,30 @@ function PathField({ value, placeholder, onChange, onBrowse, onClear, browseTitl
       trailing={
         <div className="flex items-center gap-0.5">
           {onClear && value ? (
-            <button type="button" className={PATH_ICON_BTN + ' hover:text-conf-low'} onClick={onClear} title="Clear override — use the default location">
-              <IcX />
+            <button type="button" className={PATH_ICON_BTN + ' hover:text-error-primary'} onClick={onClear} title="Clear override — use the default location">
+              <XClose />
             </button>
           ) : null}
           <button type="button" className={PATH_ICON_BTN} onClick={onBrowse} title={browseTitle ?? 'Browse for folder'}>
-            <IcFolder />
+            <Folder />
           </button>
         </div>
       }
     />
+  );
+}
+
+// Flow-rail end-cap node (Sources / Destinations). The centre "Kira" core is
+// rendered inline since it's the only filled-indigo chip on the rail.
+function FlowNode({ icon, label, caption, accent }: { icon: ReactNode; label: string; caption: ReactNode; accent?: boolean }) {
+  return (
+    <div className="flex min-w-0 shrink-0 items-center gap-2.5 rounded-xl bg-tertiary px-3 py-2 ring-1 ring-inset ring-secondary">
+      <FeaturedIcon size="sm" icon={icon} tint={accent ? 'var(--accent)' : undefined} color="gray" />
+      <div className="min-w-0">
+        <div className="text-[12.5px] font-semibold text-primary">{label}</div>
+        <div className="truncate text-[11px] text-tertiary">{caption}</div>
+      </div>
+    </div>
   );
 }
 
@@ -151,227 +171,288 @@ export function PathsSection({
   const folderModeFor = (path: string): FolderCfg =>
     watchCfg.folders[path] ?? { mode: 'scan', threshold: 0.9 };
 
+  // Per-type routing lanes — coloured in each media type's own hue (Movies
+  // teal, TV sky, Anime purple, Music amber) so the lane colour carries real
+  // meaning: dim when inheriting the root, full-saturation when routed away.
   const typeRows = [
-    { label: 'Movies', sub: 'Movies', value: targetMovie, key: 'paths.targets.movie' as const, pickerFor: 'target-movie' as const, icon: <IcFilm />, color: '#bdc1d0' },
-    { label: 'TV',     sub: 'TV',     value: targetTv,    key: 'paths.targets.tv'    as const, pickerFor: 'target-tv'    as const, icon: <IcTv />,   color: '#49b8fe' },
+    { label: 'Movies', sub: 'Movies', value: targetMovie, key: 'paths.targets.movie' as const, pickerFor: 'target-movie' as const, icon: <IcFilm />,  color: '#4ec5b3' },
+    { label: 'TV',     sub: 'TV',     value: targetTv,    key: 'paths.targets.tv'    as const, pickerFor: 'target-tv'    as const, icon: <IcTv />,    color: '#b3e5fc' },
     { label: 'Anime',  sub: 'Anime',  value: targetAnime, key: 'paths.targets.anime' as const, pickerFor: 'target-anime' as const, icon: <IcAnime />, color: 'var(--media-anime)' },
     { label: 'Music',  sub: 'Music',  value: targetMusic, key: 'paths.targets.music' as const, pickerFor: 'target-music' as const, icon: <IcMusic />, color: 'var(--media-music)' },
   ];
 
   const overrideCount = [targetMovie, targetTv, targetAnime, targetMusic].filter(Boolean).length;
+
   return (
     <SettingsLayout
       header={(
         <SectionHeader
-          icon={<IcFolder />}
-          title="Paths"
-          purpose="Tell Kira where your media lives and where renamed files should land — your media root, the folders it watches, and optional per-type destinations."
+          icon={<Folder />}
+          title="Library & paths"
+          purpose="Where your media lives, where renamed files land, and how Kira watches for new files — read it like a pipeline: sources → Kira → destinations."
           status={(
-            <StatusPill tone={watchFolders.length > 0 || watchCfg.auto_scan ? 'connected' : 'neutral'} breathe={watchCfg.auto_scan}>
+            <BadgeWithDot color={watchFolders.length > 0 || watchCfg.auto_scan ? 'success' : 'gray'} pulse={watchCfg.auto_scan}>
               {watchFolders.length} watched{overrideCount > 0 ? ` · ${overrideCount} routed` : ''}{watchCfg.auto_scan ? ' · auto' : ''}
-            </StatusPill>
+            </BadgeWithDot>
           )}
         />
       )}
     >
-      {/* Two independent columns (not a row-aligned grid): cards pack by
-          height within each column, so a short card never leaves a hole
-          beside a tall neighbour. */}
-      <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
-        <div className="flex flex-col gap-4">
-        {/* Media root */}
-        <SectionCard
-          icon={<IcFolder />}
-          title="Media root"
-          desc="Where Kira renames into — the move / hardlink target for every file."
-        >
-          <PathField
-            value={libraryRoot}
-            onChange={v => saveKey('paths.library_root')(v)}
-            onBrowse={() => setPicker({ for: 'library', initial: libraryRoot })}
-          />
-          {persistence !== null && (
-            <div className="mt-2.5 flex items-center gap-2 text-[11.5px] leading-relaxed text-ink-soft">
-              <span className={`size-1.5 shrink-0 rounded-full ${persistence === 'native' ? 'bg-conf-high' : 'bg-info'}`} />
-              {persistence === 'native'
-                ? <>Match memory: stored on the files themselves (xattr) — survives database resets and manual moves.</>
-                : <>Match memory: this volume can't hold file metadata, so renamed files are remembered in Kira's local index — survives database resets, but not files you move by hand.</>}
-            </div>
-          )}
-        </SectionCard>
+      <div className="flex flex-col gap-5">
 
-        {/* Per-type destinations */}
-        <SectionCard
-          icon={<IcFolder />}
-          title="Per-type destinations"
-          desc={<>Optional — route each media type to its own folder or drive. Blank lands at <span className="font-mono text-ink">Media root / Type</span>.</>}
-        >
-          <div className="flex flex-col gap-2.5">
-            {typeRows.map(row => (
-              <div key={row.key} className="flex items-center gap-3">
-                <span className="inline-flex w-[88px] shrink-0 items-center gap-1.5 text-[13px] font-medium text-ink-muted">
-                  <span style={{ color: row.color }} className="inline-flex [&_svg]:size-[13px]">{row.icon}</span>{row.label}
-                </span>
-                <div className="flex-1">
-                  <PathField
-                    value={row.value}
-                    placeholder={defaultTarget(row.sub)}
-                    onChange={v => saveKey(row.key)(v)}
-                    onClear={() => saveKey(row.key)('')}
-                    onBrowse={() => setPicker({ for: row.pickerFor, initial: row.value || libraryRoot })}
-                    browseTitle={`Browse for ${row.label} destination`}
-                  />
-                </div>
-              </div>
-            ))}
-            <div className={`px-3 py-2.5 ${SETTINGS_NESTED}`}>
-              <div className="text-[12px] font-medium text-ink-muted">Ignore patterns</div>
-              <div className="mt-1.5">
-                <Input
-                  mono
-                  spellCheck={false}
-                  value={ignoreText ?? ignorePatterns.join(', ')}
-                  placeholder="*.partial.mkv, Anime Music Videos, *NCOP*"
-                  onChange={e => setIgnoreText(e.target.value)}
-                  onBlur={commitIgnores}
-                  onKeyDown={e => { if (e.key === 'Enter') commitIgnores(); }}
-                />
-              </div>
-              <div className="mt-1.5 text-[11px] leading-relaxed text-ink-soft">
-                Comma-separated globs, matched against file and folder names. Samples, trailers and extras are always skipped regardless.
+        {/* ── FLOW RAIL — the pipeline at a glance: sources → Kira → destinations.
+              The trunk wires + Kira core glow/pulse only while auto-scan is armed. */}
+        <div className="overflow-hidden rounded-2xl bg-secondary px-5 py-4 shadow-xs ring-1 ring-inset ring-secondary">
+          <div className="flex items-center gap-3">
+            <FlowNode icon={<Scan />} label="Sources" caption={`${watchFolders.length} folder${watchFolders.length === 1 ? '' : 's'} watched`} />
+
+            <div className="relative hidden h-px min-w-[20px] flex-1 sm:block" style={{ background: watchCfg.auto_scan ? 'var(--accent-50)' : 'var(--line-strong)' }}>
+              {watchCfg.auto_scan ? <span className="absolute left-1/2 top-1/2 size-1.5 -translate-x-1/2 -translate-y-1/2 animate-pulse rounded-full" style={{ background: 'var(--accent)' }} /> : null}
+            </div>
+
+            {/* Kira core — the only filled-indigo chip; glows when armed */}
+            <div className="flex shrink-0 items-center gap-2 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--accent-deep)', boxShadow: watchCfg.auto_scan ? '0 0 30px -8px var(--accent)' : undefined }}>
+              <span className="text-white [&_svg]:size-[18px]"><Scan /></span>
+              <span className="text-[12px] font-semibold uppercase tracking-[0.08em] text-white">Kira</span>
+            </div>
+
+            <div className="relative hidden h-px min-w-[20px] flex-1 sm:block" style={{ background: watchCfg.auto_scan ? 'var(--accent-50)' : 'var(--line-strong)' }}>
+              {watchCfg.auto_scan ? <span className="absolute left-1/2 top-1/2 size-1.5 -translate-x-1/2 -translate-y-1/2 animate-pulse rounded-full" style={{ background: 'var(--accent)', animationDelay: '0.6s' }} /> : null}
+            </div>
+
+            <div className="flex shrink-0 items-center gap-2.5">
+              <FlowNode icon={<Folder />} label="Destinations" caption={overrideCount > 0 ? `media root · +${overrideCount} routed` : 'media root'} accent />
+              {/* per-type routing dots — lit when that type is routed off the trunk */}
+              <div className="hidden flex-col gap-1 md:flex">
+                {typeRows.map(r => (
+                  <span key={r.key} className="size-1.5 rounded-full" title={r.value ? `${r.label}: routed` : `${r.label}: inherits root`} style={{ background: r.value ? r.color : `color-mix(in srgb, ${r.color} 30%, transparent)` }} />
+                ))}
               </div>
             </div>
           </div>
-        </SectionCard>
         </div>
 
-        {/* Watch folders + Auto-scan */}
-        <div className="flex flex-col gap-4">
-        <SectionCard
-          icon={<IcScan />}
-          title="Watch folders"
-          desc="Folders Kira scans when you click “Scan now”."
-          action={(
-            <Button color="secondary" size="sm" iconLeading={IcPlus} className="shrink-0" onClick={() => setPicker({ for: 'watch', initial: libraryRoot })}>
-              Add folder
-            </Button>
+        {/* ── MEDIA ROOT — the hero destination + match-memory verdict ── */}
+        <section className="overflow-hidden rounded-2xl p-5 shadow-xs" style={{ background: 'radial-gradient(130% 130% at 92% -25%, var(--accent-8), transparent 55%), var(--color-bg-secondary)', boxShadow: 'inset 0 0 0 1px var(--accent-line)' }}>
+          <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">
+            <span className="text-[var(--accent)] [&_svg]:size-3.5"><Folder /></span>
+            Media root · renames into
+          </div>
+          <div className="mt-3">
+            <PathField
+              value={libraryRoot}
+              onChange={v => saveKey('paths.library_root')(v)}
+              onBrowse={() => setPicker({ for: 'library', initial: libraryRoot })}
+            />
+          </div>
+          {persistence !== null && (
+            <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-tertiary">
+              <span className="text-secondary">Match memory:</span>
+              <span
+                className="inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-[11.5px] font-semibold"
+                style={persistence === 'native'
+                  ? { color: 'var(--conf-high)', background: 'var(--conf-high-bg)', boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--conf-high) 30%, transparent)' }
+                  : { color: 'var(--info-bright)', background: 'var(--info-bg)', boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--info) 30%, transparent)' }}
+              >
+                <span className="settings-dot-live size-1.5 rounded-full" style={{ background: persistence === 'native' ? 'var(--conf-high)' : 'var(--info-bright)' }} />
+                {persistence === 'native' ? 'On the files (xattr)' : "In Kira's index"}
+              </span>
+              <span>{persistence === 'native' ? '— survives database resets and manual moves.' : '— survives resets, but not files you move by hand.'}</span>
+            </div>
           )}
-        >
-          <div className="flex flex-1 flex-col gap-2">
+        </section>
+
+        {/* ── PER-TYPE DESTINATIONS — colour-owned routing lanes ── */}
+        <section>
+          <div className="mb-2.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Per-type destinations · optional</div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            {typeRows.map(row => {
+              const routed = !!row.value;
+              return (
+                <div
+                  key={row.key}
+                  className="relative overflow-hidden rounded-xl bg-secondary p-3.5 shadow-xs transition-shadow"
+                  style={{ boxShadow: routed ? `inset 0 0 0 1px color-mix(in srgb, ${row.color} 38%, transparent)` : 'inset 0 0 0 1px var(--color-border-secondary)' }}
+                >
+                  {/* colour rail — dim when inheriting, full media-colour when routed */}
+                  <span aria-hidden className="absolute inset-y-0 left-0 w-[3px] transition-colors" style={{ background: routed ? row.color : `color-mix(in srgb, ${row.color} 16%, transparent)` }} />
+                  <div className="flex items-center gap-2.5">
+                    <FeaturedIcon size="md" tint={row.color} icon={row.icon} />
+                    <div className="min-w-0">
+                      <div className="text-[13px] font-semibold text-primary">{row.label}</div>
+                      <div className="mt-0.5 inline-flex items-center gap-1.5 text-[11px] font-medium" style={{ color: routed ? row.color : 'var(--color-text-tertiary)' }}>
+                        <span className="size-1.5 rounded-full" style={{ background: routed ? row.color : 'rgba(255,255,255,0.22)' }} />
+                        {routed ? 'Routed here' : 'Inherits root'}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="mt-3">
+                    <PathField
+                      value={row.value}
+                      placeholder={defaultTarget(row.sub)}
+                      onChange={v => saveKey(row.key)(v)}
+                      onClear={() => saveKey(row.key)('')}
+                      onBrowse={() => setPicker({ for: row.pickerFor, initial: row.value || libraryRoot })}
+                      browseTitle={`Browse for ${row.label} destination`}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+
+        {/* ── SOURCES — folders Kira watches + the ignore filter on intake ── */}
+        <section className="rounded-2xl bg-secondary p-5 shadow-xs ring-1 ring-inset ring-secondary">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <FeaturedIcon size="md" icon={<Scan />} tint="var(--accent)" />
+              <div>
+                <div className="text-[14px] font-semibold text-primary">Folders Kira watches</div>
+                <div className="text-[12px] text-tertiary">Scanned when you click &ldquo;Scan now&rdquo;.</div>
+              </div>
+            </div>
+            <Button color="secondary" size="sm" iconLeading={Plus} className="shrink-0" onClick={() => setPicker({ for: 'watch', initial: libraryRoot })}>Add folder</Button>
+          </div>
+          <div className="mt-4 flex flex-col gap-2">
             {watchFolders.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-white/[0.12] px-3 py-2.5 text-xs text-ink-muted">
-                No watch folders yet — add one below.
+              <div className="flex flex-col items-center gap-1.5 rounded-xl border border-dashed border-[var(--line-strong)] px-4 py-7 text-center">
+                <span className="text-tertiary [&_svg]:size-5"><Scan /></span>
+                <div className="text-[12.5px] font-medium text-secondary">Nothing watched yet</div>
+                <div className="text-[11.5px] text-tertiary">Point Kira at a folder and it&rsquo;ll scan it for new media.</div>
               </div>
             ) : null}
             {watchFolders.map((p, i) => (
-              <div key={i} className={`flex items-center gap-2.5 px-3 py-2.5 ${SETTINGS_NESTED}`}>
-                <IcFolder style={{ width: 14, height: 14 }} className="shrink-0 text-ink-soft" />
-                <span className="flex-1 truncate font-mono text-[12.5px] text-ink-muted">{p}</span>
+              <div key={i} className="group flex items-center gap-2.5 rounded-xl bg-tertiary px-3 py-2.5 ring-1 ring-inset ring-secondary">
+                <Folder style={{ width: 14, height: 14 }} className="shrink-0 text-tertiary" />
+                <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-secondary">{p}</span>
                 <button
                   type="button"
                   title="Remove"
                   onClick={() => void setWatch(watchFolders.filter((_, j) => j !== i))}
-                  className="grid size-7 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-[var(--conf-low-bg)] hover:text-conf-low [&_svg]:size-[13px]"
+                  className="grid size-7 shrink-0 place-items-center rounded-md text-tertiary opacity-0 transition-all hover:bg-error-secondary hover:text-error-primary group-hover:opacity-100 [&_svg]:size-[13px]"
                 >
-                  <IcTrash />
+                  <Trash01 />
                 </button>
               </div>
             ))}
           </div>
-        </SectionCard>
 
-      {/* Auto-scan (watched folders) — grows when expanded */}
-      <SectionCard
-        icon={<IcScan />}
-        title="Auto-scan"
-        desc="Watch your folders and scan automatically when new files appear — no need to click “Scan now”. Detected via filesystem events with a periodic poll fallback for network drives."
-        headerExtra={(
-          <Toggle
-            isSelected={watchCfg.auto_scan}
-            onChange={() => void saveWatchCfg({ ...watchCfg, auto_scan: !watchCfg.auto_scan })}
-            className="mt-0.5"
-            aria-label="Enable auto-scan"
-          />
-        )}
-      >
-        {watchCfg.auto_scan ? (
-          <div className="flex flex-col gap-4">
-            {/* timing */}
-            <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-              <NestedBox className="flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="text-[13px] font-medium text-ink">Settle delay</div>
-                  <div className="mt-0.5 text-[12px] leading-relaxed text-ink-muted">Wait after the last change before scanning.</div>
-                </div>
-                <NumberField
-                  className="w-28 shrink-0"
-                  suffix="sec"
-                  min={5}
-                  value={watchCfg.debounce_seconds}
-                  onChange={v => void saveWatchCfg({ ...watchCfg, debounce_seconds: Math.max(5, v) })}
-                />
-              </NestedBox>
-              <NestedBox className="flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="text-[13px] font-medium text-ink">Poll interval</div>
-                  <div className="mt-0.5 text-[12px] leading-relaxed text-ink-muted">Fallback re-check for network drives.</div>
-                </div>
-                <NumberField
-                  className="w-28 shrink-0"
-                  suffix="sec"
-                  min={60}
-                  value={watchCfg.poll_interval_seconds}
-                  onChange={v => void saveWatchCfg({ ...watchCfg, poll_interval_seconds: Math.max(60, v) })}
-                />
-              </NestedBox>
+          {/* Ignore filter — acts on the intake side, before files reach Kira */}
+          <div className="mt-4 border-t border-secondary pt-4">
+            <div className="flex items-center gap-2 text-[12px] font-medium text-secondary">
+              <span className="text-tertiary [&_svg]:size-3.5"><XClose /></span>
+              Ignore patterns
             </div>
-
-            {/* per-folder mode */}
-            <div className="flex flex-col gap-2">
-              <div className="text-[12px] font-medium text-ink-muted">Per-folder behaviour</div>
-              {Array.from(new Set([libraryRoot, ...watchFolders])).filter(Boolean).map(path => {
-                const fc = folderModeFor(path);
-                return (
-                  <NestedBox key={path} className="flex flex-wrap items-center gap-2.5 px-3 py-2.5">
-                    <IcFolder style={{ width: 14, height: 14 }} className="shrink-0 text-ink-soft" />
-                    <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink-muted">{path}</span>
-                    <Select<FolderCfg['mode']>
-                      style={{ width: 220 }}
-                      value={fc.mode}
-                      onChange={mode => void saveWatchCfg({ ...watchCfg, folders: { ...watchCfg.folders, [path]: { ...fc, mode } } })}
-                      options={[
-                        { value: 'scan', label: 'Scan + match only' },
-                        { value: 'auto_rename', label: 'Auto-rename high-confidence' },
-                      ]}
-                    />
-                    {fc.mode === 'auto_rename' ? (
-                      <label className="flex items-center gap-1.5 text-[12px] text-ink-soft">
-                        ≥
-                        <NumberField
-                          className="w-20"
-                          min={0} max={100} step={1}
-                          value={Math.round(fc.threshold * 100)}
-                          onChange={v => {
-                            const threshold = Math.min(1, Math.max(0, v / 100));
-                            void saveWatchCfg({ ...watchCfg, folders: { ...watchCfg.folders, [path]: { ...fc, threshold } } });
-                          }}
-                        />
-                        % conf
-                      </label>
-                    ) : null}
-                  </NestedBox>
-                );
-              })}
-              <p className="text-[11px] leading-relaxed text-ink-soft">
-                <span className="font-medium text-ink-muted">Scan + match only</span> surfaces new files in Review for you to approve.{' '}
-                <span className="font-medium text-ink-muted">Auto-rename</span> additionally organizes matches at or above the confidence
-                threshold automatically, using your default file operation (hardlink by default — non-destructive, the original stays put). Sub-threshold files still wait in Review.
-              </p>
+            <div className="mt-2">
+              <Input
+                mono
+                spellCheck={false}
+                value={ignoreText ?? ignorePatterns.join(', ')}
+                placeholder="*.partial.mkv, Anime Music Videos, *NCOP*"
+                onChange={e => setIgnoreText(e.target.value)}
+                onBlur={commitIgnores}
+                onKeyDown={e => { if (e.key === 'Enter') commitIgnores(); }}
+              />
+            </div>
+            <div className="mt-1.5 text-[11px] leading-relaxed text-tertiary">
+              Comma-separated globs, matched against file and folder names. Samples, trailers and extras are always skipped regardless.
             </div>
           </div>
-        ) : null}
-      </SectionCard>
-        </div>
+        </section>
+
+        {/* ── AUTO-SCAN — the engine: watch + act automatically ── */}
+        <section className="overflow-hidden rounded-2xl bg-secondary shadow-xs ring-1 ring-inset ring-secondary" style={watchCfg.auto_scan ? { boxShadow: 'inset 0 0 0 1px var(--accent-line)' } : undefined}>
+          <div className="flex items-center justify-between gap-3 p-5">
+            <div className="flex items-center gap-2.5">
+              <FeaturedIcon size="md" icon={<Scan />} tint="var(--accent)" />
+              <div>
+                <div className="flex items-center gap-2 text-[14px] font-semibold text-primary">
+                  Auto-scan
+                  {watchCfg.auto_scan ? <BadgeWithDot color="success" pulse>armed</BadgeWithDot> : null}
+                </div>
+                <div className="text-[12px] leading-relaxed text-tertiary">Watch your folders and scan automatically when new files appear — no need to click &ldquo;Scan now&rdquo;.</div>
+              </div>
+            </div>
+            <Toggle isSelected={watchCfg.auto_scan} onChange={() => void saveWatchCfg({ ...watchCfg, auto_scan: !watchCfg.auto_scan })} aria-label="Enable auto-scan" />
+          </div>
+
+          {/* CSS-only collapse via grid-rows 0fr→1fr (same trick as the provider cards). */}
+          <div className={cn('grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:transition-none', watchCfg.auto_scan ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]')}>
+            <div className="overflow-hidden">
+              <div className="flex flex-col gap-4 border-t border-secondary p-5">
+                {/* timing */}
+                <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                  <div className="rounded-xl bg-tertiary p-3.5 ring-1 ring-inset ring-secondary">
+                    <div className="text-[13px] font-medium text-primary">Settle delay</div>
+                    <div className="mt-0.5 text-[11.5px] leading-relaxed text-tertiary">Wait after the last change before scanning.</div>
+                    <InputNumber wrapperClassName="mt-2.5 w-full" minValue={5} value={watchCfg.debounce_seconds} onChange={v => { if (Number.isFinite(v)) void saveWatchCfg({ ...watchCfg, debounce_seconds: Math.max(5, v) }); }} />
+                  </div>
+                  <div className="rounded-xl bg-tertiary p-3.5 ring-1 ring-inset ring-secondary">
+                    <div className="text-[13px] font-medium text-primary">Poll interval</div>
+                    <div className="mt-0.5 text-[11.5px] leading-relaxed text-tertiary">Fallback re-check for network drives.</div>
+                    <InputNumber wrapperClassName="mt-2.5 w-full" minValue={60} value={watchCfg.poll_interval_seconds} onChange={v => { if (Number.isFinite(v)) void saveWatchCfg({ ...watchCfg, poll_interval_seconds: Math.max(60, v) }); }} />
+                  </div>
+                </div>
+
+                {/* per-folder behaviour — a status board; armed rows carry an indigo rail + ping */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="text-[12px] font-medium text-secondary">Per-folder behaviour</div>
+                  <div className="overflow-hidden rounded-xl ring-1 ring-inset ring-secondary">
+                    {Array.from(new Set([libraryRoot, ...watchFolders])).filter(Boolean).map(path => {
+                      const fc = folderModeFor(path);
+                      const armed = fc.mode === 'auto_rename';
+                      return (
+                        <div
+                          key={path}
+                          className="flex flex-wrap items-center gap-2.5 border-t border-secondary px-3.5 py-2.5 first:border-t-0"
+                          style={armed ? { boxShadow: 'inset 3px 0 0 0 var(--accent)' } : undefined}
+                        >
+                          <span className="relative flex size-1.5 shrink-0">
+                            {armed ? <span className="absolute inline-flex size-full animate-ping rounded-full opacity-60" style={{ background: 'var(--accent)' }} /> : null}
+                            <span className="relative inline-flex size-1.5 rounded-full" style={{ background: armed ? 'var(--accent)' : 'var(--ink-3)' }} />
+                          </span>
+                          <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-secondary">{path}</span>
+                          <Select<FolderCfg['mode']>
+                            aria-label="Folder behaviour"
+                            style={{ width: 210 }}
+                            value={fc.mode}
+                            onChange={mode => void saveWatchCfg({ ...watchCfg, folders: { ...watchCfg.folders, [path]: { ...fc, mode } } })}
+                            options={[
+                              { value: 'scan', label: 'Scan + match only' },
+                              { value: 'auto_rename', label: 'Auto-rename high-confidence' },
+                            ]}
+                          />
+                          {armed ? (
+                            <label className="flex items-center gap-1.5 text-[12px] text-tertiary">
+                              ≥
+                              <InputNumber
+                                wrapperClassName="w-24"
+                                minValue={0} maxValue={100} step={1}
+                                value={Math.round(fc.threshold * 100)}
+                                onChange={v => {
+                                  if (!Number.isFinite(v)) return;
+                                  const threshold = Math.min(1, Math.max(0, v / 100));
+                                  void saveWatchCfg({ ...watchCfg, folders: { ...watchCfg.folders, [path]: { ...fc, threshold } } });
+                                }}
+                              />
+                              % conf
+                            </label>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-tertiary">
+                    <span className="font-medium text-secondary">Scan + match only</span> surfaces new files in Review for you to approve.{' '}
+                    <span className="font-medium text-secondary">Auto-rename</span> additionally organizes matches at or above the confidence threshold automatically, using your default file operation (hardlink by default — non-destructive, the original stays put). Sub-threshold files still wait in Review.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
       </div>
 
       {picker ? (

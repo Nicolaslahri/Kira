@@ -42,9 +42,9 @@ export const SegmentedControl = ({ options, value, onChange, fullWidth, classNam
                             "duration-[var(--dur-2)] ease-[var(--ease-out)]",
                             // Springy toggle feel + visible keyboard focus, matching the
                             // app-wide button system (see "BUTTON SYSTEM" in index.css).
-                            "active:scale-[0.96] focus-visible:ring-2 focus-visible:ring-[#6ea8fe] focus-visible:ring-offset-0",
+                            "active:scale-[0.96] focus-visible:ring-2 focus-visible:ring-[var(--focus)] focus-visible:ring-offset-0",
                             fullWidth && "flex-1",
-                            active ? "bg-white/[0.1] text-ink shadow-[0_1px_2px_rgba(0,0,0,0.3)]" : "text-ink-muted hover:bg-white/[0.04] hover:text-ink",
+                            active ? "bg-white/[0.1] text-ink shadow-[0_1px_2px_var(--scrim-30)]" : "text-ink-muted hover:bg-white/[0.04] hover:text-ink",
                         )}
                     >
                         {o.label}

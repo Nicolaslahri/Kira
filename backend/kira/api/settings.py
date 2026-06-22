@@ -135,6 +135,7 @@ async def put_settings(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, int]:
     """Bulk upsert settings keys."""
+    from kira.settings_store import unwrap_str
     n = 0
     # Capture the PRIOR value of the MediaInfo toggles (only when present in this
     # payload) so we can tell a genuine OFF→ON flip — which should backfill the
@@ -147,6 +148,18 @@ async def put_settings(
         if _is_secret_key(key) and _looks_like_mask(value):
             continue
         existing = await session.get(Setting, key)
+        # Refuse to clear a CONFIGURED secret with a BLANK value. A masked field's
+        # editable value is '' (the plaintext never leaves the server), so a stray
+        # empty onChange/blur on the client would otherwise persist '' and the next
+        # GET would re-mask it as set=false — i.e. the key "disappears after a
+        # refresh". Rotating/clearing still works via an explicit non-empty value.
+        if (
+            _is_secret_key(key)
+            and unwrap_str(value) is None
+            and existing is not None
+            and unwrap_str(existing.value) is not None
+        ):
+            continue
         if key in ("parsing.read_mediainfo", "parsing.mediainfo_authoritative"):
             _mi_old[key] = existing.value if existing is not None else None
         if existing is None:

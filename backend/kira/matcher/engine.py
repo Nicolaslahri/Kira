@@ -378,9 +378,14 @@ class MatchEngine:
             if scored[0].confidence >= self.EARLY_EXIT_CONFIDENCE:
                 return scored[:limit]
 
-        # Walked all providers without a clear winner — return the global
-        # best ranked across everyone we asked.
-        all_scored.sort(key=lambda s: s.confidence, reverse=True)
+        # Walked all providers without a clear winner — return the global best
+        # ranked across everyone we asked. Deterministic tiebreak on (provider,
+        # provider_id): equal-confidence candidates (two 1.0s at the tier-1
+        # ceiling is common) must resolve the SAME way every scan, not by
+        # non-deterministic provider search-result order (e.g. AniDB title-dump
+        # iteration). is_ambiguous in the cascade trace still flags these for a
+        # future "needs resolution" surface.
+        all_scored.sort(key=lambda s: (s.confidence, str(s.provider), str(s.provider_id)), reverse=True)
 
         # No-match floor: refuse to return junk. Caller treats empty as
         # `no_match` and renders the manual-search affordance.
@@ -533,8 +538,10 @@ class MatchEngine:
             sm.raw = dict(sm.raw or {})
             sm.raw["cascade_trace"] = trace.to_dict()
 
-        # Sort by cascade-derived confidence.
-        scored.sort(key=lambda s: s.confidence, reverse=True)
+        # Sort by cascade-derived confidence, with a deterministic tiebreak on
+        # (provider, provider_id) so equal-confidence ties don't flip between
+        # scans on non-deterministic candidate order.
+        scored.sort(key=lambda s: (s.confidence, str(s.provider), str(s.provider_id)), reverse=True)
 
         # AniDB absolute → AID routing stays as a separate routing pass
         # (bipartite refinement at cluster-write time handles the per-
@@ -1341,11 +1348,19 @@ async def resolve_canonical_season(
             aid = int(provider_id)
             # ScudLee per-episode TVDB season — most precise; the only thing that
             # gives a flat absolute umbrella (One Piece) a real per-arc season.
+            scud_missed = False
             if episode is not None:
                 from kira.providers.anime_lists import resolve_anidb_to_tvdb
                 scud = await resolve_anidb_to_tvdb(aid, episode)
                 if scud is not None:
                     return scud[0]
+                # A CONCRETE episode that ScudLee can't place yet — a brand-new
+                # absolute (One Piece ep 1166) not in the mapping table. This is
+                # categorically different from "no episode signal at all": the
+                # episode genuinely belongs to the show, ScudLee is just stale.
+                # Remembered so the flat-umbrella fallback below keeps it beside
+                # its already-catalogued siblings instead of collapsing to S1.
+                scud_missed = True
             mapped = await AnimeMappings.tvdb_season(aid)
             if mapped is not None:
                 return mapped
@@ -1388,6 +1403,17 @@ async def resolve_canonical_season(
                     # episode number still rides in the filename; only the folder
                     # unifies. (A genuine special's OWN aid maps to season 0 via the
                     # `tvdb_season(aid)` check above and is unaffected.)
+                    #
+                    # EXCEPTION — a brand-new episode ScudLee hasn't catalogued yet
+                    # (scud_missed): its arc-mates (ep 1156-1165) already resolved to
+                    # their real per-arc season via ScudLee, so collapsing JUST the
+                    # new one to S1 is what splits the card (ep 1166 → S1 beside ep
+                    # 1165 → S23). Inherit the folder season so the newcomer lands
+                    # with its siblings. Only fires when we HAD a concrete episode
+                    # AND a folder season — the no-signal call still unifies to S1
+                    # (locked by test_flat_umbrella_pins_season_1).
+                    if scud_missed and parsed_season is not None:
+                        return parsed_season
                     return 1
         except Exception:
             pass

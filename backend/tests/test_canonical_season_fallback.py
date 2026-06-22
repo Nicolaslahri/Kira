@@ -82,6 +82,43 @@ async def test_flat_umbrella_pins_season_1(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_flat_umbrella_new_episode_inherits_folder_season(monkeypatch):
+    """A brand-new flat-umbrella episode ScudLee hasn't catalogued yet (One Piece
+    ep 1166) inherits its FOLDER season (23) so it lands beside its already-
+    resolved arc siblings (ep 1156-1165 → S23) — instead of collapsing to the
+    unified Season 1 default, which is ONLY for the no-episode-signal call.
+
+    Regression: ep 1166 was scanned the day it aired, before the ScudLee mapping
+    extended to cover it; `resolve_anidb_to_tvdb(69, 1166)` returned None and the
+    fallback stamped Season 1, splitting it off into a phantom card."""
+    seasons = {69: None, 411: 0, 18325: 0}  # 69 = One Piece umbrella; rest = movies
+
+    async def _season(aid):
+        return seasons.get(int(aid))
+
+    async def _tvdb(aid):
+        return 81797  # One Piece
+
+    async def _aids(tvdb_id):
+        return [69, 411, 18325]
+
+    async def _scud_miss(aid, ep, *a, **k):
+        return None  # ScudLee can't place this brand-new episode yet
+
+    monkeypatch.setattr(AnimeMappings, "tvdb_season", _season)
+    monkeypatch.setattr(AnimeMappings, "tvdb_id", _tvdb)
+    monkeypatch.setattr(AnimeMappings, "aids_by_tvdb", _aids)
+    monkeypatch.setattr("kira.providers.anime_lists.resolve_anidb_to_tvdb", _scud_miss)
+
+    # Concrete episode + a folder season → inherit it (23), NOT the S1 default.
+    assert await resolve_canonical_season("anidb", "69", 23, episode=1166) == 23
+    # No episode signal at all → still unifies to Season 1 (unchanged contract).
+    assert await resolve_canonical_season("anidb", "69", 23) == 1
+    # Episode given but no folder season to inherit → fall back to the S1 default.
+    assert await resolve_canonical_season("anidb", "69", None, episode=1166) == 1
+
+
+@pytest.mark.asyncio
 async def test_genuine_special_keeps_season_0(monkeypatch):
     """A real special's OWN aid maps to season 0 in Fribb → returns 0 directly
     (it really IS a special), unaffected by the flat-umbrella rule above."""

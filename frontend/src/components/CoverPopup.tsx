@@ -22,6 +22,7 @@ import {
 } from '../lib/icons';
 import { api } from '../lib/api';
 import { Button } from './base/buttons/button';
+import { ButtonGroup, ButtonGroupItem } from './base/button-group/button-group';
 import { libraryStats } from './LibraryGrid';
 import { fetchAnidbPoster, getCachedAnidbPoster } from '../lib/posters';
 import { fetchSeriesEpisodes, getCachedEpisodes, type ProviderEpisode } from '../lib/episodes';
@@ -904,13 +905,30 @@ export function CoverPopup({
       // Safe within a single popup: one cluster = one season's worth
       // of episodes, so episode numbers don't collide.
       if (item.mediaType === 'anime') {
-        pushFile(`ep-${ep.episode}`, f);
-        // Plus the existing (1, ep) and abs-ep fallbacks for the
-        // AniDB-native episode list case (everything stored as
-        // season=1, episode N).
-        if (ep.season !== 1) {
-          pushFile(`1-${ep.episode}`, f);
-          pushFile(`abs-${ep.episode}`, f);
+        // These fallbacks treat the file's EPISODE NUMBER as an AniDB
+        // absolute. That holds for AniDB-native files (stored as
+        // season=1|N, episode=N) and for cross-ref files whose match
+        // episode IS the absolute (One Piece S23 → episode 1156…). It does
+        // NOT hold when the file carries a SEASON-RELATIVE episode number
+        // alongside a DISTINCT absolute — e.g. `One Piece S23E12 - 1167`
+        // matched as (season 23, episode 12) with absolute 1167. There
+        // `ep.episode` (12) is not an absolute; registering it as one makes
+        // the file falsely pair to the provider's REAL episode 12 ("Clash
+        // with the Black Cat Pirates", aired 2000) ON TOP OF its true
+        // episode 1167 — so the same file renders twice. Skip the
+        // absolute-style fallbacks in that case; the exact
+        // `${season}-${episode}` and `abs-${absolute}` keys above already
+        // pair it correctly.
+        const epIsAbsolute = ep.absolute == null || ep.absolute === ep.episode;
+        if (epIsAbsolute) {
+          pushFile(`ep-${ep.episode}`, f);
+          // Plus the existing (1, ep) and abs-ep fallbacks for the
+          // AniDB-native episode list case (everything stored as
+          // season=1, episode N).
+          if (ep.season !== 1) {
+            pushFile(`1-${ep.episode}`, f);
+            pushFile(`abs-${ep.episode}`, f);
+          }
         }
       }
     });
@@ -1218,7 +1236,7 @@ export function CoverPopup({
         onTransitionEnd={handleFlyEnd}
         style={{
           background: item.noMatch
-            ? 'rgba(255,255,255,0.04)'
+            ? 'var(--glass)'
             : `linear-gradient(135deg, ${tint[0]}, ${tint[1]})`,
         }}
       >
@@ -1287,7 +1305,7 @@ export function CoverPopup({
               padding: '12px 18px',
               margin: '0 0 -1px 0',
               background: 'var(--conf-low-bg)',
-              borderBottom: '1px solid rgba(255, 91, 110, 0.32)',
+              borderBottom: '1px solid var(--conf-low-32)',
               color: 'var(--ink)',
               fontSize: 13,
               lineHeight: 1.45,
@@ -1306,21 +1324,10 @@ export function CoverPopup({
                 manually.
               </div>
             </div>
-            {/* Sync-from-Sonarr fast path. Only render when we have any
-                files to heal (always true inside this banner) — the
-                backend handles the "no Sonarr config" case with a
-                graceful toast. Eye-catching so the user sees it before
-                they reach for the slower manual-search route below. */}
-            <button
-              className="btn btn-primary"
-              onClick={handleSonarrHeal}
-              disabled={sonarrHealing}
-              style={{ flex: '0 0 auto', whiteSpace: 'nowrap' }}
-              title="Pull metadata from Sonarr for these files. Works when Sonarr already imported them — Sonarr knows the correct TVDB/AniDB identity."
-            >
-              <IcDownload />
-              <span>{sonarrHealing ? 'Syncing…' : 'Sync from Sonarr'}</span>
-            </button>
+            {/* No button here — the banner is purely informational. The
+                Sync-from-Sonarr + Search actions it references live in the
+                footer action row "below" (single source of truth for every
+                cluster action), so the banner doesn't duplicate them. */}
           </div>
         ) : null}
         <div className="cx-main">
@@ -1435,6 +1442,8 @@ export function CoverPopup({
               title="Close (Esc)"
               aria-label="Close"
             />
+            {/* All footer actions as one connected Untitled UI ButtonGroup. */}
+            <ButtonGroup size="sm">
             {(() => {
               // Re-identify button.
               //
@@ -1459,17 +1468,9 @@ export function CoverPopup({
                 ? 'Search for a match'
                 : item.kind === 'movie' ? 'Re-identify movie' : 'Re-identify';
               return (
-                <Button
-                  color="secondary"
-                  size="sm"
-                  iconLeading={IcSearch}
-                  onClick={handleReidentify}
-                  title={!hasAnyMatch
-                    ? 'Open manual search and pick the right show for these files.'
-                    : 'Open manual search and pick a different show — applies to every file in this cluster.'}
-                >
+                <ButtonGroupItem id="reidentify" iconLeading={IcSearch} onClick={handleReidentify}>
                   {label}
-                </Button>
+                </ButtonGroupItem>
               );
             })()}
 
@@ -1478,40 +1479,22 @@ export function CoverPopup({
                 as missing a preferred language. Fire-and-forget: the live
                 story plays in the activity pill, not here. */}
             {!clusterIsDead && subMissingIds.length > 0 ? (
-              <Button
-                color="secondary"
-                size="sm"
-                iconLeading={IcDownload}
-                isLoading={subBusy}
-                showTextWhileLoading
-                onClick={handleGetSubtitles}
-                title={`Fetch missing subtitles for ${subMissingIds.length} file(s) in this title.`}
-              >
+              <ButtonGroupItem id="subs" iconLeading={IcDownload} isDisabled={subBusy} onClick={handleGetSubtitles}>
                 Get subtitles ({subMissingIds.length})
-              </Button>
+              </ButtonGroupItem>
             ) : null}
 
-            {/* ── Sync from Sonarr (no-match clusters) ────────────────
-                Visible specifically on no-match clusters where the
-                low-confidence banner DOESN'T render (banner only fires
-                when at least one file has a matched-to-episode row at
-                <50% conf). True no-match clusters get this footer
-                button instead so the user always has the fast path.
-                Low-confidence clusters get the SAME action via the
-                button embedded in the banner above — we don't render
-                it here to avoid two identical buttons. */}
-            {!clusterIsDead && item.noMatch ? (
-              <Button
-                color="secondary"
-                size="sm"
-                iconLeading={IcDownload}
-                isLoading={sonarrHealing}
-                showTextWhileLoading
-                onClick={handleSonarrHeal}
-                title="Pull metadata from Sonarr for these files. Works when Sonarr already imported them."
-              >
+            {/* ── Sync from Sonarr ─────────────────────────────────────
+                The SINGLE Sonarr-heal button for any cluster that needs
+                re-identification — true no-match clusters AND low-confidence
+                clusters (best episode match <50%). The low-confidence banner
+                above is purely informational and points "below" to this
+                button, so the action lives here in the footer with every
+                other cluster action (no duplicate button in the banner). */}
+            {!clusterIsDead && (item.noMatch || isLowConfidenceCluster) ? (
+              <ButtonGroupItem id="sync" iconLeading={IcDownload} isDisabled={sonarrHealing} onClick={handleSonarrHeal}>
                 {sonarrHealing ? 'Syncing…' : 'Sync from Sonarr'}
-              </Button>
+              </ButtonGroupItem>
             ) : null}
 
             {/* ── Get missing → Sonarr ────────────────────────────────
@@ -1598,27 +1581,12 @@ export function CoverPopup({
               // episode's season gives us the right value for Sonarr.
               const seasonNum = providerEpisodes[0]?.season ?? 1;
 
-              const providerLabel = providerKey === 'anidb' ? 'AniDB→TVDB' : 'TVDB';
               return (
-                <Button
-                  color="secondary"
-                  size="sm"
-                  iconLeading={IcDownload}
-                  isLoading={sonarrSending}
-                  showTextWhileLoading
-                  onClick={() => void handleSonarrSendMissing(matchId, seasonNum, missingNumbers)}
-                  title={`Tell Sonarr to search for the ${missingNumbers.length} missing episode${missingNumbers.length === 1 ? '' : 's'} of this season. (${providerLabel})`}
-                >
+                <ButtonGroupItem id="sonarr-missing" iconLeading={IcDownload} isDisabled={sonarrSending} onClick={() => void handleSonarrSendMissing(matchId, seasonNum, missingNumbers)}>
                   {sonarrSending ? 'Sending…' : `Get missing (${missingNumbers.length}) → Sonarr`}
-                </Button>
+                </ButtonGroupItem>
               );
             })()}
-
-            {/* Push the action triad (dupes / reject / approve) to the
-                far right so Close + Re-match sit left, destructive +
-                primary stay right — the classic "secondary | primary"
-                footer layout. */}
-            <span className="cx-foot-spacer" />
             {/* Dupe resolver — only renders when the cluster has any episodes
                 with duplicate files. One click gathers the loser copies across
                 EVERY duplicated episode (keeping the best of each) and opens a
@@ -1641,16 +1609,15 @@ export function CoverPopup({
               }
               if (losers.length === 0) return null;
               return (
-                <Button
-                  color="secondary"
-                  size="sm"
-                  className="bg-[rgba(255,201,74,0.14)] text-conf-mid ring-[rgba(255,201,74,0.5)] hover:bg-[rgba(255,201,74,0.22)]"
-                  iconLeading={<IcAlertTri className="size-4 text-conf-mid" />}
+                <ButtonGroupItem
+                  id="dupes"
+                  className="text-conf-mid hover:bg-[var(--conf-mid-16)] hover:text-conf-mid *:data-icon:text-conf-mid"
+                  iconLeading={IcAlertTri}
                   title="Keep the best copy of every duplicated episode and delete the rest — in one confirmation."
                   onClick={() => setBulkConfirm({ files: losers, keepCount: epCount, epCount })}
                 >
                   Resolve {losers.length} duplicate{losers.length === 1 ? '' : 's'}
-                </Button>
+                </ButtonGroupItem>
               );
             })()}
             {(() => {
@@ -1698,9 +1665,9 @@ export function CoverPopup({
                 tooltip = 'Mark these files as rejected — they won\'t be renamed.';
               }
               return (
-                <Button
-                  color="secondary-destructive"
-                  size="sm"
+                <ButtonGroupItem
+                  id="reject"
+                  color="destructive"
                   iconLeading={IcX}
                   onClick={() => {
                     if (item.kind === 'movie') updateFile(0, { status: 'rejected' });
@@ -1720,7 +1687,7 @@ export function CoverPopup({
                   title={tooltip}
                 >
                   {label}
-                </Button>
+                </ButtonGroupItem>
               );
             })()}
             {(() => {
@@ -1756,9 +1723,8 @@ export function CoverPopup({
 
               if (eligibleCount === 0 && hasOrphans) {
                 return (
-                  <Button
+                  <ButtonGroupItem
                     color="primary"
-                    size="sm"
                     iconLeading={IcSearch}
                     onClick={() => {
                       // Hand control to the Manual Search modal — same
@@ -1768,7 +1734,7 @@ export function CoverPopup({
                     title="Open Manual Search to find a match for this file"
                   >
                     Search manually
-                  </Button>
+                  </ButtonGroupItem>
                 );
               }
 
@@ -1794,9 +1760,8 @@ export function CoverPopup({
                 //     no actions left.
                 if (canRestore) {
                   return (
-                    <Button
+                    <ButtonGroupItem
                       color="primary"
-                      size="sm"
                       iconLeading={IcRefresh}
                       onClick={() => {
                         // Flip every rejected file back to pending so
@@ -1814,19 +1779,18 @@ export function CoverPopup({
                       title="Move these files back to the review queue so they show up in Pending again."
                     >
                       Restore {rejectedCount} file{rejectedCount === 1 ? '' : 's'}
-                    </Button>
+                    </ButtonGroupItem>
                   );
                 }
                 return (
-                  <Button
-                    color="primary"
-                    size="sm"
+                  <ButtonGroupItem
+                    color="success"
                     iconLeading={IcCheck}
                     isDisabled
                     title="All files in this cluster are already renamed"
                   >
                     Nothing to rename
-                  </Button>
+                  </ButtonGroupItem>
                 );
               }
 
@@ -1855,9 +1819,8 @@ export function CoverPopup({
 
               if (isLowConfidence) {
                 return (
-                  <Button
+                  <ButtonGroupItem
                     color="primary"
-                    size="sm"
                     iconLeading={IcSearch}
                     onClick={() => {
                       // Open Manual Search prefilled for the first
@@ -1869,14 +1832,13 @@ export function CoverPopup({
                     title={`Matches are low-confidence (best is ${Math.round(maxConf)}%). Search manually to find the real series.`}
                   >
                     Search for a better match
-                  </Button>
+                  </ButtonGroupItem>
                 );
               }
 
               return (
-                <Button
-                  color="primary"
-                  size="sm"
+                <ButtonGroupItem
+                  color="success"
                   iconLeading={IcCheck}
                   onClick={async () => {
                     // Cancel any in-flight debounce — the hero button takes
@@ -1916,9 +1878,10 @@ export function CoverPopup({
                   }}
                 >
                   Approve all {eligibleCount}
-                </Button>
+                </ButtonGroupItem>
               );
             })()}
+            </ButtonGroup>
           </div>
         </div>
       </div>

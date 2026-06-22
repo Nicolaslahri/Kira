@@ -112,9 +112,9 @@ export function Chip({ children, accent }: { children: ReactNode; accent?: boole
     <span
       style={{
         fontSize: 11, padding: '3px 8px', borderRadius: 4,
-        background: accent ? 'rgba(255, 151, 75, 0.14)' : 'var(--glass-2)',
+        background: accent ? 'var(--warn-16)' : 'var(--glass-2)',
         color: accent ? 'var(--brand-a)' : 'var(--ink-2)',
-        border: '1px solid ' + (accent ? 'rgba(255, 151, 75, 0.3)' : 'var(--line)'),
+        border: '1px solid ' + (accent ? 'var(--warn-32)' : 'var(--line)'),
         fontWeight: 500,
       }}
     >

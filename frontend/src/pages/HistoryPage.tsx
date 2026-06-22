@@ -4,8 +4,11 @@ import { api, type ApiHistoryEntry } from '../lib/api';
 import { poster as makePoster } from '../lib/data';
 import { fetchAnidbPoster, getCachedAnidbPoster } from '../lib/posters';
 import { IcDownload, IcUndo, IcFolder, IcArrowRight, IcHistory, IcSearch, IcX, IcCheck, IcSparkles } from '../lib/icons';
-import { Poster, Checkbox, EmptyState, Skeleton, Select } from '../components/ui';
+import { FilterChip } from './ReviewPage';
+import { Poster, Checkbox, EmptyState, Skeleton } from '../components/ui';
 import { Button } from '../components/base/buttons/button';
+import { Input } from '../components/base/input/input';
+import { BadgeWithDot } from '../components/base/badges/badges';
 import { SegmentedControl } from '../components/base/segmented/segmented-control';
 import { cn } from '../lib/utils';
 import { cacheGet, cacheSet } from '../lib/cache';
@@ -41,18 +44,32 @@ function dayLabel(iso: string): string {
   return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: now.getFullYear() === d.getFullYear() ? undefined : 'numeric' });
 }
 
-// Operation colour language — each file-op gets a consistent hue across the
-// node dot + the inline op badge, so the ledger is scannable at a glance.
-// (move = the destructive one → accent/green "landed"; copy = blue; hardlink =
-// amber; symlink = violet.) Falls back to neutral for anything unexpected.
-const OP_STYLE: Record<string, { node: string; chip: string; ring: string }> = {
-  move:     { node: 'var(--accent)',  chip: 'hist-op-move',     ring: 'rgba(40,217,160,0.5)' },
-  copy:     { node: '#5b9dff',        chip: 'hist-op-copy',     ring: 'rgba(91,157,255,0.5)' },
-  hardlink: { node: 'var(--conf-mid)',chip: 'hist-op-hardlink', ring: 'rgba(255,201,74,0.5)' },
-  symlink:  { node: '#b48cff',        chip: 'hist-op-symlink',  ring: 'rgba(180,140,255,0.5)' },
+// Operation colour language — each file-op gets a consistent hue (the dot in
+// OpBadge), so the ledger is scannable at a glance. All four resolve to the
+// shared palette tokens (move=accent, copy=info, hardlink=conf-mid,
+// symlink=media-anime); see index.css :root `--op-*`. Neutral fallback.
+const OP_STYLE: Record<string, string> = {
+  move:     'var(--op-move)',
+  copy:     'var(--op-copy)',
+  hardlink: 'var(--op-hardlink)',
+  symlink:  'var(--op-symlink)',
 };
-function opStyle(op: string) {
-  return OP_STYLE[op] ?? { node: 'var(--ink-3)', chip: 'hist-op-move', ring: 'rgba(255,255,255,0.3)' };
+function opStyle(op: string): string {
+  return OP_STYLE[op] ?? 'var(--ink-3)';
+}
+
+// Operation badge — a BadgeWithDot-shaped pill whose dot carries the per-op
+// hue (move=emerald, copy=blue, hardlink=amber, symlink=violet). The dot color
+// is outside UUI's 5-color dot ramp, so it's fed inline while the pill chrome
+// stays on UUI tokens.
+function OpBadge({ op }: { op: string }) {
+  const node = opStyle(op);
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-secondary bg-white/[0.04] px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.05em] text-secondary backdrop-blur">
+      <span className="size-1.5 rounded-full" style={{ background: node }} />
+      {op}
+    </span>
+  );
 }
 
 /** Row poster with the same lazy AniDB resolution as the library grid:
@@ -353,118 +370,126 @@ export function HistoryPage({ pushToast }: Props) {
     else groups.push({ label, rows: [h] });
   }
 
+  // Undo-status overview — purely derived from the visible rows + verifyMap.
+  // (Op-mix would lie: `items` is server-filtered by operation, so it collapses
+  // when an op chip is active. active/undone/undoable survive any filter.)
+  const totalN = visibleItems.length;
+  const undoneN = visibleItems.filter(h => h.undone_at).length;
+  const activeN = totalN - undoneN;
+  // Optimistic default (?.undoable !== false) — matches undoBatch's predicate.
+  const undoableN = visibleItems.filter(h => !h.undone_at && verifyMap[h.id]?.undoable !== false).length;
+  // Selected rows the server says can no longer be undone — undoBatch skips them.
+  const staleSel = Array.from(selected).filter(id => verifyMap[id]?.undoable === false).length;
+
   return (
     <div className="page">
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">History</h1>
-          <p className="page-sub">
-            {view === 'renames'
-              ? 'Every rename Kira has performed — undo any of them at any time'
-              : 'Every subtitle Kira fetched — provider, match score, and sync confidence'}
-          </p>
+      <div className="mb-4">
+        {/* ROW 1 — title + undo-status strip + view toggle + actions */}
+        <div className="mb-2.5 flex flex-wrap items-center gap-x-3 gap-y-2">
+          <h1 className="mr-1 text-[22px] font-semibold leading-none tracking-tight text-primary">History</h1>
+
+          {/* UNDO-STATUS STRIP — the one compact "wow", nested in the title-row
+              dead space (≈0 added height). Presentational: there is no
+              active/undone filter, so the bar doesn't filter — the chips do. */}
+          {view === 'renames' && firstLoadDone ? (
+            <div className="flex min-w-[170px] max-w-[420px] flex-1 items-center gap-2.5">
+              <div role="group" aria-label={`Undo status: ${activeN} active, ${undoneN} undone, ${undoableN} undoable`} className="flex h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-tertiary ring-1 ring-inset ring-secondary">
+                <span className="h-full" style={{ width: `${(activeN / Math.max(totalN, 1)) * 100}%`, background: 'var(--conf-high)' }} />
+                <span className="h-full" style={{ width: `${(undoneN / Math.max(totalN, 1)) * 100}%`, background: 'var(--conf-low)' }} />
+              </div>
+              <span className="shrink-0 whitespace-nowrap text-[11px] font-medium tabular-nums text-tertiary">
+                <b className="text-primary">{activeN}</b> active{undoneN > 0 ? <> · <b style={{ color: 'var(--conf-low)' }}>{undoneN}</b> undone</> : null} · <b style={{ color: 'var(--conf-high)' }}>{undoableN}</b> undoable
+              </span>
+            </div>
+          ) : null}
+
+          {/* View toggle stays a SegmentedControl — it's a mode switch, not a filter. */}
+          <SegmentedControl
+            value={view}
+            onChange={v => setView(v as 'renames' | 'subtitles')}
+            options={[{ value: 'renames', label: 'Renames' }, { value: 'subtitles', label: 'Subtitles' }]}
+          />
+
+          {view === 'renames' ? (
+            <div className="ml-auto flex items-center gap-2">
+              <Button color="secondary" size="sm" iconLeading={IcSparkles} isLoading={cleaning} onClick={() => void cleanupOrphans()} title="Remove leftover sidecar files (NFO, posters, subtitles) that undone renames left on disk">Clean undo leftovers</Button>
+              <Button color="secondary" size="sm" iconLeading={IcDownload} href={api.exportHistoryUrl()} download>Export CSV</Button>
+            </div>
+          ) : null}
         </div>
+
+        {/* ROW 2 — period + operation FilterChips + search (renames view only) */}
         {view === 'renames' ? (
-          <div className="flex items-center gap-2.5">
-            <Button
-              color="secondary"
-              size="md"
-              iconLeading={IcSparkles}
-              isLoading={cleaning}
-              onClick={() => void cleanupOrphans()}
-              title="Remove leftover sidecar files (NFO, posters, subtitles) that undone renames left on disk"
-            >
-              Clean undo leftovers
-            </Button>
-            <Button color="secondary" size="md" iconLeading={IcDownload} href={api.exportHistoryUrl()} download>
-              Export CSV
-            </Button>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="mr-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Period</span>
+              <FilterChip on={period === 'today'} onClick={() => setPeriod('today')} label="Today" num={counts.today} />
+              <FilterChip on={period === 'week'} onClick={() => setPeriod('week')} label="This week" num={counts.week} />
+              <FilterChip on={period === 'all'} onClick={() => setPeriod('all')} label="All" num={counts.all} />
+            </div>
+            <span aria-hidden className="hidden h-5 w-px bg-white/10 sm:block" />
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="mr-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Operation</span>
+              <FilterChip on={opFilter === 'all'} onClick={() => setOpFilter('all')} label="All" />
+              <FilterChip on={opFilter === 'move'} onClick={() => setOpFilter('move')} label="Move" accent="var(--op-move)" dot />
+              <FilterChip on={opFilter === 'hardlink'} onClick={() => setOpFilter('hardlink')} label="Hardlink" accent="var(--op-hardlink)" dot />
+              <FilterChip on={opFilter === 'symlink'} onClick={() => setOpFilter('symlink')} label="Symlink" accent="var(--op-symlink)" dot />
+              <FilterChip on={opFilter === 'copy'} onClick={() => setOpFilter('copy')} label="Copy" accent="var(--op-copy)" dot />
+            </div>
+            <div className="ml-auto">
+              <Input
+                icon={IcSearch}
+                placeholder="Search renames…"
+                value={query}
+                onChange={e => setQuery(e.target.value)}
+                wrapperClassName="h-9 w-full max-w-[260px] !rounded-xl !py-0"
+                trailing={query ? (
+                  <button
+                    className="press grid size-[22px] shrink-0 place-items-center rounded-md text-ink-soft transition hover:bg-white/[0.06] hover:text-ink-muted"
+                    title="Clear"
+                    aria-label="Clear search"
+                    onClick={() => setQuery('')}
+                  >
+                    <IcX style={{ width: 11, height: 11 }} />
+                  </button>
+                ) : null}
+              />
+            </div>
           </div>
         ) : null}
-      </div>
-
-      {/* Renames ↔ Subtitles ledger toggle. */}
-      <div className="mb-5">
-        <SegmentedControl
-          value={view}
-          onChange={v => setView(v as 'renames' | 'subtitles')}
-          options={[{ value: 'renames', label: 'Renames' }, { value: 'subtitles', label: 'Subtitles' }]}
-        />
       </div>
 
       {view === 'subtitles' ? <SubtitleHistory pushToast={pushToast} /> : (
       <>
-      {/* Toolbar — period + operation filters, plus bulk actions. */}
-      <div className="mb-5 flex flex-wrap items-center gap-3">
-        <SegmentedControl
-          value={period}
-          onChange={v => setPeriod(v as Period)}
-          options={[
-            { value: 'today', label: `Today ${counts.today}` },
-            { value: 'week', label: `This week ${counts.week}` },
-            { value: 'all', label: `All ${counts.all}` },
-          ]}
-        />
-        <div className="w-[180px]">
-          <Select<OpFilter>
-            value={opFilter}
-            onChange={v => setOpFilter(v)}
-            options={[
-              { value: 'all', label: 'All operations' },
-              { value: 'move', label: 'Move' },
-              { value: 'hardlink', label: 'Hardlink' },
-              { value: 'symlink', label: 'Symlink' },
-              { value: 'copy', label: 'Copy' },
-            ]}
-          />
-        </div>
-
-        <div
-          className="hist-search flex h-9 w-full max-w-[260px] items-center gap-2 rounded-xl border border-line bg-white/[0.025] px-3 transition focus-within:border-white/[0.2] focus-within:bg-white/[0.04]"
-          onClick={(e) => { (e.currentTarget.querySelector('input') as HTMLInputElement)?.focus(); }}
-        >
-          <IcSearch style={{ width: 14, height: 14 }} className="shrink-0 text-ink-soft" />
-          <input
-            className="min-w-0 flex-1 border-0 bg-transparent text-[13px] text-ink outline-none placeholder:text-ink-soft"
-            placeholder="Search renames…"
-            value={query}
-            onChange={e => setQuery(e.target.value)}
-          />
-          {query ? (
-            <button
-              className="press grid size-[22px] shrink-0 place-items-center rounded-md text-ink-soft transition hover:bg-white/[0.06] hover:text-ink-muted"
-              title="Clear"
-              aria-label="Clear search"
-              onClick={() => setQuery('')}
-            >
-              <IcX style={{ width: 11, height: 11 }} />
-            </button>
-          ) : null}
-        </div>
-
-        {/* Bulk-undo bar — slides in springily when rows are selected. */}
-        {selected.size > 0 ? (
-          <div className="hist-bulkbar ml-auto flex items-center gap-2.5 rounded-full border border-white/[0.12] bg-white/[0.05] py-1 pl-3.5 pr-1.5 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)]">
-            <span className="text-[12px] font-medium text-ink-muted">{selected.size} selected</span>
-            <Button color="secondary-destructive" size="sm" iconLeading={IcUndo} onClick={() => void undoBatch()}>
-              Undo selected
-            </Button>
+      {/* Bulk-undo selection bar — indigo-armed, mirrors the Review page.
+          Surfaces verifyMap's "can no longer be undone" so the bar tells the
+          truth about what Undo will actually attempt. */}
+      {selected.size > 0 ? (
+        <div className="mb-3 flex flex-wrap items-center gap-3 rounded-xl bg-secondary px-4 py-2.5" style={{ boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent)' }}>
+          <div className="flex items-center gap-2 text-[13px] text-primary">
+            <span className="grid size-5 place-items-center rounded-md text-white [&_svg]:size-3" style={{ background: 'var(--accent-deep)' }} aria-hidden="true"><IcCheck /></span>
+            <b className="font-semibold tabular-nums">{selected.size} selected</b>
+            {staleSel > 0 ? <span className="text-[12px] text-secondary">· {staleSel} can no longer be undone</span> : null}
           </div>
-        ) : null}
-      </div>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <Button color="secondary" size="sm" onClick={() => setSelected(new Set())}>Clear</Button>
+            <Button color="secondary-destructive" size="sm" iconLeading={IcUndo} onClick={() => void undoBatch()}>Undo selected</Button>
+          </div>
+        </div>
+      ) : null}
 
       {/* Count strip — sits above the timeline. */}
       <div className="mb-3 flex items-center gap-3 px-0.5">
         <Checkbox on={allChecked} indeterminate={!allChecked && someChecked} onChange={toggleAll} />
-        <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-soft">
+        <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">
           {firstLoadDone ? `${visibleItems.length} ${visibleItems.length === 1 ? 'rename' : 'renames'}` : 'Loading…'}
         </span>
       </div>
 
       {!firstLoadDone ? (
-        <div className="overflow-hidden rounded-2xl border border-white/[0.12] bg-white/[0.045] shadow-[0_1px_3px_rgba(0,0,0,0.35)]">
+        <div className="overflow-hidden rounded-2xl border border-secondary bg-secondary shadow-xs">
           {[0, 1, 2, 3].map(i => (
-            <div key={`sk-${i}`} className="flex items-center gap-4 border-b border-white/[0.06] px-4 py-3 last:border-0">
+            <div key={`sk-${i}`} className="flex items-center gap-4 border-b border-secondary px-4 py-3 last:border-0">
               <Skeleton w={18} h={18} radius={4} />
               <Skeleton w={40} h={56} radius={6} />
               <div className="flex min-w-0 flex-1 flex-col gap-1.5">
@@ -480,25 +505,24 @@ export function HistoryPage({ pushToast }: Props) {
       ) : null}
 
       {/* ── Timeline ────────────────────────────────────────────────
-          Day-grouped rail: a sticky day header, then a vertical line with
-          one coloured node per rename. Rows stagger in; freshly-renamed and
-          just-restored rows get their own one-shot celebration. */}
+          Day-grouped UUI card list. Each rename is a self-contained card
+          (poster + title + op badge + from→to paths + undo). Freshly-renamed
+          rows get a brief emerald ring; just-undone rows swap Undo→Restored. */}
       {firstLoadDone && groups.length > 0 ? (
-        <div className="flex flex-col gap-7">
+        <div className="flex flex-col gap-8">
           {groups.map((g, gi) => (
-            <section key={`${g.label}-${gi}`} className="hist-day anim-rise-sm" style={{ ['--i' as string]: Math.min(gi, 6) }}>
-              <div className="hist-day-head">
-                <span className="hist-day-label">{g.label}</span>
-                <span className="hist-day-count">{g.rows.length}</span>
-                <span className="hist-day-line" />
+            <section key={`${g.label}-${gi}`} className="anim-rise-sm" style={{ ['--i' as string]: Math.min(gi, 6) }}>
+              <div className="mb-3 flex items-center gap-3">
+                <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-quaternary">{g.label}</span>
+                <span className="inline-grid h-5 min-w-[20px] place-items-center rounded-full bg-tertiary px-1.5 text-[11px] font-semibold text-tertiary ring-1 ring-secondary ring-inset">{g.rows.length}</span>
+                <span className="h-px flex-1 bg-gradient-to-r from-[var(--line-strong)] to-transparent" />
               </div>
 
-              <div className="hist-rail anim-stagger">
+              <div className="anim-stagger flex flex-col gap-2.5">
                 {g.rows.map((h, ri) => {
                   const filename = h.new_path.split(/[\\/]/).pop() || h.new_path;
                   const isFresh = freshIds.has(h.id);
                   const isRestored = justRestored.has(h.id);
-                  const op = opStyle(h.operation);
                   const undone = !!h.undone_at;
                   // Backend viability check — absent = optimistic "undoable".
                   // A row the server says we can't undo is greyed with its reason.
@@ -509,66 +533,66 @@ export function HistoryPage({ pushToast }: Props) {
                     <div
                       key={h.id}
                       className={cn(
-                        'hist-row',
-                        isFresh && 'hist-row-fresh',
-                        isRestored && 'hist-row-restored',
-                        undone && 'hist-row-undone',
-                        selected.has(h.id) && 'hist-row-selected',
+                        'group/hrow flex items-center gap-4 rounded-xl bg-secondary p-3 shadow-xs ring-1 ring-inset ring-secondary transition-[background-color,box-shadow]',
+                        'hover:bg-tertiary hover:ring-primary',
+                        selected.has(h.id) && '!bg-[var(--accent-soft)] !ring-[var(--accent-line)]',
+                        isFresh && !selected.has(h.id) && '!ring-[var(--accent-line)]',
+                        undone && 'opacity-70',
                       )}
-                      style={{ ['--i' as string]: Math.min(ri, 11), ['--node' as string]: op.node, ['--node-ring' as string]: op.ring }}
+                      // Undone rows skip the stagger entrance: kRiseSm's `both`
+                      // fill-mode would otherwise pin opacity:1 and override the
+                      // opacity-70 dim. Inline animation:none beats the
+                      // `.anim-stagger > *` rule (they're old rows — no need to
+                      // animate them in anyway).
+                      style={{ ['--i' as string]: Math.min(ri, 11), animation: undone ? 'none' : undefined }}
                     >
-                      {/* Rail node — coloured by operation. */}
-                      <span className="hist-node" aria-hidden="true">
-                        <span className="hist-node-dot" />
-                      </span>
-
-                      <div className="hist-card lift">
-                        <Checkbox
-                          on={selected.has(h.id)}
-                          onChange={() => toggleOne(h.id)}
-                          disabled={undone}
-                          title={undone ? 'Already undone' : undefined}
-                        />
-                        <HistPoster entry={h} filename={filename} />
-                        <div className="min-w-0 flex-1">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className={cn('text-[13.5px] font-semibold', undone ? 'text-ink-soft line-through' : 'text-ink')}>
-                              {h.title || filename}
-                            </span>
-                            {h.episode_title && !undone ? (
-                              <span className="truncate text-[12px] text-ink-muted">{h.episode_title}</span>
-                            ) : null}
-                            <span className={cn('hist-op', op.chip)}>{h.operation}</span>
-                            {undone ? <span className="hist-undone-pill">Undone</span> : null}
-                            {stale ? <span className="hist-stale-pill" title={staleReason}>{staleReason}</span> : null}
-                          </div>
-                          <div className="mt-1 flex items-center gap-1.5 text-[11.5px] text-ink-soft [&_svg]:size-3 [&_svg]:shrink-0">
-                            <IcFolder /><span className="truncate font-mono" title={h.old_path}>{h.old_path}</span>
-                          </div>
-                          <div className="mt-0.5 flex items-center gap-1.5 text-[11.5px] text-ink-muted [&_svg]:size-3 [&_svg]:shrink-0">
-                            <IcArrowRight /><span className="truncate font-mono" title={h.new_path}>{h.new_path}</span>
-                          </div>
+                      <Checkbox
+                        on={selected.has(h.id)}
+                        onChange={() => toggleOne(h.id)}
+                        disabled={undone}
+                        title={undone ? 'Already undone' : undefined}
+                      />
+                      <HistPoster entry={h} filename={filename} />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className={cn('text-[13.5px] font-semibold', undone ? 'text-tertiary line-through' : 'text-primary')}>
+                            {h.title || filename}
+                          </span>
+                          {h.episode_title && !undone ? (
+                            <span className="truncate text-[12px] text-tertiary">{h.episode_title}</span>
+                          ) : null}
+                          <OpBadge op={h.operation} />
+                          {undone ? <BadgeWithDot color="gray">Undone</BadgeWithDot> : null}
+                          {stale ? (
+                            <BadgeWithDot color="error" className="max-w-[240px]">
+                              <span className="min-w-0 truncate" title={staleReason}>{staleReason}</span>
+                            </BadgeWithDot>
+                          ) : null}
                         </div>
-                        <span className="shrink-0 whitespace-nowrap text-[12px] text-ink-soft">{relativeTime(h.created_at)}</span>
-                        <div className="hist-undo-slot">
-                          {/* Restored confirmation flashes over the Undo button, then
-                              the button settles into its disabled state. */}
-                          {isRestored ? (
-                            <span className="hist-restored-tag"><IcCheck style={{ width: 13, height: 13 }} />Restored</span>
-                          ) : (
-                            <Button
-                              color="secondary"
-                              size="sm"
-                              iconLeading={IcUndo}
-                              isDisabled={undone || stale}
-                              title={undone ? 'Already undone' : staleReason || undefined}
-                              onClick={() => void undoOne(h.id)}
-                              className="press"
-                            >
-                              Undo
-                            </Button>
-                          )}
+                        <div className="mt-1.5 flex items-center gap-1.5 text-[11.5px] text-tertiary [&_svg]:size-3 [&_svg]:shrink-0">
+                          <IcFolder /><span className="truncate font-mono" title={h.old_path}>{h.old_path}</span>
                         </div>
+                        <div className="mt-0.5 flex items-center gap-1.5 text-[11.5px] text-secondary [&_svg]:size-3 [&_svg]:shrink-0">
+                          <IcArrowRight className="text-[var(--accent)]" /><span className="truncate font-mono" title={h.new_path}>{h.new_path}</span>
+                        </div>
+                      </div>
+                      <span className="shrink-0 whitespace-nowrap text-[12px] text-tertiary">{relativeTime(h.created_at)}</span>
+                      <div className="flex min-w-[92px] shrink-0 justify-end">
+                        {isRestored ? (
+                          <span className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--accent-line)] bg-[var(--accent-soft)] px-3 py-1.5 text-[12px] font-semibold text-[var(--accent)] [&_svg]:size-3.5"><IcCheck />Restored</span>
+                        ) : (
+                          <Button
+                            color="secondary"
+                            size="sm"
+                            iconLeading={IcUndo}
+                            isDisabled={undone || stale}
+                            title={undone ? 'Already undone' : staleReason || undefined}
+                            onClick={() => void undoOne(h.id)}
+                            className="press"
+                          >
+                            Undo
+                          </Button>
+                        )}
                       </div>
                     </div>
                   );
@@ -580,7 +604,7 @@ export function HistoryPage({ pushToast }: Props) {
       ) : null}
 
       {firstLoadDone && !loading && visibleItems.length === 0 ? (
-        <div className="overflow-hidden rounded-2xl border border-white/[0.12] bg-white/[0.045]">
+        <div className="overflow-hidden rounded-2xl border border-secondary bg-secondary">
           {q ? (
             <EmptyState
               icon={<IcSearch />}

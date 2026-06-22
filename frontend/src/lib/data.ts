@@ -3,15 +3,18 @@ import type {
   ProviderKey, ProviderMeta,
 } from './types';
 
+// Monochrome app: poster tints are neutral dark-grey gradients (was a set of
+// vivid per-show colour pairs). A few tonal variations keep episode badges /
+// poster glows from being dead-identical while staying strictly black+white.
 const TINTS: [string, string][] = [
-  ['#e54bba', '#ff974b'],
-  ['#7200e4', '#e54bba'],
-  ['#125dff', '#49b8fe'],
-  ['#28d9a0', '#125dff'],
-  ['#ff974b', '#db413c'],
-  ['#9b18a6', '#7200e4'],
-  ['#ffc94a', '#ff974b'],
-  ['#0a5d3f', '#28d9a0'],
+  ['#3a3a3a', '#1a1a1a'],
+  ['#333333', '#161616'],
+  ['#2c2c2c', '#141414'],
+  ['#404040', '#1e1e1e'],
+  ['#2f2f2f', '#171717'],
+  ['#373737', '#1b1b1b'],
+  ['#282828', '#131313'],
+  ['#444444', '#202020'],
 ];
 
 function tintFor(seed: string): [string, string] {
@@ -55,29 +58,29 @@ export const NAMING_PROFILES: Record<string, NamingProfile> = {
 };
 
 export const PROVIDERS: Record<ProviderKey, ProviderMeta> = {
-  TMDB:        { name: 'TMDB',        for: ['movie', 'tv'],    color: '#90cea1', icon: 'film',
+  TMDB:        { name: 'TMDB',        for: ['movie', 'tv'],    color: '#90cea1', icon: 'film',  logo: '/providers/tmdb.svg',
                  desc: 'Movies and TV series · the gold standard for English-language libraries' },
-  TVDB:        { name: 'TheTVDB',     for: ['tv', 'anime'],    color: '#6ec1ff', icon: 'tv',
+  TVDB:        { name: 'TheTVDB',     for: ['tv', 'anime'],    color: '#6ec1ff', icon: 'tv',    logo: '/providers/tvdb.svg',
                  desc: 'Deep TV metadata with strong support for absolute episode numbering' },
-  AniDB:       { name: 'AniDB',       for: ['anime'],          color: '#c89bff', icon: 'anime',
+  AniDB:       { name: 'AniDB',       for: ['anime'],          color: '#c89bff', icon: 'anime', logo: '/providers/anidb.svg',
                  desc: 'The canonical source for anime — episodes, groups, alternate titles' },
-  MusicBrainz: { name: 'MusicBrainz', for: ['music'],          color: '#ffb14a', icon: 'disc',
+  MusicBrainz: { name: 'MusicBrainz', for: ['music'],          color: '#ffb14a', icon: 'disc',  logo: '/providers/musicbrainz.svg',
                  desc: 'Open music encyclopedia · artists, releases, recordings' },
   AcoustID:    { name: 'AcoustID',    for: ['music'],          color: '#28d9a0', icon: 'waveform',
                  desc: 'Audio fingerprint matching for music files with missing or wrong tags' },
-  'fanart.tv': { name: 'fanart.tv',   for: ['movie', 'tv', 'anime'], color: '#ff7575', icon: 'film',
+  'fanart.tv': { name: 'fanart.tv',   for: ['movie', 'tv', 'anime'], color: '#ff7575', icon: 'film', logo: '/providers/fanart.tv.png',
                  desc: 'Artwork only — clear logos, clear art, banners, disc & character art (used by Download artwork)' },
-  OpenSubtitles: { name: 'OpenSubtitles', for: ['movie', 'tv', 'anime'], color: '#ff9a4d', icon: 'caption',
+  OpenSubtitles: { name: 'OpenSubtitles', for: ['movie', 'tv', 'anime'], color: '#ff9a4d', icon: 'caption', logo: '/providers/opensubtitles.svg',
                  desc: 'Subtitles only — community subtitle downloads. Key enables search; the account login is what downloads need.' },
-  SubDL:       { name: 'SubDL',        for: ['movie', 'tv', 'anime'], color: '#5ac8d7', icon: 'caption',
+  SubDL:       { name: 'SubDL',        for: ['movie', 'tv', 'anime'], color: '#5ac8d7', icon: 'caption', logo: '/providers/subdl.svg',
                  desc: 'Subtitles only — modern REST catalogue. Free key at subdl.com → panel → API.' },
-  SubSource:   { name: 'SubSource',    for: ['movie', 'tv', 'anime'], color: '#b48cff', icon: 'caption',
+  SubSource:   { name: 'SubSource',    for: ['movie', 'tv', 'anime'], color: '#b48cff', icon: 'caption', logo: '/providers/subsource.svg',
                  desc: "Subtitles only — Subscene's successor. Free key from your subsource.net profile." },
 };
 
 export const TYPE_COLOR: Record<MediaType, string> = {
-  movie: 'var(--ink-3)',
-  tv:    'var(--info)',
+  movie: '#4ec5b3',
+  tv:    '#b3e5fc',
   anime: '#c89bff',
   music: '#ffb14a',
 };

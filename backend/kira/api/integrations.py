@@ -28,7 +28,7 @@ from dataclasses import asdict
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kira.database import get_session
@@ -809,8 +809,10 @@ class SonarrHealRequest(BaseModel):
     file_ids: list[int] | None = None
     # Confidence cutoff — files whose best Match scored below this AND
     # aren't user-pinned are eligible for heal. 0.50 is the same "needs
-    # review" threshold the UI uses for its low-confidence banner.
-    confidence_threshold: float = 0.50
+    # review" threshold the UI uses for its low-confidence banner. Clamped to
+    # [0,1]: an unbounded value (e.g. 2.0) would make EVERY file "below
+    # threshold" and re-pin the whole library to Sonarr metadata in one call.
+    confidence_threshold: float = Field(0.50, ge=0.0, le=1.0)
 
 
 class SonarrHealResponse(BaseModel):

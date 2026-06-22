@@ -1,17 +1,21 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { animate } from 'motion/react';
+import { PieChart, Pie, ResponsiveContainer, Tooltip } from 'recharts';
 import type { AppState, ModalState } from '../lib/types';
 import { api, type ApiHistoryEntry, type ApiNotification, type ApiScan } from '../lib/api';
 import {
   IcScan, IcCheck, IcX, IcHistory, IcArrowRight,
   IcFilm, IcTv, IcAnime, IcMusic, IcFolder, IcReview,
   IcShieldCheck, IcLink, IcAlertTri, IcSparkles, IcRefresh,
-  IcTag, IcDownload,
+  IcDownload, IcCaption,
 } from '../lib/icons';
 import { cn } from '../lib/utils';
 import { getConfBands } from '../lib/confBands';
 import { Button } from '../components/base/buttons/button';
 import { FeaturedIcon } from '../components/base/featured-icons/featured-icon';
+import { MetricCard } from '../components/base/metrics/metric-card';
+import { ActivityFeed, type ActivityFeedItem } from '../components/base/activity-feed/activity-feed';
+import { ChartTooltipContent } from '../components/base/charts/charts-base';
 import { ProgressBar } from '../components/base/progress-indicators/progress-bar';
 import { BadgeWithDot } from '../components/base/badges/badges';
 import { Skeleton, EmptyState } from '../components/ui';
@@ -43,25 +47,24 @@ function relativeTime(iso: string): string {
 }
 
 const TYPE_META = [
-  { k: 'movie' as const, label: 'Movies', icon: IcFilm,  color: '#bdc1d0' },
-  { k: 'tv' as const,    label: 'TV',     icon: IcTv,    color: '#49b8fe' },
+  { k: 'movie' as const, label: 'Movies', icon: IcFilm,  color: '#4ec5b3' },
+  { k: 'tv' as const,    label: 'TV',     icon: IcTv,    color: '#b3e5fc' },
   { k: 'anime' as const, label: 'Anime',  icon: IcAnime, color: 'var(--media-anime)' },
   { k: 'music' as const, label: 'Music',  icon: IcMusic, color: 'var(--media-music)' },
 ];
 
 const BUCKET_META = [
-  { k: 'strong' as const, label: 'Strong',       color: '#28d9a0' },
-  { k: 'likely' as const, label: 'Likely',       color: '#49b8fe' },
-  { k: 'review' as const, label: 'Needs review', color: '#ffc94a' },
-  { k: 'low' as const,    label: 'Low / none',   color: '#ff5b6e' },
+  { k: 'strong' as const, label: 'Strong',       color: 'var(--conf-high)' },
+  { k: 'likely' as const, label: 'Likely',       color: 'var(--info)' },
+  { k: 'review' as const, label: 'Needs review', color: 'var(--conf-mid)' },
+  { k: 'low' as const,    label: 'Low / none',   color: 'var(--conf-low)' },
 ];
 
-// ── Shared card shell ───────────────────────────────────────────────
-function Card({ title, icon, action, glow, divider, className, bodyClassName, children }: {
+// ── Shared card shell (Untitled UI card: ring + subtle shadow) ──────
+function Card({ title, icon, action, divider, className, bodyClassName, children }: {
   title?: ReactNode;
   icon?: ReactNode;
   action?: ReactNode;
-  glow?: boolean;
   divider?: boolean;
   className?: string;
   bodyClassName?: string;
@@ -70,25 +73,22 @@ function Card({ title, icon, action, glow, divider, className, bodyClassName, ch
   const hasHeader = title != null || action != null;
   return (
     <section className={cn(
-      'dash-card group relative flex flex-col overflow-hidden rounded-2xl border border-line bg-[rgba(255,255,255,0.025)] transition-colors duration-300 hover:border-line-strong',
+      'relative flex flex-col overflow-hidden rounded-xl bg-secondary shadow-xs ring-1 ring-inset ring-secondary',
       className,
     )}>
-      {glow ? (
-        <div className="pointer-events-none absolute -right-16 -top-16 size-48 rounded-full bg-[radial-gradient(closest-side,var(--accent-soft),transparent)] opacity-0 blur-2xl transition-opacity duration-500 group-hover:opacity-100" />
-      ) : null}
       {hasHeader ? (
         <div className={cn(
-          'relative flex items-center justify-between gap-3 px-5',
-          divider ? 'border-b border-line py-4' : 'pt-5',
+          'flex items-center justify-between gap-3 px-5',
+          divider ? 'border-b border-secondary py-4' : 'pt-5',
         )}>
           <div className="flex min-w-0 items-center gap-2.5">
             {icon}
-            {title ? <h2 className="truncate text-sm font-semibold text-ink">{title}</h2> : null}
+            {title ? <h2 className="truncate text-sm font-semibold text-primary">{title}</h2> : null}
           </div>
           {action}
         </div>
       ) : null}
-      <div className={cn('relative', bodyClassName ?? (hasHeader && !divider ? 'px-5 pb-5 pt-4' : 'p-5'))}>
+      <div className={cn(bodyClassName ?? (hasHeader && !divider ? 'px-5 pb-5 pt-4' : 'p-5'))}>
         {children}
       </div>
     </section>
@@ -141,93 +141,45 @@ function CountUp({ value, duration = 0.7, suffix }: { value: number; duration?: 
   return <span ref={ref}>{`${(0).toLocaleString()}${suffix ?? ''}`}</span>;
 }
 
-// ── KPI metric card ─────────────────────────────────────────────────
-function Metric({ icon, color, label, value, sub, onClick, index = 0 }: {
-  icon: ReactNode;
-  color: 'brand' | 'success' | 'warning' | 'error' | 'gray';
-  label: string;
-  value: ReactNode;
-  sub?: ReactNode;
-  onClick?: () => void;
-  index?: number;
-}) {
-  const inner = (
-    <>
-      <div className="pointer-events-none absolute -right-12 -top-12 size-36 rounded-full bg-[radial-gradient(closest-side,var(--accent-soft),transparent)] opacity-0 blur-2xl transition-opacity duration-500 group-hover:opacity-100" />
-      <div className="relative flex items-center justify-between">
-        <FeaturedIcon size="md" color={color} icon={icon} />
-        {onClick ? (
-          <IcArrowRight className="size-4 -translate-x-1 text-ink-faint opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100" />
-        ) : null}
-      </div>
-      <div className="relative mt-4 text-[11px] font-medium uppercase tracking-[0.09em] text-ink-soft">{label}</div>
-      <div className="relative mt-1 text-[30px] font-bold leading-none tracking-tight tabular-nums text-ink">{value}</div>
-      {sub ? <div className="relative mt-2 text-xs text-ink-soft">{sub}</div> : null}
-    </>
-  );
-  const base = 'dash-metric anim-rise-sm group relative flex flex-col overflow-hidden rounded-2xl border border-line bg-[rgba(255,255,255,0.025)] p-5 text-left transition-colors duration-300 hover:border-line-strong';
-  const style = { '--i': index } as React.CSSProperties;
-  // A clickable metric navigates — render a real <button> so it's keyboard-
-  // and screen-reader-operable; a static metric stays a plain <div>.
-  if (onClick) {
-    return (
-      <button type="button" onClick={onClick} style={style} className={cn(base, 'cursor-pointer hover:bg-[rgba(255,255,255,0.045)]')}>
-        {inner}
-      </button>
-    );
-  }
-  return <div style={style} className={base}>{inner}</div>;
-}
-
-// ── Confidence ring ─────────────────────────────────────────────────
-// An animated SVG donut that springs each confidence segment to its share of
-// the library on mount. Pure stroke-dashoffset tweens (no transform), each
-// driven by motion's `animate`; the global prefers-reduced-motion `*` net
-// (transition/animation-duration → 0.001ms) makes the CSS transitions snap,
-// and we additionally short-circuit the JS tween to land instantly.
-function ConfidenceRing({ segments, total, centerValue, centerLabel }: {
-  segments: { k: string; color: string; value: number }[];
-  total: number;
+// ── Confidence donut ────────────────────────────────────────────────
+// Untitled UI pie/donut chart (recharts) — one rounded segment per confidence
+// band, with the % matched read out in the center and a UUI tooltip on hover.
+// An empty library renders a single neutral track ring.
+function ConfidenceRing({ segments, centerValue, centerLabel }: {
+  segments: { k: string; label: string; color: string; value: number }[];
   centerValue: ReactNode;
   centerLabel: string;
 }) {
-  const R = 52;
-  const C = 2 * Math.PI * R;
-  const safeTotal = Math.max(1, total);
-
-  // Pre-compute each arc's length + rotation offset so segments sit end to end.
-  let acc = 0;
-  const arcs = segments.map((s) => {
-    const frac = total > 0 ? s.value / safeTotal : 0;
-    const len = frac * C;
-    const startFrac = acc;
-    acc += frac;
-    return { ...s, len, startFrac };
-  });
+  const data = segments.filter(s => s.value > 0).map(s => ({ name: s.label, value: s.value, fill: s.color }));
+  const hasData = data.length > 0;
+  // Recharts needs a non-empty dataset — fall back to one neutral track ring.
+  const chartData = hasData ? data : [{ name: 'Empty', value: 1, fill: 'var(--hover)' }];
 
   return (
-    <div className="relative grid size-[148px] shrink-0 place-items-center">
-      <svg viewBox="0 0 140 140" className="size-full -rotate-90">
-        <circle cx="70" cy="70" r={R} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="12" />
-        {arcs.map((a, i) => (
-          <circle
-            key={a.k}
-            className="dash-ring-arc"
-            cx="70" cy="70" r={R}
-            fill="none"
-            stroke={a.color}
-            strokeWidth="12"
-            strokeLinecap="round"
-            strokeDasharray={`${Math.max(0, a.len - (a.len > 4 ? 3 : 0))} ${C}`}
-            strokeDashoffset={-a.startFrac * C}
-            style={{ '--ring-len': `${Math.max(0, a.len - (a.len > 4 ? 3 : 0))}`, '--ring-circ': `${C}`, '--ring-delay': `${i * 90}ms` } as React.CSSProperties}
+    <div className="relative grid size-[156px] shrink-0 place-items-center">
+      <ResponsiveContainer width="100%" height="100%">
+        <PieChart>
+          <Pie
+            key="pie"
+            data={chartData}
+            dataKey="value"
+            nameKey="name"
+            innerRadius={54}
+            outerRadius={70}
+            startAngle={90}
+            endAngle={-270}
+            paddingAngle={hasData ? 2.5 : 0}
+            cornerRadius={hasData ? 7 : 0}
+            stroke="none"
+            isAnimationActive={hasData}
           />
-        ))}
-      </svg>
+          {hasData ? <Tooltip key="tooltip" cursor={false} content={<ChartTooltipContent isPieChart />} /> : null}
+        </PieChart>
+      </ResponsiveContainer>
       <div className="pointer-events-none absolute inset-0 grid place-items-center text-center">
         <div>
-          <div className="text-[34px] font-bold leading-none tracking-tight tabular-nums text-ink">{centerValue}</div>
-          <div className="mt-1 text-[10px] uppercase tracking-[0.1em] text-ink-soft">{centerLabel}</div>
+          <div className="text-[34px] font-bold leading-none tracking-tight tabular-nums text-primary">{centerValue}</div>
+          <div className="mt-1 text-[10px] uppercase tracking-[0.14em] text-quaternary">{centerLabel}</div>
         </div>
       </div>
     </div>
@@ -297,14 +249,14 @@ function SubtitleCoverageCard({ setActive }: { setActive: (p: 'dashboard' | 'rev
   return (
     <Card
       title="Subtitle coverage"
-      icon={<FeaturedIcon size="sm" color={cov.missing_files > 0 ? 'warning' : 'success'} icon={<IcTag />} />}
+      icon={<FeaturedIcon size="sm" color={cov.missing_files > 0 ? 'warning' : 'success'} icon={<IcCaption />} />}
       action={<CardLink label="Settings" onClick={() => setActive('settings')} />}
     >
       <div className="flex flex-col gap-3.5">
         <div className="flex items-end justify-between gap-3">
           <div className="flex items-end gap-2">
-            <span className="text-2xl font-bold leading-none tracking-tight text-ink tabular-nums">{pct}%</span>
-            <span className="mb-0.5 text-xs text-ink-soft">covered · {cov.wanted.map(l => l.toUpperCase()).join(', ') || 'EN'}</span>
+            <span className="text-2xl font-bold leading-none tracking-tight text-primary tabular-nums">{pct}%</span>
+            <span className="mb-0.5 text-xs text-tertiary">covered · {cov.wanted.map(l => l.toUpperCase()).join(', ') || 'EN'}</span>
           </div>
           {cov.missing_files > 0 && cov.enabled ? (
             <Button color="secondary" size="sm" iconLeading={IcDownload} isLoading={busy} showTextWhileLoading onClick={getAll}>
@@ -316,18 +268,18 @@ function SubtitleCoverageCard({ setActive }: { setActive: (p: 'dashboard' | 'rev
         {topLangs.length > 0 ? (
           <div className="flex flex-wrap gap-x-4 gap-y-1.5">
             {topLangs.map(([lang, n]) => (
-              <span key={lang} className="text-[12px] text-ink-muted">
-                <span className="font-mono uppercase text-ink-soft">{lang}</span> · {n} missing
+              <span key={lang} className="text-[12px] text-secondary">
+                <span className="font-mono uppercase text-tertiary">{lang}</span> · {n} missing
               </span>
             ))}
           </div>
         ) : (
-          <div className="text-[12px] text-ink-soft">Every inspected file has your preferred languages.</div>
+          <div className="text-[12px] text-tertiary">Every inspected file has your preferred languages.</div>
         )}
         {!cov.enabled ? (
-          <div className="text-[11px] text-ink-soft">No subtitle source configured — add one in Settings → Subtitles.</div>
+          <div className="text-[11px] text-tertiary">No subtitle source configured — add one in Settings → Subtitles.</div>
         ) : null}
-        {note ? <div className="text-[11px] text-ink-muted">{note}</div> : null}
+        {note ? <div className="text-[11px] text-secondary">{note}</div> : null}
       </div>
     </Card>
   );
@@ -388,8 +340,9 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
     // library fully matched at mid confidence is still matched. The old
     // `confidence >= high` gate made the donut read a scary-low "% matched" for
     // a fully-matched library and disagreed with Review's pending/matched split.
-    // The band breakdown lives in `buckets` + `lowConf` below (those honor the
-    // user's Confidence sliders, Settings → Confidence).
+    // `lowConf` honors the user's Confidence sliders (Settings → Confidence);
+    // `buckets` is the fixed 4-tier verdict scale (Strong/Likely/Review/Low)
+    // shared with the match badges, independent of the slider.
     const { mid } = getConfBands();
     const total = files.length;
     const matched = files.filter(f => !!f.match?.provider && !!f.match?.providerId).length;
@@ -468,7 +421,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
         id: `h${h.id}`,
         kind: h.undone_at ? 'info' : 'success',
         when: h.created_at,
-        text: <><b>{h.title || filename}</b>{' — '}<span className="font-mono text-xs">{h.operation}</span>{h.undone_at ? <span className="text-ink-soft"> · undone</span> : null}</>,
+        text: <><b>{h.title || filename}</b>{' — '}<span className="font-mono text-xs">{h.operation}</span>{h.undone_at ? <span className="text-tertiary"> · undone</span> : null}</>,
       });
     }
     for (const n of notifications.slice(0, 10)) {
@@ -495,7 +448,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
   return (
     <div className="page relative">
       {/* ── Hero band ───────────────────────────────────────────── */}
-      <section className={cn('dash-hero anim-rise relative z-10 mb-5 overflow-hidden rounded-3xl border border-line p-7 sm:p-8', scanning && 'dash-hero-live')}>
+      <section className={cn('dash-hero anim-rise relative z-10 mb-5 overflow-hidden rounded-3xl border border-secondary p-7 sm:p-8', scanning && 'dash-hero-live')}>
         <PosterFan urls={posterUrls} />
         {/* readability scrim over the poster fan */}
         <div className="dash-hero-scrim pointer-events-none absolute inset-0" />
@@ -512,10 +465,10 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
             {scanning ? (
               <div className="mt-4 max-w-md">
                 <div className="mb-2 flex items-center justify-between gap-3 text-[13px]">
-                  <span className="truncate text-ink-muted">
+                  <span className="truncate text-secondary">
                     {state.scanMessage || (state.scanPhase === 'matching' ? 'Matching against providers…' : 'Discovering files…')}
                   </span>
-                  <span className="shrink-0 font-mono tabular-nums text-ink-soft">
+                  <span className="shrink-0 font-mono tabular-nums text-tertiary">
                     {state.scanPhase === 'matching' ? `${scanPct}%` : `${state.scanFound} found`}
                   </span>
                 </div>
@@ -529,10 +482,10 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
                 />
               </div>
             ) : (
-              <p className="mt-3 text-[13.5px] text-ink-soft">
+              <p className="mt-3 text-[13.5px] text-tertiary">
                 {stats.total === 0
                   ? 'No library scanned yet — hit Scan now to get started.'
-                  : <><b className="text-ink-muted">{stats.pending}</b> pending review · <b className="text-ink-muted">{stats.matched}</b> matched{lastScan?.completed_at ? <> · last scan {relativeTime(lastScan.completed_at)}</> : null}</>}
+                  : <><b className="text-secondary">{stats.pending}</b> pending review · <b className="text-secondary">{stats.matched}</b> matched{lastScan?.completed_at ? <> · last scan {relativeTime(lastScan.completed_at)}</> : null}</>}
               </p>
             )}
           </div>
@@ -567,17 +520,15 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
       </section>
 
       {/* ── KPI strip ──────────────────────────────────────────── */}
-      <div className="anim-stagger relative z-10 grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <Metric
-          index={0}
+      <div className="relative z-10 grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <MetricCard
           icon={<IcFolder />}
-          color="brand"
+          tint="#6ea8ff"
           label="Library"
           value={<CountUp value={stats.total} />}
           sub={typesPresent > 0 ? `${typesPresent} media type${typesPresent === 1 ? '' : 's'}` : 'No files yet'}
         />
-        <Metric
-          index={1}
+        <MetricCard
           icon={<IcCheck />}
           color="success"
           label="Matched"
@@ -585,24 +536,22 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
           sub={`${matchedPct}% of library`}
           onClick={() => setActive('review')}
         />
-        <Metric
-          index={2}
+        <MetricCard
           icon={<IcReview />}
           color="warning"
           label="Pending review"
           value={<CountUp value={stats.pending} />}
           sub={stats.lowConf > 0
-            ? <span className="inline-flex items-center gap-1 text-conf-low"><IcAlertTri className="size-3" />{stats.lowConf} low-confidence</span>
+            ? <span className="inline-flex items-center gap-1 text-error-primary"><IcAlertTri className="size-3" />{stats.lowConf} low-confidence</span>
             : 'All reviewed'}
           onClick={() => setActive('review')}
         />
         {/* All-time renames from the history feed — "approved" was a dead
             metric (it's a transient state: approved files are renamed moments
             later, so the count read 0 forever). */}
-        <Metric
-          index={3}
+        <MetricCard
           icon={<IcSparkles />}
-          color="brand"
+          tint="#b48cff"
           label="Organized"
           value={<CountUp value={totalRenames ?? history.length} />}
           sub={(totalRenames ?? history.length) > 0 ? 'renames in history' : 'No renames yet'}
@@ -618,18 +567,16 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
             title="Match quality"
             icon={<FeaturedIcon size="sm" color="success" icon={<IcShieldCheck />} />}
             action={<CardLink label="Review" onClick={() => setActive('review')} />}
-            glow
           >
             <div className="flex flex-col items-center gap-7 sm:flex-row sm:gap-8">
               <ConfidenceRing
-                total={stats.total}
                 segments={[
-                  { k: 'strong', color: '#28d9a0', value: stats.buckets.strong },
-                  { k: 'likely', color: '#49b8fe', value: stats.buckets.likely },
-                  { k: 'review', color: '#ffc94a', value: stats.buckets.review },
-                  { k: 'low',    color: '#ff5b6e', value: stats.buckets.low },
+                  { k: 'strong', label: 'Strong', color: 'var(--conf-high)', value: stats.buckets.strong },
+                  { k: 'likely', label: 'Likely', color: 'var(--info)', value: stats.buckets.likely },
+                  { k: 'review', label: 'Needs review', color: 'var(--conf-mid)', value: stats.buckets.review },
+                  { k: 'low',    label: 'Low / none', color: 'var(--conf-low)', value: stats.buckets.low },
                 ]}
-                centerValue={<><CountUp value={matchedPct} suffix="" /><span className="text-xl text-ink-soft">%</span></>}
+                centerValue={<><CountUp value={matchedPct} suffix="" /><span className="text-xl text-tertiary">%</span></>}
                 centerLabel="matched"
               />
 
@@ -638,12 +585,12 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
                   const n = stats.buckets[b.k];
                   return (
                     <div key={b.k} className="flex items-center gap-3">
-                      <span className="inline-flex w-28 shrink-0 items-center gap-2 text-[13px] text-ink-muted">
+                      <span className="inline-flex w-28 shrink-0 items-center gap-2 text-[13px] text-secondary">
                         <span className="size-2 shrink-0 rounded-full" style={{ background: b.color }} />
                         {b.label}
                       </span>
                       <ProgressBar value={n} max={Math.max(1, stats.total)} color={b.color} className="flex-1" />
-                      <span className="w-8 shrink-0 text-right font-mono text-xs tabular-nums text-ink-muted">{n}</span>
+                      <span className="w-8 shrink-0 text-right font-mono text-xs tabular-nums text-secondary">{n}</span>
                     </div>
                   );
                 })}
@@ -654,19 +601,19 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
           {/* Library composition — per-type bars */}
           <Card
             title="Library composition"
-            icon={<FeaturedIcon size="sm" color="gray" icon={<IcFilm />} />}
+            icon={<FeaturedIcon size="sm" tint="#8b9eff" icon={<IcFilm />} />}
           >
             <div className="flex flex-col gap-3">
               {compositionTypes.map(t => {
                 const n = stats.byType[t.k];
                 return (
                   <div key={t.k} className="flex items-center gap-3">
-                    <span className="inline-flex w-20 shrink-0 items-center gap-1.5 text-[13px] text-ink-muted [&_svg]:size-3.5">
+                    <span className="inline-flex w-20 shrink-0 items-center gap-1.5 text-[13px] text-secondary [&_svg]:size-3.5">
                       <span style={{ color: t.color }} className="inline-flex"><t.icon /></span>
                       {t.label}
                     </span>
                     <ProgressBar value={n} max={maxType} color={t.color} minVisible={4} className="flex-1" />
-                    <span className="w-9 shrink-0 text-right font-mono text-xs tabular-nums text-ink-muted">{n}</span>
+                    <span className="w-9 shrink-0 text-right font-mono text-xs tabular-nums text-secondary">{n}</span>
                   </div>
                 );
               })}
@@ -677,7 +624,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Card
               title="Providers"
-              icon={<FeaturedIcon size="sm" color="brand" icon={<IcLink />} />}
+              icon={<FeaturedIcon size="sm" tint="#4ec5b3" icon={<IcLink />} />}
               action={<CardLink label="Configure" onClick={() => setActive('settings')} />}
             >
               <div className="flex flex-col gap-3">
@@ -688,8 +635,8 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
                   return (
                     <div key={p.slug} className="flex items-center justify-between gap-2">
                       <div className="min-w-0">
-                        <div className="text-[13px] font-medium text-ink">{p.name}</div>
-                        <div className="truncate text-[11px] text-ink-faint">{p.note}</div>
+                        <div className="text-[13px] font-medium text-primary">{p.name}</div>
+                        <div className="truncate text-[11px] text-quaternary">{p.note}</div>
                       </div>
                       <BadgeWithDot color={color}>{label}</BadgeWithDot>
                     </div>
@@ -700,13 +647,13 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
 
             <Card
               title="Storage"
-              icon={<FeaturedIcon size="sm" color="gray" icon={<IcFolder />} />}
+              icon={<FeaturedIcon size="sm" tint="#e0a44e" icon={<IcFolder />} />}
             >
               {stats.totalSize > 0 ? (
                 <div className="flex flex-col gap-3.5">
                   <div className="flex items-end gap-2">
-                    <span className="text-2xl font-bold leading-none tracking-tight text-ink">{formatBytes(stats.totalSize)}</span>
-                    <span className="mb-0.5 text-xs text-ink-soft">total</span>
+                    <span className="text-2xl font-bold leading-none tracking-tight text-primary">{formatBytes(stats.totalSize)}</span>
+                    <span className="mb-0.5 text-xs text-tertiary">total</span>
                   </div>
                   <div className="flex h-2 w-full overflow-hidden rounded-full bg-white/[0.06]">
                     {TYPE_META.map(t => {
@@ -718,19 +665,19 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
                   <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
                     {TYPE_META.filter(t => stats.sizeByType[t.k] > 0).map(t => (
                       <div key={t.k} className="flex items-center justify-between gap-2 text-[12px]">
-                        <span className="inline-flex items-center gap-1.5 text-ink-muted">
+                        <span className="inline-flex items-center gap-1.5 text-secondary">
                           <span className="size-2 rounded-full" style={{ background: t.color }} />
                           {t.label}
                         </span>
-                        <span className="font-mono tabular-nums text-ink-soft">{formatBytes(stats.sizeByType[t.k])}</span>
+                        <span className="font-mono tabular-nums text-tertiary">{formatBytes(stats.sizeByType[t.k])}</span>
                       </div>
                     ))}
                   </div>
                 </div>
               ) : (
                 <div className="flex h-full flex-col items-center justify-center gap-1 py-4 text-center">
-                  <div className="text-2xl font-bold tracking-tight text-ink tabular-nums">{stats.total}</div>
-                  <div className="text-xs text-ink-soft">files · size unavailable</div>
+                  <div className="text-2xl font-bold tracking-tight text-primary tabular-nums">{stats.total}</div>
+                  <div className="text-xs text-tertiary">files · size unavailable</div>
                 </div>
               )}
             </Card>
@@ -768,39 +715,15 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
               />
             </div>
           ) : (
-            <ol className="dash-timeline anim-stagger relative">
-              {activity.map((a, i) => (
-                <li
-                  key={a.id}
-                  className={cn('dash-timeline-item', `dash-timeline-${a.kind}`)}
-                  style={{ '--i': Math.min(i, 11) } as React.CSSProperties}
-                >
-                  <span className="dash-timeline-node" aria-hidden>
-                    {a.kind === 'success' ? <IcCheck /> : a.kind === 'error' ? <IcX /> : <IcSparkles />}
-                  </span>
-                  <div className="dash-timeline-body">
-                    <div className="min-w-0 truncate text-[13px] text-ink-muted" title={typeof a.text === 'string' ? a.text : undefined}>{a.text}</div>
-                    <div className="mt-0.5 text-[11px] text-ink-faint">{relativeTime(a.when)}</div>
-                  </div>
-                </li>
-              ))}
-              {/* Sparse feed → fade the timeline out through ghost rows
-                  instead of stopping dead with a half-empty rail. */}
-              {activity.length < 6 && Array.from({ length: 6 - activity.length }).map((_, g) => (
-                <li
-                  key={`ghost-${g}`}
-                  aria-hidden
-                  className="dash-timeline-item dash-timeline-ghost"
-                  style={{ '--i': Math.min(activity.length + g, 11), '--g': g } as React.CSSProperties}
-                >
-                  <span className="dash-timeline-node" />
-                  <div className="dash-timeline-body">
-                    <div className="dash-ghost-line" style={{ width: `${64 - g * 9}%` }} />
-                    <div className="dash-ghost-line dash-ghost-line-sub" />
-                  </div>
-                </li>
-              ))}
-            </ol>
+            <ActivityFeed
+              items={activity.map((a): ActivityFeedItem => ({
+                id: a.id,
+                icon: a.kind === 'success' ? <IcCheck /> : a.kind === 'error' ? <IcX /> : <IcSparkles />,
+                color: a.kind === 'success' ? 'success' : a.kind === 'error' ? 'error' : 'gray',
+                text: a.text,
+                time: relativeTime(a.when),
+              }))}
+            />
           )}
         </Card>
       </div>

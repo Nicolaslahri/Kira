@@ -10,7 +10,19 @@ import {
   IcCheck, IcX, IcSearch, IcAlertTri, IcDownload,
   IcTv, IcAnime, IcFilm, IcMusic, IcDisc, IcReview, IcCaption,
 } from '../lib/icons';
-import { MediaTypeIcon } from './ui';
+import { MediaTypeIcon, EmptyState } from './ui';
+import { Button } from './base/buttons/button';
+import { FeaturedIcon } from './base/featured-icons/featured-icon';
+import { cn } from '../lib/utils';
+
+// Media-type tints for the section-header featured icons (TV blue, anime
+// violet, movies neutral, music amber) — fed to FeaturedIcon's `tint`.
+const SECTION_TINT: Record<string, string> = {
+  tv: '#b3e5fc',
+  anime: 'var(--media-anime)',
+  movie: '#4ec5b3',
+  music: 'var(--media-music)',
+};
 import { fetchAnidbPoster, getCachedAnidbPoster } from '../lib/posters';
 import { api } from '../lib/api';
 import { confLevel, getConfBands } from '../lib/confBands';
@@ -188,9 +200,15 @@ function subLabel(item: LibraryItem): string {
   if (item.kind === 'movie' && !item.noMatch) return item.runtime ? `${item.runtime} min` : 'Movie';
   if (item.kind === 'album') return pluralize(item.episodes.length, 'track');
   if (item.kind === 'series') {
-    const seasons = new Set(item.episodes.map(e => e.season)).size;
-    const eps = item.episodes.length;
-    return seasons > 1 ? `S${seasons} · ${eps} eps` : pluralize(eps, 'episode');
+    // Episode count only — we deliberately don't surface a distinct-season
+    // count. TV/movie cards are split one-per-season upstream (clustering key
+    // includes the season), so they never span seasons here. An anime card
+    // carries a single AniDB AID whose per-file "season" is an unreliable
+    // TVDB cross-ref derivation: One Piece (AID 69) lands most files in
+    // season 23 but a stray one came back season 1, so `new Set([1,23]).size`
+    // rendered a bogus "S2" that also reads like "Season 2". The real season
+    // lives on the franchise-shelf heading and inside the popup.
+    return pluralize(item.episodes.length, 'episode');
   }
   return '';
 }
@@ -258,16 +276,10 @@ export function CoverCard({
         : (item.year ? String(item.year) : null))
     : null;
   const stats = useMemo(() => libraryStats(item), [item]);
-  const isAnime = item.mediaType === 'anime';
   const isMusic = item.mediaType === 'music';
-  const shape = isMusic ? 'square' : 'poster';
-
-  let ringClass = 'ring-none';
-  if (!item.noMatch && !item.matchingState && stats.cardState !== 'rejected') {
-    ringClass = `ring-${confTier(stats.avgConf)}`;
-  }
-
   const tint = item.poster.tint;
+  const mediaIcon = item.mediaType === 'movie' ? <IcFilm /> : item.mediaType === 'anime' ? <IcAnime /> : item.mediaType === 'music' ? <IcMusic /> : <IcTv />;
+  const missingSubsCount = item.files.filter(f => f.missingSubs && f.missingSubs.length > 0).length;
 
   // AniDB's title-dump search doesn't carry image URLs — fetch lazily.
   // Seed from the shared cache synchronously so cards re-render with the
@@ -294,8 +306,8 @@ export function CoverCard({
   const handleCardClick = (e: React.MouseEvent<HTMLDivElement>) => {
     // Don't trigger expand when clicking an inner action/checkbox.
     const target = e.target as HTMLElement;
-    if (target.closest('.cc-act, .cc-select, .cc-no-match-cta, .cc-nm-search-link')) return;
-    const coverEl = e.currentTarget.querySelector('.cc-cover');
+    if (target.closest('[data-cc-control]')) return;
+    const coverEl = e.currentTarget.querySelector('[data-cover]');
     if (coverEl instanceof HTMLElement) onOpen(item, coverEl);
   };
 
@@ -306,33 +318,20 @@ export function CoverCard({
     if (e.target !== e.currentTarget) return;
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
-      const coverEl = e.currentTarget.querySelector('.cc-cover');
+      const coverEl = e.currentTarget.querySelector('[data-cover]');
       if (coverEl instanceof HTMLElement) onOpen(item, coverEl);
     }
   };
 
-  const cardClass = [
-    'cc',
-    'cinema',  // CodePen-inspired hover-reveal cover treatment (see .cc.cinema in index.css)
-    'state-' + stats.cardState,
-    ringClass,
-    isAnime ? 'is-anime' : '',
-    selected ? 'selected' : '',
-    anySelected ? 'any-selected' : '',
-    focused ? 'keyfocused' : '',
-  ].filter(Boolean).join(' ');
+  void anySelected; void index;
 
   return (
     <div
-      className={cardClass}
-      style={{
-        ['--i' as never]: index,
-        // Expose the poster tint as CSS vars so the cinematic hover glow
-        // (a transform/opacity-only `::before` in index.css) can bleed the
-        // card's own dominant colors without any JS or per-card state.
-        ['--tint-a' as never]: tint[0],
-        ['--tint-b' as never]: tint[1],
-      } as React.CSSProperties}
+      className={cn(
+        'group/cc relative flex cursor-pointer flex-col gap-2.5 rounded-xl outline-none transition',
+        focused && 'outline outline-1 outline-white/20 outline-offset-2',
+        stats.cardState === 'rejected' && 'opacity-50 grayscale-[0.35] hover:opacity-75',
+      )}
       onClick={handleCardClick}
       onKeyDown={handleCardKey}
       role="button"
@@ -340,137 +339,113 @@ export function CoverCard({
       aria-label={`Open ${item.title || 'file'}${item.year ? `, ${item.year}` : ''}`}
       data-cardid={item.id}
     >
-      {item.noMatch ? (
-        <div
-          className={`cc-cover shape-${shape} cc-cover-nm`}
-          style={{ background: `linear-gradient(135deg, ${tint[0]}, ${tint[1]})` }}
-        >
-          {/* Media-type icon centered as the placeholder "art" — same
-              visual language as a missing-poster card but tinted with the
-              media-type colour so anime/movie/tv stay distinguishable. */}
-          <div className="cc-nm-icon">
-            {item.mediaType === 'movie' ? <IcFilm /> :
-             item.mediaType === 'anime' ? <IcAnime /> :
-             item.mediaType === 'music' ? <IcMusic /> :
-             <IcTv />}
-          </div>
-          {/* Small alert badge in the corner so the no-match state is
-              still obvious without dominating the cover. */}
-          <div className="cc-nm-alert" title="No metadata match found">
-            <IcAlertTri />
-          </div>
-          {/* Parsed context — what we DO know about this file. The
-              episode count comes from the cluster (multiple files of
-              the same parsed series). */}
-          {item.episodes.length > 1 ? (
-            <span className="cc-year">{pluralize(item.episodes.length, 'file')}</span>
-          ) : null}
-        </div>
-      ) : (
-        <div
-          className={`cc-cover shape-${shape}`}
-          style={{ background: `linear-gradient(135deg, ${tint[0]}, ${tint[1]})` }}
-        >
-          {effectivePosterUrl && !imgFailed ? (
-            <img
-              src={effectivePosterUrl}
-              alt=""
-              loading="lazy"
-              referrerPolicy="no-referrer"
-              onError={() => setImgFailed(true)}
-              style={{
-                position: 'absolute', inset: 0, width: '100%', height: '100%',
-                objectFit: 'cover', zIndex: 0, display: 'block',
-              }}
-            />
-          ) : (
-            <>
-              <span className="cc-init">{item.poster.init}</span>
-              {seasonLabel
-                ? <span className="cc-year">{seasonLabel}</span>
-                : (item.year ? <span className="cc-year">{item.year}</span> : null)}
-            </>
-          )}
-
-          {/* Bulk-select checkbox (top-left).
-              F-12: descriptive aria-label so screen-reader users know
-              WHICH card the checkbox belongs to + aria-pressed state. */}
-          <button
-            className={`cc-select ${selected ? 'on' : ''}`}
-            onClick={(e) => { e.stopPropagation(); onSelect(item.id); }}
-            title={selected ? 'Deselect' : 'Select'}
-            aria-label={`${selected ? 'Deselect' : 'Select'} ${item.title || 'card'}`}
-            aria-pressed={selected}
-          >
-            {selected ? <IcCheck /> : null}
-          </button>
-
-          {/* Confidence pill (top-right, replaces media-type pill) */}
-          {!item.matchingState && !item.noMatch ? (
-            <div className="cc-corner-r">
-              <span className={`cc-conf-pill ${confTier(stats.avgConf)}`}>
-                <span className="swatch" style={{ background: ccStatChipColor(stats) }} />
-                {stats.cardState === 'mixed' || stats.cardState === 'partial'
-                  ? `${stats.matched}/${stats.total}`
-                  : `${stats.avgConf}%`}
-              </span>
+      {/* Cover — Untitled UI card surface (ring + shadow) wrapping the poster. */}
+      <div
+        data-cover
+        className={cn(
+          'relative flex aspect-[2/3] items-center justify-center overflow-hidden rounded-xl bg-[var(--panel)] text-center font-bold tracking-tight text-white shadow-md ring-inset transition duration-200 ease-out group-hover/cc:-translate-y-0.5',
+          isMusic && '!aspect-square rounded-lg',
+          stats.cardState === 'approved' ? 'ring-2 ring-[var(--color-fg-success-primary)]'
+            : stats.cardState === 'rejected' ? 'ring-2 ring-[var(--color-fg-error-primary)]'
+            : selected ? 'ring-2 ring-brand'
+            : 'ring-1 ring-secondary group-hover/cc:ring-primary',
+        )}
+        style={{ background: (item.noMatch || !effectivePosterUrl) ? `linear-gradient(135deg, ${tint[0]}, ${tint[1]})` : undefined }}
+      >
+        {item.noMatch ? (
+          <>
+            <span className="text-white/90 [&_svg]:size-12">{mediaIcon}</span>
+            {/* Top-right pill stack — no-match alert, then file count. */}
+            <div className="absolute right-2.5 top-2.5 z-10 flex flex-col items-end gap-1.5">
+              <span className="grid size-6 place-items-center rounded-md bg-[var(--color-fg-error-primary)] text-white shadow-sm [&_svg]:size-3.5" title="No metadata match found"><IcAlertTri /></span>
+              {item.episodes.length > 1 ? (
+                <span className="rounded-md bg-black/55 px-1.5 py-0.5 text-[10px] font-semibold text-white ring-1 ring-inset ring-white/10 backdrop-blur">{pluralize(item.episodes.length, 'file')}</span>
+              ) : null}
             </div>
-          ) : null}
+          </>
+        ) : (
+          <>
+            {effectivePosterUrl && !imgFailed ? (
+              <img
+                src={effectivePosterUrl}
+                alt=""
+                loading="lazy"
+                referrerPolicy="no-referrer"
+                onError={() => setImgFailed(true)}
+                className="absolute inset-0 z-0 block size-full object-cover"
+              />
+            ) : (
+              <div className="relative z-[1] flex flex-col items-center">
+                <span className="text-4xl leading-none drop-shadow-[0_2px_6px_var(--scrim-50)]">{item.poster.init}</span>
+                {seasonLabel
+                  ? <span className="mt-1 text-xs font-semibold tracking-wide text-white/80 tabular-nums">{seasonLabel}</span>
+                  : (item.year ? <span className="mt-1 text-xs font-semibold tracking-wide text-white/80 tabular-nums">{item.year}</span> : null)}
+              </div>
+            )}
 
-          {/* Quick actions moved into the caption's bottom row (see
-              .cc-bottom-row below) so they sit beside the season/episode
-              sub-line instead of overlapping it. */}
+            {/* Bottom scrim so overlay pills stay legible over any poster. */}
+            <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 bottom-0 z-[1] h-2/5 bg-gradient-to-t from-black/60 to-transparent" />
 
-          {/* Sonarr live activity pill (bottom-left, in front of cover
-              art). Renders only when there's at least one in-flight
-              download for this series + season. Visible above the
-              cover art (z-index above the img); doesn't shift on
-              hover so the user can read it without moving the mouse. */}
-          {sonarrQueue && sonarrQueue.length > 0 ? (
-            <CardSonarrPill entries={sonarrQueue} />
-          ) : null}
+            {/* Bulk-select checkbox (top-left). */}
+            <button
+              data-cc-control
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onSelect(item.id); }}
+              title={selected ? 'Deselect' : 'Select'}
+              aria-label={`${selected ? 'Deselect' : 'Select'} ${item.title || 'card'}`}
+              aria-pressed={selected}
+              className={cn(
+                'absolute left-2.5 top-2.5 z-10 grid size-[22px] place-items-center rounded-md ring-1 ring-inset backdrop-blur transition [&_svg]:size-3 [&_svg]:stroke-[3]',
+                selected
+                  ? 'bg-brand-solid text-white opacity-100 ring-transparent'
+                  : 'bg-black/45 text-white opacity-0 ring-white/40 hover:ring-white group-hover/cc:opacity-100 group-focus-within/cc:opacity-100',
+              )}
+            >
+              {selected ? <IcCheck /> : null}
+            </button>
 
-          {/* Missing-preferred-subtitles badge (bottom-right): the at-a-glance
-              signal that some files in this title lack a wanted language.
-              Count = affected files; the popup's "Get subtitles" fixes them. */}
-          {(() => {
-            const n = item.files.filter(f => f.missingSubs && f.missingSubs.length > 0).length;
-            if (n === 0) return null;
-            const langs = [...new Set(item.files.flatMap(f => f.missingSubs ?? []))]
-              .map(l => l.toUpperCase()).join(', ');
-            return (
-              <span className="cc-sub-missing" title={`${n} file${n === 1 ? '' : 's'} missing ${langs} subtitles — open and click “Get subtitles”`}>
-                <IcCaption /> {n}
-              </span>
-            );
-          })()}
-        </div>
-      )}
+            {/* Top-right pill stack — confidence % first, then status pills. */}
+            <div className="absolute right-2.5 top-2.5 z-10 flex flex-col items-end gap-1.5">
+              {item.matchingState ? (
+                <span className="inline-flex items-center gap-1.5 rounded-md bg-black/55 px-1.5 py-0.5 text-[10px] font-semibold text-white ring-1 ring-inset ring-white/10 backdrop-blur">
+                  <span className="size-1.5 animate-pulse rounded-full bg-[var(--color-fg-warning-primary)]" /> Matching
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 rounded-md bg-black/55 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-white ring-1 ring-inset ring-white/10 backdrop-blur">
+                  <span className="size-1.5 rounded-full" style={{ background: ccStatChipColor(stats) }} />
+                  {stats.cardState === 'mixed' || stats.cardState === 'partial' ? `${stats.matched}/${stats.total}` : `${stats.avgConf}%`}
+                </span>
+              )}
+
+              {missingSubsCount > 0 ? (
+                <span
+                  className="inline-flex items-center gap-1 rounded-md bg-black/60 px-1.5 py-0.5 text-[10px] font-semibold text-warning-primary ring-1 ring-inset ring-white/10 backdrop-blur [&_svg]:size-3"
+                  title={`${missingSubsCount} file${missingSubsCount === 1 ? '' : 's'} missing preferred subtitles — open and click “Get subtitles”`}
+                >
+                  <IcCaption /> {missingSubsCount}
+                </span>
+              ) : null}
+
+              {sonarrQueue && sonarrQueue.length > 0 ? <CardSonarrPill entries={sonarrQueue} /> : null}
+            </div>
+          </>
+        )}
+      </div>
 
       {/* Below-cover meta */}
-      <div className="cc-meta">
-        <div className={`cc-title ${stats.cardState === 'approved' ? 'approved' : ''}`}>
+      <div className="flex flex-col gap-1 px-0.5">
+        <div className={cn(
+          'line-clamp-2 min-h-[2.4em] text-[13.5px] font-semibold leading-tight tracking-tight text-primary',
+          stats.cardState === 'approved' && 'text-tertiary line-through decoration-white/25',
+        )}>
           {item.noMatch
-            // Use the parsed title (already on item.title via the adapter
-            // fallback chain). Title-case any all-lowercase parsed titles
-            // so "one pace" → "One Pace" visually.
             ? (item.title || 'Unknown file')
-            : (inFranchise
-                // Inside a franchise group, use the block's collision-aware
-                // display title: the heading already names the show, so the
-                // trailing "(YYYY)" is dropped — UNLESS keeping it is the only
-                // thing that distinguishes two cours of the same season
-                // (Attack on Titan "Season 3" vs "Season 3 (2019)").
-                ? (displayTitle ?? (item.title || '').replace(/\s*\(\d{4}\)\s*$/, ''))
-                : item.title)}
+            : (inFranchise ? (displayTitle ?? (item.title || '').replace(/\s*\(\d{4}\)\s*$/, '')) : item.title)}
         </div>
-        <div className="cc-bottom-row">
-          <div className="cc-sub">
+        <div className="flex min-h-[18px] items-center gap-2 text-[11.5px] text-tertiary">
+          <div className="flex min-w-0 flex-1 items-center gap-1.5 truncate [&>.dot-sep]:text-quaternary">
             {item.noMatch ? (
               <>
-                {/* What the parser DID extract — season + episode count
-                    or just file count. Plus a "Search →" affordance
-                    that opens manual search without leaving the grid. */}
                 {(() => {
                   const ep = item.episodes[0];
                   if (item.episodes.length === 1 && ep) {
@@ -479,22 +454,21 @@ export function CoverCard({
                       : `S${String(ep.season).padStart(2,'0')}E${String(ep.episode).padStart(2,'0')}`;
                     return <span>{label}</span>;
                   }
-                  if (ep) {
-                    return <span>Season {ep.season} · {pluralize(item.episodes.length, 'ep')}</span>;
-                  }
+                  if (ep) return <span>Season {ep.season} · {pluralize(item.episodes.length, 'ep')}</span>;
                   return <span>{pluralize(item.files.length, 'file')}</span>;
                 })()}
                 <span className="dot-sep" />
                 <button
-                  className="cc-nm-search-link"
+                  data-cc-control
                   onClick={(e) => { e.stopPropagation(); onManualSearch(item); }}
+                  className="inline-flex shrink-0 items-center gap-1 font-medium text-brand-secondary transition-colors hover:text-brand-secondary_hover [&_svg]:size-3"
                 >
                   <IcSearch /> Search
                 </button>
               </>
             ) : (
               <>
-                {item.artist ? <span className="cc-sub-strong">{item.artist}</span> : null}
+                {item.artist ? <span className="truncate font-medium text-secondary">{item.artist}</span> : null}
                 {seasonLabel
                   ? <span>{seasonLabel}</span>
                   : ((item.yearRange || item.year) ? <span>{item.yearRange || item.year}</span> : null)}
@@ -502,28 +476,30 @@ export function CoverCard({
               </>
             )}
           </div>
-          {/* Quick actions — right side of the caption row (sub-info on the
-              left, actions on the right via space-between), so they never
-              overlap the season/episode text. Revealed with the row on hover. */}
+
+          {/* Quick actions — UUI utility buttons, revealed on hover/focus. */}
           {!item.noMatch && !item.matchingState ? (
-            <div className="cc-actions">
+            <div className="flex shrink-0 items-center gap-1 opacity-0 transition group-hover/cc:opacity-100 group-focus-within/cc:opacity-100">
               <button
-                className="cc-act approve"
+                data-cc-control
                 onClick={(e) => { e.stopPropagation(); onApprove(item); }}
                 title="Approve all matched"
                 aria-label={`Approve all matched for ${item.title || 'this title'}`}
+                className="grid size-6 place-items-center rounded-md bg-tertiary text-fg-quaternary ring-1 ring-inset ring-[var(--border-2)] transition hover:bg-[var(--color-fg-success-primary)] hover:text-white [&_svg]:size-3 [&_svg]:stroke-[3]"
               ><IcCheck /></button>
               <button
-                className="cc-act reject"
+                data-cc-control
                 onClick={(e) => { e.stopPropagation(); onReject(item); }}
                 title="Reject all"
                 aria-label={`Reject all for ${item.title || 'this title'}`}
+                className="grid size-6 place-items-center rounded-md bg-tertiary text-fg-quaternary ring-1 ring-inset ring-[var(--border-2)] transition hover:bg-[var(--color-fg-error-primary)] hover:text-white [&_svg]:size-3"
               ><IcX /></button>
               <button
-                className="cc-act"
+                data-cc-control
                 onClick={(e) => { e.stopPropagation(); onManualSearch(item); }}
                 title="Search manually"
                 aria-label={`Search manually for ${item.title || 'this file'}`}
+                className="grid size-6 place-items-center rounded-md bg-tertiary text-fg-quaternary ring-1 ring-inset ring-[var(--border-2)] transition hover:bg-primary_hover hover:text-fg-tertiary [&_svg]:size-3"
               ><IcSearch /></button>
             </div>
           ) : null}
@@ -669,21 +645,15 @@ export function LibraryGrid({
     const isFiltered = (totalLibrarySize ?? 0) > 0;
     if (isFiltered) {
       return (
-        <div className="lib-empty">
-          <div className="hero"><IcReview /></div>
-          <div>
-            <h3>Nothing matches these filters</h3>
-            <p>
-              {totalLibrarySize} file{totalLibrarySize === 1 ? '' : 's'} in your library don't match the active filters.
-            </p>
-            {onClearFilters ? (
-              <button
-                className="btn btn-primary"
-                style={{ marginTop: 12 }}
-                onClick={onClearFilters}
-              >Clear all filters</button>
-            ) : null}
-          </div>
+        <div className="grid place-items-center py-10">
+          <EmptyState
+            icon={<IcReview />}
+            title="Nothing matches these filters"
+            sub={`${totalLibrarySize} file${totalLibrarySize === 1 ? '' : 's'} in your library don't match the active filters.`}
+            action={onClearFilters ? (
+              <Button color="secondary" size="sm" onClick={onClearFilters}>Clear all filters</Button>
+            ) : undefined}
+          />
         </div>
       );
     }
@@ -742,11 +712,11 @@ export function LibraryGrid({
         if (!arr || arr.length === 0) return null;
         return (
           <section key={sec.key} className="lib-section">
-            <header className="lib-section-head">
-              <span className={`lib-section-icon ${sec.key}`}>{iconFor(sec.icon)}</span>
-              <h2 className="lib-section-title">{sec.label}</h2>
-              <div className="lib-section-meta">
-                <span className="lib-section-count">{arr.length}</span>
+            <header className="mb-4 flex items-center gap-3">
+              <FeaturedIcon size="md" tint={SECTION_TINT[sec.key]} icon={iconFor(sec.icon)} />
+              <h2 className="text-base font-semibold text-primary">{sec.label}</h2>
+              <div className="flex items-center gap-2 text-[12px] text-tertiary">
+                <span className="rounded-full bg-white/[0.06] px-1.5 py-0.5 text-[11px] font-semibold tabular-nums text-secondary">{arr.length}</span>
                 <span>{arr.length === 1 ? 'card' : 'cards'}</span>
                 <span className="dot-sep" />
                 <span>{sec.desc}</span>
@@ -770,11 +740,11 @@ export function LibraryGrid({
           section: not in SECTIONS because it spans all media types. */}
       {needsMatching.length > 0 ? (
         <section className="lib-section lib-section-needs">
-          <header className="lib-section-head">
-            <span className="lib-section-icon needs"><IcAlertTri /></span>
-            <h2 className="lib-section-title">Needs matching</h2>
-            <div className="lib-section-meta">
-              <span className="lib-section-count">{needsMatching.length}</span>
+          <header className="mb-4 flex items-center gap-3">
+            <FeaturedIcon size="md" color="error" icon={<IcAlertTri />} />
+            <h2 className="text-base font-semibold text-primary">Needs matching</h2>
+            <div className="flex items-center gap-2 text-[12px] text-tertiary">
+              <span className="rounded-full bg-white/[0.06] px-1.5 py-0.5 text-[11px] font-semibold tabular-nums text-secondary">{needsMatching.length}</span>
               <span>{needsMatching.length === 1 ? 'card' : 'cards'}</span>
               <span className="dot-sep" />
               <span>We couldn't find these in the metadata DBs — pick the right show manually</span>
@@ -1178,7 +1148,9 @@ function CardSonarrPill({ entries }: { entries: QueueEntry[] }) {
 
   return (
     <span
-      className={`cc-sonarr-pill cc-sonarr-${status}`}
+      // `static` neutralizes the legacy `.cc-sonarr-pill` absolute positioning
+      // so the pill flows inside the card's top-right pill stack.
+      className={cn(`cc-sonarr-pill cc-sonarr-${status}`, 'static')}
       title={`${explanation}${specifics}${errorLine}`}
     >
       <IcDownload />

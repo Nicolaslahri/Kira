@@ -70,6 +70,19 @@ export function maskHint(s: Record<string, unknown>, key: string): string | unde
 }
 
 /**
+ * Best-effort human label for a dotted settings key. Used as the unsaved-changes
+ * bar's fallback for controls that aren't a {@link SettingRow} (sliders,
+ * comma-lists) and so can't have their real label harvested from the DOM.
+ * Takes the leaf segment, unslugs underscores, and sentence-cases it:
+ * `matching.auto_threshold` → "Auto threshold".
+ */
+export function humanizeSettingKey(key: string): string {
+  const leaf = key.slice(key.lastIndexOf('.') + 1).replace(/_/g, ' ').trim();
+  if (!leaf) return key;
+  return leaf.charAt(0).toUpperCase() + leaf.slice(1);
+}
+
+/**
  * True when `v` is a usable http(s) URL (or empty — an unset field isn't
  * "invalid", just blank). Used to flag malformed integration URLs inline.
  */

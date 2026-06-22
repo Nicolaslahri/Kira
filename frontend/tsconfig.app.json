@@ -25,5 +25,9 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  /* Tests are run + transpiled by Vitest (esbuild), never by the production
+     build. Excluding them keeps `tsc -b && vite build` clean and fast and
+     avoids needing vitest globals in the app's type world. */
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/**/*.spec.ts", "src/**/*.spec.tsx", "src/test"]
 }

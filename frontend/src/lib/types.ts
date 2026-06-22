@@ -175,6 +175,9 @@ export interface ProviderMeta {
   for: MediaType[];
   color: string;
   icon: 'film' | 'tv' | 'anime' | 'disc' | 'waveform' | 'caption';
+  /** Optional real brand logo (served from /public/providers/). When set, the
+   *  card renders the full-colour logo tile instead of the tinted glyph. */
+  logo?: string;
   desc: string;
 }
 
@@ -196,7 +199,7 @@ export interface ToastData {
   id: string;
   title: string;
   sub?: string;
-  kind?: 'success' | 'error';
+  kind?: 'success' | 'error' | 'warning' | 'info';
 }
 
 /** Tech-tag (MediaInfo) enrichment, surfaced as the scan popup's 3rd line.

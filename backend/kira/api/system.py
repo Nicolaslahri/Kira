@@ -196,9 +196,15 @@ async def reset_matches(
         update(RenameHistory).where(RenameHistory.match_id.isnot(None)).values(match_id=None)
     )
     res = await session.execute(delete(Match))
+    # Reset EVERY file that carried match data back to pending — not just the
+    # three "settled" statuses. A scan interrupted mid-match leaves files in
+    # 'matching'/'parsed'/'discovered'; after deleting all matches those would
+    # keep a non-pending status with zero match rows and never re-enter the
+    # match queue (invisible orphans until a full re-scan). 'renamed' files are
+    # physically done on disk, so they're left as-is.
     await session.execute(
         update(MediaFile)
-        .where(MediaFile.status.in_(("matched", "no_match", "approved")))
+        .where(MediaFile.status.notin_(("pending", "renamed")))
         .values(status="pending")
     )
     await session.commit()

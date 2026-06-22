@@ -143,14 +143,14 @@ export function ActivityPill({ job, onDismiss }: { job: ApiActivityJob; onDismis
     : state === 'done' ? 'var(--conf-high)'
     : 'var(--brand-grad)';
   const iconBox = state === 'error'
-    ? 'bg-[rgba(255,91,110,0.14)] text-[var(--conf-low)]'
+    ? 'bg-[var(--conf-low-16)] text-[var(--conf-low)]'
     : state === 'done'
-      ? 'bg-[rgba(40,217,160,0.14)] text-[var(--conf-high)]'
+      ? 'bg-[var(--accent-soft)] text-[var(--conf-high)]'
       : 'bg-[var(--surface-3)] text-accent [&_svg]:animate-[spin_1.1s_linear_infinite]';
 
   return (
     <div
-      className="anim-pop relative flex max-w-[440px] items-center gap-3 overflow-hidden rounded-2xl border border-[var(--border-2)] bg-[rgba(10,10,13,0.72)] px-4 py-3 shadow-[var(--shadow-3)] backdrop-blur-2xl"
+      className="anim-pop relative flex max-w-[440px] items-center gap-3 overflow-hidden rounded-2xl border border-[var(--border-2)] bg-[var(--panel-75)] px-4 py-3 shadow-[var(--shadow-3)] backdrop-blur-2xl"
       role={state === 'error' ? 'alert' : 'status'}
       aria-live="polite"
     >

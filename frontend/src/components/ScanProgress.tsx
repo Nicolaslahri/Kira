@@ -34,7 +34,7 @@ export function ScanProgress({ phase, progress, found, message, tech }: {
 
   return (
     <div
-      className="relative w-[340px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl border border-white/[0.1] bg-[rgba(8,9,12,0.6)] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.55)] backdrop-blur-2xl"
+      className="relative w-[340px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl border border-white/[0.1] bg-[var(--panel-60)] p-4 shadow-[0_18px_60px_var(--scrim-60)] backdrop-blur-2xl"
       role="status"
       aria-live="polite"
     >
@@ -60,7 +60,7 @@ export function ScanProgress({ phase, progress, found, message, tech }: {
             </span>
             <span className="font-mono tabular-nums text-ink-soft">{found.toLocaleString()} files</span>
           </div>
-          <ProgressBar value={scanDone ? 100 : 0} indeterminate={!scanDone} color="#49b8fe" />
+          <ProgressBar value={scanDone ? 100 : 0} indeterminate={!scanDone} color="var(--info)" label="Scanning for media files" />
         </div>
 
         {/* Match phase */}
@@ -69,7 +69,7 @@ export function ScanProgress({ phase, progress, found, message, tech }: {
             <span className="font-medium text-ink-muted">Match</span>
             <span className="font-mono tabular-nums text-ink-soft">{matchActive ? `${progress}%` : 'waiting…'}</span>
           </div>
-          <ProgressBar value={matchActive ? progress : 0} color="var(--accent)" />
+          <ProgressBar value={matchActive ? progress : 0} color="var(--accent)" label="Matching files to providers" />
         </div>
 
         {/* Tech-tag phase — only when the "Read file metadata" feature is on.
@@ -87,7 +87,7 @@ export function ScanProgress({ phase, progress, found, message, tech }: {
                   : 'done'}
               </span>
             </div>
-            <ProgressBar value={techPct} indeterminate={tech.active && !tech.total} color="#a78bfa" />
+            <ProgressBar value={techPct} indeterminate={tech.active && !tech.total} color="var(--violet)" label="Reading file media info" />
           </div>
         ) : null}
       </div>

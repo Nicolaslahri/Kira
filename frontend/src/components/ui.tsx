@@ -1,19 +1,22 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'motion/react';
-import type { PosterData, ToastData, Page, MediaType } from '../lib/types';
+import type { PosterData, Page, MediaType } from '../lib/types';
 import type { SettingsSection } from '../App';
 import {
   IcDashboard, IcReview, IcHistory, IcSettings, IcSearch,
-  IcCheck, IcX, IcAlertTri, IcKeyboard, IcScan, IcSpin,
-  IcLogoMark, IcFilm, IcTv, IcAnime, IcMusic, IcChevDown, IcMenu, IcChevLeft,
+  IcCheck, IcX, IcKeyboard, IcScan, IcSpin,
+  IcLogoMark, IcFilm, IcTv, IcAnime, IcMusic, IcChevDown, IcMenu,
 } from '../lib/icons';
 import { NotificationsBell } from './NotificationsBell';
 import { api, hasStoredAuth, clearStoredAuth } from '../lib/api';
 import { cn } from '../lib/utils';
 import { confLevel } from '../lib/confBands';
 import { Button } from './base/buttons/button';
-import { FeaturedIcon } from './base/featured-icons/featured-icon';
+import { ButtonUtility } from './base/buttons/button-utility';
+import { NavItemBase } from './base/nav/nav-item';
+import { Input } from './base/input/input';
+import { Breadcrumbs } from './base/breadcrumbs/breadcrumbs';
 
 export function Poster({ data, imgUrl, size = 'md', shape = 'poster', className = '' }: {
   data: PosterData | null | undefined;
@@ -29,7 +32,7 @@ export function Poster({ data, imgUrl, size = 'md', shape = 'poster', className 
   if (imgUrl && !imgFailed) {
     return (
       <div className={`poster ${shapeClass} size-${size} ${className}`} style={{
-        background: '#0a0815',
+        background: 'var(--panel)',
         overflow: 'hidden',
       }}>
         <img
@@ -47,8 +50,8 @@ export function Poster({ data, imgUrl, size = 'md', shape = 'poster', className 
   if (!data) {
     return (
       <div className={`poster ${shapeClass} size-${size} ${className}`} style={{
-        background: 'rgba(255,255,255,0.04)',
-        border: '1px dashed rgba(255,255,255,0.12)',
+        background: 'var(--glass)',
+        border: '1px dashed var(--border-2)',
       }}>
         <span className="pinit" style={{ opacity: 0.4, fontSize: 14 }}>?</span>
       </div>
@@ -108,7 +111,7 @@ export function MediaTypeIcon({ type }: { type: MediaType | string }) {
   return <IcFilm />;
 }
 
-export function Sidebar({ active, setActive, settingsSection, setSettingsSection, pendingCount, scanRunning, backendOk, mobileOpen = false, onClose }: {
+export function Sidebar({ active, setActive, settingsSection, setSettingsSection, pendingCount, scanRunning, backendOk, mobileOpen = false, onClose, searchQuery, onSearchChange, onScan, onShortcuts }: {
   active: Page;
   setActive: (p: Page) => void;
   settingsSection: string;
@@ -120,6 +123,13 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
   mobileOpen?: boolean;
   /** Close the mobile drawer (called after navigating). */
   onClose?: () => void;
+  /** Global search (moved here from the top bar) — drives the Review filter. */
+  searchQuery: string;
+  onSearchChange: (q: string) => void;
+  /** Workspace scan trigger (moved here from the top bar). */
+  onScan: () => void;
+  /** Opens the keyboard-shortcuts modal (moved here from the top bar). */
+  onShortcuts: () => void;
 }) {
   const items: { key: Page; label: string; icon: ReactNode; count?: number }[] = [
     { key: 'dashboard', label: 'Dashboard', icon: <IcDashboard /> },
@@ -146,26 +156,6 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
   const statusLabel = backendOk === false ? 'Backend disconnected'
     : scanRunning ? 'Scanning…' : backendOk === null ? 'Connecting…' : 'Idle';
   const statusLive = scanRunning || backendOk === null;
-
-  // Collapsible rail (desktop only). Persisted so it survives reloads, and
-  // mirrored onto the document root's --side-w so App.tsx's grid track
-  // (grid-cols-[var(--side-w)_1fr]) reflows automatically — no App.tsx state
-  // change needed. Purely presentational; never affects mobile drawer width.
-  const [collapsed, setCollapsed] = useState<boolean>(() => {
-    try { return localStorage.getItem('kira.sidebar.collapsed') === '1'; } catch { return false; }
-  });
-  // Track the desktop breakpoint reactively — the collapse feature is desktop-
-  // only, so on mobile the drawer always renders full (labels + sub-nav) at
-  // 240px regardless of the persisted collapse flag.
-  const [isDesktop, setIsDesktop] = useState<boolean>(() => {
-    try { return window.matchMedia('(min-width: 1024px)').matches; } catch { return true; }
-  });
-  useEffect(() => {
-    const mq = window.matchMedia('(min-width: 1024px)');
-    const onChange = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    mq.addEventListener('change', onChange);
-    return () => mq.removeEventListener('change', onChange);
-  }, []);
 
   // Live app version — /health is the single source (backend truth), the
   // hardcoded fallback only covers "backend unreachable". Plus a gentle
@@ -201,230 +191,177 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
     return () => { cancelled = true; };
   }, []);
 
-  // `rail` is the effective icon-only mode: collapsed AND on desktop.
-  const rail = collapsed && isDesktop;
+  // Fixed-width sidebar (the Untitled UI sidebar isn't collapsible). Keep the
+  // App grid track (`grid-cols-[var(--side-w)_1fr]`) in sync.
   useEffect(() => {
-    const root = document.documentElement;
-    // The mobile drawer is always full --side-w; only collapse the desktop rail.
-    root.style.setProperty('--side-w', rail ? '76px' : '240px');
-    return () => { root.style.setProperty('--side-w', '240px'); };
-  }, [rail]);
-  useEffect(() => {
-    try { localStorage.setItem('kira.sidebar.collapsed', collapsed ? '1' : '0'); } catch { /* private mode */ }
-  }, [collapsed]);
+    document.documentElement.style.setProperty('--side-w', '264px');
+  }, []);
 
   return (
     <aside className={cn(
-      'kira-sidebar fixed inset-y-0 left-0 z-50 flex h-screen w-[var(--side-w)] flex-col gap-6 px-3 py-5 transition-transform duration-300 ease-[var(--ease-out)] lg:sticky lg:top-0 lg:z-20 lg:translate-x-0',
+      'kira-sidebar fixed inset-y-0 left-0 z-50 flex h-screen w-[var(--side-w)] flex-col pt-5 transition-transform duration-300 ease-[var(--ease-out)] lg:sticky lg:top-0 lg:z-20 lg:translate-x-0',
       mobileOpen ? 'translate-x-0' : '-translate-x-full',
-      rail && 'lg:items-center',
     )}>
       {/* Brand */}
-      <div className={cn('flex items-center gap-3 px-2', rail && 'lg:justify-center lg:px-0')}>
-        <div className="kira-brandmark press grid size-9 shrink-0 place-items-center rounded-xl text-white [&_svg]:size-5">
+      <div className="flex items-center gap-3 px-5">
+        <div className="kira-brandmark flex size-9 shrink-0 items-center">
           <IcLogoMark />
         </div>
-        {!rail ? (
-          <div className="leading-tight">
-            <div className="text-[15px] font-bold tracking-tight text-primary">Kira</div>
-            <div className="text-[11px] text-quaternary">
-              v{version ?? '0.5.0'}
-              {updateTo ? (
-                <a
-                  href="https://github.com/Nicolaslahri/Kira/releases"
-                  target="_blank" rel="noreferrer"
-                  className="ml-1.5 font-medium text-info hover:underline"
-                  title={`Version ${updateTo} is available on GitHub`}
-                >
-                  · v{updateTo} out
-                </a>
-              ) : null}
-            </div>
+        <div className="leading-tight">
+          <div className="text-[15px] font-bold tracking-tight text-primary">Kira</div>
+          <div className="text-[11px] text-quaternary">
+            v{version ?? '0.5.0'}
+            {updateTo ? (
+              <a
+                href="https://github.com/Nicolaslahri/Kira/releases"
+                target="_blank" rel="noreferrer"
+                className="ml-1.5 font-medium text-info hover:underline"
+                title={`Version ${updateTo} is available on GitHub`}
+              >
+                · v{updateTo} out
+              </a>
+            ) : null}
           </div>
-        ) : null}
-        {/* Desktop rail toggle — sits top-right of the brand row when expanded. */}
-        <button
-          onClick={() => setCollapsed(c => !c)}
-          className={cn(
-            'press ml-auto hidden size-7 shrink-0 place-items-center rounded-lg text-fg-quaternary transition hover:bg-[var(--surface-hover)] hover:text-fg-tertiary lg:grid [&_svg]:size-4',
-            rail && 'lg:hidden',
-          )}
-          title="Collapse sidebar"
-          aria-label="Collapse sidebar"
-        >
-          <IcChevLeft />
-        </button>
+        </div>
       </div>
 
-      {/* Nav */}
-      <nav className="flex flex-1 flex-col gap-1">
-        {!rail ? (
-          <div className="px-3 pb-1.5 pt-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-quaternary">
-            Workspace
-          </div>
-        ) : (
-          // Rail mode: a thin expand affordance replaces the section label.
-          <button
-            onClick={() => setCollapsed(false)}
-            className="press mb-1 hidden size-9 place-items-center self-center rounded-lg text-fg-quaternary transition hover:bg-[var(--surface-hover)] hover:text-fg-tertiary lg:grid [&_svg]:size-4 [&_svg]:rotate-180"
-            title="Expand sidebar"
-            aria-label="Expand sidebar"
-          >
-            <IcChevLeft />
-          </button>
-        )}
-        {items.map(it => {
-          const isActive = active === it.key;
-          const isSettings = it.key === 'settings';
-          return (
-            <div key={it.key}>
-              <button
-                onClick={() => { setActive(it.key); if (it.key !== 'settings') onClose?.(); }}
-                title={rail ? it.label : undefined}
-                aria-current={isActive ? 'page' : undefined}
-                className={cn(
-                  'kira-nav-item group press relative flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-semibold',
-                  rail && 'lg:justify-center lg:px-0',
-                  isActive ? 'text-primary' : 'text-tertiary hover:text-secondary',
-                )}
-              >
-                {/* Morphing active indicator — a springy brand-gradient pill that
-                    slides between items via a shared layoutId. Sits behind the
-                    label/icon (z-0); content is z-10. */}
-                {isActive ? (
-                  <motion.span
-                    layoutId="nav-active"
-                    className="kira-nav-active absolute inset-0 rounded-xl"
-                    transition={{ type: 'spring', stiffness: 520, damping: 38 }}
-                  />
-                ) : null}
-                <span className={cn(
-                  'relative z-10 inline-flex size-5 shrink-0 transition-transform duration-200 ease-[var(--ease-back)] [&_svg]:size-5',
-                  'group-hover:scale-110 group-active:scale-95',
-                  isActive ? 'text-white' : 'text-fg-quaternary group-hover:text-fg-tertiary',
-                )}>
-                  {it.icon}
-                </span>
-                {!rail ? <span className="relative z-10 flex-1 text-left">{it.label}</span> : null}
-                {it.count != null && it.count > 0 ? (
-                  rail ? (
-                    // Rail mode: a tiny dot on the icon corner signals "items waiting".
-                    <span className="absolute right-2 top-1.5 z-10 size-1.5 rounded-full bg-conf-mid lg:right-3" aria-hidden="true" />
-                  ) : (
-                    <span className={cn(
-                      'relative z-10 rounded-full px-1.5 py-0.5 text-[11px] font-semibold tabular-nums ring-1 ring-inset transition-colors',
-                      isActive ? 'bg-white/20 text-white ring-white/20' : 'bg-[var(--surface-2)] text-tertiary ring-[var(--border-2)]',
-                    )}>
-                      {it.count}
-                    </span>
-                  )
-                ) : null}
-                {/* Settings gets a chevron that rotates when expanded */}
-                {isSettings && !rail ? (
-                  <IcChevDown
-                    style={{ width: 14, height: 14 }}
-                    className={cn('relative z-10 shrink-0 transition-transform duration-200', isActive ? 'rotate-180 text-white/80' : 'text-fg-quaternary')}
-                  />
-                ) : null}
-              </button>
+      {/* Search — moved here from the top bar. Drives the Review queue filter
+          (typing from any page jumps to Review — see App.handleSearchChange). */}
+      <div className="mt-5 px-4">
+        <Input
+          icon={IcSearch}
+          aria-label="Search"
+          placeholder="Search files, titles, paths…"
+          value={searchQuery}
+          onChange={e => onSearchChange(e.target.value)}
+          wrapperClassName="sidebar-search h-10 rounded-lg ring-1 ring-inset ring-secondary bg-secondary px-3 py-0 transition-[border-color,box-shadow,background] duration-200 ease-[var(--ease-out)] focus-within:ring-[var(--accent-line)] focus-within:bg-tertiary focus-within:shadow-[var(--glow-accent)]"
+          trailing={
+            searchQuery ? (
+              <ButtonUtility size="xs" color="tertiary" icon={IcX} tooltip="Clear search" onClick={() => onSearchChange('')} className="-mr-1 shrink-0" />
+            ) : (
+              <span className="rounded ring-1 ring-inset ring-secondary px-1.5 py-0.5 font-mono text-[10px] text-quaternary">/</span>
+            )
+          }
+        />
+      </div>
 
-              {/* Nested sub-settings — expand when Settings is active. Hidden in
-                  rail mode (no room); expanding the rail reveals them again. */}
-              {isSettings && !rail ? (
-                <AnimatePresence initial={false}>
-                  {isActive ? (
-                    <motion.div
-                      initial={{ height: 0, opacity: 0 }}
-                      animate={{ height: 'auto', opacity: 1 }}
-                      exit={{ height: 0, opacity: 0 }}
-                      transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
-                      className="overflow-hidden"
-                    >
-                      <div className="relative ml-[22px] mt-1 flex flex-col gap-0.5 border-l border-[var(--border-2)] pl-3">
-                        {settingsSub.flatMap(s => {
-                          const subActive = settingsSection === s.key;
-                          // A band label sits above the first item of each group.
-                          // flatMap keeps both the label and the button as direct
-                          // flex children, so buttons still stretch full width.
-                          const out: React.ReactNode[] = [];
-                          if (s.group) {
+      {/* Nav — Untitled UI sidebar items (NavItemBase). */}
+      <nav className="mt-5 flex flex-1 flex-col overflow-y-auto px-4">
+        <p className="px-2 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Workspace</p>
+        <ul className="flex flex-col gap-1">
+          {items.map(it => {
+            const isActive = active === it.key;
+            const isSettings = it.key === 'settings';
+            return (
+              <li key={it.key}>
+                <NavItemBase
+                  icon={it.icon}
+                  current={isActive}
+                  badge={isSettings
+                    ? <IcChevDown className={cn('size-3.5 shrink-0 stroke-[2.5px] text-fg-quaternary transition-transform duration-200', isActive && 'rotate-180')} />
+                    : (it.count && it.count > 0 ? it.count : undefined)}
+                  onClick={() => { setActive(it.key); if (it.key !== 'settings') onClose?.(); }}
+                >
+                  {it.label}
+                </NavItemBase>
+
+                {/* Settings expands inline to its grouped sub-sections. */}
+                {isSettings ? (
+                  <AnimatePresence initial={false}>
+                    {isActive ? (
+                      <motion.div
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: 'auto', opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
+                        className="overflow-hidden"
+                      >
+                        <ul className="mt-0.5 flex flex-col gap-0.5 pb-1">
+                          {settingsSub.flatMap(s => {
+                            const out: ReactNode[] = [];
+                            if (s.group) {
+                              out.push(
+                                <li key={`grp-${s.key}`}>
+                                  <p className="px-3 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary first:pt-1">{s.group}</p>
+                                </li>,
+                              );
+                            }
                             out.push(
-                              <div
-                                key={`grp-${s.key}`}
-                                className="px-2.5 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-[0.09em] text-fg-quaternary first:pt-1"
-                              >
-                                {s.group}
-                              </div>,
+                              <li key={s.key}>
+                                <NavItemBase
+                                  type="child"
+                                  current={settingsSection === s.key}
+                                  onClick={() => { setSettingsSection(s.key); onClose?.(); }}
+                                >
+                                  {s.label}
+                                </NavItemBase>
+                              </li>,
                             );
-                          }
-                          out.push(
-                            <button
-                              key={s.key}
-                              onClick={() => { setSettingsSection(s.key); onClose?.(); }}
-                              className={cn(
-                                'relative rounded-lg px-2.5 py-1.5 text-left text-[13px] transition duration-100 ease-linear',
-                                subActive ? 'font-semibold text-secondary' : 'text-tertiary hover:text-secondary hover:bg-[var(--surface-hover)]',
-                              )}
-                            >
-                              {subActive ? (
-                                <motion.span
-                                  layoutId="settings-sub-active"
-                                  className="absolute -left-[13px] top-1/2 h-4 w-[2px] -translate-y-1/2 rounded-full"
-                                  style={{ background: 'var(--brand-grad)' }}
-                                  transition={{ type: 'spring', stiffness: 600, damping: 40 }}
-                                />
-                              ) : null}
-                              {s.label}
-                            </button>,
-                          );
-                          return out;
-                        })}
-                      </div>
-                    </motion.div>
-                  ) : null}
-                </AnimatePresence>
-              ) : null}
-            </div>
-          );
-        })}
+                            return out;
+                          })}
+                        </ul>
+                      </motion.div>
+                    ) : null}
+                  </AnimatePresence>
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
       </nav>
 
-      {/* Status footer */}
-      <div className={cn(
-        'mt-auto rounded-xl border border-[var(--border-2)] bg-[var(--surface-1)] shadow-[var(--shadow-1)]',
-        rail ? 'lg:grid lg:size-9 lg:place-items-center lg:self-center lg:p-0' : 'px-3 py-2.5',
-      )}>
-        <div className={cn('flex items-center gap-2 text-xs text-tertiary', rail && 'lg:gap-0')}>
-          <span
-            className={cn('size-[7px] shrink-0 rounded-full', statusLive && 'breathe')}
-            style={{ background: statusColor, boxShadow: `0 0 0 3px ${statusColor}2e` }}
+      {/* Bottom — the workspace actions + status that used to live in the top
+          bar: Scan (primary), Notifications, Shortcuts, connection status, Sign out. */}
+      <div className="mt-auto flex flex-col gap-2.5 px-4 pb-4 pt-3">
+        <Button
+          color="primary"
+          size="md"
+          iconLeading={scanRunning ? IcSpin : IcScan}
+          isDisabled={scanRunning}
+          onClick={onScan}
+          className="w-full justify-center"
+        >
+          {scanRunning ? 'Scanning…' : 'Scan now'}
+        </Button>
+
+        <div className="flex items-center gap-2">
+          <NotificationsBell placement="up-left" />
+          <ButtonUtility
+            size="md"
+            color="secondary"
+            icon={IcKeyboard}
+            tooltip="Keyboard shortcuts (?)"
+            onClick={onShortcuts}
+            className="shrink-0"
           />
-          {!rail ? <span>{statusLabel}</span> : null}
-          {/* Sign out — only meaningful when this tab holds credentials
-              (i.e. the server has auth enabled and we're signed in). */}
-          {!rail && hasStoredAuth() ? (
-            <button
-              type="button"
-              onClick={() => clearStoredAuth()}
-              className="ml-auto shrink-0 text-[11px] text-fg-quaternary transition-colors hover:text-fg-secondary"
-              title="Sign out of this tab"
-            >
-              Sign out
-            </button>
-          ) : null}
+          <div className="ml-auto flex h-9 min-w-0 flex-1 items-center gap-1.5 rounded-lg ring-1 ring-inset ring-secondary bg-secondary px-2.5 text-tertiary shadow-xs">
+            <span
+              className={cn('size-[7px] shrink-0 rounded-full', statusLive && 'breathe')}
+              style={{ background: statusColor, boxShadow: `0 0 0 3px ${statusColor}2e` }}
+            />
+            <span className="truncate text-[11.5px]">{statusLabel}</span>
+          </div>
         </div>
+
+        {/* Sign out — only when this tab holds credentials (auth enabled). */}
+        {hasStoredAuth() ? (
+          <Button
+            color="secondary"
+            size="sm"
+            onClick={() => clearStoredAuth()}
+            className="w-full justify-center"
+            title="Sign out of this tab"
+          >
+            Sign out
+          </Button>
+        ) : null}
       </div>
     </aside>
   );
 }
 
-export function Topbar({ active, onScan, scanRunning, onShortcuts, searchQuery, onSearchChange, onMenuClick }: {
+export function Topbar({ active, onMenuClick }: {
   active: Page;
-  onScan: () => void;
-  scanRunning: boolean;
-  onShortcuts: () => void;
-  searchQuery: string;
-  onSearchChange: (q: string) => void;
   /** Opens the mobile nav drawer (hamburger). Hidden on lg+. */
   onMenuClick?: () => void;
 }) {
@@ -435,130 +372,22 @@ export function Topbar({ active, onScan, scanRunning, onShortcuts, searchQuery, 
     settings: ['Settings'],
   };
   const trail = titles[active];
+  // Slim context bar: the search / scan / notifications / shortcuts that used
+  // to live here now live in the sidebar; only the mobile-nav trigger and the
+  // page breadcrumb remain.
   return (
     <header className="topbar-glass sticky top-0 z-30 flex h-[62px] items-center gap-3 border-b border-[var(--border-2)] px-4 lg:gap-4 lg:px-7">
-      <button
-        className="press grid size-9 shrink-0 place-items-center rounded-lg text-fg-quaternary transition hover:bg-[var(--surface-hover)] hover:text-fg-tertiary lg:hidden [&_svg]:size-5"
-        title="Menu"
-        aria-label="Open navigation"
-        onClick={onMenuClick}
-      >
-        <IcMenu />
-      </button>
-      {/* Breadcrumb — the active leaf animates in (key changes per page). */}
-      <div className="flex items-center text-[13px] text-tertiary">
-        {trail.map((s, i) => (
-          <span key={i} className="flex items-center">
-            {i > 0 ? <span className="mx-2 text-quaternary">/</span> : null}
-            {i === trail.length - 1
-              ? <motion.b
-                  key={s}
-                  initial={{ opacity: 0, y: -4 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
-                  className="font-semibold text-secondary"
-                >{s}</motion.b>
-              : s}
-          </span>
-        ))}
-      </div>
-
-      <div
-        className="topbar-search ml-auto flex h-9 w-full max-w-sm items-center gap-2 rounded-lg border border-[var(--border-2)] bg-[var(--surface-1)] px-3 transition-[border-color,box-shadow,background] duration-200 ease-[var(--ease-out)] focus-within:border-accent-line focus-within:bg-[var(--surface-2)] focus-within:shadow-[var(--glow-accent)]"
-        onClick={(e) => { (e.currentTarget.querySelector('input') as HTMLInputElement)?.focus(); }}
-      >
-        <IcSearch style={{ width: 14, height: 14 }} className="text-fg-quaternary transition-colors" />
-        <input
-          className="min-w-0 flex-1 border-0 bg-transparent text-[13px] text-primary outline-none placeholder:text-placeholder"
-          placeholder="Search files, titles, paths…"
-          value={searchQuery}
-          onChange={e => onSearchChange(e.target.value)}
-        />
-        {searchQuery ? (
-          <button
-            className="press grid size-[22px] place-items-center rounded-md text-fg-quaternary transition hover:bg-[var(--surface-hover)] hover:text-fg-tertiary"
-            title="Clear"
-            aria-label="Clear search"
-            onClick={() => onSearchChange('')}
-          >
-            <IcX style={{ width: 11, height: 11 }} />
-          </button>
-        ) : (
-          <span className="rounded border border-[var(--border-2)] px-1.5 py-0.5 font-mono text-[10px] text-quaternary">/</span>
-        )}
-      </div>
-
-      <button
-        className="press grid size-9 shrink-0 place-items-center rounded-lg border border-[var(--border-2)] bg-[var(--surface-1)] text-fg-quaternary shadow-[var(--shadow-1)] transition hover:bg-[var(--surface-hover)] hover:text-fg-tertiary [&_svg]:size-[16px]"
-        title="Keyboard shortcuts (?)"
-        aria-label="Keyboard shortcuts"
-        onClick={onShortcuts}
-      >
-        <IcKeyboard />
-      </button>
-      <NotificationsBell />
-      <Button
+      <ButtonUtility
         size="md"
-        color="primary"
-        iconLeading={scanRunning ? IcSpin : IcScan}
-        isDisabled={scanRunning}
-        onClick={onScan}
-      >
-        {scanRunning ? 'Scanning…' : 'Scan now'}
-      </Button>
+        color="tertiary"
+        icon={IcMenu}
+        tooltip="Open navigation"
+        onClick={onMenuClick}
+        className="shrink-0 lg:hidden"
+      />
+      {/* Breadcrumb — the active leaf animates in (handled inside Breadcrumbs). */}
+      <Breadcrumbs items={trail.map(label => ({ label }))} />
     </header>
-  );
-}
-
-export function Toast({ toasts, onDismiss, leading }: { toasts: ToastData[]; onDismiss?: (id: string) => void; leading?: ReactNode }) {
-  return (
-    <div className="toasts">
-      <AnimatePresence initial={false}>
-        {leading ? (
-          <motion.div
-            key="__leading"
-            layout
-            initial={{ opacity: 0, y: 12, scale: 0.97 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.96, transition: { duration: 0.15 } }}
-            transition={{ type: 'spring', stiffness: 400, damping: 32 }}
-          >
-            {leading}
-          </motion.div>
-        ) : null}
-        {toasts.map(t => (
-          <motion.div
-            key={t.id}
-            layout
-            initial={{ opacity: 0, y: 12, scale: 0.97 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.96, transition: { duration: 0.15 } }}
-            transition={{ type: 'spring', stiffness: 400, damping: 32 }}
-            className="flex w-[340px] max-w-[90vw] items-start gap-3 rounded-xl border border-white/[0.1] bg-[rgba(8,9,12,0.66)] px-3.5 py-3 shadow-[0_12px_32px_rgba(0,0,0,0.5)] backdrop-blur-2xl"
-          >
-            <FeaturedIcon
-              size="sm"
-              color={t.kind === 'error' ? 'error' : 'success'}
-              icon={t.kind === 'error' ? <IcAlertTri /> : <IcCheck />}
-            />
-            <div className="min-w-0 flex-1">
-              <div className="text-[13px] font-semibold text-ink">{t.title}</div>
-              {t.sub ? <div className="mt-0.5 text-[12px] leading-relaxed text-ink-muted">{t.sub}</div> : null}
-            </div>
-            {onDismiss ? (
-              <button
-                onClick={() => onDismiss(t.id)}
-                aria-label="Dismiss"
-                title="Dismiss"
-                className="grid size-6 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink [&_svg]:size-[14px]"
-              >
-                <IcX />
-              </button>
-            ) : null}
-          </motion.div>
-        ))}
-      </AnimatePresence>
-    </div>
   );
 }
 
@@ -582,7 +411,7 @@ export function Checkbox({ on, onChange, indeterminate, disabled, title }: {
       onClick={(e) => { e.stopPropagation(); if (!disabled) onChange?.(); }}
     >
       {on ? <IcCheck /> : indeterminate ? (
-        <svg viewBox="0 0 24 24" style={{ width: 12, height: 12, color: '#061814' }}>
+        <svg viewBox="0 0 24 24" style={{ width: 12, height: 12, color: 'var(--on-accent)' }}>
           <rect x="5" y="11" width="14" height="2" rx="1" fill="currentColor" />
         </svg>
       ) : null}
@@ -750,8 +579,8 @@ export function Select<T>({
       <button
         type="button"
         className={cn(
-          'flex w-full items-center justify-between gap-2 rounded-xl border bg-glass px-3.5 py-2.5 text-[13px] text-ink outline-none transition-colors hover:bg-glass-2 disabled:cursor-not-allowed disabled:opacity-55',
-          open ? 'border-accent-line bg-glass-2' : 'border-line',
+          'flex w-full items-center justify-between gap-2 rounded-xl border bg-white/[0.04] px-3.5 py-2.5 text-[13px] text-primary outline-none transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:opacity-55',
+          open ? 'border-brand bg-white/[0.07]' : 'border-secondary',
         )}
         onClick={handleOpen}
         onKeyDown={(e) => {
@@ -770,20 +599,20 @@ export function Select<T>({
         aria-expanded={open}
         aria-label={ariaLabel}
       >
-        <span className={cn('flex-1 truncate text-left', mono && 'font-mono text-[12px]', !selected && 'text-ink-soft')}>
+        <span className={cn('flex-1 truncate text-left', mono && 'font-mono text-[12px]', !selected && 'text-tertiary')}>
           {selected ? selected.label : (placeholder ?? '— select —')}
         </span>
-        <IcChevDown className={cn('size-4 shrink-0 text-ink-soft transition-transform duration-200', open && 'rotate-180')} />
+        <IcChevDown className={cn('size-4 shrink-0 text-tertiary transition-transform duration-200', open && 'rotate-180')} />
       </button>
       {open && popPos && createPortal(
         <div
           ref={popupRef}
           role="listbox"
           style={{ position: 'fixed', top: popPos.top, left: popPos.left, width: popPos.width }}
-          className="z-[1000] max-h-[280px] overflow-y-auto rounded-xl border border-line bg-[#0e0f14] p-1 shadow-[0_12px_32px_rgba(0,0,0,0.5),0_2px_6px_rgba(0,0,0,0.4)] [scrollbar-width:thin]"
+          className="z-[1000] max-h-[280px] overflow-y-auto rounded-xl border border-secondary bg-[var(--panel)] p-1 shadow-[0_12px_32px_var(--scrim-50),0_2px_6px_var(--scrim-40)] [scrollbar-width:thin]"
         >
           {options.length === 0 ? (
-            <div className="px-2.5 py-3 text-center text-[12px] text-ink-soft">No options available.</div>
+            <div className="px-2.5 py-3 text-center text-[12px] text-tertiary">No options available.</div>
           ) : options.map((opt, idx) => {
             const isSelected = keyOf(opt.value) === selectedKey;
             const isActive = idx === activeIdx;
@@ -795,15 +624,15 @@ export function Select<T>({
                 aria-selected={isSelected}
                 className={cn(
                   'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] transition-colors [&_svg]:size-4 [&_svg]:shrink-0',
-                  isActive && 'bg-glass-2',
-                  isSelected ? 'text-accent' : 'text-ink',
+                  isActive && 'bg-white/[0.07]',
+                  isSelected ? 'text-brand-secondary' : 'text-primary',
                 )}
                 onMouseEnter={() => setActiveIdx(idx)}
                 onClick={() => { onChange(opt.value); setOpen(false); }}
               >
                 <span className={cn('flex-1 truncate', mono && 'font-mono text-[12px]', isSelected && 'font-medium')}>{opt.label}</span>
                 {opt.secondary ? (
-                  <span className="shrink-0 text-[11px] text-ink-soft">{opt.secondary}</span>
+                  <span className="shrink-0 text-[11px] text-tertiary">{opt.secondary}</span>
                 ) : null}
                 {isSelected ? <IcCheck /> : null}
               </button>
@@ -827,18 +656,17 @@ export function FilterPill({ on, onClick, label, num }: {
       onClick={onClick}
       aria-pressed={on}
       className={cn(
-        'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[12.5px] font-medium outline-none transition-colors duration-[var(--dur-1)] ease-[var(--ease-out)]',
-        'focus-visible:ring-2 focus-visible:ring-accent-line focus-visible:ring-offset-0',
+        'inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12.5px] font-semibold outline-brand transition duration-100 ease-linear focus-visible:outline-2 focus-visible:outline-offset-2',
         on
-          ? 'bg-accent-soft text-ink shadow-[inset_0_0_0_1px_var(--accent-line)]'
-          : 'text-ink-muted hover:bg-white/[0.05] hover:text-ink',
+          ? 'bg-tertiary text-primary shadow-xs ring-1 ring-inset ring-secondary'
+          : 'text-tertiary hover:bg-primary_hover hover:text-secondary',
       )}
     >
       {label}
       {num != null ? (
         <span className={cn(
-          'rounded-md px-1.5 py-0.5 text-[10px] font-semibold tabular-nums',
-          on ? 'bg-accent-line text-ink' : 'bg-white/[0.06] text-ink-soft',
+          'rounded-full px-1.5 py-0.5 text-[10px] font-semibold tabular-nums',
+          on ? 'bg-white/10 text-secondary' : 'bg-white/[0.06] text-tertiary',
         )}>{num}</span>
       ) : null}
     </button>
@@ -850,7 +678,7 @@ export function FilterPill({ on, onClick, label, num }: {
 // (status / confidence / media) stay visually separated from each other.
 export function FilterGroup({ children }: { children: ReactNode }) {
   return (
-    <div className="inline-flex flex-wrap items-center gap-0.5 rounded-xl border border-line bg-white/[0.025] p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+    <div className="inline-flex flex-wrap items-center gap-0.5 rounded-lg bg-secondary p-1 ring-1 ring-inset ring-secondary">
       {children}
     </div>
   );
@@ -905,12 +733,17 @@ export function EmptyState({ icon, title, sub, action }: {
   sub: string;
   action?: ReactNode;
 }) {
+  // Untitled UI empty-state shape (featured-icon chip + title + description),
+  // built on UUI semantic tokens. Kept lightweight on purpose — the upstream
+  // UUI `application/empty-state` drags in @untitledui/icons, file-icons,
+  // illustrations and background-patterns, none of which Kira vendors. Pixel-
+  // matches the retired `.empty` CSS.
   return (
-    <div className="empty">
-      <div className="empty-icon">{icon}</div>
+    <div className="flex flex-col items-center gap-4 px-6 py-14 text-center">
+      <div className="grid size-16 place-items-center rounded-2xl border border-secondary bg-white/[0.04] text-tertiary [&_svg]:size-7">{icon}</div>
       <div>
-        <div className="empty-title">{title}</div>
-        <div className="empty-sub">{sub}</div>
+        <div className="text-[17px] font-semibold text-primary">{title}</div>
+        <div className="mx-auto max-w-[420px] text-[13px] text-tertiary">{sub}</div>
       </div>
       {action}
     </div>

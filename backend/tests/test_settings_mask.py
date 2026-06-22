@@ -168,3 +168,61 @@ async def test_put_skips_bullet_placeholder_for_secret_key():
     assert result == {"updated": 0}
     assert sess.stored("providers.tmdb.api_key") == "realStoredKey9999"
     assert sess.added == []
+
+
+# ── "secret disappears after refresh" guard: a BLANK value must never clear a
+# already-configured secret. A masked field's editable value is '' (the
+# plaintext never leaves the server), so a stray empty onChange/blur on the
+# client would otherwise persist '' and the next GET would re-mask it as
+# set=false — making the key vanish on every refresh. ────────────────────────
+@pytest.mark.asyncio
+async def test_put_skips_empty_for_existing_secret():
+    sess, result = await _put(
+        {"integrations.sonarr.api_key": "realStoredKey9999"},
+        {"integrations.sonarr.api_key": ""},
+    )
+    assert result == {"updated": 0}
+    assert sess.stored("integrations.sonarr.api_key") == "realStoredKey9999"  # untouched
+    assert sess.added == []
+
+
+@pytest.mark.asyncio
+async def test_put_skips_whitespace_for_existing_secret():
+    sess, result = await _put(
+        {"integrations.plex.token": "realStoredKey9999"},
+        {"integrations.plex.token": "   "},
+    )
+    assert result == {"updated": 0}
+    assert sess.stored("integrations.plex.token") == "realStoredKey9999"
+
+
+@pytest.mark.asyncio
+async def test_put_skips_wrapped_empty_for_existing_secret():
+    # The {"value": ""} wrapped storage shape is unwrapped and treated as blank.
+    sess, result = await _put(
+        {"providers.opensubtitles.password": "realStoredKey9999"},
+        {"providers.opensubtitles.password": {"value": ""}},
+    )
+    assert result == {"updated": 0}
+    assert sess.stored("providers.opensubtitles.password") == "realStoredKey9999"
+
+
+@pytest.mark.asyncio
+async def test_put_allows_real_rotation_of_secret():
+    # The guard blocks only blanks — rotating a configured secret to a NEW real
+    # value must still work.
+    sess, result = await _put(
+        {"integrations.sonarr.api_key": "oldKey1111"},
+        {"integrations.sonarr.api_key": "newKey2222"},
+    )
+    assert result == {"updated": 1}
+    assert sess.stored("integrations.sonarr.api_key") == "newKey2222"
+
+
+@pytest.mark.asyncio
+async def test_put_allows_empty_for_unset_secret():
+    # Nothing configured yet → no secret to protect → an empty write is a
+    # harmless no-op row (the guard only fires when a real value already exists).
+    sess, result = await _put({}, {"integrations.sonarr.api_key": ""})
+    assert result == {"updated": 1}
+    assert sess.stored("integrations.sonarr.api_key") == ""

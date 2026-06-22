@@ -4,10 +4,10 @@ import { cx, sortCx } from "@/utils/cx";
 import { isReactComponent } from "@/utils/is-react-component";
 
 export const styles = sortCx({
-    info: "border-line bg-glass [&_[data-alert-icon]]:text-ink-soft",
-    warning: "border-[rgba(255,201,74,0.28)] bg-[var(--conf-mid-bg)] [&_[data-alert-icon]]:text-conf-mid",
-    error: "border-[rgba(255,91,110,0.28)] bg-[var(--conf-low-bg)] [&_[data-alert-icon]]:text-conf-low",
-    success: "border-accent-line bg-[var(--conf-high-bg)] [&_[data-alert-icon]]:text-conf-high",
+    info: "border-secondary bg-white/[0.04] [&_[data-alert-icon]]:text-tertiary",
+    warning: "border-[var(--conf-mid-32)] bg-warning-secondary [&_[data-alert-icon]]:text-warning-primary",
+    error: "border-[var(--conf-low-32)] bg-error-secondary [&_[data-alert-icon]]:text-error-primary",
+    success: "border-brand bg-success-secondary [&_[data-alert-icon]]:text-success-primary",
 });
 
 export interface AlertProps {
@@ -30,7 +30,7 @@ export const Alert = ({ color = "info", icon: Icon, title, children, className }
         <div
             role="status"
             className={cx(
-                "flex items-start gap-2.5 rounded-xl border px-3 py-2.5 text-[12.5px] leading-relaxed text-ink-muted",
+                "flex items-start gap-2.5 rounded-xl border px-3 py-2.5 text-[12.5px] leading-relaxed text-secondary",
                 styles[color],
                 className,
             )}
@@ -42,7 +42,7 @@ export const Alert = ({ color = "info", icon: Icon, title, children, className }
                 </span>
             ) : null}
             <div className="min-w-0 flex-1">
-                {title ? <div className="mb-0.5 font-semibold text-ink">{title}</div> : null}
+                {title ? <div className="mb-0.5 font-semibold text-primary">{title}</div> : null}
                 {children}
             </div>
         </div>

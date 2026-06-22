@@ -56,7 +56,7 @@ export function DupesResolverModal({ item, episode, files, onClose, onRequestDel
       onClick={onClose}
       style={{
         position: 'fixed', inset: 0,
-        background: 'rgba(7, 6, 12, 0.78)',
+        background: 'var(--panel-75)',
         backdropFilter: 'blur(6px)',
         WebkitBackdropFilter: 'blur(6px)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -66,7 +66,7 @@ export function DupesResolverModal({ item, episode, files, onClose, onRequestDel
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
-          background: '#14121b',
+          background: 'var(--panel)',
           color: 'var(--ink)',
           borderRadius: 'var(--r-lg)',
           padding: 24,
@@ -76,7 +76,7 @@ export function DupesResolverModal({ item, episode, files, onClose, onRequestDel
           overflow: 'hidden',
           display: 'flex', flexDirection: 'column',
           border: '1px solid var(--line-strong)',
-          boxShadow: '0 24px 60px rgba(0, 0, 0, 0.6)',
+          boxShadow: '0 24px 60px var(--scrim-60)',
         }}
       >
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 16, marginBottom: 18 }}>
@@ -84,7 +84,7 @@ export function DupesResolverModal({ item, episode, files, onClose, onRequestDel
             style={{
               flexShrink: 0,
               width: 44, height: 44, borderRadius: 8,
-              background: 'rgba(255, 201, 74, 0.15)',
+              background: 'var(--conf-mid-16)',
               color: 'var(--conf-mid)',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
               fontWeight: 700, fontSize: 18,
@@ -156,8 +156,8 @@ export function DupesResolverModal({ item, episode, files, onClose, onRequestDel
             title="Delete every copy except the one marked Keep — in a single confirmation."
             style={{
               padding: '9px 16px', borderRadius: 8,
-              background: losers.length ? 'var(--conf-low)' : 'rgba(255,91,110,0.25)',
-              color: '#fff', border: 'none',
+              background: losers.length ? 'var(--conf-low)' : 'var(--conf-low-24)',
+              color: 'var(--ink)', border: 'none',
               fontSize: 13, fontWeight: 600,
               cursor: losers.length ? 'pointer' : 'not-allowed',
               opacity: losers.length ? 1 : 0.55,
@@ -291,9 +291,9 @@ function DupeFileCard({ file, isKept, suggested, onKeep, onDelete }: DupeFileCar
               style={{
                 appearance: 'none',
                 padding: '8px 12px', borderRadius: 8,
-                background: 'rgba(255, 91, 110, 0.15)',
+                background: 'var(--conf-low-16)',
                 color: 'var(--conf-low)',
-                border: '1px solid rgba(255, 91, 110, 0.35)',
+                border: '1px solid var(--conf-low-32)',
                 fontSize: 12, fontWeight: 600, cursor: 'pointer',
                 display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6,
               }}
@@ -338,7 +338,7 @@ export function DeleteConfirmModal({ file, onCancel, onConfirm }: DeleteConfirmM
       style={{
         position: 'fixed', inset: 0,
         // Solid dark overlay with blur so the popup behind doesn't bleed through.
-        background: 'rgba(7, 6, 12, 0.78)',
+        background: 'var(--panel-75)',
         backdropFilter: 'blur(6px)',
         WebkitBackdropFilter: 'blur(6px)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -349,15 +349,15 @@ export function DeleteConfirmModal({ file, onCancel, onConfirm }: DeleteConfirmM
         onClick={(e) => e.stopPropagation()}
         style={{
           // Opaque card, not glassy — this is a destructive prompt, it
-          // needs to dominate. Solid #14121b reads above the popup behind.
-          background: '#14121b',
+          // needs to dominate. Solid var(--panel) reads above the popup behind.
+          background: 'var(--panel)',
           color: 'var(--ink)',
           borderRadius: 'var(--r-lg)',
           padding: 28,
           maxWidth: 540,
           width: '90%',
-          border: '1px solid rgba(255, 91, 110, 0.4)',
-          boxShadow: '0 24px 60px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 91, 110, 0.18)',
+          border: '1px solid var(--conf-low-32)',
+          boxShadow: '0 24px 60px var(--scrim-60), 0 0 0 1px var(--conf-low-16)',
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
@@ -384,7 +384,7 @@ export function DeleteConfirmModal({ file, onCancel, onConfirm }: DeleteConfirmM
             fontSize: 12,
             padding: '10px 12px',
             borderRadius: 8,
-            background: 'rgba(0, 0, 0, 0.35)',
+            background: 'var(--scrim-30)',
             border: '1px solid var(--line)',
             color: 'var(--ink-2)',
             wordBreak: 'break-all',
@@ -401,7 +401,7 @@ export function DeleteConfirmModal({ file, onCancel, onConfirm }: DeleteConfirmM
             fontSize: 13, color: 'var(--ink-2)',
             marginBottom: 20, cursor: 'pointer',
             padding: '8px 10px', borderRadius: 6,
-            background: 'rgba(255, 255, 255, 0.03)',
+            background: 'var(--surface-1)',
           }}
         >
           <input
@@ -429,8 +429,8 @@ export function DeleteConfirmModal({ file, onCancel, onConfirm }: DeleteConfirmM
             onClick={onConfirm}
             style={{
               padding: '9px 16px', borderRadius: 8,
-              background: acknowledged ? 'var(--conf-low)' : 'rgba(255, 91, 110, 0.25)',
-              color: '#fff',
+              background: acknowledged ? 'var(--conf-low)' : 'var(--conf-low-24)',
+              color: 'var(--ink)',
               border: 'none',
               fontSize: 13, fontWeight: 600,
               cursor: acknowledged ? 'pointer' : 'not-allowed',
@@ -482,7 +482,7 @@ export function BulkDeleteConfirmModal({ files, keepCount, epCount, onCancel, on
       onClick={onCancel}
       style={{
         position: 'fixed', inset: 0,
-        background: 'rgba(7, 6, 12, 0.78)',
+        background: 'var(--panel-75)',
         backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         zIndex: 11000,
@@ -491,11 +491,11 @@ export function BulkDeleteConfirmModal({ files, keepCount, epCount, onCancel, on
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
-          background: '#14121b', color: 'var(--ink)',
+          background: 'var(--panel)', color: 'var(--ink)',
           borderRadius: 'var(--r-lg)', padding: 28, maxWidth: 620, width: '92%',
           maxHeight: '82vh', display: 'flex', flexDirection: 'column',
-          border: '1px solid rgba(255, 91, 110, 0.4)',
-          boxShadow: '0 24px 60px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 91, 110, 0.18)',
+          border: '1px solid var(--conf-low-32)',
+          boxShadow: '0 24px 60px var(--scrim-60), 0 0 0 1px var(--conf-low-16)',
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
@@ -531,7 +531,7 @@ export function BulkDeleteConfirmModal({ files, keepCount, epCount, onCancel, on
               className="mono"
               style={{
                 fontSize: 12, padding: '7px 2px', lineHeight: 1.4,
-                wordBreak: 'break-all', borderBottom: '1px solid rgba(255,255,255,0.04)',
+                wordBreak: 'break-all', borderBottom: '1px solid var(--glass)',
               }}
             >
               <span style={{ color: 'var(--ink)', fontWeight: 600 }}>{f.filename}</span>
@@ -544,7 +544,7 @@ export function BulkDeleteConfirmModal({ files, keepCount, epCount, onCancel, on
           style={{
             display: 'flex', alignItems: 'center', gap: 10,
             fontSize: 13, color: 'var(--ink-2)', marginBottom: 18, cursor: 'pointer',
-            padding: '8px 10px', borderRadius: 6, background: 'rgba(255, 255, 255, 0.03)',
+            padding: '8px 10px', borderRadius: 6, background: 'var(--surface-1)',
           }}
         >
           <input
@@ -571,8 +571,8 @@ export function BulkDeleteConfirmModal({ files, keepCount, epCount, onCancel, on
             onClick={onConfirm}
             style={{
               padding: '9px 16px', borderRadius: 8,
-              background: acknowledged ? 'var(--conf-low)' : 'rgba(255, 91, 110, 0.25)',
-              color: '#fff', border: 'none', fontSize: 13, fontWeight: 600,
+              background: acknowledged ? 'var(--conf-low)' : 'var(--conf-low-24)',
+              color: 'var(--ink)', border: 'none', fontSize: 13, fontWeight: 600,
               cursor: acknowledged ? 'pointer' : 'not-allowed',
               opacity: acknowledged ? 1 : 0.55,
               display: 'inline-flex', alignItems: 'center', gap: 6,

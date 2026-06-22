@@ -109,19 +109,26 @@ export function AdvancedSection({
           icon={<IcSettings />}
           title="Advanced"
           purpose="Power-user settings — history retention, performance, file metadata, and maintenance. The danger zone lives at the bottom, deliberately set apart."
-          status={<StatusPill tone={readMediainfo ? 'accent' : 'neutral'}>{readMediainfo ? 'MediaInfo on' : 'Defaults'}</StatusPill>}
+          status={(
+            <div className="flex flex-wrap items-center justify-end gap-1.5">
+              <StatusPill tone={readMediainfo ? 'accent' : 'neutral'}>{readMediainfo ? 'MediaInfo on' : 'Defaults'}</StatusPill>
+              <StatusPill tone="neutral">{retention === 'forever' ? 'History kept forever' : `History ${retention}d`}</StatusPill>
+            </div>
+          )}
         />
       )}
     >
       <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
-      {/* Library & performance */}
+      {/* Library & performance (tall — owns column 1) */}
       <SectionCard
+        tint="var(--accent)"
         icon={<IcSettings />}
         title={<>Library &amp; performance</>}
         desc="How long history is kept and how hard Kira hits your disk."
       >
         <div className="flex flex-col gap-4">
           <SettingRow
+            settingKeys="history.retention_days"
             label="History retention"
             desc="How long to keep the rename log for undo. Older entries are pruned daily."
           >
@@ -140,6 +147,7 @@ export function AdvancedSection({
             </div>
           </SettingRow>
           <SettingRow
+            settingKeys="rename.concurrency"
             label="Concurrent file reads"
             desc="How many parallel per-file operations run at once — post-rename subtitle downloads and the background media-info reads. The file moves themselves are deliberately one-at-a-time; that ordering is what makes a half-failed batch safely resumable."
           >
@@ -151,12 +159,14 @@ export function AdvancedSection({
             />
           </SettingRow>
           <SettingRow
+            settingKeys="rename.stamp_ids"
             label="Remember matches on files"
             desc={<>After a rename, stamp the file with its resolved provider IDs (extended attributes where the volume supports them, Kira's local index otherwise) so a re-scan — even after a database reset — re-identifies it instantly with zero searches. Turn off if you don't want Kira attaching any metadata to your files.</>}
           >
             <Toggle isSelected={stampIds} onChange={() => saveKey('rename.stamp_ids')(!stampIds)} className="mt-0.5" aria-label="Remember matches on files" />
           </SettingRow>
           <SettingRow
+            settingKeys="rename.on_conflict"
             label="When a file already exists at the target"
             desc={<>How Kira handles a rename whose destination is already occupied by a <em>different</em> file. (A re-run where the same file is already in place is always a safe no-op, regardless of this.)</>}
           >
@@ -174,12 +184,14 @@ export function AdvancedSection({
             </div>
           </SettingRow>
           <SettingRow
+            settingKeys="rename.symlink_relative"
             label="Relative symlink targets"
             desc={<>Only applies when the rename op is <strong className="text-ink">Symlink</strong>. Point each link at a path <em>relative</em> to its own folder instead of an absolute one, so links survive the library being remounted or bind-mounted at a different path (common in Docker). Off = absolute targets.</>}
           >
             <Toggle isSelected={symlinkRelative} onChange={() => saveKey('rename.symlink_relative')(!symlinkRelative)} className="mt-0.5" aria-label="Relative symlink targets" />
           </SettingRow>
           <SettingRow
+            settingKeys="rename.set_permissions"
             label="Set file ownership & permissions"
             desc={<>After each rename, apply a fixed mode and/or owner to the file and any folders Kira creates — so a media server running as a different user (common on Docker / NAS) can always read them. Best-effort: chown is Unix-only; on Windows this no-ops.</>}
           >
@@ -208,6 +220,7 @@ export function AdvancedSection({
             </NestedBox>
           ) : null}
           <SettingRow
+            settingKeys="advanced.update_check"
             label="Check for updates"
             desc={<>On app load, compare this install against the latest GitHub release and show a small note in the sidebar when a newer version exists. One anonymous API call to github.com — off means zero outbound calls.</>}
           >
@@ -216,14 +229,18 @@ export function AdvancedSection({
         </div>
       </SectionCard>
 
+      {/* Column 2 — the two short cards stacked so the grid row stays balanced. */}
+      <div className="flex flex-col gap-4">
       {/* File metadata */}
       <SectionCard
+        tint="var(--accent-bright)"
         icon={<IcFilm />}
         title="File metadata (MediaInfo)"
         desc="Read real resolution / codec / HDR straight from the file container."
       >
         <div className="flex flex-col gap-4">
           <SettingRow
+            settingKeys="parsing.read_mediainfo"
             label="Read file metadata"
             desc="Fill in resolution / codec / HDR from the file when the filename doesn't carry them. Runs in the background after a scan — never slows it. No-op if the MediaInfo library isn't installed."
           >
@@ -231,6 +248,7 @@ export function AdvancedSection({
           </SettingRow>
           <NestedBox dimmed={!readMediainfo}>
             <SettingRow
+              settingKeys="parsing.mediainfo_authoritative"
               label="Authoritative tech tags"
               desc={<>Let the file's real metadata <strong className="text-ink">override</strong> what the filename claims for <span className="font-mono text-ink">{'{{vc}}'}</span> <span className="font-mono text-ink">{'{{hdr}}'}</span> <span className="font-mono text-ink">{'{{channels}}'}</span> and quality. Reads every file (not just tag-less ones) so it's heavier — but it runs in the background, so the scan still finishes fast; the corrected tags fill in after. Gives true source-accurate tags.</>}
             >
@@ -243,6 +261,7 @@ export function AdvancedSection({
       {/* Backup & restore — settings only (the database holds matches/history
           and has its own lifecycle; this covers configuration). */}
       <SectionCard
+        tint="var(--conf-high)"
         icon={<IcDownload />}
         title="Backup &amp; restore"
         desc={<>Export every setting as a JSON file, or import one to restore a configuration. <strong className="text-ink">API keys are never included</strong> — they leave the server masked — so re-enter those after a restore.</>}
@@ -268,26 +287,33 @@ export function AdvancedSection({
         </div>
       </SectionCard>
       </div>
+      </div>
 
       {/* Danger zone — visually quarantined: its own labelled group + the
           red-tinted SectionCard tone. */}
-      <div className="settings-danger-zone flex flex-col gap-2.5 pt-2">
-      <div className="flex items-center gap-3">
+      <div className="settings-danger-zone flex flex-col gap-2.5 pt-6">
+      <div className="flex items-center gap-2.5">
+        <IcAlertTri className="size-3.5 shrink-0 text-conf-low" />
         <span className="text-[11px] font-semibold uppercase tracking-[0.1em] text-conf-low">Danger zone</span>
-        <span className="h-px flex-1 bg-[rgba(255,91,110,0.25)]" />
+        <span className="h-px flex-1 bg-[var(--conf-low-24)]" />
       </div>
       <SectionCard
         tone="danger"
         icon={<IcAlertTri />}
         title="Reset"
-        desc="Four levels, lightest first — each says exactly what it destroys. Files already on disk are never touched by any of them."
+        desc="Four levels, lightest first — each shows exactly what survives and what is lost. Files already on disk are never touched."
       >
-        <div className="flex flex-col gap-2.5">
+        {/* Blast-radius ladder — a gradient spine threads four rungs of
+            strictly-growing destruction. Each rung carries its own cumulative
+            radius bar; the arm / typed-confirm safety flow is unchanged. */}
+        <div className="relative flex flex-col gap-2.5 pl-5">
+          <span aria-hidden className="absolute left-[7px] top-3 bottom-3 w-0.5 rounded-full" style={{ background: 'linear-gradient(var(--conf-mid), color-mix(in srgb, var(--conf-mid) 45%, var(--conf-low)), var(--conf-low), var(--danger))' }} />
           <DangerRow
             level={1}
             badge="history"
             name="Clear rename history"
-            lost="The rename log and undo. Files, matches, and settings survive."
+            survives="Files · matches · settings · account"
+            lost="The rename log and undo."
             confirmWord={null}
             onRun={async () => {
               const r = await api.resetHistory();
@@ -298,7 +324,8 @@ export function AdvancedSection({
             level={2}
             badge="matches"
             name="Forget all matches"
-            lost="Every identification — files flip back to pending for a fresh re-match. Files, history, and settings survive."
+            survives="Files · history · settings · account"
+            lost="Every identification — files flip back to pending for a fresh re-match."
             confirmWord={null}
             onRun={async () => {
               const r = await api.resetMatches();
@@ -310,7 +337,8 @@ export function AdvancedSection({
             level={3}
             badge="library data"
             name="Reset database"
-            lost="All files, matches, history, and notifications. Settings and your account survive. Renames on disk are NOT undone."
+            survives="Settings · your account"
+            lost="All files, matches, history, and notifications. Renames on disk are NOT undone."
             confirmWord="DELETE"
             onRun={async () => {
               await api.resetDatabase();
@@ -322,7 +350,8 @@ export function AdvancedSection({
             level={4}
             badge="everything"
             name="Factory reset"
-            lost="Everything above PLUS every setting, API key, and the account itself — back to the first-run sign-up and onboarding."
+            survives="Nothing but the files already on disk"
+            lost="Everything above PLUS every setting, API key, and the account itself — back to first-run."
             confirmWord="FACTORY"
             onRun={async () => {
               await api.factoryReset();
@@ -343,12 +372,18 @@ export function AdvancedSection({
 // second click; heavy tiers demand the confirm word typed out. Every row
 // states exactly what is destroyed.
 
-const DANGER_COLORS = ['var(--conf-mid)', '#ff9a4d', 'var(--conf-low)', '#ff2d44'];
+// Monotonic light→catastrophic ramp. The old [conf-mid, warn, conf-low, danger]
+// did NOT escalate — --warn is grey and --danger === --conf-low, so it read
+// amber → grey → red → red. color-mix gives a true amber → orange-red → red →
+// deepest-red climb so the blast-radius ladder is honest.
+const DANGER_COLORS = ['var(--conf-mid)', 'color-mix(in srgb, var(--conf-mid) 45%, var(--conf-low))', 'var(--conf-low)', 'var(--danger)'];
 
-function DangerRow({ level, badge, name, lost, confirmWord, onRun }: {
+function DangerRow({ level, badge, name, survives, lost, confirmWord, onRun }: {
   level: 1 | 2 | 3 | 4;
   badge: string;
   name: string;
+  /** What this tier spares — the green half of the survives/lost split. */
+  survives: string;
   lost: string;
   /** null = two-click arm; string = must be typed to enable the button. */
   confirmWord: string | null;
@@ -378,7 +413,8 @@ function DangerRow({ level, badge, name, lost, confirmWord, onRun }: {
       className="flex flex-col gap-2 rounded-xl border px-3.5 py-3"
       style={{
         borderColor: `color-mix(in srgb, ${color} 30%, transparent)`,
-        background: `color-mix(in srgb, ${color} 5%, transparent)`,
+        background: `color-mix(in srgb, ${color} ${level === 4 ? 8 : 5}%, transparent)`,
+        ...(level === 4 ? { boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--danger) 30%, transparent)' } : {}),
       }}
     >
       <div className="flex items-center gap-3">
@@ -397,7 +433,22 @@ function DangerRow({ level, badge, name, lost, confirmWord, onRun }: {
               {badge}
             </span>
           </div>
-          <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-muted">{lost}</div>
+          {/* Cumulative blast bar — lights one more segment per tier. */}
+          <div className="mt-1.5 flex h-1.5 gap-px overflow-hidden rounded-full">
+            {[0, 1, 2, 3].map(i => (
+              <span
+                key={i}
+                className={`flex-1 ${i <= level - 1 ? '' : 'bg-tertiary opacity-30'}`}
+                style={i <= level - 1 ? { background: DANGER_COLORS[i] } : undefined}
+              />
+            ))}
+          </div>
+          <div className="mt-1.5 text-[11.5px] leading-relaxed">
+            <span className="font-semibold text-conf-low">Lost:</span> <span className="text-ink-muted">{lost}</span>
+          </div>
+          <div className="text-[11px] leading-relaxed">
+            <span className="font-semibold" style={{ color: 'var(--conf-high)' }}>Survives:</span> <span className="text-tertiary">{survives}</span>
+          </div>
         </div>
         {!armed ? (
           <Button color="secondary-destructive" size="sm" className="shrink-0" onClick={() => setArmed(true)}>

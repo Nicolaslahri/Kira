@@ -1055,6 +1055,24 @@ async def bulk_select_manual_match(
         if f.parsed_data:
             existing_ep = existing_ep or f.parsed_data.get("episode")
             existing_season = existing_season or f.parsed_data.get("season")
+        # Canonicalize the season the SAME way _rematch_one (L563) and the
+        # scan path (scans.py L1175) do — the commandeer/APPEND writes below
+        # were the ONE path that stamped the raw parsed/sibling season. For
+        # AniDB the Fribb/ScudLee cross-ref is ground truth (each AID = one
+        # TVDB season; a flat umbrella like One Piece, or a separate-series-
+        # per-season franchise, pins Season 1 — the cour cases that are
+        # season-1-by-design), so a season-LOCAL folder index ("Season 3")
+        # can't leak into the stored season and drive a wrong rename SxxExx.
+        # Consult the ROUTED `final_provider_id` so a sibling cour AID's own
+        # canonical season is used (still == existing_season for normal cours).
+        # No-op for TVDB/TMDB and unmapped AIDs (returns existing_season). Only
+        # season_number is touched here — the provider_id / episode routing
+        # above (final_episode_override, redrive_episode, umbrella remap) is
+        # deliberately left untouched. Mirrors _rematch_one (no `episode` arg)
+        # rather than the scan path so One Piece stays unified at Season 1.
+        canonical_season = await resolve_canonical_season(
+            payload.provider, final_provider_id, existing_season,
+        )
         # When routing supplied a cour-local episode number, that wins
         # over the season-local one (it's the canonical AniDB episode
         # index for the routed AID). Skip for non-routed files.
@@ -1144,9 +1162,13 @@ async def bulk_select_manual_match(
             # Fill season/episode only when missing — never clobber a
             # value the matcher previously assigned correctly. Routing
             # overrides take precedence (final_episode_override forces
-            # episode_number to the cour-local number).
-            if target_match.season_number is None and existing_season is not None:
-                target_match.season_number = existing_season
+            # episode_number to the cour-local number). `canonical_season`
+            # (not the raw parsed/sibling season) keeps a freshly-filled
+            # season identical to what the APPEND branch and the other two
+            # match paths would store, so commandeered + first-time-pinned
+            # siblings of the same show never diverge.
+            if target_match.season_number is None and canonical_season is not None:
+                target_match.season_number = canonical_season
             if final_episode_override is not None:
                 target_match.episode_number = final_episode_override
             elif redrive_episode and existing_ep is not None:
@@ -1191,7 +1213,7 @@ async def bulk_select_manual_match(
                 title=title_for_row,
                 year=payload.year,
                 series_name=title_for_row if match_type == "tv_episode" else None,
-                season_number=existing_season,
+                season_number=canonical_season,
                 episode_number=existing_ep,
                 poster_url=poster_for_row,
                 overview=payload.overview,

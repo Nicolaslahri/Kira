@@ -1192,7 +1192,22 @@ def undo_op(op: FileOp, src: Path, dst: Path) -> None:
 
 
 def _same_inode(a: Path, b: Path) -> bool:
+    """True only when a and b are provably the SAME filesystem object (a hardlink
+    pair, or the same entry). Used to let a MOVE-over-existing safely unlink the
+    source (the bytes survive at the destination hardlink).
+
+    ZERO-INODE GUARD: many CIFS/NFS mounts — common under Docker, which is this
+    app's primary deployment — report `st_ino == 0` (and often `st_dev == 0`)
+    for every file. Without this guard two genuinely DIFFERENT files both look
+    "same inode", so an occupied-target MOVE (overwrite=False) would unlink the
+    SOURCE believing the destination is its hardlink → silent data loss over an
+    unrelated file. If either file lacks a real inode we cannot prove sameness,
+    so return False and let the normal on-conflict path handle it (a conflict
+    error is a safe degradation; deleting the source is not)."""
     try:
-        return a.stat().st_ino == b.stat().st_ino and a.stat().st_dev == b.stat().st_dev
+        sa, sb = a.stat(), b.stat()
     except OSError:
         return False
+    if sa.st_ino == 0 or sb.st_ino == 0:
+        return False
+    return sa.st_ino == sb.st_ino and sa.st_dev == sb.st_dev

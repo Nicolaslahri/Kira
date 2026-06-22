@@ -10,11 +10,11 @@ export const styles = sortCx({
         lg: "size-11 rounded-xl [&_svg]:size-5",
     },
     colors: {
-        brand: "bg-accent-soft text-accent",
-        success: "bg-[var(--conf-high-bg)] text-conf-high",
-        warning: "bg-[var(--conf-mid-bg)] text-conf-mid",
-        error: "bg-[var(--conf-low-bg)] text-conf-low",
-        gray: "bg-white/[0.08] text-ink-muted",
+        brand: "bg-brand-secondary text-fg-brand-primary",
+        success: "bg-success-secondary text-fg-success-primary",
+        warning: "bg-warning-secondary text-fg-warning-primary",
+        error: "bg-error-secondary text-fg-error-primary",
+        gray: "bg-white/[0.08] text-fg-secondary",
     },
 });
 
@@ -33,16 +33,19 @@ export interface FeaturedIconProps {
 }
 
 /**
- * Untitled UI "Featured icon" (light theme): a tinted rounded chip wrapping a
- * single icon. Re-skinned to Kira's tokens so success/error/warning track the
- * confidence palette and brand tracks the emerald accent. Pass `tint` for an
- * arbitrary brand color.
+ * Untitled UI "Featured icon": a tinted rounded chip wrapping a single icon.
+ * Uses UUI semantic tokens (brand / success / warning / error); Kira's dark
+ * theme re-points those at the confidence palette + emerald accent (see the
+ * "Kira look bridge" in theme.css), so brand reads emerald and success/error/
+ * warning track confidence. Pass `tint` for an arbitrary brand color.
  */
 export const FeaturedIcon = ({ icon: Icon, color = "brand", size = "sm", tint, className, children }: FeaturedIconProps) => {
     return (
         <span
             className={cx("grid shrink-0 place-items-center", styles.sizes[size], !tint && styles.colors[color], className)}
-            style={tint ? { backgroundColor: `${tint}1f`, color: tint } : undefined}
+            // color-mix (not `${tint}1f`) so `tint` accepts a `var(--token)` —
+            // string-concatenating an alpha onto a var() would be invalid CSS.
+            style={tint ? { backgroundColor: `color-mix(in srgb, ${tint} 12%, transparent)`, color: tint } : undefined}
         >
             {isValidElement(Icon) && Icon}
             {isReactComponent(Icon) && <Icon />}

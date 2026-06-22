@@ -148,7 +148,14 @@ async def extract(video_path: str, languages: list[str], forced: str = "") -> li
     wanted = [w for w in (normalize_lang(x) for x in languages) if w]
     saved: list[str] = []
     _exts = ("srt", "ass", "vtt")
-    for want in wanted:
+    # Untagged-track rescue: many fansub MKVs carry a SINGLE text track with no
+    # language metadata (normalize_lang → None), which the per-language match
+    # below would never select — so the file's own embedded sub is ignored and
+    # Kira needlessly fetches over the network (defeating the "embedded is best
+    # for anime" path). When there's exactly one text track and it's untagged,
+    # treat it as the user's TOP wanted language.
+    lone_untagged = tracks[0] if (len(tracks) == 1 and tracks[0]["lang"] is None) else None
+    for i, want in enumerate(wanted):
         # Already have a sidecar for this language (a prior run OR another
         # source — OpenSubtitles writes `.srt`)? Skip; don't clobber/duplicate.
         if any(
@@ -167,6 +174,21 @@ async def extract(video_path: str, languages: list[str], forced: str = "") -> li
             match = plain_t                  # never emit a forced (signs-only) track
         else:                                 # '' | include → main dialogue preferred
             match = plain_t or forced_t
+        # No language-tagged track matched — fall back to the lone untagged track
+        # for the user's TOP language only (default/include preference; a forced
+        # requirement can't be assumed of an untagged track). Skip it if the track
+        # is itself flagged forced: that's a signs/songs-only sub (dialogue is
+        # hardsubbed), and writing it as the main dialogue sidecar would both give
+        # the user the wrong sub and suppress the OpenSubtitles fetch that would
+        # have grabbed a real one — mirror the `exclude` guard at L174.
+        if (
+            match is None
+            and i == 0
+            and lone_untagged is not None
+            and not lone_untagged["forced"]
+            and forced in ("", "include")
+        ):
+            match = lone_untagged
         if match is None:
             continue
         # Keep the track's native extension (ASS styling would be lost to SRT).

@@ -121,17 +121,21 @@
     --color-alpha-white: rgb(255 255 255);
     --color-alpha-black: rgb(0 0 0);
 
-    --color-brand-50: rgb(249 245 255);
-    --color-brand-100: rgb(244 235 255);
-    --color-brand-200: rgb(233 215 254);
-    --color-brand-300: rgb(214 187 251);
-    --color-brand-400: rgb(182 146 246);
-    --color-brand-500: rgb(158 119 237);
-    --color-brand-600: rgb(127 86 217);
-    --color-brand-700: rgb(105 65 198);
-    --color-brand-800: rgb(83 56 158);
-    --color-brand-900: rgb(66 48 125);
-    --color-brand-950: rgb(44 28 95);
+    /* Kira brand = the Untitled UI neutral (grey) scale. The whole app is
+       monochrome — black + white + greys — so the brand ramp carries no hue;
+       the dark-mode bridge still pins the key solids to --accent (white) for
+       on-black brightness. Aliasing brand → a palette is the UUI pattern. */
+    --color-brand-50: var(--color-neutral-50);
+    --color-brand-100: var(--color-neutral-100);
+    --color-brand-200: var(--color-neutral-200);
+    --color-brand-300: var(--color-neutral-300);
+    --color-brand-400: var(--color-neutral-400);
+    --color-brand-500: var(--color-neutral-500);
+    --color-brand-600: var(--color-neutral-600);
+    --color-brand-700: var(--color-neutral-700);
+    --color-brand-800: var(--color-neutral-800);
+    --color-brand-900: var(--color-neutral-900);
+    --color-brand-950: var(--color-neutral-950);
 
     /* LIGHT MODE VARIABLES */
 
@@ -852,5 +856,71 @@
         --outline-color-brand-solid: var(--color-bg-brand-solid);
         --outline-color-brand-solid_hover: var(--color-bg-brand-solid_hover);
         --outline-color-brand_alt: var(--color-border-brand_alt);
+
+        /* ── Kira look bridge ──────────────────────────────────────────
+           "Untitled UI underneath, Kira on top." Every UUI semantic token
+           above is re-pointed at Kira's legacy palette (index.css :root), so
+           UUI components (Button, Input, and the migrated Dashboard) render
+           Kira's pure-black / emerald identity instead of UUI's neutral+purple
+           defaults. These come LAST in the block, so they win the cascade.
+           Migrating a component from legacy classes (text-ink, border-line) to
+           UUI classes (text-primary, border-secondary) is therefore a pixel-
+           faithful, mechanical rename. */
+
+        /* Brand → Kira indigo accent. Solid primary-button fills use the deeper
+           --accent-deep (indigo); the hardcoded white label reads on it, and on
+           hover it lifts to the brighter --accent. Icons/accents/focus use the
+           bright indigo accent. */
+        --color-bg-brand-solid: var(--accent-deep);
+        --color-bg-brand-solid_hover: var(--accent);
+        --color-bg-brand-secondary: var(--accent-soft);
+        --color-bg-brand-primary: var(--accent-soft);
+        --color-fg-brand-primary: var(--accent);
+        --color-fg-brand-primary_alt: var(--accent);
+        --color-fg-brand-secondary: var(--accent);
+        --color-text-brand-secondary: var(--accent);
+        --color-text-brand-secondary_hover: var(--ink-2);
+        --color-text-brand-tertiary: var(--accent);
+        --color-border-brand: var(--accent-line);
+        --color-focus-ring: var(--accent);
+
+        /* Text tiers → Kira ink ramp (#fff … #6b7088) */
+        --color-text-primary: var(--ink);
+        --color-text-secondary: var(--ink-2);
+        --color-text-secondary_hover: var(--ink);
+        --color-text-tertiary: var(--ink-3);
+        --color-text-tertiary_hover: var(--ink-2);
+        --color-text-quaternary: var(--ink-4);
+        --color-text-placeholder: var(--ink-3);
+
+        /* Foreground (icons) → Kira ink ramp */
+        --color-fg-primary: var(--ink);
+        --color-fg-secondary: var(--ink-2);
+        --color-fg-tertiary: var(--ink-3);
+        --color-fg-quaternary: var(--ink-4);
+
+        /* Surfaces → Kira pure-black canvas + glass elevations */
+        --color-bg-primary: var(--bg);
+        --color-bg-primary_hover: var(--hover);
+        --color-bg-secondary: var(--surface-1);
+        --color-bg-secondary_hover: var(--surface-hover);
+        --color-bg-tertiary: var(--surface-2);
+
+        /* Hairlines → Kira white-alpha lines */
+        --color-border-primary: var(--line-strong);
+        --color-border-secondary: var(--line);
+        --color-border-tertiary: var(--line);
+
+        /* Feedback → Kira confidence palette (emerald / amber / red) */
+        --color-fg-success-primary: var(--conf-high);
+        --color-text-success-primary: var(--conf-high);
+        --color-bg-success-secondary: var(--conf-high-bg);
+        --color-fg-warning-primary: var(--conf-mid);
+        --color-text-warning-primary: var(--conf-mid);
+        --color-bg-warning-secondary: var(--conf-mid-bg);
+        --color-fg-error-primary: var(--conf-low);
+        --color-fg-error-secondary: var(--conf-low);
+        --color-text-error-primary: var(--conf-low);
+        --color-bg-error-secondary: var(--conf-low-bg);
     }
 }

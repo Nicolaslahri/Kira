@@ -13,6 +13,9 @@ export interface ProgressBarProps {
     minVisible?: number;
     /** Animated indeterminate sweep for "working, total unknown" states. */
     indeterminate?: boolean;
+    /** Accessible name announced by screen readers — essential for the
+     *  indeterminate bar, which has no numeric value to read out. */
+    label?: string;
     /** Class for the outer track element. */
     className?: string;
 }
@@ -29,6 +32,7 @@ export const ProgressBar = ({
     height = 6,
     minVisible = 0,
     indeterminate = false,
+    label = "Loading",
     className,
 }: ProgressBarProps) => {
     const ratio = max > 0 ? value / max : 0;
@@ -36,7 +40,7 @@ export const ProgressBar = ({
 
     if (indeterminate) {
         return (
-            <div className={cx("relative overflow-hidden rounded-full bg-white/[0.06]", className)} style={{ height }} role="progressbar">
+            <div className={cx("relative overflow-hidden rounded-full bg-white/[0.06]", className)} style={{ height }} role="progressbar" aria-label={label} aria-busy={true}>
                 <div
                     className="absolute inset-y-0 w-2/5 rounded-full"
                     style={{ background: color, opacity: 0.85, animation: "kira-indeterminate 1.1s ease-in-out infinite" }}
@@ -50,6 +54,7 @@ export const ProgressBar = ({
             className={cx("overflow-hidden rounded-full bg-white/[0.06]", className)}
             style={{ height }}
             role="progressbar"
+            aria-label={label}
             aria-valuenow={value}
             aria-valuemin={0}
             aria-valuemax={max}

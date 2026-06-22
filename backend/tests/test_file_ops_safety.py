@@ -175,3 +175,34 @@ def test_undo_move_cross_device_preserves_only_copy_on_corruption(tmp_path, monk
 
     assert dst.read_bytes() == b"precious" * 4000    # the only copy survived
     assert not src.exists()                          # partial restore rolled back
+
+
+# ── Zero-inode filesystem guard (audit fix) ───────────────────────────────────
+# Bug: _same_inode compared st_ino/st_dev with no zero guard. Many CIFS/NFS
+# mounts (common under Docker) report st_ino == st_dev == 0 for EVERY file, so
+# two genuinely different files looked identical → an occupied-target MOVE would
+# unlink the SOURCE believing dst was its hardlink. Now an unknown (zero) inode
+# is never judged "same".
+def test_same_inode_zero_inode_fs_is_not_same(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    a = tmp_path / "a.mkv"; a.write_bytes(b"a")
+    b = tmp_path / "b.mkv"; b.write_bytes(b"b")
+    # Simulate the CIFS/NFS "no real inode identity" reporting.
+    monkeypatch.setattr(type(a), "stat", lambda self, *args, **kw: SimpleNamespace(st_ino=0, st_dev=0))
+    assert ops._same_inode(a, b) is False
+
+
+def test_same_inode_true_for_real_hardlink(tmp_path):
+    a = tmp_path / "a.mkv"; a.write_bytes(b"x" * 100)
+    b = tmp_path / "b.mkv"
+    try:
+        os.link(a, b)
+    except OSError:
+        pytest.skip("hardlinks unsupported on this filesystem")
+    assert ops._same_inode(a, b) is True
+
+
+def test_same_inode_false_for_distinct_files(tmp_path):
+    a = tmp_path / "a.mkv"; a.write_bytes(b"x")
+    b = tmp_path / "b.mkv"; b.write_bytes(b"y")
+    assert ops._same_inode(a, b) is False

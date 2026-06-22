@@ -551,7 +551,47 @@ def _build_ctx(
     return ctx
 
 
-def format_target_path(
+# Top-level `{{ token }}` reference: the leading identifier of each placeholder
+# (skipping optional whitespace-control "-"/"+"/"~"). Filters, `{% %}` statements,
+# and filter arguments are deliberately NOT captured — we report the underlying
+# token's value, i.e. what the engine resolved before any filter ran.
+_TOKEN_REF_RE = re.compile(r"\{\{[-+~\s]*([a-zA-Z_][a-zA-Z0-9_]*)")
+
+
+def _resolve_template_tokens(template: str, ctx: dict[str, Any]) -> list[tuple[str, str]]:
+    """Per-token value map for a rendered template (the live-preview "anatomy").
+
+    For each DISTINCT top-level ``{{ token }}`` in `template` (first-appearance
+    order) return ``(token, value)``, where `value` is that token rendered on
+    its own against the SAME `ctx` the full path was built from — so it is
+    exactly what the engine produced for that slot, never an approximation of
+    the rendered string. Pure / read-only.
+
+    Tokens the engine doesn't populate (a typo, or a name outside the
+    vocabulary) are skipped: they render blank and carry no real value. A
+    KNOWN-but-empty token (e.g. ``{{variant}}`` on a default-flavour file) is
+    still returned with an empty string, so the UI can show why it contributes
+    nothing to the path.
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for m in _TOKEN_REF_RE.finditer(template):
+        name = m.group(1)
+        if name in seen or name not in ctx:
+            continue
+        seen.add(name)
+        try:
+            value = apply_template("{{ " + name + " }}", ctx)
+        except ValueError:
+            # A name that collides with a Jinja keyword can't render standalone;
+            # fall back to the raw ctx value (None → "").
+            v = ctx.get(name)
+            value = "" if v is None else str(v)
+        out.append((name, value))
+    return out
+
+
+def _format_target_impl(
     parsed: ParsedFile,
     library_root: str,
     profile: NamingProfile,
@@ -563,22 +603,15 @@ def format_target_path(
     metadata: dict[str, Any] | None = None,
     file_size: int | None = None,
     anime_numbering: str = "seasonal",
-) -> Path:
-    """Build the destination Path for a renamed file.
+) -> tuple[Path, str, dict[str, Any]]:
+    """Core path builder shared by ``format_target_path`` (path only) and
+    ``format_target_path_with_tokens`` (path + per-token values).
 
-    `library_title`/`library_year` are the *match-resolved* values (e.g. canonical
-    TVDB title), preferred over the parser's guess where available.
-    `episode_title` comes from the Match row (the matcher fetched it from the
-    provider's episode list). Optional — passes through to the {t} token.
-    `season_override` lets the caller pin a canonical season (e.g. AniDB's
-    Fribb-mapped TVDB season) without mutating the ParsedFile.
-
-    `type_target_root` (new): per-media-type destination override. When set,
-    bypasses the `library_root / SUBFOLDER[type]` convention and uses the
-    given path AS the root. Lets users send each media type to its own
-    folder (e.g. `Z:\\Plex\\TV Shows` for tv, `Z:\\Plex\\Anime` for anime).
-    When None, the legacy `library_root + SUBFOLDER` layout is used so
-    existing installs don't change behavior.
+    Returns ``(target, template, ctx)`` so a caller that wants the per-token
+    "anatomy" gets the EXACT template + render context the path was produced
+    from — there is only ever one ``_build_ctx`` per call, so the reported token
+    values can never drift from the rendered path. See ``format_target_path``
+    for the parameter semantics.
     """
     template = select_template(profile, parsed.media_type, anime_numbering=anime_numbering)
     ctx = _build_ctx(
@@ -628,4 +661,76 @@ def format_target_path(
         raise ValueError(
             f"Refusing to write outside target root: {target} not under {target_root_path}"
         ) from e
+    return target, template, ctx
+
+
+def format_target_path(
+    parsed: ParsedFile,
+    library_root: str,
+    profile: NamingProfile,
+    library_title: str | None = None,
+    library_year: int | None = None,
+    episode_title: str | None = None,
+    season_override: int | None = None,
+    type_target_root: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    file_size: int | None = None,
+    anime_numbering: str = "seasonal",
+) -> Path:
+    """Build the destination Path for a renamed file.
+
+    `library_title`/`library_year` are the *match-resolved* values (e.g. canonical
+    TVDB title), preferred over the parser's guess where available.
+    `episode_title` comes from the Match row (the matcher fetched it from the
+    provider's episode list). Optional — passes through to the {t} token.
+    `season_override` lets the caller pin a canonical season (e.g. AniDB's
+    Fribb-mapped TVDB season) without mutating the ParsedFile.
+
+    `type_target_root` (new): per-media-type destination override. When set,
+    bypasses the `library_root / SUBFOLDER[type]` convention and uses the
+    given path AS the root. Lets users send each media type to its own
+    folder (e.g. `Z:\\Plex\\TV Shows` for tv, `Z:\\Plex\\Anime` for anime).
+    When None, the legacy `library_root + SUBFOLDER` layout is used so
+    existing installs don't change behavior.
+    """
+    target, _template, _ctx = _format_target_impl(
+        parsed, library_root, profile,
+        library_title=library_title, library_year=library_year,
+        episode_title=episode_title, season_override=season_override,
+        type_target_root=type_target_root, metadata=metadata,
+        file_size=file_size, anime_numbering=anime_numbering,
+    )
     return target
+
+
+def format_target_path_with_tokens(
+    parsed: ParsedFile,
+    library_root: str,
+    profile: NamingProfile,
+    library_title: str | None = None,
+    library_year: int | None = None,
+    episode_title: str | None = None,
+    season_override: int | None = None,
+    type_target_root: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    file_size: int | None = None,
+    anime_numbering: str = "seasonal",
+) -> tuple[Path, list[tuple[str, str]]]:
+    """Like ``format_target_path`` but ALSO returns the per-token value map
+    (``[(token, value), ...]``) for the resolved template — each top-level
+    ``{{ token }}`` rendered against the same context the path was built from.
+
+    Powers the Settings → Naming "Anatomy of a filename" preview, so token chips
+    can show the engine's real provider-resolved value (``{{n}}`` → "Dune",
+    ``{{y}}`` → "2021", ``{{resolution}}`` → "2160p") instead of approximating
+    from the rendered string. Read-only — identical path semantics to
+    ``format_target_path``.
+    """
+    target, template, ctx = _format_target_impl(
+        parsed, library_root, profile,
+        library_title=library_title, library_year=library_year,
+        episode_title=episode_title, season_override=season_override,
+        type_target_root=type_target_root, metadata=metadata,
+        file_size=file_size, anime_numbering=anime_numbering,
+    )
+    return target, _resolve_template_tokens(template, ctx)

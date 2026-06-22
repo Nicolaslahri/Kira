@@ -1,5 +1,5 @@
 import type { FC, InputHTMLAttributes, ReactNode } from "react";
-import { isValidElement } from "react";
+import { isValidElement, useEffect, useRef, useState } from "react";
 import { cx } from "@/utils/cx";
 import { isReactComponent } from "@/utils/is-react-component";
 
@@ -14,13 +14,28 @@ export interface InputProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 
     trailing?: ReactNode;
     /** Class for the outer wrapper (border/bg/focus ring live here). */
     wrapperClassName?: string;
+    /** Gate editing behind an explicit "Edit" button. Until the user clicks
+     *  Edit (or the field itself), the input is read-only — so the browser
+     *  can't autofill it or pop the "save password?" prompt on a credential /
+     *  URL bar that's just sitting in Settings. Click Edit → editable + focused;
+     *  blur re-locks. Opt-in: default behavior is unchanged. */
+    editGate?: boolean;
 }
 
 /**
  * Untitled UI text input, re-skinned to Kira's glass tokens. The border + focus
  * ring sit on the wrapper so leading/trailing slots stay inside the field.
  */
-export const Input = ({ mono, invalid, icon: Icon, trailing, wrapperClassName, className, ...props }: InputProps) => {
+export const Input = ({
+    mono, invalid, icon: Icon, trailing, wrapperClassName, className,
+    editGate, readOnly, onBlur, onClick, ...props
+}: InputProps) => {
+    const [editing, setEditing] = useState(false);
+    const ref = useRef<HTMLInputElement>(null);
+    // Locked = gated AND not currently editing → read-only, browser leaves it
+    // alone. Focus the field once it unlocks so Edit jumps straight to typing.
+    const locked = !!editGate && !editing;
+    useEffect(() => { if (editing) ref.current?.focus(); }, [editing]);
     return (
         <div
             className={cx(
@@ -32,13 +47,30 @@ export const Input = ({ mono, invalid, icon: Icon, trailing, wrapperClassName, c
             {isValidElement(Icon) && Icon}
             {isReactComponent(Icon) && <Icon className="size-4 shrink-0 text-ink-soft" />}
             <input
+                ref={ref}
+                readOnly={locked || readOnly}
+                onBlur={(e) => { if (editGate) setEditing(false); onBlur?.(e); }}
+                onClick={(e) => { if (locked) setEditing(true); onClick?.(e); }}
                 className={cx(
                     "min-w-0 flex-1 border-0 bg-transparent text-[13px] text-ink outline-none placeholder:text-ink-faint",
                     mono && "font-mono text-[12.5px]",
+                    locked && "cursor-pointer",
                     className,
                 )}
                 {...props}
             />
+            {locked && (
+                <button
+                    type="button"
+                    onClick={() => setEditing(true)}
+                    className="press shrink-0 rounded-md px-2 py-0.5 text-[11px] font-medium text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink"
+                    aria-label="Edit"
+                >
+                    Edit
+                </button>
+            )}
+            {/* Trailing (eye / browse / clear) stays available even when locked —
+                e.g. the path field's Browse must work without clicking Edit. */}
             {trailing}
         </div>
     );

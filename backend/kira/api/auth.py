@@ -89,10 +89,15 @@ def _setting_str(row: Setting | None) -> str | None:
     return v if isinstance(v, str) and v.strip() else None
 
 
-async def get_db_account() -> tuple[str, str] | None:
+async def get_db_account(*, raise_on_error: bool = False) -> tuple[str, str] | None:
     """(username, password_hash) or None. Cached after the first read so the
     auth middleware costs a tuple check per request, not a DB hit. Refreshed
-    by `set_account_cache` when /auth/setup creates the account."""
+    by `set_account_cache` when /auth/setup creates the account.
+
+    `raise_on_error=True` propagates a DB-read failure instead of returning
+    None. The auth middleware uses this to FAIL CLOSED during the boot window:
+    a transient DB error (e.g. mid-migration) must NOT be read as "no account →
+    open" when an account may actually exist."""
     global _account_cache
     if _account_cache is _UNSET:
         try:
@@ -103,7 +108,9 @@ async def get_db_account() -> tuple[str, str] | None:
             _account_cache = (u, h) if u and h else None
         except Exception as e:
             # Don't cache a transient failure (e.g. DB mid-migration at boot).
-            logger.warning("auth: account lookup failed (treating as unset): %r", e)
+            logger.warning("auth: account lookup failed: %r", e)
+            if raise_on_error:
+                raise
             return None
     return _account_cache  # type: ignore[return-value]
 

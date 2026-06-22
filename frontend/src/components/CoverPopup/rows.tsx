@@ -1,7 +1,9 @@
-import { memo, useState, useEffect, useRef, useCallback, type CSSProperties } from 'react';
+import { memo, useState, useEffect, useRef, useCallback, type CSSProperties, type ReactNode } from 'react';
 import type { LibraryItem, LibEpisode, LibFile } from '../../lib/types';
 import { api } from '../../lib/api';
-import { IcCheck, IcX, IcSearch, IcAlertTri, IcDownload } from '../../lib/icons';
+import { IcCheck, IcX, IcSearch, IcAlertTri, IcDownload, Ic4K, Ic1080, IcCaption } from '../../lib/icons';
+import { ButtonGroup, ButtonGroupItem } from '../base/button-group/button-group';
+import { cn } from '../../lib/utils';
 import { confTier } from '../LibraryGrid';
 import { audioLangChip, subLangChip, missingSubChip, inferQuality, inferSource } from './quality';
 import { detectFromFilename, formatEta, formatBytes, statusLabel, formatUpcomingAirDate } from './format';
@@ -24,6 +26,34 @@ import type { SonarrQueueEntry, PairedRowShape } from './types';
 // preserved from the old two-cell design — this is a VIEW recomposition,
 // not a logic change.
 // ─────────────────────────────────────────────────────────────────────
+
+// ── UUI tech-spec chip. Neutral glassy pill + inset ring; `className`
+//    tints specific specs (HDR amber, audio-language emerald, release
+//    group monospace). Shared by every paired/orphan/download row so the
+//    tag rail reads consistently.
+function RowTag({ children, className, title }: { children: ReactNode; className?: string; title?: string }) {
+  return (
+    <span
+      title={title}
+      className={cn(
+        'inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-white/[0.05] px-1.5 py-[3px] text-[10.5px] font-medium leading-none text-tertiary ring-1 ring-white/[0.07] ring-inset',
+        className,
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
+// Confidence chip color ramp (paired-row aside). Mirrors the old
+// .cx-row-conf tiers — emerald / amber / red glass.
+function confChipClass(tier: 'high' | 'mid' | 'low'): string {
+  return tier === 'high'
+    ? 'bg-[var(--conf-high-bg)] text-[var(--conf-high)] ring-[var(--accent-line)]'
+    : tier === 'mid'
+      ? 'bg-[var(--conf-mid-bg)] text-[var(--conf-mid)] ring-[var(--conf-mid-32)]'
+      : 'bg-[var(--conf-low-bg)] text-[var(--conf-low)] ring-[var(--conf-low-32)]';
+}
 
 // Skeleton placeholder row. Renders during the ~150ms-3s window between
 // popup open and episode-list arrival. Shimmer animation is driven by
@@ -59,12 +89,12 @@ function MissingSubAction({ file }: { file: LibFile }) {
   };
   return (
     <button
-      className="cx-row-tag missing-sub press inline-flex items-center gap-1"
       onClick={browse}
       title={`Missing preferred subtitles (${(file.missingSubs ?? []).map(l => l.toUpperCase()).join(', ')}) — click to browse & pick`}
+      className="inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-[var(--warn-bg)] px-1.5 py-[3px] text-[10.5px] font-semibold leading-none text-[var(--warn)] ring-1 ring-[var(--warn-line)] ring-inset transition-colors hover:bg-[var(--warn-line)] hover:ring-[var(--warn)] disabled:cursor-progress disabled:opacity-60 [&_svg]:size-[11px]"
     >
       {label}
-      <IcDownload style={{ width: 10, height: 10 }} />
+      <IcDownload />
     </button>
   );
 }
@@ -208,21 +238,28 @@ function PairRowCellImpl({
     }
     const { prefix, num } = badgeContent(item, ep, undefined);
     return (
-      <div className="cx-pair blank anim-pair" style={staggerVar(staggerIndex)}>
-        <div className="cx-pair-thumb ep blank-thumb" style={{ ['--ep-a' as never]: epColor[0], ['--ep-b' as never]: epColor[1] } as CSSProperties}>
-          {prefix ? <span className="ep-prefix">{prefix}</span> : null}
-          <span className="ep-num">{num}</span>
+      <div
+        className="anim-pair relative my-[7px] grid grid-cols-[56px_minmax(0,1fr)_auto] items-center gap-3.5 rounded-xl border border-dashed border-secondary bg-secondary/40 p-3 transition-colors hover:bg-tertiary"
+        style={staggerVar(staggerIndex)}
+      >
+        <div
+          className="relative flex size-14 shrink-0 flex-col items-center justify-center overflow-hidden rounded-xl border border-white/10 text-white opacity-45"
+          style={{ backgroundImage: `linear-gradient(135deg, ${epColor[0]}, ${epColor[1]})` }}
+        >
+          <span className="pointer-events-none absolute inset-0 bg-gradient-to-b from-white/10 via-transparent to-black/35" />
+          {prefix ? <span className="relative z-10 font-mono text-[9px] font-bold uppercase leading-none tracking-[0.08em] opacity-90">{prefix}</span> : null}
+          <span className="relative z-10 mt-0.5 font-mono text-[17px] font-bold leading-none tabular-nums drop-shadow">{num}</span>
         </div>
-        <div className="cx-pair-body">
-          <MarqueeText className="cx-pair-eptitle">
+        <div className="flex min-w-0 flex-col gap-1">
+          <MarqueeText className="text-[13.5px] font-semibold leading-tight text-tertiary">
             <span title={ep.title || undefined}>
               {ep.title || (isAlbum ? `Track ${ep.track}` : `Episode ${ep.episode}`)}
             </span>
           </MarqueeText>
-          <div className="cx-pair-empty">No file for this episode</div>
+          <div className="text-[11px] text-quaternary">No file for this {isAlbum ? 'track' : 'episode'}</div>
         </div>
-        <div className="cx-pair-aside">
-          <span className="cx-row-conf muted">—</span>
+        <div className="flex shrink-0 items-center">
+          <span className="inline-flex items-center rounded-md bg-white/[0.04] px-2 py-0.5 text-[11px] font-medium text-quaternary ring-1 ring-secondary ring-inset">—</span>
         </div>
       </div>
     );
@@ -234,27 +271,37 @@ function PairRowCellImpl({
   //    SERIES match, not an episode the file can be renamed into).
   if (!ep && file) {
     return (
-      <div className={`cx-pair orphan anim-pair ${statusClass(file)}`} style={staggerVar(staggerIndex)}>
-        <div className="cx-pair-thumb file undetected orphan-thumb">
-          <span className="ep-num">—</span>
+      <div
+        className={cn(
+          'anim-pair relative my-[7px] grid grid-cols-[56px_minmax(0,1fr)_auto] items-center gap-3.5 rounded-xl border p-3 shadow-xs transition-colors',
+          'border-secondary bg-secondary hover:border-primary hover:bg-tertiary',
+          statusClass(file) === 'rejected' && 'opacity-55 hover:opacity-100',
+        )}
+        style={{ ...staggerVar(staggerIndex), animation: statusClass(file) === 'rejected' ? 'none' : undefined }}
+      >
+        <div className="flex size-14 shrink-0 items-center justify-center rounded-xl border border-dashed border-[var(--border-2)] bg-white/[0.02] font-mono text-[22px] font-bold leading-none text-quaternary">
+          —
         </div>
-        <div className="cx-pair-body">
-          <MarqueeText className="cx-pair-filename mono">
+        <div className="flex min-w-0 flex-col gap-1.5">
+          <MarqueeText className="font-mono text-[12px] text-secondary">
             <span title={file.filename}>{file.filename}</span>
           </MarqueeText>
-          <MarqueeText className="cx-pair-folder mono">
-            <span className="seg" title={file.folder}>{file.folder}</span>
+          <MarqueeText className="font-mono text-[10.5px] text-quaternary">
+            <span title={file.folder}>{file.folder}</span>
           </MarqueeText>
-          <div className="cx-pair-orphan-row">
-            <span className="cx-pair-empty">Orphaned · no matching {isAlbum ? 'track' : 'episode'}</span>
-            <button className="cx-blank-btn" onClick={() => onManualSearch(item, null, fileIdx)}>
+          <div className="flex flex-wrap items-center gap-2 pt-0.5">
+            <span className="text-[11px] font-medium text-[var(--conf-low)]">Orphaned · no matching {isAlbum ? 'track' : 'episode'}</span>
+            <button
+              onClick={() => onManualSearch(item, null, fileIdx)}
+              className="inline-flex items-center gap-1 rounded-md bg-tertiary px-2 py-1 text-[11px] font-semibold text-secondary ring-1 ring-secondary ring-inset transition-colors hover:bg-primary_hover hover:text-primary [&_svg]:size-3"
+            >
               <IcSearch /> Search this file
             </button>
           </div>
         </div>
-        <div className="cx-pair-aside" onClick={(e) => e.stopPropagation()}>
+        <div className="flex shrink-0 items-center" onClick={(e) => e.stopPropagation()}>
           <span
-            className="cx-row-conf low"
+            className="inline-flex items-center rounded-md bg-[var(--conf-low-bg)] px-2 py-0.5 text-[11px] font-semibold text-[var(--conf-low)] ring-1 ring-[var(--conf-low-32)] ring-inset"
             title={
               file.matchId != null
                 ? `Series matched but no episode in it matches this file's number. Use "Search this file" to fix.`
@@ -263,8 +310,6 @@ function PairRowCellImpl({
           >
             No episode
           </span>
-          {/* No aside search icon — the body's "Search this file" CTA is the
-              one and only search affordance on an orphan row. */}
         </div>
       </div>
     );
@@ -286,71 +331,89 @@ function PairRowCellImpl({
       : `S${String(e.season).padStart(2, '0')}E${String(e.episode).padStart(2, '0')}`;
 
   return (
-    <div className={`cx-pair anim-pair ${statusClass(f)} ${wrong ? 'wrong' : ''}`} style={staggerVar(staggerIndex)}>
-      {/* Leading episode badge — the strong "this is episode N" anchor. */}
+    <div
+      className={cn(
+        'anim-pair group/row relative my-[7px] grid grid-cols-[56px_minmax(0,1fr)_auto] items-center gap-3.5 rounded-xl border p-3 shadow-xs transition-colors',
+        'border-secondary bg-secondary hover:border-primary hover:bg-tertiary',
+        (f.status === 'approved' || f.status === 'renamed') && '!border-[var(--conf-high-32)] !bg-[var(--conf-high-bg)]',
+        f.status === 'rejected' && 'opacity-55 hover:opacity-100',
+        wrong && f.status !== 'approved' && f.status !== 'renamed' && '!border-[var(--conf-mid-32)]',
+      )}
+      // anim-pair's cxPairIn `both` fill pins opacity:1; kill it for rejected
+      // rows so the opacity-55 dim actually takes (they don't need entrance).
+      style={{ ...staggerVar(staggerIndex), animation: f.status === 'rejected' ? 'none' : undefined }}
+    >
+      {/* Leading episode badge — poster-tinted square, the "this is episode N" anchor. */}
       <div
-        className="cx-pair-thumb ep"
-        style={{ ['--ep-a' as never]: epColor[0], ['--ep-b' as never]: epColor[1] } as CSSProperties}
+        className="relative flex size-14 shrink-0 flex-col items-center justify-center overflow-hidden rounded-xl border border-white/10 text-white shadow-sm"
+        style={{ backgroundImage: `linear-gradient(135deg, ${epColor[0]}, ${epColor[1]})` }}
       >
-        {prefix ? <span className="ep-prefix">{prefix}</span> : null}
-        <span className="ep-num">{num}</span>
+        <span className="pointer-events-none absolute inset-0 bg-gradient-to-b from-white/10 via-transparent to-black/35" />
+        {prefix ? <span className="relative z-10 font-mono text-[9px] font-bold uppercase leading-none tracking-[0.08em] opacity-90">{prefix}</span> : null}
+        <span className="relative z-10 mt-0.5 font-mono text-[17px] font-bold leading-none tabular-nums drop-shadow">{num}</span>
       </div>
 
       {/* Body — episode identity on top, the file that fills it beneath. */}
-      <div className="cx-pair-body">
-        <div className="cx-pair-head">
-          <MarqueeText className="cx-pair-eptitle">
+      <div className="flex min-w-0 flex-col gap-2">
+        <div className="min-w-0">
+          <MarqueeText className="text-[13.5px] font-semibold leading-tight text-primary">
             <span title={e.title || undefined}>
               {e.title || (isAlbum ? `Track ${e.track}` : `Episode ${e.episode}`)}
+              {isAlbum && e.duration ? <span className="ml-2 text-xs font-medium text-quaternary">· {e.duration}</span> : null}
             </span>
-            {isAlbum && e.duration ? <span className="cx-pair-dur">· {e.duration}</span> : null}
           </MarqueeText>
-          <div className="cx-pair-epmeta">
-            <span>{fullTag}</span>
+          <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-tertiary">
+            <span className="font-mono font-medium text-secondary">{fullTag}</span>
             {e.airDate && !isAlbum ? <><span className="dot-sep" /><span>{e.airDate}</span></> : null}
             {e.runtime && !isAlbum ? <><span className="dot-sep" /><span>{e.runtime} min</span></> : null}
           </div>
         </div>
 
-        {/* The file row — name, folder, tech chips. The visual "this file
-            fills the slot" connection. */}
-        <div className="cx-pair-file">
-          <MarqueeText className="cx-pair-filename mono">
+        {/* The file that fills the slot — name + tech chips, divided from the
+            episode identity above so the pairing reads top-down. */}
+        <div className="flex min-w-0 flex-col gap-1.5 border-t border-secondary pt-2">
+          <MarqueeText className="font-mono text-[11px] text-quaternary">
             <span title={f.filename}>{f.filename}</span>
           </MarqueeText>
-          <div className="cx-pair-tags">
-            {f.size ? <span className="cx-row-tag">{f.size}</span> : null}
-            {(() => { const q = inferQuality(f); return q ? <span className="cx-row-tag">{q}</span> : null; })()}
-            {(() => { const s = inferSource(f); return s ? <span className="cx-row-tag">{s}</span> : null; })()}
-            {f.codec ? <span className="cx-row-tag">{f.codec}</span> : null}
-            {f.hdr ? <span className="cx-row-tag hdr">{f.hdr}</span> : null}
-            {f.channels ? <span className="cx-row-tag">{f.channels}</span> : null}
-            {f.audio?.[0] ? <span className="cx-row-tag">{f.audio[0]}</span> : null}
-            {(() => { const a = audioLangChip(f); return a ? <span className="cx-row-tag lang">{a}</span> : null; })()}
-            {(() => { const s = subLangChip(f); return s ? <span className="cx-row-tag">{s}</span> : null; })()}
+          <div className="flex flex-wrap items-center gap-1">
+            {f.size ? <RowTag>{f.size}</RowTag> : null}
+            {(() => {
+              const q = inferQuality(f);
+              if (!q) return null;
+              if (q === '2160p') return <Ic4K className="h-[17px] w-auto shrink-0" aria-label="4K" />;
+              if (q === '1080p') return <Ic1080 className="h-[17px] w-auto shrink-0" aria-label="1080p" />;
+              return <RowTag>{q}</RowTag>;
+            })()}
+            {(() => { const s = inferSource(f); return s ? <RowTag>{s}</RowTag> : null; })()}
+            {f.codec ? <RowTag>{f.codec}</RowTag> : null}
+            {f.hdr ? <RowTag className="bg-[var(--conf-mid-12)] text-[var(--conf-mid)] ring-[var(--conf-mid-32)]">{f.hdr}</RowTag> : null}
+            {f.channels ? <RowTag>{f.channels}</RowTag> : null}
+            {f.audio?.[0] ? <RowTag>{f.audio[0]}</RowTag> : null}
+            {(() => { const a = audioLangChip(f); return a ? <RowTag className="text-[var(--accent)] ring-[var(--accent-line)]">{a}</RowTag> : null; })()}
+            {(() => { const s = subLangChip(f); return s ? <RowTag><IcCaption className="mr-1 inline-block size-3 align-[-1px]" />{s.replace(/^SUB /, '')}</RowTag> : null; })()}
             <MissingSubAction file={f} />
-            {f.releaseGroup ? <span className="cx-row-tag rg" title={f.releaseGroup}>[{f.releaseGroup}]</span> : null}
+            {f.releaseGroup ? <RowTag className="font-mono text-quaternary" title={f.releaseGroup}>[{f.releaseGroup}]</RowTag> : null}
             {row.kind === 'dupe-primary' && row.dupeAll && row.dupeAll.length > 1 ? (
               <button
-                className="cx-row-dupe"
                 onClick={(ev) => {
                   ev.stopPropagation();
                   if (row.episode && row.dupeAll) onOpenDupeModal(row.episode, row.dupeAll);
                 }}
                 title={`${row.dupeAll.length} files claim this episode — click to pick which to keep`}
+                className="inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-[var(--conf-mid-bg)] px-1.5 py-[3px] text-[10.5px] font-semibold leading-none text-[var(--conf-mid)] ring-1 ring-[var(--conf-mid-32)] ring-inset transition-colors hover:bg-[var(--conf-mid-24)] [&_svg]:size-3"
               >
                 <IcAlertTri /> +{row.dupeAll.length - 1}
               </button>
             ) : null}
           </div>
           {wrong ? (
-            <div className="cx-pair-wrong">
-              <span className="cx-row-warn">
+            <div className="flex flex-wrap items-center gap-2 rounded-lg bg-[var(--conf-mid-8)] px-2 py-1.5 ring-1 ring-[var(--conf-mid-24)] ring-inset">
+              <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-[var(--conf-mid)] [&_svg]:size-3.5">
                 <IcAlertTri /> Filename suggests a different {isAlbum ? 'track' : 'episode'}
               </span>
               <button
-                className="cx-blank-btn"
                 onClick={() => onManualSearch(item, row.episodeIdx, fileIdx)}
+                className="inline-flex items-center gap-1 rounded-md bg-tertiary px-2 py-1 text-[11px] font-semibold text-secondary ring-1 ring-secondary ring-inset transition-colors hover:bg-primary_hover hover:text-primary [&_svg]:size-3"
               >
                 <IcSearch /> Find correct
               </button>
@@ -359,40 +422,36 @@ function PairRowCellImpl({
         </div>
       </div>
 
-      {/* Aside — ONE confidence pill, the status pill, the per-row actions.
-          stopPropagation so clicks here never bubble to a future row click. */}
-      <div className="cx-pair-aside" onClick={(ev) => ev.stopPropagation()}>
+      {/* Aside — status badge (when set) + confidence chip + the joined
+          approve/reject ButtonGroup. stopPropagation so clicks here never
+          bubble to a future row click. */}
+      <div className="flex shrink-0 flex-col items-end gap-2" onClick={(ev) => ev.stopPropagation()}>
         {f.status === 'renamed' ? (
-          <span className="cx-row-status renamed" title="File has been renamed"><IcCheck /> Renamed</span>
+          <span className="inline-flex items-center gap-1 rounded-md bg-[var(--conf-high-bg)] px-2 py-0.5 text-[11px] font-semibold text-[var(--conf-high)] ring-1 ring-[var(--conf-high-32)] ring-inset [&_svg]:size-3" title="File has been renamed"><IcCheck /> Renamed</span>
         ) : f.status === 'approved' ? (
-          <span className="cx-row-status approved" title="Approved — queued for rename"><IcCheck /> Approved</span>
+          <span className="inline-flex items-center gap-1 rounded-md bg-[var(--conf-high-bg)] px-2 py-0.5 text-[11px] font-semibold text-[var(--conf-high)] ring-1 ring-[var(--conf-high-32)] ring-inset [&_svg]:size-3" title="Approved — queued for rename"><IcCheck /> Approved</span>
         ) : f.status === 'rejected' ? (
-          <span className="cx-row-status rejected" title="Rejected"><IcX /> Rejected</span>
+          <span className="inline-flex items-center gap-1 rounded-md bg-[var(--conf-low-bg)] px-2 py-0.5 text-[11px] font-semibold text-[var(--conf-low)] ring-1 ring-[var(--conf-low-32)] ring-inset [&_svg]:size-3" title="Rejected"><IcX /> Rejected</span>
         ) : null}
-        <span className={`cx-row-conf ${confT}`}>{conf}%</span>
-        <div className="cx-pair-actions">
-          {/* ✓ / ✗ as a joined segmented pair — one connected control so
-              the approve/reject decision reads as a single toggle, not two
-              loose dots. No per-row search: re-identification lives on the
-              orphan/wrong CTAs and the footer's Re-identify (owner call —
-              a per-row icon on every cell was noise without a job). */}
-          <div className="seg-pair">
-            <button
-              className="cx-row-act approve press"
-              title="Approve this file"
-              aria-label="Approve this file"
-              onClick={() => fileIdx >= 0 ? updateFile(fileIdx, { status: 'approved' }) : null}
-              disabled={fileIdx < 0}
-            ><IcCheck /></button>
-            <button
-              className="cx-row-act reject press"
-              title="Reject this file"
-              aria-label="Reject this file"
-              onClick={() => fileIdx >= 0 ? updateFile(fileIdx, { status: 'rejected' }) : null}
-              disabled={fileIdx < 0}
-            ><IcX /></button>
-          </div>
-        </div>
+        <span className={cn('inline-flex items-center rounded-md px-2 py-0.5 text-[11px] font-bold tabular-nums ring-1 ring-inset', confChipClass(confT))}>{conf}%</span>
+        <ButtonGroup size="sm">
+          <ButtonGroupItem
+            color="success"
+            iconLeading={IcCheck}
+            aria-label="Approve this file"
+            title="Approve this file"
+            isDisabled={fileIdx < 0}
+            onClick={() => fileIdx >= 0 ? updateFile(fileIdx, { status: 'approved' }) : null}
+          />
+          <ButtonGroupItem
+            color="destructive"
+            iconLeading={IcX}
+            aria-label="Reject this file"
+            title="Reject this file"
+            isDisabled={fileIdx < 0}
+            onClick={() => fileIdx >= 0 ? updateFile(fileIdx, { status: 'rejected' }) : null}
+          />
+        </ButtonGroup>
       </div>
     </div>
   );

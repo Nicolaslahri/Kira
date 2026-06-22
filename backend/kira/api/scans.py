@@ -6,6 +6,7 @@ import logging
 import asyncio
 import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,6 +46,18 @@ router = APIRouter(prefix="/scans", tags=["scans"])
 # so the polling client sees rows appear in real time.
 SCAN_COMMIT_EVERY = 5
 MATCH_COMMIT_EVERY = 3
+
+# PERF (NAS responsiveness): how many directory entries the discovery walk
+# pulls per hop into the worker thread before handing a batch back to the
+# event loop. The walk + per-file stat() are blocking network round-trips on
+# an SMB/NFS share; running them inline on the loop stalled every other HTTP
+# request. We now drain the walk in a dedicated thread `SCAN_WALK_BATCH`
+# entries at a time (see `_drain_walk_batch`). Bounded by entries *pulled*
+# (not survivors) so an all-already-known re-scan can't become one giant
+# uninterruptible hop — between batches the loop is free to serve requests
+# and honor cancellation. The event loop still yields every SCAN_COMMIT_EVERY
+# survivors via the commit checkpoint, so progress streams as before.
+SCAN_WALK_BATCH = 256
 
 # EE-3: Process-level lock around scan worker. Without this, two
 # concurrent POST /scans calls (user double-clicks "Scan", or two browser
@@ -375,40 +388,45 @@ async def enrich_mediainfo_background(file_ids: list[int], *, reason: str | None
 
             path_by_fid = {w[0]: w[1] for w in work}
             done = 0
-            for fut in asyncio.as_completed([_read_one(*w) for w in work]):
-                try:
-                    fid, mi, cur = await fut
-                    done += 1
-                    if mi is not None or cur is not None:
-                        mf = await session.get(MediaFile, fid)
-                        if mf is not None and mf.parsed_data:
-                            parsed = ParsedFile(**mf.parsed_data)
-                            changed = _mediainfo.enrich_parsed(parsed, mi, authoritative=authoritative)
-                            if cur is not None and (parsed.mi_stamp != cur or parsed.mi_raw != mi):
-                                parsed.mi_stamp, parsed.mi_raw = cur, mi
-                                changed = True
-                            # Record on-disk sidecar languages ([] = looked, none
-                            # found) so coverage is accurate even for subs we
-                            # didn't write. Always set it here — this pass IS the
-                            # authoritative "we inspected this file" moment.
-                            sidecars = sidecar_map.get(path_by_fid.get(fid, ""), [])
-                            if parsed.sub_sidecars != sidecars:
-                                parsed.sub_sidecars = sidecars
-                                changed = True
-                            if changed:
-                                mf.parsed_data = parsed.to_dict()
-                                await session.commit()
-                                updated += 1
-                except Exception as e:
-                    done += 1
-                    logger.warning(f"enrich_mediainfo_background: file failed (non-fatal): {e!r}")
+            # Process in bounded chunks so a large (up to 20k-file) backfill can't
+            # materialize tens of thousands of Tasks at once. The `sem` still caps
+            # CONCURRENT NAS reads to its width; this caps SCHEDULED coroutines.
+            _CHUNK = 256
+            for _i in range(0, len(work), _CHUNK):
+                for fut in asyncio.as_completed([_read_one(*w) for w in work[_i:_i + _CHUNK]]):
                     try:
-                        await session.rollback()
-                    except Exception:
-                        pass
-                # Report after every completion: cheap in-memory write, and it
-                # keeps the job from being marked stale during a slow NAS read.
-                activity.progress(_MI_ENRICH_JOB, done, total)
+                        fid, mi, cur = await fut
+                        done += 1
+                        if mi is not None or cur is not None:
+                            mf = await session.get(MediaFile, fid)
+                            if mf is not None and mf.parsed_data:
+                                parsed = ParsedFile(**mf.parsed_data)
+                                changed = _mediainfo.enrich_parsed(parsed, mi, authoritative=authoritative)
+                                if cur is not None and (parsed.mi_stamp != cur or parsed.mi_raw != mi):
+                                    parsed.mi_stamp, parsed.mi_raw = cur, mi
+                                    changed = True
+                                # Record on-disk sidecar languages ([] = looked, none
+                                # found) so coverage is accurate even for subs we
+                                # didn't write. Always set it here — this pass IS the
+                                # authoritative "we inspected this file" moment.
+                                sidecars = sidecar_map.get(path_by_fid.get(fid, ""), [])
+                                if parsed.sub_sidecars != sidecars:
+                                    parsed.sub_sidecars = sidecars
+                                    changed = True
+                                if changed:
+                                    mf.parsed_data = parsed.to_dict()
+                                    await session.commit()
+                                    updated += 1
+                    except Exception as e:
+                        done += 1
+                        logger.warning(f"enrich_mediainfo_background: file failed (non-fatal): {e!r}")
+                        try:
+                            await session.rollback()
+                        except Exception:
+                            pass
+                    # Report after every completion: cheap in-memory write, and it
+                    # keeps the job from being marked stale during a slow NAS read.
+                    activity.progress(_MI_ENRICH_JOB, done, total)
     except Exception as e:
         logger.warning(f"enrich_mediainfo_background: aborted (non-fatal): {e!r}")
     finally:
@@ -538,7 +556,12 @@ async def _match_singleton(session, engine, fid: int) -> None:
     # (resolve_canonical_season(..., episode=ep_num)) runs for EVERY match —
     # incl. movies — so it must always be bound.
     ep_num: int | None = None
+    # Stored episode_number — defaults to the file's own parsed episode. Bound
+    # here (not only inside the tv_episode branch) so the Match write below is
+    # always safe; movies leave it None (parsed.episode is None there anyway).
+    stored_ep: int | None = parsed.episode
     if scored and scored[0].match_type == "tv_episode":
+        _ep_dicts: list = []
         # Phase 4 validation gate: fetch the top's episode list and, for a
         # western-TV singleton whose TVDB/TMDB match doesn't contain the
         # file's episode, re-rank to a better-fitting alternate. No-op for
@@ -552,6 +575,32 @@ async def _match_singleton(session, engine, fid: int) -> None:
             logger.warning(f"_match_singleton: episode validation failed for file {fid}: {e!r}")
             episodes_by_key = {}
         ep_num = parsed.absolute_episode if parsed.absolute_episode is not None else parsed.episode
+        # ── Flat-umbrella episode consistency (parity with _match_cluster) ──
+        # A flat-umbrella AniDB match (One Piece AID 69 → tvdb_season None) must
+        # store the ABSOLUTE episode, exactly as the cluster path does. Without
+        # this, a SINGLE-file scan of "One Piece S23E12 - 1167" kept its TVDB-
+        # season-LOCAL number (12). The seasonal rename then feeds 12 to ScudLee,
+        # which reads it as *absolute* episode 12 and misfiles the file into
+        # "Season 01" — and the popup pairs it against the wrong episode (the
+        # real ep 12, a 2000 episode) on top of its true 1167, rendering it
+        # twice. A singleton has no cour routing, so routed_aid is always None.
+        # Untouched for TV and per-season/cour anime (is_flat_umbrella False).
+        if scored[0].provider == "anidb" and ep_num is not None:
+            try:
+                from kira.providers.anime_mappings import AnimeMappings
+                _flat = (await AnimeMappings.tvdb_season(int(scored[0].provider_id))) is None
+            except Exception:
+                _flat = False
+            if _flat:
+                _a2l = {
+                    d["absolute_number"]: d["episode"]
+                    for d in _ep_dicts
+                    if d.get("absolute_number") is not None and d.get("episode") is not None
+                }
+                _l2a = {loc: ab for ab, loc in _a2l.items()}
+                stored_ep = remap_umbrella_local_to_absolute(
+                    ep_num, is_flat_umbrella=True, routed_aid=None, local_to_abs=_l2a,
+                )
         if ep_num is not None and episodes_by_key:
             # When the absolute→AID reroute fired, the matcher stashed the
             # per-AID local episode on scored[0].raw. Pass it to tier 3.
@@ -593,7 +642,7 @@ async def _match_singleton(session, engine, fid: int) -> None:
             match_type=m.match_type, confidence=m.confidence,
             title=m.title, year=m.year,
             series_name=m.title if m.match_type == "tv_episode" else None,
-            season_number=canonical_season, episode_number=parsed.episode,
+            season_number=canonical_season, episode_number=stored_ep,
             episode_title=ep_title if rank == 0 else None,
             poster_url=m.poster_url, overview=row_overview,
             is_selected=(rank == 0),
@@ -1576,7 +1625,9 @@ async def _validate_and_rerank_by_episodes(
         (p.season, (p.episode if p.episode is not None else p.absolute_episode))
         for _fid, p in files
     ]
-    top_cov = coverage(file_eps, top_by_key)
+    # strict_season: western TV has real seasons, so disable the (1, episode)
+    # fallback that would otherwise let a wrong series' season 1 inflate coverage.
+    top_cov = coverage(file_eps, top_by_key, strict_season=True)
     from kira.matcher.episode_validation import COVERAGE_FLOOR
     if top_cov >= COVERAGE_FLOOR:
         return scored, top_by_key, top_dicts  # incumbent fits — no probing
@@ -1594,7 +1645,7 @@ async def _validate_and_rerank_by_episodes(
         alt_by_key = {(ep.season, ep.episode): ep.title for ep in alt_eps}
         if not alt_by_key:
             continue
-        alt_cov = coverage(file_eps, alt_by_key)
+        alt_cov = coverage(file_eps, alt_by_key, strict_season=True)
         if alt_cov > best_cov:
             best_cov, best_idx, best_by_key, best_eps = alt_cov, i, alt_by_key, alt_eps
 
@@ -1954,6 +2005,72 @@ async def _prune_missing_files(
     return removed
 
 
+def _drain_walk_batch(
+    walk_iter,
+    batch_size: int,
+    walked_norm: set[str],
+    renamed_lc: set[str],
+    existing_lc: set[str],
+    norm_fn,
+) -> tuple[list[tuple[Path, int | None]], bool]:
+    """Pull up to `batch_size` entries from a (synchronous) `scanner.walk`
+    iterator, applying dedup, and `stat()` only the survivors for their size.
+
+    ALL blocking filesystem I/O — stepping `os.walk` via `next()` AND the
+    per-file `stat()` — happens HERE, on the dedicated walk thread, so the
+    event loop never blocks on a slow NAS round-trip. The caller awaits this
+    via `run_in_executor` and consumes survivors (parse + ORM) on the loop.
+
+    Dedup runs in-thread too, on purpose: the original loop stat()'d a file
+    ONLY after it passed the already-walked / renamed / existing checks, so
+    a re-scan of a known library skips thousands of stats. Moving dedup here
+    keeps that optimization — we never stat a file we'd discard. `norm_fn`
+    (`_norm`) is filesystem-free, so it's safe off the loop.
+
+    Returns `(survivors, exhausted)`. `survivors` is a list of
+    `(path, size_or_None)`; `exhausted` is True once the iterator is spent.
+    The batch is bounded by entries PULLED, not survivors, so a batch where
+    every entry is deduped still returns promptly (with an empty list and
+    `exhausted=False`) rather than walking the whole tree in one hop —
+    keeping cancellation latency and progress cadence bounded.
+
+    NOTE: `walked_norm` is mutated here; that's safe because the walk runs on
+    a single pinned thread and the caller only reads the set after the walk
+    has fully drained (the prune sweep), so there's no concurrent access.
+    """
+    survivors: list[tuple[Path, int | None]] = []
+    pulled = 0
+    while pulled < batch_size:
+        try:
+            path = next(walk_iter)
+        except StopIteration:
+            return survivors, True
+        pulled += 1
+        # Skip-if-already-walked-this-scan. Lowercase + both slash forms so
+        # trailing-slash / case / separator noise can't sneak duplicates past.
+        spath_norm = str(path).lower().replace("/", "\\")
+        if spath_norm in walked_norm:
+            continue
+        walked_norm.add(spath_norm)
+        # Skip files that ARE the result of a previous rename (or are already
+        # tracked as MediaFiles). The pre-normalized sets carry the lowercased
+        # original AND resolved form, so a UNC-stored DB path matches the
+        # drive-letter-walked filesystem path.
+        spath_forms = norm_fn(str(path))
+        if spath_forms & renamed_lc:
+            continue
+        if spath_forms & existing_lc:
+            continue
+        # PERF: one stat per SURVIVING file, for size only. (os.walk already
+        # classified entries via scandir, so no is_file() round-trip.)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = None
+        survivors.append((path, size))
+    return survivors, False
+
+
 async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] | None:
     """Walk the tree, parse each file, then match each new file in turn.
 
@@ -2055,11 +2172,15 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
         auto_rename_ids: list[int] | None = None
         try:
             # ── Phase 1: walk + parse ─────────────────────────────────────
-            # EE-2: reset the thread-local walk-error list BEFORE iteration
-            # so this scan sees only its own scandir() failures. We do it
-            # here (not inside scanner.walk) because walk() recurses on
-            # symlinked dirs and a per-call reset would erase parent state.
-            scanner.reset_walk_errors()
+            # EE-2: the thread-local walk-error list is reset BEFORE iteration
+            # so this scan sees only its own scandir() failures — but the reset
+            # runs on the WALK THREAD (where the thread-local actually lives),
+            # not here. The reset, the whole walk, and the final
+            # get_walk_errors() read ALL run on one pinned thread (see the walk
+            # executor below). Resetting/reading on the loop thread would touch a
+            # different thread-local than the walk populates and silently drop
+            # every scandir failure — wrongly marking a partial NAS scan
+            # 'completed' AND arming the prune sweep to delete present files.
             # User-defined ignore globs (Settings → Paths) — refreshed per
             # scan so edits apply to the very next run.
             try:
@@ -2101,68 +2222,98 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
             dead_roots: list[str] = []
             # NOTE: MediaInfo enrichment is NOT read here anymore — it moved to
             # `_match_phase` so the discovery walk does no file-content reads.
-            for root_path in root_paths:
-              if not _root_reachable(root_path):
-                dead_roots.append(str(root_path))
-                continue
-              for path in scanner.walk(root_path):
-                spath_str = str(path)
-                # Skip-if-already-walked-this-scan. Lowercase + both
-                # slash forms so trailing-slash / case / separator
-                # noise can't sneak duplicates past us.
-                spath_norm = spath_str.lower().replace("/", "\\")
-                if spath_norm in walked_paths_this_scan:
-                    continue
-                walked_paths_this_scan.add(spath_norm)
-                # Skip files that ARE the result of a previous rename
-                # (or are already tracked as MediaFiles).
-                #
-                # Compare against the pre-normalized sets built above —
-                # they include the lowercased original string AND the
-                # lowercased resolved form (so a UNC-stored DB path
-                # matches the drive-letter-walked filesystem path).
-                spath_forms = _norm(str(path))
-                if spath_forms & renamed_paths_lc:
-                    continue
-                if spath_forms & existing_lc:
-                    continue
-                try:
-                    file_size = path.stat().st_size
-                except OSError:
-                    file_size = None
-                parsed = parse_path(path)
-                # NOTE: NEITHER the xattr ID read NOR the MediaInfo header read
-                # happens here. The discovery walk must stay fast — one `stat`
-                # (for size) + pure-string parse per file, nothing that opens
-                # the file or does an extra filesystem round-trip. On a NAS each
-                # such per-file I/O is a network hit that makes scanning crawl.
-                # Both moved to the MATCH phase (`_apply_xattr_ids`,
-                # `_enrich_mediainfo_phase`), off the discovery critical path —
-                # FileBot's "list fast, read at identify-time" model.
-                mf = MediaFile(
-                    scan_id=scan_id,
-                    file_path=str(path),
-                    file_size=file_size,
-                    media_type=parsed.media_type,
-                    status="discovered",
-                    parsed_data=parsed.to_dict(),
-                    # EE-5: pass file_path so same-titled shows in different
-                    # folders ("The Office UK" vs "The Office US") get
-                    # distinct series_keys via the parent-folder fingerprint
-                    # when the parser couldn't extract a year.
-                    series_key=_compute_series_key(parsed, file_path=str(path)),
-                    variant_key=_compute_variant_key(parsed),
+            # The discovery walk runs on a DEDICATED single-thread executor,
+            # NOT the event loop. scanner.walk()'s os.walk + the per-file stat()
+            # are blocking network round-trips on a NAS; run inline on the loop
+            # they stalled every other HTTP request between yields. We pull the
+            # walk in bounded batches (`_drain_walk_batch`) off-thread and
+            # consume survivors (parse + ORM) here, yielding control BETWEEN
+            # batches and every SCAN_COMMIT_EVERY rows at the commit checkpoint.
+            #
+            # Why a private single-thread executor instead of asyncio.to_thread?
+            # scanner records scandir() failures in a THREAD-LOCAL; to_thread's
+            # shared pool would scatter successive batches across different
+            # worker threads, losing those errors. Pinning the reset, every
+            # batch, and the final get_walk_errors() read to ONE thread keeps
+            # the walk-error accounting (→ completed_partial + prune guard)
+            # correct. The executor is torn down in `finally` — including on
+            # cancellation, where an in-flight batch is bounded so it drains
+            # quickly and the loop is free again at once.
+            walk_errors: list[str] = []
+            loop = asyncio.get_running_loop()
+            walk_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="kira-scan-walk"
+            )
+            try:
+                # Reset the walk-error thread-local ON the walk thread — that's
+                # where scanner.walk() will populate it.
+                await loop.run_in_executor(walk_executor, scanner.reset_walk_errors)
+                for root_path in root_paths:
+                    if not _root_reachable(root_path):
+                        dead_roots.append(str(root_path))
+                        continue
+                    # Lazy generator — every next() (os.walk stepping) and the
+                    # survivor stats run on the walk thread inside the drainer.
+                    walk_iter = scanner.walk(root_path)
+                    while True:
+                        survivors, exhausted = await loop.run_in_executor(
+                            walk_executor,
+                            _drain_walk_batch,
+                            walk_iter,
+                            SCAN_WALK_BATCH,
+                            walked_paths_this_scan,
+                            renamed_paths_lc,
+                            existing_lc,
+                            _norm,
+                        )
+                        for path, file_size in survivors:
+                            parsed = parse_path(path)
+                            # NOTE: NEITHER the xattr ID read NOR the MediaInfo
+                            # header read happens here. The discovery walk stays
+                            # fast — one stat (for size, taken off-loop above) +
+                            # pure-string parse per file, nothing that opens the
+                            # file or does an extra filesystem round-trip. Both
+                            # moved to the MATCH phase (`_apply_xattr_ids`,
+                            # `_enrich_mediainfo_phase`), off the discovery
+                            # critical path — FileBot's "list fast, read at
+                            # identify-time" model.
+                            mf = MediaFile(
+                                scan_id=scan_id,
+                                file_path=str(path),
+                                file_size=file_size,
+                                media_type=parsed.media_type,
+                                status="discovered",
+                                parsed_data=parsed.to_dict(),
+                                # EE-5: pass file_path so same-titled shows in
+                                # different folders ("The Office UK" vs "The
+                                # Office US") get distinct series_keys via the
+                                # parent-folder fingerprint when the parser
+                                # couldn't extract a year.
+                                series_key=_compute_series_key(parsed, file_path=str(path)),
+                                variant_key=_compute_variant_key(parsed),
+                            )
+                            session.add(mf)
+                            new_files.append(mf)
+                            count += 1
+                            if count % SCAN_COMMIT_EVERY == 0:
+                                scan = await session.get(Scan, scan_id)
+                                if scan:
+                                    scan.file_count = count
+                                    scan.current_path = str(path)
+                                await session.commit()
+                                await asyncio.sleep(0)
+                        if exhausted:
+                            break
+                # Read walk errors FROM the walk thread before teardown — the
+                # thread-local lives there, so the read must run on it too.
+                walk_errors = await loop.run_in_executor(
+                    walk_executor, scanner.get_walk_errors
                 )
-                session.add(mf)
-                new_files.append(mf)
-                count += 1
-                if count % SCAN_COMMIT_EVERY == 0:
-                    scan = await session.get(Scan, scan_id)
-                    if scan:
-                        scan.file_count = count
-                        scan.current_path = str(path)
-                    await session.commit()
-                    await asyncio.sleep(0)
+            finally:
+                # Always release the walk thread — success, error, cancellation.
+                # wait=False so a cancel isn't held up by an in-flight stat on a
+                # wedged mount: the bounded batch finishes and the thread exits.
+                walk_executor.shutdown(wait=False)
 
             # After the final commit every mf.id is populated; no need to
             # re-query. This is also faster than running a SELECT over the
@@ -2176,7 +2327,7 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
             # Review. ONLY when the walk was fully healthy: a dead root or a
             # scandir error means part of the tree was unreadable, so "not seen"
             # ≠ "deleted" and pruning would wipe present files (NAS-blip guard).
-            if not dead_roots and not scanner.get_walk_errors():
+            if not dead_roots and not walk_errors:
                 try:
                     await _prune_missing_files(
                         session, root_paths, walked_paths_this_scan, _norm,
@@ -2290,8 +2441,9 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
             # badge instead of a green check) and notify so the user
             # knows to retry once the NAS/permissions are stable.
             # In-walk scandir failures PLUS any top-level root that was entirely
-            # unreachable — both make the scan INCOMPLETE.
-            walk_failures = scanner.get_walk_errors() + dead_roots
+            # unreachable — both make the scan INCOMPLETE. `walk_errors` was
+            # captured from the walk thread (where the thread-local lives).
+            walk_failures = walk_errors + dead_roots
 
             scan = await session.get(Scan, scan_id)
             if scan:

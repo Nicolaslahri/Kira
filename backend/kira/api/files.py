@@ -375,8 +375,17 @@ async def bulk_status(
         raise HTTPException(400, "Body must be {ids: int[], status: string}")
     if status not in VALID_STATUSES:
         raise HTTPException(400, f"Invalid status. Must be one of {VALID_STATUSES}")
-    files = list(await session.scalars(select(MediaFile).where(MediaFile.id.in_(ids))))
-    for f in files:
-        f.status = status
+    if len(ids) > 50_000:
+        raise HTTPException(400, "Too many ids (max 50000)")
+    # Chunk the IN list: a large batch in a single `.in_()` trips SQLite's
+    # bound-variable limit (~32k) with an uncaught 500. Every other bulk
+    # endpoint bounds this; this one had slipped through.
+    updated = 0
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        files = list(await session.scalars(select(MediaFile).where(MediaFile.id.in_(chunk))))
+        for f in files:
+            f.status = status
+        updated += len(files)
     await session.commit()
-    return {"updated": len(files)}
+    return {"updated": updated}

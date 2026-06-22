@@ -740,9 +740,22 @@ export const api = {
    *  omitted per-type template falls back to the backend's Plex default. */
   previewTemplate: (body: {
     movie?: string; tv?: string; anime?: string; music?: string; samples_per_type?: number;
+    /** Opt-in: also resolve each top-level {{token}} to its engine value
+     *  (Settings → Naming "Anatomy of a filename"). Omit/false → `tokens` is
+     *  null on every sample and the call is unaffected. */
+    with_tokens?: boolean;
   }) =>
     request<{
-      samples: { media_type: string; filename: string; rendered: string; error: string | null }[];
+      samples: {
+        media_type: string;
+        filename: string;
+        rendered: string;
+        error: string | null;
+        /** Present only when the request set `with_tokens`. Each top-level
+         *  template token mapped to the value the engine produced for THIS
+         *  sample, in template order — e.g. `{token:'n', value:'Dune'}`. */
+        tokens: { token: string; value: string }[] | null;
+      }[];
     }>('/rename/preview-template', {
       method: 'POST',
       body: JSON.stringify(body),

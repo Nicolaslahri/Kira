@@ -28,6 +28,7 @@ from kira.renamer import (
     discover_sidecars,
     execute_op,
     format_target_path,
+    format_target_path_with_tokens,
     RenameSkipped,
 )
 
@@ -59,6 +60,18 @@ class TemplatePreviewRequest(BaseModel):
     anime: str | None = None
     music: str | None = None
     samples_per_type: int = 3
+    # Opt-in: also return the resolved value of each top-level {{token}} in the
+    # template (Settings → Naming "Anatomy of a filename"). Off by default so the
+    # existing live-preview call is byte-for-byte unaffected and pays nothing for
+    # the extra per-token render.
+    with_tokens: bool = False
+
+
+class TemplateToken(BaseModel):
+    """One {{token}} → its engine-resolved value for a single sample (e.g.
+    {"token": "n", "value": "Dune"} / {"token": "resolution", "value": "2160p"})."""
+    token: str
+    value: str
 
 
 class PreviewSample(BaseModel):
@@ -66,6 +79,9 @@ class PreviewSample(BaseModel):
     filename: str
     rendered: str            # relative path the template produces (posix)
     error: str | None = None
+    # Per-token value map for THIS sample, in template order. None unless the
+    # request set `with_tokens` (so existing consumers see the field absent/null).
+    tokens: list[TemplateToken] | None = None
 
 
 class TemplatePreviewResponse(BaseModel):
@@ -133,8 +149,7 @@ async def preview_template(
                         meta.setdefault("tvdbid", selected.provider_id)
                     elif prov == "anidb":
                         meta.setdefault("anidbid", selected.provider_id)
-                target = format_target_path(
-                    parsed, preview_root, profile,
+                render_kwargs = dict(
                     library_title=selected.title or parsed.title,
                     library_year=(selected.year if selected.year is not None else parsed.year),
                     episode_title=selected.episode_title,
@@ -142,9 +157,20 @@ async def preview_template(
                     metadata=meta,
                     file_size=f.file_size,
                 )
+                tokens: list[TemplateToken] | None = None
+                if payload.with_tokens:
+                    target, tok_pairs = format_target_path_with_tokens(
+                        parsed, preview_root, profile, **render_kwargs,
+                    )
+                    tokens = [TemplateToken(token=k, value=v) for k, v in tok_pairs]
+                else:
+                    target = format_target_path(
+                        parsed, preview_root, profile, **render_kwargs,
+                    )
                 samples.append(PreviewSample(
                     media_type=mtype, filename=fname,
                     rendered=_relativize_preview(target, preview_root),
+                    tokens=tokens,
                 ))
             except Exception as e:
                 samples.append(PreviewSample(

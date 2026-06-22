@@ -321,7 +321,10 @@ def read_embedded_title(path: str) -> str | None:
     if not _AVAILABLE:
         return None
     try:
-        info = _MediaInfo.parse(path)  # type: ignore[union-attr]
+        # Header-only fast parse: the title lives in the General track header, so
+        # the deep bitstream scan the default speed pays for is wasted here —
+        # and this runs serially per untitled file on the match path (NAS reads).
+        info = _parse_fast_then_full(path)
     except Exception:
         return None
     for track in getattr(info, "tracks", []):

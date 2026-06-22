@@ -1,13 +1,54 @@
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo, useEffect, type ReactNode } from 'react';
 import type { AppState, MediaFile, ModalState, LibraryItem } from '../lib/types';
 import { IcCheck, IcX, IcSparkles, IcPlay, IcFilm, IcTv, IcAnime, IcMusic, IcSearch } from '../lib/icons';
-import { FilterPill, FilterGroup } from '../components/ui';
+import { cn } from '../lib/utils';
 import { Button } from '../components/base/buttons/button';
 import { LibraryGrid } from '../components/LibraryGrid';
 import { CoverPopup } from '../components/CoverPopup';
 import { ManualSearchModal } from '../components/modals';
 import { buildLibraryItems } from '../lib/adapters';
 import { confLevel, getConfBands } from '../lib/confBands';
+
+// Colour-coded filter chip — a detached toggle that lights up in its OWN
+// semantic colour when active (tinted fill + colour ring + colour label/count),
+// and sits as a quiet dark chip when off. `accent` = the option's colour (omit
+// for neutral options like Pending / Any / All — they light up white). Replaces
+// the old uniform grey segmented pills so each status/confidence/media option
+// reads as its own colour-keyed object with its label always visible.
+export function FilterChip({ on, onClick, label, num, accent, icon, dot }: {
+  on: boolean; onClick: () => void; label: ReactNode;
+  num?: number; accent?: string; icon?: ReactNode; dot?: boolean;
+}) {
+  const c = accent ?? 'var(--accent)';
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={on}
+      style={on ? {
+        background: `color-mix(in srgb, ${c} 13%, transparent)`,
+        boxShadow: `inset 0 0 0 1px color-mix(in srgb, ${c} 34%, transparent)`,
+      } : undefined}
+      className={cn(
+        'group inline-flex h-7 items-center gap-1.5 rounded-lg px-2.5 text-[12.5px] font-medium leading-none outline-brand transition-colors focus-visible:outline-2 focus-visible:outline-offset-2',
+        on ? 'text-primary' : 'bg-secondary text-secondary ring-1 ring-inset ring-secondary hover:bg-primary_hover hover:text-primary',
+      )}
+    >
+      {icon ? (
+        <span className="inline-flex [&_svg]:size-3.5" style={accent ? { color: accent } : undefined}>{icon}</span>
+      ) : dot ? (
+        <span className="size-1.5 rounded-full" style={{ background: c, opacity: on ? 1 : 0.7 }} />
+      ) : null}
+      <span style={on && accent ? { color: accent } : undefined}>{label}</span>
+      {num != null ? (
+        <span
+          className={cn('ml-0.5 min-w-[1.25rem] rounded-md px-1 py-px text-center text-[10.5px] font-semibold tabular-nums', !on && 'bg-tertiary text-tertiary')}
+          style={on ? { background: `color-mix(in srgb, ${c} 20%, transparent)`, color: c } : undefined}
+        >{num}</span>
+      ) : null}
+    </button>
+  );
+}
 
 interface Props {
   state: AppState;
@@ -320,89 +361,120 @@ export function ReviewPage({
   const isLoading = !state.hydrated;
   const isLibraryEmpty = !isLoading && state.files.length === 0;
 
+  // Library-progress funnel — the one library-wide orientation cue. A clean
+  // partition of the library (renamed + approved + pendingPlain + noMatch +
+  // rejected === statusCounts.all): noMatch is a SUBSET of pending, so carve it
+  // OUT (subtract, don't add) to keep widths ≤ 100%. Each segment is also a
+  // status filter, so the bar reinforces the chips instead of duplicating them.
+  const total = Math.max(statusCounts.all, 1);
+  const pendingPlain = Math.max(statusCounts.pending - statusCounts.noMatch, 0);
+  const funnel = ([
+    { key: 'renamed',  n: statusCounts.renamed,  color: 'var(--conf-high)',                                            status: 'renamed',  label: 'Renamed' },
+    { key: 'approved', n: statusCounts.approved,  color: 'var(--accent)',                                              status: 'approved', label: 'Approved' },
+    { key: 'pending',  n: pendingPlain,           color: 'color-mix(in srgb, var(--conf-mid) 50%, var(--line-strong))', status: 'pending',  label: 'Pending' },
+    { key: 'nomatch',  n: statusCounts.noMatch,   color: 'var(--conf-low)',                                            status: 'no_match', label: 'No match' },
+    { key: 'rejected', n: statusCounts.rejected,  color: 'color-mix(in srgb, var(--conf-low) 55%, var(--line-strong))', status: 'rejected', label: 'Rejected' },
+  ] as { key: string; n: number; color: string; status: 'renamed' | 'approved' | 'pending' | 'no_match' | 'rejected'; label: string }[]).filter(s => s.n > 0);
+
   return (
     <div className="page">
       {(isLoading || isLibraryEmpty) ? null : (
-      <div className="mb-5">
-        <div className="mb-4 flex flex-wrap items-end justify-between gap-4">
-          <div>
-            <h1 className="page-title">Library</h1>
-            <p className="mt-1.5 text-[13px] text-ink-muted [&>.sep]:px-1.5 [&>.sep]:text-ink-soft">
-              <b className="font-semibold text-ink">{statusCounts.pending}</b> pending
-              {statusCounts.noMatch > 0 ? <><span className="sep">·</span><b className="font-semibold text-conf-low">{statusCounts.noMatch}</b> no match</> : null}
-              <span className="sep">·</span><b className="font-semibold text-ink">{statusCounts.approved}</b> approved
-              <span className="sep">·</span><b className="font-semibold text-conf-high">{statusCounts.renamed}</b> renamed
-              <span className="sep">·</span><b className="font-semibold text-ink">{statusCounts.rejected}</b> rejected
-            </p>
+      <div className="mb-4">
+        {/* Filter toolbar — colour-coded chips (FilterChip): each status /
+            confidence / media option is a detached chip that lights up in its
+            OWN colour when active, label + count always visible. Row 1 = title +
+            status + action; row 2 = confidence + media (each a labelled
+            cluster). The verbose "544 pending · …" stat line stays dropped —
+            every count lives on its chip. */}
+        <div className="mb-2.5 flex flex-wrap items-center gap-x-3 gap-y-2">
+          <h1 className="mr-1 text-[22px] font-semibold leading-none tracking-tight text-primary">Library</h1>
+
+          {/* Library-progress funnel — the workspace's one library-wide overview.
+              Nests in the title row's dead space (≈0 added height); each segment
+              is also a status filter, mutually consistent with the chips. */}
+          <div className="flex min-w-[150px] max-w-[380px] flex-1 items-center gap-2">
+            <div role="group" aria-label="Library progress" className="flex h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-tertiary ring-1 ring-inset ring-secondary">
+              {funnel.map(s => (
+                <button
+                  key={s.key}
+                  type="button"
+                  onClick={() => setStatusF(s.status)}
+                  title={`${s.label}: ${s.n}`}
+                  aria-label={`${s.label}: ${s.n} — filter`}
+                  style={{ width: `${(s.n / total) * 100}%`, background: s.color }}
+                  className="h-full min-w-[2px] outline-brand transition-[width,filter] duration-300 hover:brightness-125 focus-visible:outline-2 focus-visible:outline-offset-2"
+                />
+              ))}
+            </div>
+            <span className="shrink-0 whitespace-nowrap text-[11px] font-medium tabular-nums text-tertiary">
+              <b className="text-primary">{statusCounts.renamed}</b> / {statusCounts.all} renamed
+            </span>
           </div>
-          {statusF === 'approved' && statusCounts.approved > 0 ? (
-            <Button
-              color="primary"
-              size="md"
-              iconLeading={IcPlay}
-              isLoading={renaming}
-              showTextWhileLoading
-              onClick={async () => {
-                const ids = state.files.filter(f => f.status === 'approved').map(f => f.id);
-                if (!ids.length || !renameFilesDirectly) return;
-                setRenaming(true);
-                try { await renameFilesDirectly(ids); } finally { setRenaming(false); }
-              }}
-            >
-              Rename {statusCounts.approved} approved
-            </Button>
-          ) : (
-            <Button color="secondary" size="md" iconLeading={IcSparkles} onClick={selectHighConf}>
-              Select high-confidence
-            </Button>
-          )}
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            <FilterChip on={statusF === 'pending'}  onClick={() => setStatusF('pending')}  label="Pending"  num={statusCounts.pending} />
+            <FilterChip on={statusF === 'no_match'} onClick={() => setStatusF('no_match')} label="No match" num={statusCounts.noMatch} accent="var(--conf-low)" dot />
+            <FilterChip on={statusF === 'approved'} onClick={() => setStatusF('approved')} label="Approved" num={statusCounts.approved} />
+            <FilterChip on={statusF === 'renamed'}  onClick={() => setStatusF('renamed')}  label="Renamed"  num={statusCounts.renamed} accent="var(--conf-high)" icon={<IcCheck />} />
+            <FilterChip on={statusF === 'rejected'} onClick={() => setStatusF('rejected')} label="Rejected" num={statusCounts.rejected} />
+            <FilterChip on={statusF === 'all'}      onClick={() => setStatusF('all')}      label="All"      num={statusCounts.all} />
+          </div>
+
+          <div className="ml-auto">
+            {statusF === 'approved' && statusCounts.approved > 0 ? (
+              <Button
+                color="primary"
+                size="sm"
+                iconLeading={IcPlay}
+                isLoading={renaming}
+                showTextWhileLoading
+                onClick={async () => {
+                  const ids = state.files.filter(f => f.status === 'approved').map(f => f.id);
+                  if (!ids.length || !renameFilesDirectly) return;
+                  setRenaming(true);
+                  try { await renameFilesDirectly(ids); } finally { setRenaming(false); }
+                }}
+              >
+                Rename {statusCounts.approved} approved
+              </Button>
+            ) : (
+              <Button color="secondary" size="sm" iconLeading={IcSparkles} onClick={selectHighConf}>
+                Select high-confidence
+              </Button>
+            )}
+          </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-2.5">
-          <FilterGroup>
-            <FilterPill on={statusF === 'pending'}  onClick={() => setStatusF('pending')}  label="Pending"  num={statusCounts.pending} />
-            <FilterPill
-              on={statusF === 'no_match'}
-              onClick={() => setStatusF('no_match')}
-              label={<span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full" style={{ background: 'var(--conf-low)' }} />No match</span>}
-              num={statusCounts.noMatch}
-            />
-            <FilterPill on={statusF === 'approved'} onClick={() => setStatusF('approved')} label="Approved" num={statusCounts.approved} />
-            <FilterPill
-              on={statusF === 'renamed'}
-              onClick={() => setStatusF('renamed')}
-              label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3 [&_svg]:text-conf-high"><IcCheck />Renamed</span>}
-              num={statusCounts.renamed}
-            />
-            <FilterPill on={statusF === 'rejected'} onClick={() => setStatusF('rejected')} label="Rejected" num={statusCounts.rejected} />
-            <FilterPill on={statusF === 'all'}      onClick={() => setStatusF('all')}      label="All"      num={statusCounts.all} />
-          </FilterGroup>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="mr-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Confidence</span>
+            <FilterChip on={conf === 'all'}  onClick={() => setConf('all')}  label="Any" num={counts.all} />
+            <FilterChip on={conf === 'high'} onClick={() => setConf('high')} label="Strong" num={counts.high} accent="var(--conf-high)" dot />
+            <FilterChip on={conf === 'mid'}  onClick={() => setConf('mid')}  label="Needs review" num={counts.mid} accent="var(--conf-mid)" dot />
+            <FilterChip on={conf === 'low'}  onClick={() => setConf('low')}  label="Low" num={counts.low} accent="var(--conf-low)" dot />
+          </div>
 
-          <FilterGroup>
-            <FilterPill on={conf === 'all'}  onClick={() => setConf('all')}  label="Any" num={counts.all} />
-            <FilterPill on={conf === 'high'} onClick={() => setConf('high')} label={<span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full" style={{ background: 'var(--conf-high)' }} />Strong</span>} num={counts.high} />
-            <FilterPill on={conf === 'mid'}  onClick={() => setConf('mid')}  label={<span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full" style={{ background: 'var(--conf-mid)' }} />Needs review</span>} num={counts.mid} />
-            <FilterPill on={conf === 'low'}  onClick={() => setConf('low')}  label={<span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full" style={{ background: 'var(--conf-low)' }} />Low</span>}  num={counts.low} />
-          </FilterGroup>
+          <span aria-hidden className="hidden h-5 w-px bg-white/10 sm:block" />
 
-          <FilterGroup>
-            <FilterPill on={type === 'all'}   onClick={() => setType('all')}   label="All media" />
-            <FilterPill on={type === 'movie'} onClick={() => setType('movie')} label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3"><IcFilm />Movies</span>}  num={counts.movie} />
-            <FilterPill on={type === 'tv'}    onClick={() => setType('tv')}    label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3"><IcTv />TV</span>}      num={counts.tv} />
-            <FilterPill on={type === 'anime'} onClick={() => setType('anime')} label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3" style={{ color: type === 'anime' ? 'var(--media-anime)' : undefined }}><IcAnime />Anime</span>} num={counts.anime} />
-            <FilterPill on={type === 'music'} onClick={() => setType('music')} label={<span className="inline-flex items-center gap-1.5 [&_svg]:size-3" style={{ color: type === 'music' ? 'var(--media-music)' : undefined }}><IcMusic />Music</span>} num={counts.music} />
-          </FilterGroup>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="mr-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Media</span>
+            <FilterChip on={type === 'all'}   onClick={() => setType('all')}   label="All" />
+            <FilterChip on={type === 'movie'} onClick={() => setType('movie')} label="Movies" num={counts.movie} accent="#4ec5b3" icon={<IcFilm />} />
+            <FilterChip on={type === 'tv'}    onClick={() => setType('tv')}    label="TV" num={counts.tv} accent="#b3e5fc" icon={<IcTv />} />
+            <FilterChip on={type === 'anime'} onClick={() => setType('anime')} label="Anime" num={counts.anime} accent="var(--media-anime)" icon={<IcAnime />} />
+            <FilterChip on={type === 'music'} onClick={() => setType('music')} label="Music" num={counts.music} accent="var(--media-music)" icon={<IcMusic />} />
+          </div>
         </div>
       </div>
       )}
 
       {selected.size > 0 ? (
-        <div className="mb-3 flex flex-wrap items-center gap-3 rounded-xl border border-accent-line bg-accent-soft px-4 py-2.5 shadow-[0_4px_16px_rgba(0,0,0,0.35),inset_0_1px_0_rgba(255,255,255,0.04)] backdrop-blur-sm">
-          <div className="flex items-center gap-2 text-[13px] text-ink">
-            <span className="grid size-5 place-items-center rounded-md bg-accent-line text-accent [&_svg]:size-3" aria-hidden="true"><IcCheck /></span>
+        <div className="mb-3 flex flex-wrap items-center gap-3 rounded-xl bg-secondary px-4 py-2.5" style={{ boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent)' }}>
+          <div className="flex items-center gap-2 text-[13px] text-primary">
+            <span className="grid size-5 place-items-center rounded-md text-white [&_svg]:size-3" style={{ background: 'var(--accent-deep)' }} aria-hidden="true"><IcCheck /></span>
             <b className="font-semibold tabular-nums">{selected.size} selected</b>
             {selectedNoMatchInfo.items.length > 0 ? (
-              <span className="text-[12px] text-ink-muted">
+              <span className="text-[12px] text-secondary">
                 · {selectedNoMatchInfo.items.length} need matching ({selectedNoMatchInfo.fileIds.length} files)
               </span>
             ) : null}
@@ -423,7 +495,7 @@ export function ReviewPage({
               }}
             >Reject</Button>
 
-            <span aria-hidden="true" className="mx-1 h-5 w-px bg-accent-line" />
+            <span aria-hidden="true" className="mx-1 h-5 w-px bg-[var(--accent-line)]" />
 
             {selectedNoMatchInfo.items.length > 0 && selectedNoMatchInfo.seed ? (
               <Button

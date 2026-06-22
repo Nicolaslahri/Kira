@@ -962,6 +962,14 @@ class AniDBProvider(MetadataProvider):
             n = counts[member]
             if n <= 0:
                 continue
+            # Skip Fribb season-0 members (recap movies / specials / compilation
+            # films that get linked into the relation chain). They are NOT part
+            # of the franchise's ABSOLUTE episode numbering, and — sorting first
+            # via the season-0 key — would otherwise consume absolute range
+            # [1..n] and shift every real TV episode's absolute span, mis-routing
+            # pure absolute-numbered files to the wrong AID.
+            if fribb_seasons.get(member) == 0:
+                continue
             offsets.append((member, cursor, cursor + n - 1))
             cursor += n
 

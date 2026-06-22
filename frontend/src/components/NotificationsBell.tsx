@@ -5,6 +5,7 @@ import { IcBell, IcCheck, IcAlertTri } from '../lib/icons';
 import { cn } from '../lib/utils';
 import { FeaturedIcon } from './base/featured-icons/featured-icon';
 import { Button } from './base/buttons/button';
+import { ButtonUtility } from './base/buttons/button-utility';
 import { Alert } from './base/alert/alert';
 
 function relativeTime(iso: string): string {
@@ -29,7 +30,11 @@ function kindIcon(kind: string): ReactNode {
   return <IcBell />;
 }
 
-export function NotificationsBell() {
+export function NotificationsBell({ placement = 'down-right' }: { placement?: 'down-right' | 'up-left' } = {}) {
+  // Panel opens downward-right beneath the topbar bell, or upward-left when the
+  // bell lives at the bottom of the (narrow) sidebar — there it escapes to the
+  // right over the content (sidebar drops overflow-hidden for this).
+  const up = placement === 'up-left';
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<ApiNotification[]>([]);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -104,20 +109,25 @@ export function NotificationsBell() {
 
   return (
     <div ref={wrapRef} className="relative">
-      <button
-        ref={triggerRef}
-        className={cn(
-          'press group relative grid size-9 shrink-0 place-items-center rounded-lg border bg-[var(--surface-1)] text-fg-quaternary shadow-[var(--shadow-1)] transition hover:bg-[var(--surface-hover)] hover:text-fg-tertiary [&_svg]:size-[16px] [&_svg]:transition-transform [&_svg]:duration-300 hover:[&_svg]:-rotate-12',
-          unread > 0 ? 'border-accent-line' : 'border-[var(--border-2)]',
-        )}
-        title={unread > 0 ? `Notifications (${unread} unread)` : 'Notifications'}
-        aria-label={unread > 0 ? `Notifications, ${unread} unread` : 'Notifications'}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        aria-controls="notifications-panel"
-        onClick={() => setOpen(o => !o)}
-      >
-        <IcBell />
+      {/* Bell = UUI ButtonUtility + an overlaid count badge (their notifications
+          pattern). The icon nudges on hover and the ring turns emerald when
+          unread — Kira touches layered on via className. */}
+      <span className="relative inline-flex">
+        <ButtonUtility
+          ref={triggerRef}
+          size="md"
+          color="secondary"
+          icon={IcBell}
+          tooltip={unread > 0 ? `Notifications (${unread} unread)` : 'Notifications'}
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          aria-controls="notifications-panel"
+          onClick={() => setOpen(o => !o)}
+          className={cn(
+            '[&_[data-icon]]:transition-transform [&_[data-icon]]:duration-300 hover:[&_[data-icon]]:-rotate-12',
+            unread > 0 && 'ring-[var(--accent)]',
+          )}
+        />
         <AnimatePresence>
           {unread > 0 ? (
             <motion.span
@@ -127,13 +137,13 @@ export function NotificationsBell() {
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0, opacity: 0 }}
               transition={{ type: 'spring', stiffness: 600, damping: 22 }}
-              className="absolute -right-1 -top-1 grid h-4 min-w-4 place-items-center rounded-full bg-conf-low px-1 text-[9px] font-bold leading-none text-white shadow-[0_0_0_3px_rgba(255,91,110,0.25)]"
+              className="pointer-events-none absolute -right-1 -top-1 grid h-4 min-w-4 place-items-center rounded-full bg-[var(--color-fg-error-primary)] px-1 text-[9px] font-bold leading-none text-white shadow-[0_0_0_3px_var(--conf-low-24)]"
             >
               {unread > 99 ? '99+' : unread}
             </motion.span>
           ) : null}
         </AnimatePresence>
-      </button>
+      </span>
 
       <AnimatePresence>
       {open ? (
@@ -143,15 +153,18 @@ export function NotificationsBell() {
           role="dialog"
           aria-label="Notifications"
           tabIndex={-1}
-          initial={{ opacity: 0, y: -8, scale: 0.97 }}
+          initial={{ opacity: 0, y: up ? 8 : -8, scale: 0.97 }}
           animate={{ opacity: 1, y: 0, scale: 1 }}
-          exit={{ opacity: 0, y: -6, scale: 0.98 }}
+          exit={{ opacity: 0, y: up ? 6 : -6, scale: 0.98 }}
           transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
-          style={{ transformOrigin: 'top right' }}
-          className="absolute right-0 top-[calc(100%+8px)] z-50 w-[360px] overflow-hidden rounded-2xl border border-[var(--border-3)] bg-[rgba(14,14,18,0.96)] shadow-[var(--shadow-3)] backdrop-blur-xl outline-none"
+          style={{ transformOrigin: up ? 'bottom left' : 'top right' }}
+          className={cn(
+            'absolute z-50 w-[360px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl border border-[var(--border-3)] bg-[var(--panel-90)] shadow-[var(--shadow-3)] backdrop-blur-xl outline-none',
+            up ? 'bottom-[calc(100%+8px)] left-0' : 'right-0 top-[calc(100%+8px)]',
+          )}
         >
           <div className="flex items-center justify-between border-b border-white/[0.1] px-4 py-3">
-            <div className="text-[13px] font-semibold text-ink">Notifications</div>
+            <div className="text-[13px] font-semibold text-primary">Notifications</div>
             {items.some(i => !i.read) ? (
               <Button color="link-gray" size="sm" className="text-xs" onClick={() => void markAllRead()}>Mark all read</Button>
             ) : null}
@@ -164,7 +177,7 @@ export function NotificationsBell() {
           {items.length === 0 ? (
             <div className="flex flex-col items-center gap-2.5 px-6 py-10 text-center">
               <FeaturedIcon size="md" color="gray" icon={<IcBell />} />
-              <div className="text-[13px] text-ink-muted">All caught up — no notifications.</div>
+              <div className="text-[13px] text-secondary">All caught up — no notifications.</div>
             </div>
           ) : (
             <div className="max-h-[420px] overflow-y-auto [scrollbar-width:thin]">
@@ -172,7 +185,7 @@ export function NotificationsBell() {
                 <button
                   key={n.id}
                   className={cn(
-                    'flex w-full items-start gap-3 border-b border-white/[0.06] px-4 py-3 text-left transition-colors last:border-0 hover:bg-glass',
+                    'flex w-full items-start gap-3 border-b border-white/[0.06] px-4 py-3 text-left transition-colors last:border-0 hover:bg-primary_hover',
                     !n.read && 'bg-[var(--accent-soft)]',
                   )}
                   onClick={async () => {
@@ -181,13 +194,13 @@ export function NotificationsBell() {
                 >
                   <FeaturedIcon size="sm" color={kindColor(n.kind)} icon={kindIcon(n.kind)} />
                   <div className="min-w-0 flex-1">
-                    <div className="text-[13px] font-medium text-ink">{n.title}</div>
+                    <div className="text-[13px] font-medium text-primary">{n.title}</div>
                     {/* whitespace-pre-line: multi-line bodies (e.g. the subtitle
                         summary's bulleted "To fix" list) keep their line breaks. */}
-                    {n.body ? <div className="mt-0.5 whitespace-pre-line text-[12px] leading-relaxed text-ink-muted">{n.body}</div> : null}
-                    <div className="mt-1 text-[11px] text-ink-faint">{relativeTime(n.created_at)}</div>
+                    {n.body ? <div className="mt-0.5 whitespace-pre-line text-[12px] leading-relaxed text-secondary">{n.body}</div> : null}
+                    <div className="mt-1 text-[11px] text-tertiary">{relativeTime(n.created_at)}</div>
                   </div>
-                  {!n.read ? <span className="mt-1.5 size-2 shrink-0 rounded-full bg-accent" /> : null}
+                  {!n.read ? <span className="mt-1.5 size-2 shrink-0 rounded-full bg-[var(--color-fg-brand-primary)]" /> : null}
                 </button>
               ))}
             </div>

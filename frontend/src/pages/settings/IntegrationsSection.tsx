@@ -1,7 +1,7 @@
 import { useState, useEffect, type ReactNode, type Dispatch, type SetStateAction } from 'react';
 import { IcTv, IcRefresh, IcEyeOff, IcEye, IcCheck, IcAlertTri, IcLink, IcSettings, IcFilm } from '../../lib/icons';
 import { Select } from '../../components/ui';
-import { SettingsLayout, SectionCard, NestedBox, FieldRow, SETTINGS_NESTED, SectionHeader, StatusPill } from '../../components/settings-blocks';
+import { SettingsLayout, NestedBox, FieldRow, SETTINGS_NESTED, SectionHeader } from '../../components/settings-blocks';
 import { BadgeWithDot } from '../../components/base/badges/badges';
 import { Button } from '../../components/base/buttons/button';
 import { Input } from '../../components/base/input/input';
@@ -15,14 +15,17 @@ import { strSetting, isValidHttpUrl, secretSet, maskHint, type SaveKeyFn, type P
  * onChange wrapper for a server-masked secret input. The editable value is
  * always empty-or-plaintext (the mask is shown as a placeholder, never as the
  * value — see strSetting/maskHint), so a real edit never contains a bullet.
- * This guard is belt-and-suspenders: it refuses to persist anything that still
- * carries a `•`, so the backend's mask-protection (`_looks_like_mask`) can
- * never be tripped from here. An empty string IS saved (lets the user clear a
- * secret); a bullet-bearing string is dropped silently.
+ * Two guards: a bullet-bearing string is dropped (can't trip the backend's
+ * `_looks_like_mask`), and a blank/whitespace string is dropped so a stray empty
+ * onChange can't clobber an already-SAVED secret — a masked field's editable
+ * value is '' after a refresh, so without this an empty event would persist ''
+ * and the key would "disappear". Removing a secret is a deliberate server-side
+ * action, never an accidental blank field.
  */
 function saveSecret(save: (v: string) => void) {
   return (raw: string) => {
     if (raw.includes('•')) return;
+    if (raw.trim() === '') return;
     save(raw);
   };
 }
@@ -75,19 +78,43 @@ function StatusDot({ state, label, detail, checkedAt }: {
   );
 }
 
-/** A SectionCard title with a trailing background-health dot. */
-function titleWithDot(title: string, state: HealthState, detail?: string, checkedAt?: string) {
+// Brand tints for the outbound integrations — each tool reads in its own
+// recognisable hue (like the provider logos on Connections).
+const BRAND = {
+  sonarr: '#5c9fe6', radarr: '#ffc230', plex: '#e5a00d',
+  jellyfin: '#a45cc9', webhook: 'var(--accent)', discord: '#5865f2',
+} as const;
+
+// One outbound integration as a canonical UUI card: a brand-tinted FeaturedIcon,
+// title + description + an optional header action (status badge / Test), and the
+// config body below a hairline divider. A connected card carries a faint green
+// ring so "wired up" reads at a glance (matches the Connections provider cards).
+function IntegrationCard({ icon, tint, title, desc, headerExtra, connected, children }: {
+  icon: ReactNode; tint: string; title: ReactNode; desc?: ReactNode;
+  headerExtra?: ReactNode; connected?: boolean; children?: ReactNode;
+}) {
   return (
-    <span className="inline-flex items-center gap-2">
-      {title}
-      <StatusDot state={state} label={title} detail={detail} checkedAt={checkedAt} />
-    </span>
+    <div
+      className="overflow-hidden rounded-2xl bg-secondary transition-shadow"
+      style={{ boxShadow: connected ? 'inset 0 0 0 1px color-mix(in srgb, var(--conf-high) 38%, transparent)' : 'inset 0 0 0 1px var(--color-border-secondary)' }}
+    >
+      <div className="flex items-start gap-3 p-4">
+        <FeaturedIcon size="md" tint={tint} icon={icon} />
+        <div className="min-w-0 flex-1">
+          <div className="text-[14px] font-semibold text-primary">{title}</div>
+          {desc ? <div className="mt-1 text-[12px] leading-relaxed text-tertiary">{desc}</div> : null}
+        </div>
+        {headerExtra ? <div className="shrink-0">{headerExtra}</div> : null}
+      </div>
+      {children ? <div className="border-t border-secondary p-4">{children}</div> : null}
+    </div>
   );
 }
 
 export function IntegrationsSection({
   rawSettings,
   saveKey,
+  pushToast,
 }: {
   rawSettings: Record<string, unknown>;
   setRawSettings: Dispatch<SetStateAction<Record<string, unknown>>>;
@@ -278,13 +305,13 @@ export function IntegrationsSection({
         setRoots(r.root_folders ?? []);
       } else {
         setTestStatus('fail');
-        setTestDetail(r.detail ?? 'Sonarr test failed.');
         setProfiles([]);
         setRoots([]);
+        pushToast({ title: 'Sonarr connection failed', sub: r.detail ?? undefined, kind: 'error' });
       }
     } catch (e) {
       setTestStatus('fail');
-      setTestDetail((e as Error).message);
+      pushToast({ title: 'Sonarr test failed', sub: (e as Error).message, kind: 'error' });
     } finally {
       setTesting(false);
     }
@@ -329,10 +356,17 @@ export function IntegrationsSection({
   const plexHealth = healthState(health['plex'], plexConfigured);
   const jellyfinHealth = healthState(health['jellyfin'], jellyfinConfigured);
 
+  // One status badge, fed by BOTH the manual Test result AND the always-on
+  // background health poll (no more separate red dot next to the title).
   const sonarrStatusColor: 'success' | 'error' | 'gray' =
-    testStatus === 'ok' ? 'success' : testStatus === 'fail' ? 'error' : 'gray';
+    testStatus === 'ok' || sonarrHealth === 'ok' ? 'success'
+    : testStatus === 'fail' || sonarrHealth === 'failed' ? 'error'
+    : 'gray';
   const sonarrStatusLabel =
-    testStatus === 'ok' ? 'Connected' : testStatus === 'fail' ? 'Failed' : sonarrConfigured ? 'Saved' : 'Not set up';
+    testStatus === 'ok' || sonarrHealth === 'ok' ? 'Connected'
+    : testStatus === 'fail' ? 'Failed'
+    : sonarrHealth === 'failed' ? 'Offline'
+    : sonarrConfigured ? 'Saved' : 'Not set up';
 
   // Inline label + control row used throughout the integrations forms
   // (URL / token / key fields). Delegates to the shared FieldRow primitive
@@ -391,23 +425,50 @@ export function IntegrationsSection({
           title="Integrations"
           purpose="Push actions OUT to tools in your media stack — Sonarr grabs, Plex / Jellyfin refreshes, inbound webhooks, and notifications. Radarr arrives with movie-collection grouping."
           status={(
-            <StatusPill tone={testStatus === 'ok' ? 'connected' : wiredCount > 0 ? 'warning' : 'neutral'} breathe={testStatus === 'ok'}>
+            <BadgeWithDot color={testStatus === 'ok' ? 'success' : wiredCount > 0 ? 'warning' : 'gray'} pulse={testStatus === 'ok'}>
               {wiredCount > 0 ? `${wiredCount} configured` : 'None set up'}
-            </StatusPill>
+            </BadgeWithDot>
           )}
         />
       )}
     >
+      <div className="flex flex-col gap-5">
+
+        {/* ── FLOW HERO — Kira pushes actions OUT to your media stack ── */}
+        <div className="overflow-hidden rounded-2xl bg-secondary px-5 py-4 shadow-xs ring-1 ring-inset ring-secondary">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-3">
+            <div className="flex shrink-0 items-center gap-2 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--accent-deep)' }}>
+              <span className="text-white [&_svg]:size-[18px]"><IcLink /></span>
+              <span className="text-[12px] font-semibold uppercase tracking-[0.08em] text-white">Kira</span>
+            </div>
+            <div className="hidden h-px min-w-[20px] flex-1 sm:block" style={{ background: 'var(--line-strong)' }} />
+            <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">pushes to your stack</span>
+            <div className="hidden h-px min-w-[20px] flex-1 sm:block" style={{ background: 'var(--line-strong)' }} />
+            <div className="flex shrink-0 items-center gap-2">
+              {([
+                { icon: <IcTv />,       color: BRAND.sonarr,   on: sonarrConfigured,                       label: 'Sonarr' },
+                { icon: <IcRefresh />,  color: BRAND.plex,     on: !!plexUrl,                              label: 'Plex' },
+                { icon: <IcRefresh />,  color: BRAND.jellyfin, on: !!jellyfinUrl,                          label: 'Jellyfin' },
+                { icon: <IcSettings />, color: BRAND.discord,  on: !!discordWebhook || !!genericWebhook,   label: 'Notifications' },
+              ]).map((t, i) => (
+                <span key={i} title={`${t.label}: ${t.on ? 'configured' : 'not set up'}`}>
+                  <FeaturedIcon size="sm" tint={t.on ? t.color : `color-mix(in srgb, ${t.color} 28%, transparent)`} icon={t.icon} />
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
+
       {/* Two height-packed columns: left = the *arr stack (Sonarr outbound,
-          inbound webhook, Radarr teaser), right = media servers + notifications.
-          Independent flex columns so a short card never leaves a hole beside
-          a tall neighbour. */}
+          inbound webhook, Radarr teaser), right = media servers + notifications. */}
       <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
         <div className="flex flex-col gap-4">
       {/* ── Sonarr block ─────────────────────────────────────────── */}
-      <SectionCard
+      <IntegrationCard
+        tint={BRAND.sonarr}
+        connected={testStatus === 'ok' || sonarrHealth === 'ok'}
         icon={<IcTv />}
-        title={titleWithDot('Sonarr', sonarrHealth, health['sonarr']?.detail, health['sonarr']?.checked_at)}
+        title="Sonarr"
         desc={<>When configured, the cover popup gets a <span className="font-mono text-ink">Get missing → Sonarr</span> button that one-clicks a search for every episode Kira knows you don't have. URL + API key live in Sonarr's <span className="font-mono text-ink">Settings → General → Security</span>.</>}
         headerExtra={(
           <div className="flex shrink-0 items-center gap-2.5">
@@ -428,15 +489,16 @@ export function IntegrationsSection({
       >
         <div className="flex flex-col gap-3">
           {fieldRow('URL',
-            <Input wrapperClassName="flex-1" mono value={sonarrUrl} placeholder="http://sonarr:8989" invalid={!isValidHttpUrl(sonarrUrl)} aria-invalid={!isValidHttpUrl(sonarrUrl)} title={!isValidHttpUrl(sonarrUrl) ? 'Enter a full http(s) URL, e.g. http://sonarr:8989' : undefined} onChange={e => saveKey('integrations.sonarr.url')(e.target.value)} />
+            <Input wrapperClassName="flex-1" mono editGate value={sonarrUrl} placeholder="http://sonarr:8989" invalid={!isValidHttpUrl(sonarrUrl)} aria-invalid={!isValidHttpUrl(sonarrUrl)} title={!isValidHttpUrl(sonarrUrl) ? 'Enter a full http(s) URL, e.g. http://sonarr:8989' : undefined} onChange={e => saveKey('integrations.sonarr.url')(e.target.value)} />
           )}
           {fieldRow('URL base',
-            <Input wrapperClassName="flex-1" mono value={sonarrUrlBase} placeholder="optional · e.g. /sonarr (reverse-proxy setups)" onChange={e => saveKey('integrations.sonarr.url_base')(e.target.value)} />
+            <Input wrapperClassName="flex-1" mono editGate value={sonarrUrlBase} placeholder="optional · e.g. /sonarr (reverse-proxy setups)" onChange={e => saveKey('integrations.sonarr.url_base')(e.target.value)} />
           )}
           {fieldRow('API key',
             <Input
               wrapperClassName="flex-1"
               mono
+              editGate
               type={showApiKey ? 'text' : 'password'}
               value={sonarrApiKey}
               placeholder={maskHint(rawSettings, 'integrations.sonarr.api_key') ?? "from Sonarr's General → Security page"}
@@ -461,9 +523,6 @@ export function IntegrationsSection({
           <Alert color="success" icon={IcCheck} className="mt-3.5">
             {testDetail ?? `Connected to Sonarr${version ? ` v${version}` : ''}.`}
           </Alert>
-        ) : null}
-        {testStatus === 'fail' ? (
-          <Alert color="error" icon={IcAlertTri} className="mt-3.5">{testDetail || 'Connection failed.'}</Alert>
         ) : null}
 
         {/* Per-series-type defaults — only render after a successful
@@ -530,17 +589,19 @@ export function IntegrationsSection({
             {roots.length === 0 ? 'root folders' : ''} configured yet. Set them up in Sonarr, then Test again.
           </Alert>
         )}
-      </SectionCard>
+      </IntegrationCard>
 
       {/* ── Inbound webhook (Sonarr / Radarr post-import trigger) ─── */}
-      <SectionCard
+      <IntegrationCard
+        tint={BRAND.webhook}
+        connected={webhookSet}
         icon={<IcLink />}
         title="Inbound webhook"
         desc={<>Let Sonarr / Radarr tell Kira to scan the moment a release imports. Set a token, then add a <span className="font-mono text-ink">Connect → Webhook</span> in *arr pointing at the URL below. Blank token = disabled.</>}
       >
         <div className="flex flex-col gap-3">
           {fieldRow('Token',
-            <Input wrapperClassName="flex-1" mono type={showSecrets ? 'text' : 'password'} value={webhookToken} placeholder={maskHint(rawSettings, 'integrations.webhook.token') ?? 'a shared secret you choose'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.webhook.token'))(e.target.value)} trailing={secretEye} />
+            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={webhookToken} placeholder={maskHint(rawSettings, 'integrations.webhook.token') ?? 'a shared secret you choose'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.webhook.token'))(e.target.value)} trailing={secretEye} />
           )}
           {webhookSet ? (
             <NestedBox className="px-3 py-2.5">
@@ -556,12 +617,12 @@ export function IntegrationsSection({
             </NestedBox>
           ) : null}
         </div>
-      </SectionCard>
+      </IntegrationCard>
 
       {/* ── Radarr placeholder ───────────────────────────────────── */}
       <div className="rounded-2xl border border-dashed border-white/[0.14] bg-white/[0.02] p-4">
         <div className="flex items-start gap-3">
-          <FeaturedIcon size="md" color="gray" icon={<IcFilm />} />
+          <FeaturedIcon size="md" tint={BRAND.radarr} icon={<IcFilm />} />
           <div className="min-w-0 flex-1">
             <div className="text-[15px] font-semibold text-ink-muted">Radarr (outbound)</div>
             <div className="mt-1 text-[12.5px] leading-relaxed text-ink-soft">
@@ -576,7 +637,9 @@ export function IntegrationsSection({
 
         <div className="flex flex-col gap-4">
       {/* ── Media servers (Plex / Jellyfin library refresh) ──────── */}
-      <SectionCard
+      <IntegrationCard
+        tint={BRAND.plex}
+        connected={plexConfigured || jellyfinConfigured}
         icon={<IcRefresh />}
         title="Media servers"
         desc="After Kira renames a batch it nudges Plex / Jellyfin to re-scan, so the changes show up right away instead of at the next scheduled scan. Leave a server blank to skip it."
@@ -584,39 +647,42 @@ export function IntegrationsSection({
         <div className="flex flex-col gap-3">
           <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-muted">Plex<StatusDot state={plexHealth} label="Plex" detail={health['plex']?.detail} checkedAt={health['plex']?.checked_at} /></div>
           {fieldRow('URL',
-            <Input wrapperClassName="flex-1" mono value={plexUrl} placeholder="http://plex:32400" invalid={!isValidHttpUrl(plexUrl)} aria-invalid={!isValidHttpUrl(plexUrl)} title={!isValidHttpUrl(plexUrl) ? 'Enter a full http(s) URL, e.g. http://plex:32400' : undefined} onChange={e => saveKey('integrations.plex.url')(e.target.value)} />
+            <Input wrapperClassName="flex-1" mono editGate value={plexUrl} placeholder="http://plex:32400" invalid={!isValidHttpUrl(plexUrl)} aria-invalid={!isValidHttpUrl(plexUrl)} title={!isValidHttpUrl(plexUrl) ? 'Enter a full http(s) URL, e.g. http://plex:32400' : undefined} onChange={e => saveKey('integrations.plex.url')(e.target.value)} />
           )}
           {fieldRow('Token',
-            <Input wrapperClassName="flex-1" mono type={showSecrets ? 'text' : 'password'} value={plexToken} placeholder={maskHint(rawSettings, 'integrations.plex.token') ?? 'X-Plex-Token'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.plex.token'))(e.target.value)} trailing={secretEye} />
+            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={plexToken} placeholder={maskHint(rawSettings, 'integrations.plex.token') ?? 'X-Plex-Token'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.plex.token'))(e.target.value)} trailing={secretEye} />
           )}
           <div className="mt-1 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-muted">Jellyfin<StatusDot state={jellyfinHealth} label="Jellyfin" detail={health['jellyfin']?.detail} checkedAt={health['jellyfin']?.checked_at} /></div>
           {fieldRow('URL',
-            <Input wrapperClassName="flex-1" mono value={jellyfinUrl} placeholder="http://jellyfin:8096" invalid={!isValidHttpUrl(jellyfinUrl)} aria-invalid={!isValidHttpUrl(jellyfinUrl)} title={!isValidHttpUrl(jellyfinUrl) ? 'Enter a full http(s) URL, e.g. http://jellyfin:8096' : undefined} onChange={e => saveKey('integrations.jellyfin.url')(e.target.value)} />
+            <Input wrapperClassName="flex-1" mono editGate value={jellyfinUrl} placeholder="http://jellyfin:8096" invalid={!isValidHttpUrl(jellyfinUrl)} aria-invalid={!isValidHttpUrl(jellyfinUrl)} title={!isValidHttpUrl(jellyfinUrl) ? 'Enter a full http(s) URL, e.g. http://jellyfin:8096' : undefined} onChange={e => saveKey('integrations.jellyfin.url')(e.target.value)} />
           )}
           {fieldRow('API key',
-            <Input wrapperClassName="flex-1" mono type={showSecrets ? 'text' : 'password'} value={jellyfinKey} placeholder={maskHint(rawSettings, 'integrations.jellyfin.api_key') ?? 'Dashboard → API Keys'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.jellyfin.api_key'))(e.target.value)} trailing={secretEye} />
+            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={jellyfinKey} placeholder={maskHint(rawSettings, 'integrations.jellyfin.api_key') ?? 'Dashboard → API Keys'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.jellyfin.api_key'))(e.target.value)} trailing={secretEye} />
           )}
         </div>
-      </SectionCard>
+      </IntegrationCard>
 
       {/* ── Notifications fan-out (Discord / generic webhook) ─────── */}
-      <SectionCard
+      <IntegrationCard
+        tint={BRAND.discord}
+        connected={!!discordWebhook || !!genericWebhook}
         icon={<IcSettings />}
         title="Notifications"
         desc="Push scan + rename events to a Discord channel or any generic webhook (Apprise, n8n, a custom script), on top of the in-app bell. Leave blank to skip."
       >
         <div className="flex flex-col gap-3">
           {fieldRow('Discord',
-            <Input wrapperClassName="flex-1" mono type={showSecrets ? 'text' : 'password'} value={discordWebhook} placeholder="https://discord.com/api/webhooks/…" autoComplete="off" onChange={e => saveKey('notifications.discord_webhook')(e.target.value)} trailing={secretEye} />,
+            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={discordWebhook} placeholder="https://discord.com/api/webhooks/…" autoComplete="off" onChange={e => saveKey('notifications.discord_webhook')(e.target.value)} trailing={secretEye} />,
             'w-24',
           )}
           {fieldRow('Webhook',
-            <Input wrapperClassName="flex-1" mono value={genericWebhook} placeholder="https://example.com/hook (JSON POST)" invalid={!isValidHttpUrl(genericWebhook)} aria-invalid={!isValidHttpUrl(genericWebhook)} title={!isValidHttpUrl(genericWebhook) ? 'Enter a full http(s) URL, e.g. https://example.com/hook' : undefined} onChange={e => saveKey('notifications.webhook_url')(e.target.value)} />,
+            <Input wrapperClassName="flex-1" mono editGate value={genericWebhook} placeholder="https://example.com/hook (JSON POST)" invalid={!isValidHttpUrl(genericWebhook)} aria-invalid={!isValidHttpUrl(genericWebhook)} title={!isValidHttpUrl(genericWebhook) ? 'Enter a full http(s) URL, e.g. https://example.com/hook' : undefined} onChange={e => saveKey('notifications.webhook_url')(e.target.value)} />,
             'w-24',
           )}
         </div>
-      </SectionCard>
+      </IntegrationCard>
         </div>
+      </div>
       </div>
     </SettingsLayout>
   );

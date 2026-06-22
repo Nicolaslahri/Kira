@@ -1,8 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { api, type ApiSubtitleCandidate, type ApiPackEntry } from '../lib/api';
 import { IcX, IcDownload, IcCheck, IcSpin, IcCaption, IcAlertTri, IcChevLeft } from '../lib/icons';
 import { cn } from '../lib/utils';
+import { Button } from './base/buttons/button';
+import { FeaturedIcon } from './base/featured-icons/featured-icon';
+import { BadgeWithDot } from './base/badges/badges';
 
 type PushToast = (t: { title: string; sub?: string; kind?: 'success' | 'error' }) => void;
 
@@ -18,10 +21,12 @@ interface PackChoice {
   entries: ApiPackEntry[];
 }
 
-const SYNC: Record<string, { label: string; cls: string }> = {
-  guaranteed: { label: 'in sync', cls: 'text-[var(--conf-high)] border-[color-mix(in_srgb,var(--conf-high)_45%,transparent)] bg-[color-mix(in_srgb,var(--conf-high)_12%,transparent)]' },
-  likely:     { label: 'likely sync', cls: 'text-[#49b8fe] border-[rgba(73,184,254,0.4)] bg-[rgba(73,184,254,0.12)]' },
-  unknown:    { label: 'sync unknown', cls: 'text-ink-soft border-line bg-white/[0.04]' },
+// Sync-confidence chip → BadgeWithDot (Flow rule: "likely" + "unknown" are GREY,
+// never blue). Only the LABEL distinguishes them; the dot carries the hue.
+const SYNC: Record<string, { label: string; color: 'success' | 'gray' }> = {
+  guaranteed: { label: 'in sync', color: 'success' },
+  likely:     { label: 'likely sync', color: 'gray' },
+  unknown:    { label: 'sync unknown', color: 'gray' },
 };
 function scoreColor(s: number): string {
   return s >= 85 ? 'var(--conf-high)' : s >= 55 ? 'var(--conf-mid)' : 'var(--conf-low)';
@@ -66,12 +71,22 @@ export function SubtitleBrowseModal({ pushToast }: { pushToast: PushToast }) {
   // Opt-in offer: a pack we just picked from could fill N other episodes.
   const [packOffer, setPackOffer] = useState<{ provider: string; ref: string; language: string; count: number } | null>(null);
   const [filling, setFilling] = useState(false);
+  // Animated dismissal: flip `closing` to play the exit, then unmount once it's done.
+  const [closing, setClosing] = useState(false);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const close = () => {
+    if (closeTimer.current) return; // already animating out
+    setClosing(true);
+    closeTimer.current = setTimeout(() => { setTarget(null); setClosing(false); closeTimer.current = null; }, 190);
+  };
 
   useEffect(() => {
     const onOpen = (e: Event) => {
       const detail = (e as CustomEvent).detail as BrowseTarget;
+      if (closeTimer.current) { clearTimeout(closeTimer.current); closeTimer.current = null; }
       setTarget(detail); setCands(null); setError(null); setDone(new Set());
-      setPackChoice(null); setExtracting(null); setPackOffer(null); setFilling(false);
+      setPackChoice(null); setExtracting(null); setPackOffer(null); setFilling(false); setClosing(false);
     };
     window.addEventListener('kira:browse-subtitles', onOpen);
     return () => window.removeEventListener('kira:browse-subtitles', onOpen);
@@ -90,7 +105,7 @@ export function SubtitleBrowseModal({ pushToast }: { pushToast: PushToast }) {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       // Esc backs out of the pack sub-view first, then closes the modal.
-      if (packChoice) setPackChoice(null); else setTarget(null);
+      if (packChoice) setPackChoice(null); else close();
     };
     if (target) window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -197,113 +212,122 @@ export function SubtitleBrowseModal({ pushToast }: { pushToast: PushToast }) {
 
   return createPortal(
     <div className="fixed inset-0 z-[200] grid place-items-center p-4" role="dialog" aria-modal="true">
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setTarget(null)} />
-      <div className="anim-pop relative flex max-h-[82vh] w-full max-w-[640px] flex-col overflow-hidden rounded-2xl border border-[var(--border-2)] bg-[rgba(12,12,15,0.96)] shadow-[var(--shadow-3)]">
-        <div className="flex items-center gap-3 border-b border-line px-5 py-3.5">
+      <div className={cn('absolute inset-0 bg-[var(--scrim-60)] backdrop-blur-sm', closing ? 'anim-fade-out' : 'anim-fade')} onClick={close} />
+      <div className={cn(
+        'relative flex max-h-[82vh] w-full max-w-[640px] flex-col overflow-hidden rounded-2xl bg-[var(--panel-90)] shadow-[var(--shadow-3)] ring-1 ring-inset ring-secondary',
+        closing ? 'anim-pop-out pointer-events-none' : 'anim-pop',
+      )}>
+        {/* Header — a canonical eyebrow names the phase; the leading slot becomes
+            a real Back button in the pack sub-view (you went a level deeper). */}
+        <div className="flex items-center gap-3 border-b border-secondary px-5 py-3.5">
           {packChoice ? (
-            <button className="press grid size-8 shrink-0 place-items-center rounded-lg bg-[var(--surface-3)] text-ink-soft hover:text-ink [&_svg]:size-4" onClick={() => setPackChoice(null)} aria-label="Back"><IcChevLeft /></button>
+            <button className="press grid size-9 shrink-0 place-items-center rounded-lg bg-tertiary text-tertiary ring-1 ring-inset ring-secondary transition hover:text-secondary hover:ring-primary [&_svg]:size-4" onClick={() => setPackChoice(null)} aria-label="Back"><IcChevLeft /></button>
           ) : (
-            <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-[var(--surface-3)] text-accent [&_svg]:size-4"><IcCaption /></span>
+            <FeaturedIcon size="md" tint="var(--accent)" icon={<IcCaption />} />
           )}
           <div className="min-w-0 flex-1">
-            <div className="text-[14px] font-semibold text-ink">{packChoice ? `Choose ${packEpLabel} in this pack` : 'Browse subtitles'}</div>
-            <div className="truncate font-mono text-[11.5px] text-ink-soft">{target.filename}</div>
+            {packChoice ? <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Confirm the episode</div> : null}
+            <div className="truncate text-sm font-semibold text-primary">{packChoice ? `Choose ${packEpLabel} in this pack` : 'Browse subtitles'}</div>
+            <div className="truncate font-mono text-[11px] text-tertiary">{target.filename}</div>
           </div>
-          <button className="press grid size-7 place-items-center rounded-md text-ink-soft hover:bg-white/[0.07] hover:text-ink [&_svg]:size-4" onClick={() => setTarget(null)} aria-label="Close"><IcX /></button>
+          <button className="press grid size-7 place-items-center rounded-md text-tertiary transition hover:bg-tertiary hover:text-secondary [&_svg]:size-4" onClick={close} aria-label="Close"><IcX /></button>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+        <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-3 py-3">
           {packChoice ? (
-            /* ── Pack contents picker ─────────────────────────────────── */
-            <div className="flex flex-col gap-2">
-              <div className="mb-1 flex items-start gap-2 rounded-xl border border-[rgba(245,180,90,0.35)] bg-[rgba(245,180,90,0.08)] px-3.5 py-2.5 text-[11.5px] leading-relaxed text-[#f5b45a] [&_svg]:mt-0.5 [&_svg]:size-4 [&_svg]:shrink-0">
-                <IcAlertTri />
-                <span>
-                  Kira couldn't be sure which file inside this pack is <span className="font-semibold">{packEpLabel}</span>.
-                  Entries are ranked by everything we know — episode number, title, runtime and release group.
-                  The top one is our best guess; pick the right file to save it.
-                </span>
+            /* ── Pack contents picker — confirm which file inside the archive ── */
+            <>
+              <div className="mb-1 flex items-start gap-3 rounded-xl bg-[var(--conf-mid-8)] px-3.5 py-3 ring-1 ring-inset ring-[var(--conf-mid-32)]">
+                <FeaturedIcon size="sm" tint="var(--conf-mid)" icon={<IcAlertTri />} />
+                <div>
+                  <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--conf-mid-bright)]">Confirm the episode</div>
+                  <div className="mt-1 text-[11.5px] leading-relaxed text-[var(--conf-mid-bright)]">
+                    Kira couldn't be sure which file inside this pack is <span className="font-semibold">{packEpLabel}</span>.
+                    Entries are ranked by episode number, title, runtime and release group — the top one (the indigo-railed row)
+                    is our best guess; pick the right file to save it.
+                  </div>
+                </div>
               </div>
               {packChoice.entries.length === 0 ? (
-                <div className="px-3 py-8 text-center text-[13px] text-ink-soft">The archive had no readable subtitle files.</div>
+                <div className="px-3 py-10 text-center text-[13px] text-tertiary">The archive had no readable subtitle files.</div>
               ) : packChoice.entries.map((entry, i) => {
                 const isBest = i === 0 && entry.score > 0;
                 return (
                   <div key={entry.name} className={cn(
-                    'flex items-center gap-3 rounded-xl border px-3.5 py-2.5',
-                    isBest ? 'border-[rgba(73,184,254,0.4)] bg-[rgba(73,184,254,0.06)]' : 'border-line bg-white/[0.025]',
+                    'flex items-center gap-3.5 rounded-xl px-3.5 py-3 shadow-xs ring-1 ring-inset transition-[background-color,box-shadow]',
+                    isBest
+                      ? 'bg-[var(--accent-8)] shadow-[inset_3px_0_0_var(--accent)] ring-[var(--accent-line)] hover:bg-[var(--accent-12)]'
+                      : 'bg-tertiary ring-secondary hover:ring-primary',
                   )}>
                     <div className="relative grid size-10 shrink-0 place-items-center">
                       <svg viewBox="0 0 36 36" className="size-full -rotate-90">
-                        <circle cx="18" cy="18" r="15.5" fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="3.2" />
+                        <circle cx="18" cy="18" r="15.5" fill="none" stroke="var(--line)" strokeWidth="3.2" />
                         <circle cx="18" cy="18" r="15.5" fill="none" stroke={scoreColor(entry.score)} strokeWidth="3.2" strokeLinecap="round" strokeDasharray={`${(entry.score / 100) * 97.4} 97.4`} />
                       </svg>
-                      <span className="absolute text-[10.5px] font-bold tabular-nums text-ink">{entry.score}</span>
+                      <span className="absolute text-[10.5px] font-bold tabular-nums text-primary">{entry.score}</span>
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="truncate font-mono text-[12px] text-ink" title={entry.name}>{entryBase(entry.name)}</span>
-                        {isBest ? <span className="rounded border border-[rgba(73,184,254,0.45)] bg-[rgba(73,184,254,0.12)] px-1.5 text-[10px] font-semibold uppercase tracking-wide text-[#49b8fe]">best guess</span> : null}
+                        <span className="truncate font-mono text-[12px] text-primary" title={entry.name}>{entryBase(entry.name)}</span>
+                        {isBest ? <span className="rounded bg-[var(--accent-12)] px-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--accent-bright)] ring-1 ring-inset ring-[var(--accent-line)]">best guess</span> : null}
                       </div>
-                      {entry.reasons.length ? <div className="mt-0.5 truncate text-[11px] text-ink-muted">{entry.reasons.join(' · ')}</div> : <div className="mt-0.5 text-[11px] text-ink-faint">no matching signal</div>}
+                      {entry.reasons.length ? <div className="mt-0.5 truncate text-[11px] text-quaternary">{entry.reasons.join(' · ')}</div> : <div className="mt-0.5 text-[11px] text-quaternary">no matching signal</div>}
                     </div>
-                    <button
-                      className="press inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-line bg-white/[0.05] px-2.5 py-1.5 text-[12px] font-medium text-ink transition hover:bg-white/[0.1] disabled:opacity-50 [&_svg]:size-3.5"
-                      disabled={extracting !== null}
-                      onClick={() => void chooseEntry(entry)}
-                    >
-                      {extracting === entry.name ? <IcSpin className="animate-spin" /> : <IcDownload />}
+                    <Button color={isBest ? 'primary' : 'secondary'} size="sm" iconLeading={IcDownload} isLoading={extracting === entry.name} showTextWhileLoading isDisabled={extracting !== null} onClick={() => void chooseEntry(entry)}>
                       {extracting === entry.name ? 'Saving' : 'Use this'}
-                    </button>
+                    </Button>
                   </div>
                 );
               })}
-            </div>
+            </>
           ) : error ? (
-            <div className="flex items-center gap-2 px-3 py-6 text-[13px] text-[var(--conf-low)] [&_svg]:size-4"><IcAlertTri />{error}</div>
+            <div className="flex flex-col items-center gap-3 px-3 py-12 text-center">
+              <FeaturedIcon size="md" tint="var(--conf-low)" icon={<IcAlertTri />} />
+              <div className="text-[13px] text-[var(--conf-low-bright)]">Couldn't reach the providers</div>
+              <div className="max-w-[80%] break-words text-[11px] text-quaternary">{error}</div>
+            </div>
           ) : cands === null ? (
-            <div className="flex items-center justify-center gap-2 px-3 py-10 text-[13px] text-ink-soft [&_svg]:size-4 [&_svg]:animate-[spin_1.1s_linear_infinite]"><IcSpin /> Searching every provider…</div>
+            <div className="flex flex-col items-center gap-3 px-3 py-12 text-center">
+              <FeaturedIcon size="md" color="gray" icon={<IcSpin />} className="[&_svg]:animate-[spin_1.1s_linear_infinite]" />
+              <div className="text-[13px] text-secondary">Searching every provider…</div>
+              <div className="text-[11px] text-quaternary">Ranking results the same way auto-pick does</div>
+            </div>
           ) : cands.length === 0 ? (
-            <div className="px-3 py-10 text-center text-[13px] text-ink-soft">No candidates found across the enabled providers.</div>
+            <div className="flex flex-col items-center gap-3 px-3 py-12 text-center">
+              <FeaturedIcon size="md" color="gray" icon={<IcCaption />} />
+              <div className="text-[13px] text-secondary">No candidates found</div>
+              <div className="text-[11px] text-quaternary">None of the enabled providers had a match for this file.</div>
+            </div>
           ) : (
-            <div className="flex flex-col gap-2">
+            <>
               {/* Opt-in season fill — a pack we just picked from can cover more
-                  episodes. We do NOT auto-patch the library off one click; the
-                  user decides here. */}
+                  episodes. Neutral container + indigo action: an obvious-but-
+                  optional next step (we do NOT auto-patch the library). */}
               {packOffer ? (
-                <div className="mb-1 flex items-center gap-3 rounded-xl border border-[rgba(73,184,254,0.4)] bg-[rgba(73,184,254,0.08)] px-3.5 py-2.5">
-                  <div className="min-w-0 flex-1 text-[12px] leading-relaxed text-[#9cd6ff]">
+                <div className="mb-1 flex items-center gap-3 rounded-xl bg-[var(--info-8)] px-3.5 py-3 ring-1 ring-inset ring-[var(--info-32)]">
+                  <FeaturedIcon size="sm" tint="var(--info)" icon={<IcCaption />} />
+                  <div className="min-w-0 flex-1 text-[12px] leading-relaxed text-[var(--info-bright)]">
                     This came from a <span className="font-semibold">season pack</span> — {packOffer.count} other
                     episode{packOffer.count === 1 ? '' : 's'} in this series {packOffer.count === 1 ? 'is' : 'are'} missing
                     {' '}{packOffer.language.toUpperCase()}. Fill {packOffer.count === 1 ? 'it' : 'them'} from the same download?
                   </div>
-                  <button
-                    className="press inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-[rgba(73,184,254,0.5)] bg-[rgba(73,184,254,0.15)] px-3 py-1.5 text-[12px] font-semibold text-[#9cd6ff] transition hover:bg-[rgba(73,184,254,0.25)] disabled:opacity-50 [&_svg]:size-3.5"
-                    disabled={filling}
-                    onClick={() => void fillSeason()}
-                  >
-                    {filling ? <IcSpin className="animate-spin" /> : null}
-                    {filling ? 'Filling…' : `Fill ${packOffer.count}`}
-                  </button>
-                  <button
-                    className="press shrink-0 rounded-md px-1.5 text-[12px] text-ink-soft hover:text-ink"
-                    onClick={() => setPackOffer(null)}
-                  >
-                    Dismiss
-                  </button>
+                  <Button color="primary" size="sm" isLoading={filling} showTextWhileLoading onClick={() => void fillSeason()}>{filling ? 'Filling…' : `Fill ${packOffer.count}`}</Button>
+                  <Button color="link-gray" size="sm" onClick={() => setPackOffer(null)}>Dismiss</Button>
                 </div>
               ) : null}
-              {/* When every result is a whole-season archive, say so up front —
-                  the user isn't doing anything wrong, that's just all the
-                  provider has, and Kira extracts the right episode for them. */}
+              {/* When every result is a whole-season archive, say so up front and
+                  foreshadow the confirm-the-episode step. */}
               {allPacks ? (
-                <div className="mb-1 flex items-start gap-2 rounded-xl border border-[rgba(245,180,90,0.35)] bg-[rgba(245,180,90,0.08)] px-3.5 py-2.5 text-[11.5px] leading-relaxed text-[#f5b45a] [&_svg]:mt-0.5 [&_svg]:size-4 [&_svg]:shrink-0">
-                  <IcAlertTri />
-                  <span>
-                    No single-episode subtitle was found — these are <span className="font-semibold">complete-season packs</span>.
-                    Kira downloads the archive and pulls out <span className="font-semibold">{epLabel}</span> automatically; if it
-                    can't be sure which file is yours, it'll ask you to confirm.
-                  </span>
+                <div className="mb-1 flex items-start gap-3 rounded-xl bg-[var(--conf-mid-8)] px-3.5 py-3 ring-1 ring-inset ring-[var(--conf-mid-32)]">
+                  <FeaturedIcon size="sm" tint="var(--conf-mid)" icon={<IcAlertTri />} />
+                  <div>
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--conf-mid-bright)]">Only season packs found</div>
+                    <div className="mt-1 text-[11.5px] leading-relaxed text-[var(--conf-mid-bright)]">
+                      No single-episode subtitle was found — these are <span className="font-semibold">complete-season packs</span>.
+                      Kira downloads the archive and pulls out <span className="font-semibold">{epLabel}</span> automatically; if it
+                      can't be sure which file is yours, it'll ask you to confirm.
+                    </div>
+                  </div>
                 </div>
               ) : null}
               {cands.map(c => {
@@ -312,52 +336,50 @@ export function SubtitleBrowseModal({ pushToast }: { pushToast: PushToast }) {
                 const isDone = done.has(key);
                 return (
                   <div key={key} className={cn(
-                    'flex items-center gap-3 rounded-xl border px-3.5 py-2.5',
-                    c.is_pack
-                      ? 'border-[rgba(245,180,90,0.28)] bg-[rgba(245,180,90,0.04)]'
-                      : 'border-line bg-white/[0.025]',
+                    'flex items-center gap-3.5 rounded-xl px-3.5 py-3 shadow-xs ring-1 ring-inset transition-[background-color,box-shadow]',
+                    // The amber pack-rail only earns its place when packs are MIXED
+                    // with singles; when everything's a pack the callout owns that.
+                    c.is_pack && !allPacks
+                      ? 'bg-[var(--conf-mid-8)] shadow-[inset_2px_0_0_var(--conf-mid)] ring-[var(--conf-mid-32)]'
+                      : 'bg-tertiary ring-secondary hover:ring-primary',
                   )}>
                     <div className="relative grid size-10 shrink-0 place-items-center">
                       <svg viewBox="0 0 36 36" className="size-full -rotate-90">
-                        <circle cx="18" cy="18" r="15.5" fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="3.2" />
+                        <circle cx="18" cy="18" r="15.5" fill="none" stroke="var(--line)" strokeWidth="3.2" />
                         <circle cx="18" cy="18" r="15.5" fill="none" stroke={scoreColor(c.score)} strokeWidth="3.2" strokeLinecap="round" strokeDasharray={`${(c.score / 100) * 97.4} 97.4`} />
                       </svg>
-                      <span className="absolute text-[10.5px] font-bold tabular-nums text-ink">{c.score}</span>
+                      <span className="absolute text-[10.5px] font-bold tabular-nums text-primary">{c.score}</span>
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="text-[12.5px] font-semibold text-ink">{c.provider}</span>
-                        <span className="rounded border border-line px-1 text-[10px] font-bold uppercase text-ink-muted">{c.language}</span>
-                        <span className={cn('rounded border px-1.5 text-[10px]', sync.cls)}>{sync.label}</span>
-                        {c.hearing_impaired ? <span className="rounded border border-line px-1 text-[10px] text-ink-soft">SDH</span> : null}
-                        {c.is_pack ? (
-                          <span className="rounded border border-[rgba(245,180,90,0.4)] bg-[rgba(245,180,90,0.1)] px-1.5 text-[10px] font-semibold uppercase tracking-wide text-[#f5b45a]">season pack</span>
+                        <span className="text-[12.5px] font-semibold text-primary">{c.provider}</span>
+                        <span className="rounded bg-secondary px-1 text-[10px] font-bold uppercase tabular-nums text-tertiary ring-1 ring-inset ring-secondary">{c.language}</span>
+                        {/* Only surface sync when it's a positive signal — "unknown"
+                            is the absence of info and just adds a repeated grey chip. */}
+                        {c.sync === 'guaranteed' || c.sync === 'likely' ? <BadgeWithDot color={sync.color}>{sync.label}</BadgeWithDot> : null}
+                        {c.hearing_impaired ? <span className="rounded bg-secondary px-1 text-[10px] text-tertiary ring-1 ring-inset ring-secondary">SDH</span> : null}
+                        {c.is_pack && !allPacks ? (
+                          <span className="rounded bg-[var(--conf-mid-16)] px-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--conf-mid-bright)] ring-1 ring-inset ring-[var(--conf-mid-32)]">season pack</span>
                         ) : null}
                       </div>
-                      <div className="mt-0.5 truncate font-mono text-[11px] text-ink-soft" title={c.release_name}>{c.release_name || '—'}</div>
-                      {c.is_pack ? (
-                        <div className="mt-0.5 text-[11px] text-[#f5b45a]/80">Full-season archive — Kira extracts {epLabel}</div>
+                      <div className="mt-1 truncate font-mono text-[11px] text-tertiary" title={c.release_name}>{c.release_name || '—'}</div>
+                      {c.is_pack && !allPacks ? (
+                        <div className="mt-0.5 truncate text-[11px] text-[var(--conf-mid-bright)]">Full-season archive — Kira extracts {epLabel}</div>
                       ) : c.reasons.length ? (
-                        <div className="mt-0.5 truncate text-[11px] text-ink-muted">{c.reasons.join(' · ')}</div>
+                        <div className="mt-0.5 truncate text-[11px] text-quaternary">{c.reasons.join(' · ')}</div>
                       ) : null}
                     </div>
                     {isDone ? (
-                      <span className="inline-flex shrink-0 items-center gap-1 text-[12px] font-medium text-[var(--conf-high)] [&_svg]:size-4"><IcCheck /> saved</span>
+                      <span className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--conf-high-16)] px-2.5 py-1.5 text-[12px] font-medium text-[var(--conf-high)] ring-1 ring-inset ring-[var(--conf-high-32)] [&_svg]:size-4"><IcCheck /> saved</span>
                     ) : (
-                      <button
-                        className="press inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-line bg-white/[0.05] px-2.5 py-1.5 text-[12px] font-medium text-ink transition hover:bg-white/[0.1] disabled:opacity-50 [&_svg]:size-3.5"
-                        disabled={picking !== null}
-                        onClick={() => void pick(c)}
-                        title={c.is_pack ? `Download the pack and extract ${epLabel}` : undefined}
-                      >
-                        {picking === key ? <IcSpin className="animate-spin" /> : <IcDownload />}
+                      <Button color="secondary" size="sm" iconLeading={IcDownload} isLoading={picking === key} showTextWhileLoading isDisabled={picking !== null} onClick={() => void pick(c)} title={c.is_pack ? `Download the pack and extract ${epLabel}` : undefined}>
                         {picking === key ? (c.is_pack ? 'Extracting' : 'Downloading') : (c.is_pack ? 'Extract episode' : 'Download')}
-                      </button>
+                      </Button>
                     )}
                   </div>
                 );
               })}
-            </div>
+            </>
           )}
         </div>
       </div>

@@ -33,6 +33,8 @@ def episode_exists(
     by_key: dict[tuple[int, int], str | None],
     season: int | None,
     episode: int | None,
+    *,
+    strict_season: bool = False,
 ) -> bool:
     """True when (season, episode) — or the season-agnostic (1, episode)
     fallback — is present in the provider's episode list.
@@ -40,16 +42,26 @@ def episode_exists(
     The (1, episode) fallback mirrors ``_lookup_episode_title``: AniDB returns
     everything as season 1, and some providers don't model the user's folder
     season. ``None`` season is treated as season 1.
+
+    ``strict_season=True`` DISABLES the (1, episode) fallback. The western-TV
+    coverage gate needs this: otherwise a WRONG series' season 1 satisfies the
+    cluster's low-numbered files (S05E03 "exists" because some season-1 ep 3
+    does), inflating coverage and silently defeating the wrong-series safety
+    net. AniDB callers must NOT pass strict — their lists are all season 1.
     """
     if episode is None:
         return False
     s = season if season is not None else 1
-    return (s, episode) in by_key or (1, episode) in by_key
+    if (s, episode) in by_key:
+        return True
+    return (not strict_season) and (1, episode) in by_key
 
 
 def coverage(
     file_episodes: list[tuple[int | None, int | None]],
     by_key: dict[tuple[int, int], str | None],
+    *,
+    strict_season: bool = False,
 ) -> float:
     """Fraction of the cluster's files whose episode exists in ``by_key``.
 
@@ -64,7 +76,7 @@ def coverage(
         if episode is None:
             continue
         total += 1
-        if episode_exists(by_key, season, episode):
+        if episode_exists(by_key, season, episode, strict_season=strict_season):
             have += 1
     return (have / total) if total else 1.0
 

@@ -264,6 +264,12 @@ async def download_and_save(
     otherwise it raises PackEpisodeMissing so the caller falls through to the
     next candidate (a non-interactive flow has no user to ask). `overwrite=True`
     replaces an existing sidecar. None on plain failure; Quota/Auth propagate."""
+    # Quality floor: automated saves must clear the user's min_score, same as
+    # fetch_subtitles. The INTERACTIVE manual_pick path deliberately skips this
+    # (the user chose it). Closes the upgrade-sweep gap where a low manual pick
+    # could be auto-replaced by a still-below-floor release.
+    if ctx.min_score and cand.score is not None and cand.score < ctx.min_score:
+        return None
     raw = await download_raw(client, cand, ctx)
     if not raw:
         return None

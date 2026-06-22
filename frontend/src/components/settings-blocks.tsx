@@ -6,7 +6,7 @@ import { IcChevDown, IcRefresh, IcAlertTri, IcFilm, IcTv, IcAnime, IcMusic, IcDi
 import { cn } from '../lib/utils';
 import { Button } from './base/buttons/button';
 import { FeaturedIcon } from './base/featured-icons/featured-icon';
-import { Badge } from './base/badges/badges';
+import { Badge, BadgeWithDot } from './base/badges/badges';
 import { Input } from './base/input/input';
 import { Alert } from './base/alert/alert';
 import { Toggle } from './base/toggle/toggle';
@@ -18,7 +18,7 @@ import { Select } from './ui';
 // on the shared elevation tokens (--surface-* / --border-* / --shadow-*) so
 // the cards read as clearly raised against the canvas, matching the rest of
 // the Phase 1–4 redesign. `.settings-card` adds the hover lift + entrance.
-export const SETTINGS_CARD = 'settings-card rounded-2xl border border-[var(--border-2)] bg-[var(--surface-2)] shadow-[var(--shadow-1)]';
+export const SETTINGS_CARD = 'settings-card rounded-2xl border border-[var(--border-2)] bg-tertiary shadow-[var(--shadow-1)]';
 export const SETTINGS_NESTED = 'rounded-xl border border-[var(--border-1)] bg-[var(--surface-3)]';
 export const SETTINGS_DIVIDER = 'border-[var(--border-1)]';
 
@@ -65,7 +65,7 @@ export function SettingsLayout({ intro, children, wide: _wide = false, actions, 
       <div className="settings-stage flex w-full flex-col gap-4">
         {intro || actions ? (
           <div className="flex flex-wrap items-start justify-between gap-3">
-            {intro ? <p className="max-w-3xl text-[13px] leading-relaxed text-ink-muted">{intro}</p> : <span />}
+            {intro ? <p className="max-w-3xl text-[13px] leading-relaxed text-secondary">{intro}</p> : <span />}
             {actions}
           </div>
         ) : null}
@@ -100,11 +100,11 @@ export function SettingsGrid({ children, className }: { children: ReactNode; cla
 export type StatusTone = 'connected' | 'warning' | 'error' | 'neutral' | 'accent';
 
 const STATUS_TONE: Record<StatusTone, { dot: string; text: string; ring: string }> = {
-  connected: { dot: 'var(--conf-high)', text: 'text-conf-high', ring: 'border-[var(--accent-line)]' },
-  warning:   { dot: 'var(--conf-mid)',  text: 'text-conf-mid',  ring: 'border-[rgba(255,201,74,0.32)]' },
-  error:     { dot: 'var(--conf-low)',  text: 'text-conf-low',  ring: 'border-[rgba(255,91,110,0.35)]' },
-  accent:    { dot: 'var(--accent)',    text: 'text-accent',    ring: 'border-[var(--accent-line)]' },
-  neutral:   { dot: 'var(--ink-3)',     text: 'text-ink-soft',  ring: 'border-[var(--border-2)]' },
+  connected: { dot: 'var(--color-fg-success-primary)', text: 'text-success-primary', ring: 'border-[var(--color-border-brand)]' },
+  warning:   { dot: 'var(--color-fg-warning-primary)', text: 'text-warning-primary',  ring: 'border-[var(--conf-mid-32)]' },
+  error:     { dot: 'var(--color-fg-error-primary)',   text: 'text-error-primary',  ring: 'border-[var(--conf-low-32)]' },
+  accent:    { dot: 'var(--color-fg-brand-primary)',   text: 'text-brand-secondary',    ring: 'border-[var(--color-border-brand)]' },
+  neutral:   { dot: 'var(--color-text-tertiary)',      text: 'text-tertiary',  ring: 'border-[var(--border-2)]' },
 };
 
 /**
@@ -121,7 +121,7 @@ export function StatusPill({ tone, children, breathe = false }: {
   const alive = breathe && (tone === 'connected' || tone === 'accent');
   return (
     <span className={cn(
-      'settings-status-pill inline-flex shrink-0 items-center gap-2 rounded-full border bg-[var(--surface-1)] px-3 py-1.5 text-[12px] font-semibold',
+      'settings-status-pill inline-flex shrink-0 items-center gap-2 rounded-full border bg-secondary px-3 py-1.5 text-[12px] font-semibold',
       t.ring, t.text,
     )}>
       <span
@@ -152,13 +152,13 @@ export function SectionHeader({ icon, title, purpose, status, filter, accent = f
   accent?: boolean;
 }) {
   return (
-    <div className="settings-section-header flex flex-wrap items-start gap-4 rounded-2xl border border-[var(--border-2)] bg-[var(--surface-1)] px-4 py-4 shadow-[var(--shadow-1)]">
+    <div className="settings-section-header flex flex-wrap items-start gap-4 rounded-2xl border border-[var(--border-2)] bg-secondary px-4 py-4 shadow-[var(--shadow-1)]">
       <span className={cn('settings-section-icon grid size-11 shrink-0 place-items-center rounded-xl [&_svg]:size-[22px]', accent ? 'settings-section-icon-accent' : '')}>
         {icon}
       </span>
       <div className="min-w-0 flex-1">
-        <h2 className="text-[17px] font-semibold tracking-[-0.01em] text-ink">{title}</h2>
-        <p className="mt-1 max-w-2xl text-[13px] leading-relaxed text-ink-muted">{purpose}</p>
+        <h2 className="text-[17px] font-semibold tracking-[-0.01em] text-primary">{title}</h2>
+        <p className="mt-1 max-w-2xl text-[13px] leading-relaxed text-secondary">{purpose}</p>
       </div>
       {(status || filter) ? (
         <div className="flex shrink-0 flex-wrap items-center gap-2.5 self-center">
@@ -183,7 +183,7 @@ export function SettingsFilter({ value, onChange, placeholder = 'Filter settings
 }) {
   return (
     <div className="settings-filter relative">
-      <IcSearch className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-ink-soft" aria-hidden="true" />
+      <IcSearch className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-tertiary" aria-hidden="true" />
       <input
         type="text"
         value={value}
@@ -191,33 +191,18 @@ export function SettingsFilter({ value, onChange, placeholder = 'Filter settings
         placeholder={placeholder}
         spellCheck={false}
         aria-label="Filter settings in this section"
-        className="settings-filter-input h-9 w-[200px] max-w-full rounded-full border border-[var(--border-2)] bg-[var(--surface-1)] pl-8 pr-8 text-[12.5px] text-ink outline-none placeholder:text-ink-soft"
+        className="settings-filter-input h-9 w-[200px] max-w-full rounded-full border border-[var(--border-2)] bg-secondary pl-8 pr-8 text-[12.5px] text-primary outline-none placeholder:text-tertiary"
       />
       {value ? (
         <button
           type="button"
           onClick={() => onChange('')}
           aria-label="Clear filter"
-          className="absolute right-2.5 top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded-full text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink [&_svg]:size-3"
+          className="absolute right-2.5 top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded-full text-tertiary transition-colors hover:bg-white/[0.07] hover:text-primary [&_svg]:size-3"
         >
           <IcX />
         </button>
       ) : null}
-    </div>
-  );
-}
-
-/**
- * Optional muted group label that breaks a long section into labelled
- * clusters ("Primary" / "Advanced" / "Per-type"). Gives dense pages a
- * scannable rhythm without changing any control. Renders an uppercase
- * eyebrow with a hairline rule.
- */
-export function GroupLabel({ children }: { children: ReactNode }) {
-  return (
-    <div className="flex items-center gap-3 pt-1">
-      <span className="text-[11px] font-semibold uppercase tracking-[0.1em] text-ink-soft">{children}</span>
-      <span className="h-px flex-1 bg-[var(--border-1)]" />
     </div>
   );
 }
@@ -237,6 +222,7 @@ export function SectionCard({
   action,
   children,
   tone = 'default',
+  tint,
 }: {
   icon: ReactNode;
   title: ReactNode;
@@ -245,24 +231,26 @@ export function SectionCard({
   action?: ReactNode;
   children?: ReactNode;
   tone?: 'default' | 'danger';
+  /** Optional hex/CSS-var icon tint (defaults to the neutral gray treatment). */
+  tint?: string;
 }) {
   const danger = tone === 'danger';
   return (
     <div className={cn(
       'p-4',
       danger
-        ? 'rounded-2xl border border-[rgba(255,91,110,0.3)] bg-[var(--conf-low-bg)]'
+        ? 'rounded-2xl border border-[var(--conf-low-32)] bg-error-secondary'
         : SETTINGS_CARD,
     )}>
       <div className={cn(
         'flex items-start gap-3',
         children != null && 'border-b pb-3.5',
-        danger ? 'border-[rgba(255,91,110,0.2)]' : SETTINGS_DIVIDER,
+        danger ? 'border-[var(--conf-low-24)]' : SETTINGS_DIVIDER,
       )}>
-        <FeaturedIcon size="md" color={danger ? 'error' : 'gray'} icon={icon} />
+        <FeaturedIcon size="md" color={danger ? 'error' : tint ? undefined : 'gray'} tint={danger ? undefined : tint} icon={icon} />
         <div className="min-w-0 flex-1">
-          <div className={cn('text-[15px] font-semibold', danger ? 'text-conf-low' : 'text-ink')}>{title}</div>
-          {desc ? <div className="mt-1 text-[12.5px] leading-relaxed text-ink-muted">{desc}</div> : null}
+          <div className={cn('text-[15px] font-semibold', danger ? 'text-error-primary' : 'text-primary')}>{title}</div>
+          {desc ? <div className="mt-1 text-[12.5px] leading-relaxed text-secondary">{desc}</div> : null}
         </div>
         {action}
         {headerExtra}
@@ -292,7 +280,7 @@ function nodeText(node: ReactNode): string {
   return '';
 }
 
-export function SettingRow({ label, desc, children, layout = 'inline', disabled = false, control }: {
+export function SettingRow({ label, desc, children, layout = 'inline', disabled = false, control, settingKeys }: {
   label: ReactNode;
   desc?: ReactNode;
   children?: ReactNode;
@@ -300,25 +288,35 @@ export function SettingRow({ label, desc, children, layout = 'inline', disabled 
   control?: ReactNode;
   layout?: 'inline' | 'stacked';
   disabled?: boolean;
+  /** Settings key(s) this row's control owns (dotted, e.g. `rename.mode`).
+   *  Stamped as `data-setting-keys` so the per-section filter can force the row
+   *  visible while it's dirty — an unsaved control must never be hidden by a
+   *  narrower query, or Save would persist a change the user can no longer see.
+   *  Also lets the unsaved-changes bar name what's pending. */
+  settingKeys?: string | string[];
 }) {
   const node = control ?? children;
   // Stamp searchable text so SettingsFilter can scope-highlight this row. The
   // attribute is inert when no filter is active.
   const search = `${nodeText(label)} ${nodeText(desc)}`.toLowerCase().trim();
+  // Space-joined owned keys (dotted ids never contain spaces) read back via
+  // `dataset.settingKeys`; the plain label feeds the save bar's pending list.
+  const keys = (Array.isArray(settingKeys) ? settingKeys : settingKeys ? [settingKeys] : []).join(' ');
+  const labelText = nodeText(label).trim();
   if (layout === 'stacked') {
     return (
-      <div className={cn('setting-row', disabled && 'opacity-50')} data-search={search}>
-        <div className="text-[13.5px] font-medium text-ink">{label}</div>
-        {desc ? <div className="mt-0.5 text-[12.5px] leading-relaxed text-ink-muted">{desc}</div> : null}
+      <div className={cn('setting-row', disabled && 'opacity-50')} data-search={search} data-setting-keys={keys || undefined} data-setting-label={keys ? labelText : undefined}>
+        <div className="text-[13.5px] font-medium text-primary">{label}</div>
+        {desc ? <div className="mt-0.5 text-[12.5px] leading-relaxed text-secondary">{desc}</div> : null}
         <div className="mt-2.5">{node}</div>
       </div>
     );
   }
   return (
-    <div className={cn('setting-row flex items-start justify-between gap-4', disabled && 'opacity-50')} data-search={search}>
+    <div className={cn('setting-row flex items-start justify-between gap-4', disabled && 'opacity-50')} data-search={search} data-setting-keys={keys || undefined} data-setting-label={keys ? labelText : undefined}>
       <div className="min-w-0">
-        <div className="text-[13.5px] font-medium text-ink">{label}</div>
-        {desc ? <div className="mt-0.5 text-[12.5px] leading-relaxed text-ink-muted">{desc}</div> : null}
+        <div className="text-[13.5px] font-medium text-primary">{label}</div>
+        {desc ? <div className="mt-0.5 text-[12.5px] leading-relaxed text-secondary">{desc}</div> : null}
       </div>
       <div className="shrink-0">{node}</div>
     </div>
@@ -345,7 +343,7 @@ export function FieldRow({ label, children, labelWidth = 'w-20' }: {
     // URL/key inputs (a 96px label left ~240px on a 360px screen); switches to
     // the aligned inline row at sm+.
     <label className="flex flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-3">
-      <span className={cn('shrink-0 text-[13px] font-medium text-ink-muted', labelWidth)}>{label}</span>
+      <span className={cn('shrink-0 text-[13px] font-medium text-secondary', labelWidth)}>{label}</span>
       {children}
     </label>
   );
@@ -389,7 +387,7 @@ export function SliderField({
 }) {
   return (
     <div className={cn('flex items-center gap-3', disabled && 'opacity-50')}>
-      <span className="inline-flex w-20 shrink-0 items-center gap-2 text-[13px] font-medium text-ink">
+      <span className="inline-flex w-20 shrink-0 items-center gap-2 text-[13px] font-medium text-primary">
         {dot ? <span className="size-2 rounded-full" style={{ background: dot }} /> : null}
         {label}
       </span>
@@ -433,7 +431,7 @@ export function NumberField({ value, min, max, step = 1, onChange, className, su
       max={max}
       step={step}
       value={value}
-      trailing={suffix ? <span className="shrink-0 select-none text-[12px] font-medium text-ink-soft">{suffix}</span> : undefined}
+      trailing={suffix ? <span className="shrink-0 select-none text-[12px] font-medium text-tertiary">{suffix}</span> : undefined}
       onChange={e => {
         const n = Number(e.target.value);
         if (!Number.isFinite(n)) return;
@@ -484,10 +482,10 @@ export function ProviderField({ kind = 'text', label, value, placeholder, option
 
   const labelBlock = (
     <div className={disabled ? 'opacity-60' : undefined}>
-      <div className="text-[13px] font-medium text-ink">{label}</div>
-      {desc ? <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-soft">{desc}</div> : null}
+      <div className="text-[13px] font-medium text-primary">{label}</div>
+      {desc ? <div className="mt-0.5 text-[11.5px] leading-relaxed text-tertiary">{desc}</div> : null}
       {disabled && disabledReason ? (
-        <div className="mt-0.5 text-[11px] leading-relaxed text-conf-mid">{disabledReason}</div>
+        <div className="mt-0.5 text-[11px] leading-relaxed text-warning-primary">{disabledReason}</div>
       ) : null}
     </div>
   );
@@ -524,12 +522,22 @@ export function ProviderField({ kind = 'text', label, value, placeholder, option
       <div className="mb-1.5">{labelBlock}</div>
       <Input
         mono={mono}
+        editGate
         type={isPassword && !show ? 'password' : 'text'}
         value={text}
         aria-label={label}
         disabled={disabled}
         onChange={e => setText(e.target.value)}
-        onBlur={() => { if (text !== value) onSave?.(text); }}
+        onBlur={() => {
+          if (text === value) return;
+          // Don't clear a configured secret by blurring a blank field. A masked
+          // secret's prop value is '' after a refresh, so an empty blur there is
+          // spurious (mirrors the backend empty-secret guard); a password is never
+          // cleared by blanking. A real value still passes through.
+          if (isPassword && text.trim() === '') return;
+          if (text.trim() === '' && (value ?? '') === '') return;
+          onSave?.(text);
+        }}
         placeholder={placeholder}
         // Off for ALL credential fields (not just passwords) — these API-key
         // `text` inputs were the ones browser autofill silently overwrote.
@@ -540,7 +548,7 @@ export function ProviderField({ kind = 'text', label, value, placeholder, option
             onClick={() => setShow(s => !s)}
             title={show ? 'Hide' : 'Show'}
             aria-label={show ? 'Hide value' : 'Show value'}
-            className="grid size-6 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink [&_svg]:size-[14px]"
+            className="grid size-6 shrink-0 place-items-center rounded-md text-tertiary transition-colors hover:bg-white/[0.07] hover:text-primary [&_svg]:size-[14px]"
           >
             {show ? <IcEyeOff /> : <IcEye />}
           </button>
@@ -624,24 +632,17 @@ const PROVIDER_ICON: Record<string, FC<{ className?: string }>> = {
   film: IcFilm, tv: IcTv, anime: IcAnime, disc: IcDisc, waveform: IcWaveform, caption: IcCaption,
 };
 
-// Provider avatar: tries the official logo at /providers/<slug>.svg and falls
-// back to the tinted media-type icon when that file is missing. Drop brand
-// SVGs into frontend/public/providers/ to light these up.
-function ProviderLogo({ slug, color, icon: Icon }: { slug: string; color: string; icon: FC<{ className?: string }> }) {
-  const [failed, setFailed] = useState(false);
-  if (failed) return <FeaturedIcon size="md" tint={color} icon={<Icon />} />;
-  // `flex` is LOAD-BEARING: a bare inline <span> ignores width/height/overflow,
-  // so the img escaped its 36px box and rendered the raw SVG at ~300px (the
-  // "one-foot icons" bug). A flex box honors size-9 and clips the image.
+// Real provider brand logos now live in frontend/public/providers/. When a
+// provider has one (PROVIDERS[k].logo), the card renders the full-colour logo
+// on a clean white tile (so marks read on the dark UI); otherwise it falls back
+// to the brand-tinted glyph above.
+export function ProviderLogo({ src, size = 'md' }: { src: string; size?: 'sm' | 'md' }) {
   return (
-    <span className="flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white/[0.06]">
-      <img
-        src={`/providers/${slug}.svg`}
-        alt=""
-        draggable={false}
-        onError={() => setFailed(true)}
-        className="size-full rounded-lg object-cover"
-      />
+    <span className={cn(
+      'grid shrink-0 place-items-center overflow-hidden bg-white ring-1 ring-inset ring-black/10',
+      size === 'md' ? 'size-9 rounded-lg' : 'size-7 rounded-md',
+    )}>
+      <img src={src} alt="" aria-hidden loading="lazy" className={cn('object-contain', size === 'md' ? 'size-[26px]' : 'size-[19px]')} />
     </span>
   );
 }
@@ -649,20 +650,13 @@ function ProviderLogo({ slug, color, icon: Icon }: { slug: string; color: string
 export function ProviderCard({ providerKey, fields = [], defaultOpen = false, status = 'connected', warning, onTest, bannedUntil, fallbackChain }: ProviderBlockProps) {
   const [open, setOpen] = useState(defaultOpen);
   const [testing, setTesting] = useState(false);
-  // One-shot success pulse after a verified test. Cleared on a timer so the
-  // celebration plays once and the card settles back to rest.
-  const [celebrate, setCelebrate] = useState(false);
-  // "Last tested" feel — remember the moment of a verified test so the tile
-  // reads as alive. Local + transient (resets on navigation), matching the
-  // Integrations section's own test-state lifetime.
+  // "Last tested" feel — remember a verified test so the status badge reads
+  // "Verified". Local + transient (resets on navigation).
   const [testedAt, setTestedAt] = useState<number | null>(null);
-  const celebrateTimer = useRef<number | undefined>(undefined);
-  useEffect(() => () => window.clearTimeout(celebrateTimer.current), []);
   const p = PROVIDERS[providerKey];
   if (!p) return null;
 
   const Icon = PROVIDER_ICON[p.icon] ?? IcFilm;
-  const slug = providerKey.toLowerCase();
 
   // F-06: clearer labels for the discovered states. "Coming soon"
   // distinguishes "we haven't built this yet" from "you need a key";
@@ -673,13 +667,12 @@ export function ProviderCard({ providerKey, fields = [], defaultOpen = false, st
     status === 'error' ? 'Error' :
     status === 'coming-soon' ? 'Coming soon' :
     status === 'not-configured' ? 'Not configured' : 'Disabled';
-  // Map the provider state onto the shared StatusPill tones (dot + glow).
-  const pillTone: StatusTone =
-    status === 'connected' ? 'connected' :
+  // Provider state → UUI BadgeWithDot colour (the dot carries the meaning).
+  const badgeColor: 'success' | 'warning' | 'error' | 'gray' =
+    status === 'connected' ? 'success' :
     status === 'warning' ? 'warning' :
-    status === 'error' ? 'error' : 'neutral';
-  // A configured/connected tile reads visually distinct from an empty one —
-  // a faint accent wash + brighter border so "wired up" is obvious at a glance.
+    status === 'error' ? 'error' : 'gray';
+  // A connected card reads "wired up" at a glance via a faint green ring.
   const live = status === 'connected';
 
   const handleTest = async () => {
@@ -687,51 +680,37 @@ export function ProviderCard({ providerKey, fields = [], defaultOpen = false, st
     setTesting(true);
     try {
       const ok = await onTest();
-      if (ok === true) {
-        setCelebrate(true);
-        setTestedAt(Date.now());
-        window.clearTimeout(celebrateTimer.current);
-        celebrateTimer.current = window.setTimeout(() => setCelebrate(false), 1200);
-      }
+      if (ok === true) setTestedAt(Date.now());
     } finally { setTesting(false); }
   };
 
   return (
-    <div className={cn('provider-card overflow-hidden transition-colors', live && 'provider-card-live', celebrate && 'provider-card-ok', SETTINGS_CARD)}>
-      {/* Header is a flex row, not a single <button>, so the Test button can
-          live here without nesting interactive elements. Two toggle regions
-          (the main info area + the status/chevron) flank the Test action. */}
-      <div className="flex w-full items-center gap-3 px-4 py-3.5">
+    <div
+      className="overflow-hidden rounded-xl bg-secondary shadow-xs transition-shadow"
+      // Inset 1px ring as the border — neutral by default, faint green when the
+      // provider is connected. Inline (not a Tailwind ring class) so the
+      // color-mix tint stays valid CSS.
+      style={{ boxShadow: live
+        ? 'inset 0 0 0 1px color-mix(in srgb, var(--conf-high) 40%, transparent)'
+        : 'inset 0 0 0 1px var(--color-border-secondary)' }}
+    >
+      {/* Header = two toggle regions (the main info area + the status/chevron),
+          either of which expands/collapses the card. The Test action lives in
+          the expanded body footer, not here, so the header stays clean. */}
+      <div className="flex w-full items-center gap-3 p-4">
         <button type="button" className="flex min-w-0 flex-1 items-center gap-3 text-left" onClick={() => setOpen(o => !o)}>
-          <span className="relative shrink-0">
-            <ProviderLogo slug={slug} color={p.color} icon={Icon} />
-            {/* Corner status dot on the monogram — breathes when connected. */}
-            <span
-              className={cn(
-                'absolute -bottom-0.5 -right-0.5 size-2.5 rounded-full border-2 border-[var(--bg)]',
-                live && 'settings-dot-live',
-              )}
-              style={{ background: STATUS_TONE[pillTone].dot, boxShadow: live ? `0 0 6px ${STATUS_TONE[pillTone].dot}` : undefined }}
-              aria-hidden="true"
-            />
-          </span>
+          {p.logo ? <ProviderLogo src={p.logo} size="md" /> : <FeaturedIcon size="md" tint={p.color} icon={<Icon />} />}
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="text-[14px] font-semibold text-ink">{p.name}</span>
+              <span className="text-sm font-semibold text-primary">{p.name}</span>
               {p.for.map(t => <Badge key={t}>{t}</Badge>)}
             </div>
-            <div className="mt-0.5 truncate text-[12px] text-ink-muted">{p.desc}</div>
+            <div className="mt-0.5 truncate text-[12px] text-tertiary">{p.desc}</div>
           </div>
         </button>
-        {/* Only when expanded — keeps collapsed cards clean. */}
-        {open && onTest ? (
-          <Button color="secondary" size="sm" iconLeading={IcRefresh} isLoading={testing} showTextWhileLoading onClick={handleTest}>
-            Test connection
-          </Button>
-        ) : null}
-        <button type="button" className="flex shrink-0 items-center gap-3" onClick={() => setOpen(o => !o)} aria-label={open ? 'Collapse' : 'Expand'}>
-          <StatusPill tone={pillTone} breathe={live}>{testedAt ? 'Verified' : statusLabel}</StatusPill>
-          <IcChevDown className={cn('size-4 shrink-0 text-ink-soft transition-transform duration-200', open && 'rotate-180')} />
+        <button type="button" className="flex shrink-0 items-center gap-2.5" onClick={() => setOpen(o => !o)} aria-label={open ? 'Collapse' : 'Expand'}>
+          <BadgeWithDot color={badgeColor} pulse={live}>{testedAt ? 'Verified' : statusLabel}</BadgeWithDot>
+          <IcChevDown className={cn('size-4 shrink-0 text-tertiary transition-transform duration-200', open && 'rotate-180')} />
         </button>
       </div>
 
@@ -740,15 +719,15 @@ export function ProviderCard({ providerKey, fields = [], defaultOpen = false, st
           card. The body always mounts but is clipped when collapsed. */}
       <div className={cn('grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:transition-none', open ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]')}>
         <div className="overflow-hidden">
-            <div className={cn('flex flex-col gap-3.5 border-t px-4 py-4', SETTINGS_DIVIDER)}>
+            <div className="flex flex-col gap-3.5 border-t border-secondary px-4 py-4">
               {/* Ban countdown — only renders while bannedUntil is set + future. */}
               {bannedUntil ? <BanCountdownBanner unixSec={bannedUntil} fallbackChain={fallbackChain} /> : null}
               {warning ? <Alert color="warning" icon={IcAlertTri}>{warning}</Alert> : null}
               {fallbackChain && fallbackChain.length > 0 ? (
                 <Alert color="info">
-                  <strong className="text-ink-muted">Fallback chain:</strong> if unavailable, Kira tries{' '}
+                  <strong className="text-secondary">Fallback chain:</strong> if unavailable, Kira tries{' '}
                   {fallbackChain.map((k, i) => (
-                    <span key={k}>{i > 0 ? ' → ' : ''}<span className="text-ink-muted">{k.toUpperCase()}</span></span>
+                    <span key={k}>{i > 0 ? ' → ' : ''}<span className="text-secondary">{k.toUpperCase()}</span></span>
                   ))}{' '}in order.
                 </Alert>
               ) : null}
@@ -756,6 +735,15 @@ export function ProviderCard({ providerKey, fields = [], defaultOpen = false, st
               {fields.length > 0 ? (
                 <div className="flex flex-col gap-3.5">
                   {fields.map((f, i) => <ProviderField key={i} {...f} />)}
+                </div>
+              ) : null}
+
+              {/* Test the connection — a clean footer action, right-aligned. */}
+              {onTest ? (
+                <div className="flex justify-end pt-0.5">
+                  <Button color="secondary" size="sm" iconLeading={IcRefresh} isLoading={testing} showTextWhileLoading onClick={handleTest}>
+                    Test
+                  </Button>
                 </div>
               ) : null}
             </div>
@@ -1290,25 +1278,37 @@ export function NamingTemplateTabs({ profile, savedCustom, onSaveCustom }: {
 
   return (
     <div>
-      <div className="provider-tabs" style={{ marginBottom: 16 }}>
-        {tabs.map(t => (
-          <button key={t.key} className={`provider-tab ${tab === t.key ? 'on' : ''}`} onClick={() => setTab(t.key)}>
-            <span style={{ display: 'inline-flex', alignItems: 'center', width: 13, height: 13, color: tab === t.key ? TYPE_COLOR[t.key] : 'var(--ink-3)' }}>
-              {t.icon}
-            </span>
-            {t.label}
-          </button>
-        ))}
+      {/* Media-type tabs — OWN class (.naming-mtab), never the shared
+          .provider-tab (ManualSearch depends on that). The active tab tints to
+          its media colour so the whole studio "wears" the type you're editing. */}
+      <div className="naming-mtabs">
+        {tabs.map(t => {
+          const c = TYPE_COLOR[t.key];
+          const on = tab === t.key;
+          return (
+            <button
+              key={t.key}
+              className={`naming-mtab ${on ? 'on' : ''}`}
+              onClick={() => setTab(t.key)}
+              style={on ? { color: c, borderColor: `color-mix(in srgb, ${c} 40%, transparent)`, background: `color-mix(in srgb, ${c} 10%, transparent)`, boxShadow: `inset 0 -2px 0 0 ${c}` } : undefined}
+            >
+              <span style={{ display: 'inline-flex', alignItems: 'center', width: 13, height: 13, color: on ? c : 'var(--ink-3)' }}>
+                {t.icon}
+              </span>
+              {t.label}
+            </button>
+          );
+        })}
       </div>
 
-      <div className="naming-editor">
+      <div className="naming-editor" style={{ ['--mtab' as string]: TYPE_COLOR[tab] }}>
         {/* ── LEFT: template + token palette ───────────────── */}
         <div className="naming-pane">
           <div className="naming-pane-head">
-            <span>{tabs.find(t => t.key === tab)!.label} template</span>
+            <span>Template · {tabs.find(t => t.key === tab)!.label}</span>
             {!editable
               ? <span className="naming-lock">{profile} preset · pick Custom to edit</span>
-              : <span className="naming-lock" style={{ color: 'var(--accent)' }}>editable · autosaved</span>}
+              : <BadgeWithDot color="success" pulse>editable · autosaved</BadgeWithDot>}
           </div>
           <TemplateChipEditor
             key={tab}
@@ -1364,7 +1364,7 @@ export function NamingTemplateTabs({ profile, savedCustom, onSaveCustom }: {
           </div>
 
           <div className="naming-pane-head" style={{ marginTop: 18 }}>
-            <span>Tokens for {tab}</span>
+            <span>Tokens · {tab}</span>
             {editable ? <span className="naming-lock">click or drag to insert</span> : null}
           </div>
           <div className="naming-tokens">
@@ -1396,7 +1396,32 @@ export function NamingTemplateTabs({ profile, savedCustom, onSaveCustom }: {
         {/* ── RIGHT: live preview against the real library ─── */}
         <div className="naming-pane naming-pane-preview">
           <div className="naming-pane-head">
-            <span>Live preview · your library</span>
+            <span style={{ color: 'var(--mtab)' }}>Live preview · your library</span>
+          </div>
+          {/* OUTPUT TRACK BAR — the page's "wow": one track per media type, only
+              the active one lit full-colour. The structural twin of Matching's
+              confidence tier bar. Reads ONLY `tab` + TYPE_COLOR, so it never
+              touches the editor or the live-preview internals. */}
+          <div className="mb-3.5">
+            <div className="flex h-2.5 w-full gap-1.5">
+              {tabs.map(t => {
+                const c = TYPE_COLOR[t.key];
+                const on = t.key === tab;
+                return <span key={t.key} className="flex-1 rounded-full transition-all" style={{ background: on ? c : `color-mix(in srgb, ${c} 22%, transparent)`, boxShadow: on ? `0 0 0 3px color-mix(in srgb, ${c} 22%, transparent)` : 'none' }} />;
+              })}
+            </div>
+            <div className="mt-2.5 flex flex-wrap justify-between gap-x-4 gap-y-1 text-[11.5px] text-tertiary">
+              {tabs.map(t => {
+                const c = TYPE_COLOR[t.key];
+                const on = t.key === tab;
+                return (
+                  <span key={t.key} className="inline-flex items-center gap-1.5" style={on ? { color: c, fontWeight: 600 } : undefined}>
+                    <span className="size-1.5 rounded-full" style={{ background: c }} />
+                    {t.label}
+                  </span>
+                );
+              })}
+            </div>
           </div>
           <LiveTemplatePreview tab={tab} template={tpl} />
         </div>

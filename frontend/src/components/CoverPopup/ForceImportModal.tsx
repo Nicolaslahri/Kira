@@ -61,7 +61,7 @@ export function ForceImportConfirmModal({
       onClick={onCancel}
       style={{
         position: 'fixed', inset: 0,
-        background: 'rgba(7, 6, 12, 0.78)',
+        background: 'var(--panel-75)',
         backdropFilter: 'blur(6px)',
         WebkitBackdropFilter: 'blur(6px)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -71,7 +71,7 @@ export function ForceImportConfirmModal({
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
-          background: '#14121b',
+          background: 'var(--panel)',
           color: 'var(--ink)',
           borderRadius: 'var(--r-lg)',
           padding: 24,
@@ -81,14 +81,14 @@ export function ForceImportConfirmModal({
           overflow: 'hidden',
           display: 'flex', flexDirection: 'column',
           border: '1px solid var(--line-strong)',
-          boxShadow: '0 24px 60px rgba(0, 0, 0, 0.6)',
+          boxShadow: '0 24px 60px var(--scrim-60)',
         }}
       >
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14, marginBottom: 16 }}>
           <span style={{
             display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
             width: 40, height: 40, borderRadius: 8,
-            background: 'rgba(255, 201, 74, 0.15)',
+            background: 'var(--conf-mid-16)',
             color: 'var(--conf-mid)',
             flexShrink: 0,
           }}>
@@ -123,7 +123,7 @@ export function ForceImportConfirmModal({
                   ? 'var(--conf-low-bg)'
                   : 'var(--accent-soft)',
                 border: '1px solid ' + (c.rejection_reasons.length > 0
-                  ? 'rgba(255, 91, 110, 0.30)'
+                  ? 'var(--conf-low-32)'
                   : 'var(--accent-line)'),
               }}
             >
@@ -256,8 +256,8 @@ export function ForceImportConfirmModal({
             disabled={confirming || importableCount === 0}
             style={{
               padding: '9px 18px', borderRadius: 8,
-              background: importableCount > 0 ? 'var(--conf-high)' : 'rgba(40, 217, 160, 0.25)',
-              color: importableCount > 0 ? '#022b1c' : 'var(--ink-3)',
+              background: importableCount > 0 ? 'var(--conf-high)' : 'var(--accent-24)',
+              color: importableCount > 0 ? 'var(--on-accent-deep)' : 'var(--ink-3)',
               border: 'none',
               fontSize: 13, fontWeight: 600,
               cursor: confirming

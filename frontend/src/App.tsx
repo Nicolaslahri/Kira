@@ -6,7 +6,8 @@ import { apiToMediaFile } from './lib/adapters';
 import { cacheGet, cacheSet } from './lib/cache';
 import { setConfBands, getConfBands } from './lib/confBands';
 import { ScanProgress } from './components/ScanProgress';
-import { Sidebar, Topbar, Toast } from './components/ui';
+import { Sidebar, Topbar } from './components/ui';
+import { notify, NotificationToaster } from './components/base/notifications/notification';
 import { useActivity, ActivityPill } from './components/ActivityIndicator';
 import { SubtitleBrowseModal } from './components/SubtitleBrowseModal';
 import { ManualSearchModal, RenamePreviewModal, KeyboardShortcutsModal, FileDetailsModal } from './components/modals';
@@ -269,25 +270,12 @@ export default function App() {
   // write bumps this; each poll snapshots it before fetching and drops its
   // replace if a user write bumped in the meantime.
   const filesGenRef = useRef(0);
-  const bumpFilesGen = useCallback(() => { filesGenRef.current += 1; }, []);
+  const bumpFilesGen = useCallback(() => { filesGenRef.current += 1; return filesGenRef.current; }, []);
 
-  const [toasts, setToasts] = useState<ToastData[]>([]);
-  const pushToast = useCallback((t: Omit<ToastData, 'id'>) => {
-    const id = Math.random().toString(36).slice(2);
-    setToasts(xs => [...xs, { id, ...t }]);
-    // Duration scales with content length: short success toasts vanish
-    // quickly; long error messages (e.g. file paths or stack traces)
-    // stick around long enough to actually read. Errors get a 50% bonus.
-    const contentLen = (t.title?.length ?? 0) + (t.sub?.length ?? 0);
-    const baseMs = Math.max(4000, Math.min(15000, contentLen * 60));
-    const ms = t.kind === 'error' ? Math.round(baseMs * 1.5) : baseMs;
-    setTimeout(() => setToasts(xs => xs.filter(x => x.id !== id)), ms);
-  }, []);
-  // Manual dismiss — passed to Toast components so users can clear long
-  // error messages without waiting.
-  const dismissToast = useCallback((id: string) => {
-    setToasts(xs => xs.filter(x => x.id !== id));
-  }, []);
+  // Toasts are now Untitled UI notifications on Sonner. pushToast keeps its
+  // old signature so every call site is unchanged; the content-length duration
+  // scaling (errors linger 50% longer) lives in notify().
+  const pushToast = useCallback((t: Omit<ToastData, 'id'>) => { notify(t); }, []);
 
   // Background-activity poll (boot auto-heal, subtitle fetches, ffmpeg
   // install…) + the one-time "recovered after restart" toast. Always mounted
@@ -346,18 +334,27 @@ export default function App() {
   const SCAN_ROOT = scanRoot;
 
   const refreshFiles = useCallback(async () => {
+    // Claim a new generation BEFORE the fetch; commit the full-list replace only
+    // if no newer reload/mutation bumped the gen while we were in flight. Without
+    // this, two overlapping full-list refetches (e.g. a debounced rescan racing a
+    // rename's refetch) let the older, slower-resolving one clobber the newer
+    // state — the "my change reverted a second later" bug. Targeted single-file
+    // patches transform current state synchronously and don't need this.
+    const myGen = bumpFilesGen();
     try {
       const rows = await api.listAllFiles();
       const mapped = rows.map(apiToMediaFile);
-      bumpFilesGen(); setState(s => ({ ...s, files: mapped }));
-      cacheSet('files', mapped);
+      if (myGen === filesGenRef.current) {
+        setState(s => ({ ...s, files: mapped }));
+        cacheSet('files', mapped);
+      }
       return mapped;  // let callers compare counts (import-landed detection)
     } catch (err) {
       // Connectivity is tracked centrally in the request layer; just log.
       console.warn('Failed to refresh files:', err);
       return null;
     }
-  }, []);
+  }, [bumpFilesGen]);
 
   // Poll a scan to completion, animating the progress banner + live file list.
   // Extracted so BOTH a freshly-started scan (runScan) and a re-attached
@@ -906,8 +903,7 @@ export default function App() {
         const effProfile = opts?.profile ?? savedProfile;
         const effOp = opts?.op ?? savedOp;
         const res = await api.rename({ file_ids: backendIds, profile: effProfile, op: effOp });
-        const rows = await api.listAllFiles();
-        bumpFilesGen(); setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
+        await refreshFiles();   // guarded full-list reload (gen-checked)
         if (res.failed === 0) {
           // Tier 1.2: the backend tags videos whose sidecar files were
           // moved along with the video via a "[SIDECARS] …" prefix on
@@ -1068,7 +1064,7 @@ export default function App() {
       }
       if (e.key === '/') {
         e.preventDefault();
-        (document.querySelector('.topbar .search input') as HTMLInputElement)?.focus();
+        (document.querySelector('.sidebar-search input') as HTMLInputElement)?.focus();
         return;
       }
       if (e.key === 'g') {
@@ -1196,8 +1192,7 @@ export default function App() {
           overview: selection.overview ?? null,
           media_type: selection.mediaType ?? file.mediaType,
         });
-        const rows = await api.listAllFiles();
-        bumpFilesGen(); setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
+        await refreshFiles();   // guarded full-list reload (gen-checked)
         pushToast({
           title: `Pinned ${res.updated} file${res.updated === 1 ? '' : 's'} to ${selection.title}`,
           sub: 'Future rescans will leave these alone.',
@@ -1262,8 +1257,7 @@ export default function App() {
       // Refetch all files so the new matches propagate everywhere
       // (Needs matching section recomputes, cards re-render with the
       // matched cover, the no_match counts drop).
-      const rows = await api.listAllFiles();
-      bumpFilesGen(); setState(s => ({ ...s, files: rows.map(apiToMediaFile) }));
+      await refreshFiles();   // guarded full-list reload (gen-checked)
       pushToast({
         title: `Pinned ${res.updated} file${res.updated === 1 ? '' : 's'} to ${selection.title}`,
         sub: 'Future rescans will leave these alone.',
@@ -1304,7 +1298,7 @@ export default function App() {
         }} />
       )}
       <div className="relative z-[1] min-h-screen lg:grid lg:grid-cols-[var(--side-w)_1fr]">
-        <Sidebar active={active} setActive={setActive} settingsSection={settingsSection} setSettingsSection={setSettingsSection} pendingCount={pendingCount} scanRunning={state.scanRunning} backendOk={backendOk} mobileOpen={mobileNavOpen} onClose={() => setMobileNavOpen(false)} />
+        <Sidebar active={active} setActive={setActive} settingsSection={settingsSection} setSettingsSection={setSettingsSection} pendingCount={pendingCount} scanRunning={state.scanRunning} backendOk={backendOk} mobileOpen={mobileNavOpen} onClose={() => setMobileNavOpen(false)} searchQuery={searchQuery} onSearchChange={handleSearchChange} onScan={runScan} onShortcuts={() => openModal('shortcuts')} />
         {/* Mobile drawer backdrop — tap to dismiss (hidden on lg+) */}
         {mobileNavOpen ? (
           <div className="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm lg:hidden" onClick={() => setMobileNavOpen(false)} />
@@ -1312,11 +1306,6 @@ export default function App() {
         <main className="main relative min-w-0">
           <Topbar
             active={active}
-            onScan={runScan}
-            scanRunning={state.scanRunning}
-            onShortcuts={() => openModal('shortcuts')}
-            searchQuery={searchQuery}
-            onSearchChange={handleSearchChange}
             onMenuClick={() => setMobileNavOpen(true)}
           />
 
@@ -1422,21 +1411,27 @@ export default function App() {
         />
       )}
 
-      <Toast
-        toasts={toasts}
-        onDismiss={dismissToast}
-        leading={state.scanRunning ? (
-          <ScanProgress
-            phase={state.scanPhase}
-            progress={state.scanProgress}
-            found={state.scanFound}
-            message={state.scanMessage}
-            tech={state.scanTech}
-          />
-        ) : activeJob ? (
-          <ActivityPill job={activeJob} onDismiss={dismissJob} />
-        ) : null}
-      />
+      {/* Persistent activity indicator (scan progress / background job) — fixed
+          in the bottom-right corner; the Sonner toast stack lifts above it. */}
+      {(state.scanRunning || activeJob) ? (
+        <div className="fixed bottom-6 right-6 z-[9998]">
+          {state.scanRunning ? (
+            <ScanProgress
+              phase={state.scanPhase}
+              progress={state.scanProgress}
+              found={state.scanFound}
+              message={state.scanMessage}
+              tech={state.scanTech}
+            />
+          ) : activeJob ? (
+            <ActivityPill job={activeJob} onDismiss={dismissJob} />
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* Untitled UI notifications (Sonner). Offset lifts the stack above the
+          activity pill when one is showing so a toast never covers it. */}
+      <NotificationToaster offset={(state.scanRunning || activeJob) ? 112 : 24} />
 
       {/* Manual subtitle browse-and-pick — opens on any "No EN" chip click. */}
       <SubtitleBrowseModal pushToast={pushToast} />

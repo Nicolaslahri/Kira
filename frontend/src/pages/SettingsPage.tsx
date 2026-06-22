@@ -1,17 +1,18 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { AppState, ToastData } from '../lib/types';
 import type { SettingsSection } from '../App';
-import { IcTrash, IcCheck, IcRefresh, IcTag, IcArrowRight } from '../lib/icons';
+import { IcTrash, IcCheck, IcRefresh, IcTag, IcArrowRight, IcAlertTri, IcFilm, IcTv, IcAnime, IcMusic, IcSparkles } from '../lib/icons';
 import { SegmentedControl } from '../components/base/segmented/segmented-control';
-import { ProviderCard, NamingTemplateTabs, SETTINGS_CARD, SETTINGS_NESTED, SETTINGS_DIVIDER, SettingsLayout, SectionCard, SettingRow, NestedBox, SliderField, SectionHeader, SettingsFilter, StatusPill } from '../components/settings-blocks';
+import { ProviderCard, ProviderLogo, NamingTemplateTabs, SETTINGS_NESTED, SETTINGS_DIVIDER, SettingsLayout, SectionCard, SettingRow, NestedBox, SliderField, SectionHeader, SettingsFilter, StatusPill } from '../components/settings-blocks';
 import { Button } from '../components/base/buttons/button';
 import { FeaturedIcon } from '../components/base/featured-icons/featured-icon';
+import { BadgeWithDot } from '../components/base/badges/badges';
 import { Toggle } from '../components/base/toggle/toggle';
 import { Input } from '../components/base/input/input';
 import { IcShieldCheck, IcChevDown, IcLink, IcSearch, IcHistory, IcUndo, IcFolder, IcSpin, IcCaption } from '../lib/icons';
 import { Select } from '../components/ui';
 import { api, type ApiProvider } from '../lib/api';
-import { strSetting } from './settings/helpers';
+import { strSetting, isValidHttpUrl, humanizeSettingKey } from './settings/helpers';
 import { AdvancedSection } from './settings/AdvancedSection';
 import { PathsSection } from './settings/PathsSection';
 import { SubtitlesCard } from './settings/SubtitlesCard';
@@ -413,6 +414,13 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
     () => Object.keys(rawSettings).filter(k => !settingsEqual(rawSettings[k], baseline[k])),
     [rawSettings, baseline],
   );
+  // Block Save while any integration URL is malformed. The field shows a red
+  // ring, but Save previously only checked `dirty`, so a bad URL (missing
+  // scheme, etc.) persisted and failed later at scan/refresh with a vaguer error.
+  const invalidUrls = useMemo(() => {
+    const URL_KEYS = ['integrations.sonarr.url', 'integrations.plex.url', 'integrations.jellyfin.url', 'notifications.webhook_url'];
+    return URL_KEYS.filter(k => !isValidHttpUrl(strSetting(rawSettings, k)));
+  }, [rawSettings]);
   const dirty = dirtyKeys.length > 0;
 
   // Bumped on discard() to force-remount the subtrees that hold seed-once LOCAL
@@ -488,20 +496,65 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
   // query prop through every sub-page's SettingsLayout, and entirely
   // presentational. Cards with zero visible rows collapse via CSS.
   const sectionRef = useRef<HTMLDivElement>(null);
+  // Stable primitive snapshot of the dirty-key SET (not the per-keystroke draft
+  // values). Typing again into an already-dirty field leaves this unchanged, so
+  // the DOM pass below still doesn't re-run on every keystroke — only when a key
+  // actually flips dirty↔clean (or the query / section changes).
+  const dirtyStamp = dirtyKeys.join('|');
   useEffect(() => {
     const root = sectionRef.current;
     if (!root) return;
+    // Keys with unsaved edits: a row owning any of these is force-shown even
+    // when it doesn't match the query, so Save can never persist a change the
+    // filter has hidden from view.
+    const dirtySet = new Set(dirtyStamp ? dirtyStamp.split('|') : []);
     const rows = root.querySelectorAll<HTMLElement>('.setting-row[data-search]');
     rows.forEach(row => {
       const hay = row.dataset.search ?? '';
-      const hit = !filterQ || hay.includes(filterQ);
-      row.classList.toggle('setting-row-hidden', !hit);
-      row.classList.toggle('setting-row-hit', !!filterQ && hit);
+      const keys = (row.dataset.settingKeys ?? '').split(' ').filter(Boolean);
+      const isDirty = keys.some(k => dirtySet.has(k));
+      const matches = !filterQ || hay.includes(filterQ);
+      row.classList.toggle('setting-row-hidden', !matches && !isDirty);
+      row.classList.toggle('setting-row-hit', !!filterQ && matches);
+      // Shown ONLY because it's dirty (doesn't match the active query): flag it
+      // so the user sees WHY this otherwise-filtered-out row is still present.
+      row.classList.toggle('setting-row-dirty', !!filterQ && !matches && isDirty);
     });
-    // Deps are ONLY the query + section: each row re-stamps its own `data-search`
-    // on its own re-render, so we don't need to re-run this DOM pass on every
-    // `rawSettings`/`providers` change (i.e. on every keystroke in any field).
-  }, [filterQ, section]);
+    // Deps: query + section (+ remount nonce) as before, plus a STABLE stamp of
+    // the dirty-key set so a control becoming dirty re-runs the pass to reveal
+    // it — without re-running on every keystroke into an already-dirty field.
+  }, [filterQ, section, discardNonce, dirtyStamp]);
+
+  // Harvest each rendered row's key → human label as the user visits sections,
+  // so the unsaved-changes bar can NAME what's pending — even for edits made in
+  // a section you've since navigated away from. A control must be rendered
+  // before it can be edited, so by the time a key is dirty its label is already
+  // captured here. Accumulates (never forgets) and only re-renders on a change.
+  const [keyLabels, setKeyLabels] = useState<Record<string, string>>({});
+  useEffect(() => {
+    const root = sectionRef.current;
+    if (!root) return;
+    setKeyLabels(prev => {
+      let changed = false;
+      const next = { ...prev };
+      root.querySelectorAll<HTMLElement>('.setting-row[data-setting-keys]').forEach(row => {
+        const label = (row.dataset.settingLabel ?? '').trim();
+        if (!label) return;
+        for (const k of (row.dataset.settingKeys ?? '').split(' ').filter(Boolean)) {
+          if (next[k] !== label) { next[k] = label; changed = true; }
+        }
+      });
+      return changed ? next : prev;
+    });
+  }, [section, discardNonce]);
+
+  // Pending-change labels for the save bar: the harvested label when we have it,
+  // else a humanized fallback from the dotted key (controls that aren't a
+  // SettingRow — sliders, comma-lists — never get harvested).
+  const dirtyLabels = useMemo(
+    () => dirtyKeys.map(k => keyLabels[k] ?? humanizeSettingKey(k)),
+    [dirtyKeys, keyLabels],
+  );
 
   return (
     <div className="page relative">
@@ -516,7 +569,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
             role="status"
             aria-live="polite"
             className={`save-indicator inline-flex shrink-0 items-center gap-2 self-center rounded-full border px-3 py-1.5 text-[12px] font-medium ${
-              saveStatus === 'error' ? 'save-indicator-error border-[rgba(255,91,110,0.4)] text-conf-low'
+              saveStatus === 'error' ? 'save-indicator-error border-[var(--conf-low-32)] text-conf-low'
                 : saveStatus === 'saved' ? 'save-indicator-saved border-accent-line text-accent'
                 : 'border-line text-ink-muted'
             }`}
@@ -534,8 +587,35 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
           active section is already labelled there, so no in-page section
           header is needed. Each section width-constrains its own content via
           SettingsLayout so the forms don't stretch edge-to-edge. */}
-      <div key={section} ref={sectionRef} className={filterQ ? 'settings-filtering' : undefined}>
-          {section === 'connections' && (
+      <div key={`${section}-${discardNonce}`} ref={sectionRef} className={filterQ ? 'settings-filtering' : undefined}>
+          {section === 'connections' && (() => {
+            // Per-media-type identification readiness — derived purely from the
+            // providers health map (no new data/calls). NOTE: deriveProviderStatus
+            // ('anidb') is pinned to 'warning' (rate-limit caveat), so anime reads
+            // providers['anidb'].configured directly; and the hero pill is just
+            // "Kira", never connectedCount (AniDB never counts + music sits unused
+            // in PROVIDER_KEYS, so the count would mislead).
+            const tmdbOk = deriveProviderStatus(providers['tmdb'], 'tmdb') === 'connected';
+            const tvdbOk = deriveProviderStatus(providers['tvdb'], 'tvdb') === 'connected';
+            const anidbOk = providers['anidb']?.configured === true;
+            const idTypes = [
+              { key: 'movie', label: 'Movies', icon: <IcFilm />, color: '#4ec5b3', covered: tmdbOk, via: tmdbOk ? 'TMDB' : null },
+              { key: 'tv', label: 'TV', icon: <IcTv />, color: '#b3e5fc', covered: tvdbOk || tmdbOk, via: tvdbOk ? 'TheTVDB' : tmdbOk ? 'TMDB' : null },
+              { key: 'anime', label: 'Anime', icon: <IcAnime />, color: 'var(--media-anime)', covered: anidbOk || tvdbOk || tmdbOk, via: anidbOk ? 'AniDB' : tvdbOk ? 'TheTVDB' : tmdbOk ? 'TMDB' : null },
+              ...(MUSIC_PROVIDERS_ENABLED ? [{ key: 'music', label: 'Music', icon: <IcMusic />, color: 'var(--media-music)', covered: deriveProviderStatus(providers['musicbrainz'], 'musicbrainz') === 'connected', via: deriveProviderStatus(providers['musicbrainz'], 'musicbrainz') === 'connected' ? 'MusicBrainz' : null }] : []),
+            ];
+            const coveredCount = idTypes.filter(t => t.covered).length;
+            const allCovered = coveredCount === idTypes.length;
+            const enrichmentArtwork = fanartKeySet;
+            const subSourceCount = [osKeySet, subdlKeySet, subsourceKeySet].filter(Boolean).length;
+            const heroSources: { n: string; c: string; i: ReactNode; logo: string | null; on: boolean }[] = [
+              { n: 'TMDB', c: '#90cea1', i: <IcFilm />, logo: '/providers/tmdb.svg', on: tmdbOk },
+              { n: 'TheTVDB', c: '#6ec1ff', i: <IcTv />, logo: '/providers/tvdb.svg', on: tvdbOk },
+              { n: 'AniDB', c: '#c89bff', i: <IcAnime />, logo: '/providers/anidb.svg', on: anidbOk },
+              { n: 'fanart.tv', c: '#ff7575', i: <IcSparkles />, logo: '/providers/fanart.tv.png', on: fanartKeySet },
+              { n: 'Subtitles', c: '#ff9a4d', i: <IcCaption />, logo: null, on: osKeySet || subdlKeySet || subsourceKeySet },
+            ];
+            return (
             <SettingsLayout
               header={(
                 <SectionHeader
@@ -543,13 +623,83 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                   title="Connections"
                   purpose="Metadata sources Kira pulls FROM to identify your media. Each provider is configured independently."
                   status={(
-                    <StatusPill tone={connectedCount > 0 ? 'connected' : 'neutral'} breathe={connectedCount > 0}>
+                    <BadgeWithDot color={connectedCount > 0 ? 'success' : 'gray'} pulse={connectedCount > 0}>
                       {connectedCount} of {PROVIDER_KEYS.length} connected
-                    </StatusPill>
+                    </BadgeWithDot>
                   )}
                 />
               )}
             >
+              <div className="flex flex-col gap-5">
+              {/* ── FLOW HERO — inbound: the metadata sources feed INTO Kira,
+                  the mirror of Integrations' outbound "Kira pushes to your stack". ── */}
+              <div className="overflow-hidden rounded-2xl bg-secondary px-5 py-4 shadow-xs ring-1 ring-inset ring-secondary">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-3">
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    {heroSources.map(s => (
+                      <span key={s.n} title={`${s.n}: ${s.on ? 'connected' : 'not set up'}`} className={s.on ? '' : 'opacity-45 grayscale'}>
+                        {s.logo
+                          ? <ProviderLogo src={s.logo} size="sm" />
+                          : <FeaturedIcon size="sm" icon={s.i} tint={s.c} />}
+                      </span>
+                    ))}
+                  </div>
+                  <div className="hidden h-px min-w-[20px] flex-1 sm:block" style={{ background: 'var(--line-strong)' }} />
+                  <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">feed metadata into</span>
+                  <div className="hidden h-px min-w-[20px] flex-1 sm:block" style={{ background: 'var(--line-strong)' }} />
+                  <div className="flex shrink-0 items-center gap-2 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--accent-deep)' }}>
+                    <span className="text-white [&_svg]:size-[16px]"><IcLink /></span>
+                    <span className="text-[12px] font-semibold uppercase tracking-[0.06em] text-white">Kira</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* ── IDENTIFICATION COVERAGE (the wow) — can Kira identify each kind
+                  of media I own? Honest about fallbacks; all derived from state. ── */}
+              <section className="rounded-2xl bg-secondary p-5 shadow-xs ring-1 ring-inset ring-secondary">
+                <div className="flex items-center gap-2.5">
+                  <FeaturedIcon size="md" icon={<IcShieldCheck />} tint={allCovered ? 'var(--conf-high)' : 'var(--conf-mid)'} />
+                  <div>
+                    <div className="text-[14px] font-semibold text-primary">Identification coverage</div>
+                    <div className="mt-0.5 text-[12px] text-tertiary">Which kinds of media Kira can identify with the sources you've connected — fallbacks counted.</div>
+                  </div>
+                </div>
+                <div className={`mt-4 grid grid-cols-1 gap-2.5 ${MUSIC_PROVIDERS_ENABLED ? 'sm:grid-cols-2 lg:grid-cols-4' : 'sm:grid-cols-3'}`}>
+                  {idTypes.map(t => (
+                    <div
+                      key={t.key}
+                      className="relative flex items-center gap-2.5 overflow-hidden rounded-xl bg-tertiary px-3 py-2.5 ring-1 ring-inset ring-secondary"
+                      style={t.covered ? { boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--conf-high) 34%, transparent)' } : undefined}
+                    >
+                      <span aria-hidden className="absolute inset-x-0 top-0 h-0.5" style={{ background: t.covered ? t.color : 'var(--line-strong)' }} />
+                      <FeaturedIcon size="sm" icon={t.icon} tint={t.covered ? t.color : `color-mix(in srgb, ${t.color} 26%, transparent)`} />
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[12.5px] font-semibold" style={t.covered ? { color: t.color } : undefined}>
+                          <span className={t.covered ? '' : 'text-tertiary'}>{t.label}</span>
+                        </div>
+                        <div className="mt-0.5 text-[11px] text-tertiary">{t.covered ? `via ${t.via}` : 'no source yet'}</div>
+                      </div>
+                      {t.covered
+                        ? <span className="text-[var(--conf-high)] [&_svg]:size-[15px]"><IcCheck /></span>
+                        : <span className="size-1.5 shrink-0 rounded-full opacity-60" style={{ background: 'var(--info)' }} />}
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-secondary pt-3">
+                  <span className="text-[11.5px] text-tertiary">
+                    {coveredCount} of {idTypes.length} media types covered{allCovered ? '' : ' — add a source below for the rest'}.
+                  </span>
+                  <span className="ml-auto inline-flex items-center gap-1.5 rounded-full bg-tertiary px-2.5 py-1 text-[11px] ring-1 ring-inset ring-secondary">
+                    <span className="size-1.5 rounded-full" style={{ background: enrichmentArtwork ? 'var(--conf-high)' : 'var(--info)' }} />
+                    Artwork {enrichmentArtwork ? 'on' : 'off'}
+                  </span>
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-tertiary px-2.5 py-1 text-[11px] ring-1 ring-inset ring-secondary">
+                    <span className="size-1.5 rounded-full" style={{ background: subSourceCount > 0 ? 'var(--conf-high)' : 'var(--info)' }} />
+                    Subtitles {subSourceCount}/3
+                  </span>
+                </div>
+              </section>
+
               {/* Preferred metadata source + anime cross-ref live in the
                   Matching section now (Identification band) — Connections is
                   credentials only. */}
@@ -561,6 +711,10 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                   space beside its collapsed neighbour. */}
               <div key={`conn-${discardNonce}`} className="flex flex-col gap-2.5 xl:flex-row xl:items-start">
               <div className="flex min-w-0 flex-1 flex-col gap-2.5">
+              <div className="mb-1">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Identification</div>
+                <div className="mt-0.5 text-[11px] text-tertiary">Sources that tell Kira what each file is. Anime falls back AniDB → TheTVDB → TMDB.</div>
+              </div>
               <ProviderCard
                 providerKey="TMDB" status={deriveProviderStatus(providers['tmdb'], 'tmdb')}
                 fields={[
@@ -663,6 +817,10 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
 
               {/* Right column — artwork + subtitle sources. */}
               <div className="flex min-w-0 flex-1 flex-col gap-2.5">
+              <div className="mb-1">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Artwork &amp; subtitles</div>
+                <div className="mt-0.5 text-[11px] text-tertiary">Optional enrichment — posters, logos, and subtitle catalogues.</div>
+              </div>
               <ProviderCard
                 providerKey="fanart.tv"
                 status={fanartKeySet ? 'connected' : 'not-configured'}
@@ -736,8 +894,10 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
               />
               </div>
               </div>
+              </div>
             </SettingsLayout>
-          )}
+            );
+          })()}
 
           {section === 'paths' && (
             <PathsSection rawSettings={rawSettings} setRawSettings={setRawSettings} saveKey={saveKey} />
@@ -756,13 +916,37 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                   icon={<IcTag />}
                   title="Naming"
                   purpose="How Kira names files and lays them out on disk. Pick a profile, tune the template, watch the live preview, then choose the sidecars to write. Applies to new scans."
-                  status={<StatusPill tone="accent">{profile} profile</StatusPill>}
+                  status={<BadgeWithDot color="brand">{profile} profile</BadgeWithDot>}
                   filter={<SettingsFilter value={filter} onChange={setFilter} />}
                 />
               )}
             >
-              {/* Naming profile + templates */}
+              {/* ── FLOW HERO — how a name is built: Profile → Template → Land.
+                  Terminal pill is STATEFUL: it reads the real rename mode. ── */}
+              <div className="overflow-hidden rounded-2xl bg-secondary px-5 py-4 shadow-xs ring-1 ring-inset ring-secondary">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-3">
+                  <div className="flex shrink-0 items-center gap-2.5 rounded-xl bg-tertiary px-3 py-2 ring-1 ring-inset ring-secondary">
+                    <FeaturedIcon size="sm" icon={<IcTag />} color="gray" />
+                    <div className="min-w-0"><div className="text-[12.5px] font-semibold text-primary">Profile</div><div className="text-[11px] text-tertiary">{profile} base</div></div>
+                  </div>
+                  <div className="hidden h-px min-w-[20px] flex-1 sm:block" style={{ background: 'var(--line-strong)' }} />
+                  <div className="flex shrink-0 items-center gap-2.5 rounded-xl bg-tertiary px-3 py-2 ring-1 ring-inset ring-secondary">
+                    <FeaturedIcon size="sm" icon={<IcRefresh />} color="gray" />
+                    <div className="min-w-0"><div className="text-[12.5px] font-semibold text-primary">Template</div><div className="text-[11px] text-tertiary">tokens + filters</div></div>
+                  </div>
+                  <div className="hidden h-px min-w-[20px] flex-1 sm:block" style={{ background: 'var(--line-strong)' }} />
+                  <div className="flex shrink-0 items-center gap-2 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--accent-deep)' }}>
+                    <span className="text-white [&_svg]:size-[16px]"><IcCheck /></span>
+                    <span className="text-[12px] font-semibold uppercase tracking-[0.06em] text-white">{(() => { const v = rawSettings['rename.mode']; const m = typeof v === 'string' ? v : (v && typeof v === 'object' && 'value' in v) ? String((v as { value: string }).value) : 'in-place'; return m === 'move-to-library' ? 'Move to library' : 'In-place'; })()}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* ── WHAT IT IS CALLED — profile + template studio ── */}
+              <div>
+              <div className="mb-2.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">What it is called</div>
               <SectionCard
+                tint="var(--accent)"
                 icon={<IcTag />}
                 title="Naming profile"
                 desc="New scans use this profile unless overridden in the rename preview."
@@ -790,6 +974,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                   </div>
                 </div>
               </SectionCard>
+              </div>
 
               {/* Two height-packed columns: left = file ops (File handling +
                   cleanup breadcrumb), right = sidecar output (NFO / artwork +
@@ -797,6 +982,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                   leave a hole beside tall neighbours. */}
               <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
               <div className="flex flex-col gap-4">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Where it goes</div>
               <SectionCard
                 icon={<IcRefresh />}
                 title="File handling"
@@ -805,6 +991,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                 <div className="flex flex-col gap-5">
                   <SettingRow
                     layout="stacked"
+                    settingKeys="rename.mode"
                     label="Rename mode"
                     desc={<><strong className="text-ink">In-place</strong> keeps each file in its current folder (only the file / show / season names change). <strong className="text-ink">Move to library</strong> builds a fresh tree under your Media root.</>}
                   >
@@ -826,6 +1013,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
 
                   <SettingRow
                     layout="stacked"
+                    settingKeys="rename.default_op"
                     label="Default file operation"
                     desc="What Kira does with the original file when it lands the renamed copy at the target path."
                   >
@@ -847,6 +1035,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
 
                   <SettingRow
                     layout="stacked"
+                    settingKeys="naming.anime_numbering"
                     label="Anime episode numbering"
                     desc={<>How anime episodes are numbered in the output. <strong className="text-ink">Seasonal</strong> → <strong className="text-ink">S04E05</strong> inside Season folders. <strong className="text-ink">Absolute</strong> → the series-wide number in a flat folder (e.g. <strong className="text-ink">One Piece - 1156</strong>). Falls back to SxxExx when a show has no absolute number. Applies to new scans / re-renames.</>}
                   >
@@ -882,14 +1071,17 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
               </div>
 
               <div className="flex flex-col gap-4">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">What else gets written</div>
               {/* Sidecar files — NFO + artwork output (right column). */}
               <SectionCard
+                tint="var(--conf-high)"
                 icon={<IcTag />}
                 title="Sidecar files"
                 desc="Optional metadata + artwork written next to each renamed file."
               >
                 <div className="flex flex-col gap-5">
                   <SettingRow
+                    settingKeys="naming.write_nfo"
                     label="Write .nfo files"
                     desc="Save Kodi / Emby-style metadata sidecars (movie / episode / tvshow .nfo) next to each renamed file. Pure output from the matched metadata — off by default."
                   >
@@ -942,6 +1134,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                   )}
 
                   <SettingRow
+                    settingKeys="naming.download_artwork"
                     label="Download artwork"
                     desc="Save artwork beside each renamed file (Plex / Kodi local-asset convention, e.g. `<name>-poster.jpg`, `<name>-clearlogo.png`). Best-effort, off by default."
                   >
@@ -1052,6 +1245,14 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
               const s = typeof v === 'string' ? v : (v && typeof v === 'object' && 'value' in v ? String((v as { value: unknown }).value) : 'off');
               return (['off', 'keep_subs', 'all'] as const).includes(s as 'off') ? s : 'off';
             })();
+            // One pure 0–4 aggressiveness level drives the hero pill, the meter,
+            // and the danger flag — read from the same expression so they can
+            // never desync. `isPermanentMass` = the one genuinely irreversible
+            // corner (delete EVERYTHING non-video with no trash to recover from).
+            const level = !masterOn ? 0 : !sweepOn ? 1 : nonvideoMode === 'off' ? 2 : nonvideoMode === 'keep_subs' ? 3 : 4;
+            const isPermanentMass = level === 4 && !trashOn;
+            const segColors = ['var(--conf-high)', 'color-mix(in srgb, var(--conf-high) 60%, var(--conf-mid))', 'var(--conf-mid)', 'color-mix(in srgb, var(--conf-mid) 50%, var(--conf-low))', 'var(--conf-low)'];
+            const segLabels = ['Off', 'Empty only', 'Artifacts', 'Non-video', 'Everything'];
             return (
               <SettingsLayout
                 header={(
@@ -1067,33 +1268,94 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                   />
                 )}
               >
+                {/* ── FLOW HERO — Move leaves the source behind → Sweep → a
+                    stateful pill whose COLOUR encodes recoverable vs permanent. ── */}
+                <div className="overflow-hidden rounded-2xl bg-secondary px-5 py-4 shadow-xs ring-1 ring-inset ring-secondary">
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-3">
+                    <div className="flex shrink-0 items-center gap-2.5 rounded-xl bg-tertiary px-3 py-2 ring-1 ring-inset ring-secondary">
+                      <FeaturedIcon size="sm" color="gray" icon={<IcArrowRight />} />
+                      <div className="min-w-0"><div className="text-[12.5px] font-semibold text-primary">Move</div><div className="text-[11px] text-tertiary">source left behind</div></div>
+                    </div>
+                    <div className="hidden h-px min-w-[20px] flex-1 sm:block" style={{ background: 'var(--line-strong)' }} />
+                    <div className={`flex shrink-0 items-center gap-2.5 rounded-xl bg-tertiary px-3 py-2 ring-1 ring-inset ring-secondary${!masterOn ? ' opacity-50' : ''}`}>
+                      <FeaturedIcon size="sm" color="gray" icon={<IcTrash />} />
+                      <div className="min-w-0"><div className="text-[12.5px] font-semibold text-primary">Sweep</div><div className="text-[11px] text-tertiary">{!masterOn ? 'disabled' : !sweepOn ? 'empty dirs only' : nonvideoMode === 'all' ? 'all leftovers' : nonvideoMode === 'keep_subs' ? 'leftovers · keep subs' : 'artifacts'}</div></div>
+                    </div>
+                    <div className="hidden h-px min-w-[20px] flex-1 sm:block" style={{ background: 'var(--line-strong)' }} />
+                    <div className="flex shrink-0 items-center gap-2 rounded-xl px-3.5 py-2.5" style={{ background: isPermanentMass ? 'var(--conf-low)' : masterOn && trashOn ? 'var(--conf-high)' : 'var(--accent-deep)' }}>
+                      <span className="text-white [&_svg]:size-[16px]">{isPermanentMass ? <IcAlertTri /> : !masterOn ? <IcShieldCheck /> : trashOn ? <IcUndo /> : <IcCheck />}</span>
+                      <span className="text-[12px] font-semibold uppercase tracking-[0.06em] text-white">{!masterOn ? 'Off · nothing removed' : isPermanentMass ? 'Permanent · all files' : trashOn ? 'Recoverable · trash' : !sweepOn ? 'Empty only' : 'Deletes artifacts'}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── SAFETY SPECTRUM METER (the wow) — a 0→4 aggressiveness
+                    thermometer; goes red only at a permanent mass-delete. ── */}
+                <section className="rounded-2xl bg-secondary p-5 shadow-xs ring-1 ring-inset ring-secondary">
+                  <div className="flex items-center gap-2.5">
+                    <FeaturedIcon size="md" icon={<IcShieldCheck />} tint={level <= 1 ? 'var(--conf-high)' : level <= 3 ? 'var(--conf-mid)' : 'var(--conf-low)'} />
+                    <div>
+                      <div className="text-[14px] font-semibold text-primary">Cleanup aggressiveness</div>
+                      <div className="mt-0.5 text-[12px] text-tertiary">How much Kira removes after a Move — and whether it's recoverable.</div>
+                    </div>
+                  </div>
+                  <div className="mt-4 flex h-2.5 w-full overflow-hidden rounded-full">
+                    {segColors.map((c, i) => (
+                      <span key={i} className={i > level ? 'opacity-30' : ''} style={{ width: '20%', background: c }} />
+                    ))}
+                  </div>
+                  <div className="mt-2.5 flex justify-between gap-x-2 text-[11px]">
+                    {segLabels.map((lab, i) => (
+                      <span key={i} className={`inline-flex flex-col items-center gap-1 text-center ${i === level ? 'font-semibold text-primary' : 'text-tertiary'}`}>
+                        <span className="size-1.5 rounded-full" style={{ background: segColors[i] }} />
+                        {lab}
+                      </span>
+                    ))}
+                  </div>
+                  {level === 4 ? (isPermanentMass ? (
+                    <div className="mt-3 flex items-center gap-2.5 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--conf-low-bg)', boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--conf-low) 32%, transparent)' }}>
+                      <FeaturedIcon size="sm" color="error" icon={<IcAlertTri />} />
+                      <div className="text-[12px] leading-relaxed text-error-primary">
+                        Permanent mass-delete — every non-video file in any folder a Move empties is removed with no recovery.{' '}
+                        <button type="button" onClick={() => saveKey('rename.cleanup_trash')(true)} className="font-semibold underline underline-offset-2 transition-colors hover:text-ink">Enable trash</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mt-3 flex items-center gap-2.5 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--conf-high-bg)', boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--conf-high) 32%, transparent)' }}>
+                      <FeaturedIcon size="sm" color="success" icon={<IcUndo />} />
+                      <div className="text-[12px] leading-relaxed text-success-primary">Aggressive, but recoverable — everything swept lands in your Trash folder.</div>
+                    </div>
+                  )) : null}
+                </section>
+
                 {/* Toggles left, transparency disclosure right — side by side
                     so the section's two cards share the width. */}
                 <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
                 {/* Cleanup toggles */}
                 <SectionCard
+                  tint="var(--accent)"
                   icon={<IcTrash />}
                   title="Source folder cleanup"
                   desc="Applies after a Move only — Copy / Hardlink / Symlink never empty the source."
                 >
                   <div className="flex flex-col gap-4">
-                    {/* Master toggle */}
-                    <SettingRow
-                      label="Remove empty folders after Move"
-                      desc={<>After a Move, walk up the source's folder chain and <span className="font-mono text-ink">rmdir</span> each level that's now empty. Stops at your Media root — never deletes the library root itself.</>}
-                    >
-                      <Toggle isSelected={masterOn} onChange={() => saveKey('rename.cleanup_empty_source_dirs')(!masterOn)} className="mt-0.5" aria-label="Remove empty folders after Move" />
-                    </SettingRow>
+                    {/* Master rung — green rail = the always-safe floor. */}
+                    <div className="flex flex-col gap-1.5">
+                      <CleanupRow rail="var(--conf-high)" name="Remove empty folders after Move" hint="rmdir up to your Media root">
+                        <Toggle isSelected={masterOn} onChange={() => saveKey('rename.cleanup_empty_source_dirs')(!masterOn)} aria-label="Remove empty folders after Move" />
+                      </CleanupRow>
+                      <div className="px-0.5 text-[11.5px] leading-relaxed text-ink-muted">After a Move, walk up the source's folder chain and <span className="font-mono text-ink">rmdir</span> each level that's now empty. Stops at your Media root — never deletes the library root itself.</div>
+                    </div>
 
-                    {/* Sub-toggle — artifact sweep, dimmed when master is off. */}
-                    <NestedBox dimmed={!masterOn}>
-                      <SettingRow
-                        label="Also delete media-server metadata"
-                        desc={<>Sweep known Plex / Jellyfin / Kodi cache files (posters, banners, NFOs, <span className="font-mono text-ink">.actors/</span>, per-episode thumbnails) so the folder can actually be removed. <strong className="text-ink">Disable</strong> for strict “only touch genuinely empty folders” behavior.</>}
-                      >
-                        <Toggle isSelected={sweepOn} isDisabled={!masterOn} onChange={() => saveKey('rename.cleanup_media_server_artifacts')(!sweepOn)} className="mt-0.5" aria-label="Delete media-server cache files" />
-                      </SettingRow>
-                    </NestedBox>
+                    {/* Dependent rungs unlock once the master is on. */}
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">If a folder still has leftovers</div>
+                    {/* Sweep rung — dims + disables when master is off. */}
+                    <div className="flex flex-col gap-1.5">
+                      <CleanupRow rail="var(--accent)" dim={!masterOn} name="Also delete media-server metadata" hint="Plex / Jellyfin / Kodi cache">
+                        <Toggle isSelected={sweepOn} isDisabled={!masterOn} onChange={() => saveKey('rename.cleanup_media_server_artifacts')(!sweepOn)} aria-label="Delete media-server cache files" />
+                      </CleanupRow>
+                      <div className={`px-0.5 text-[11.5px] leading-relaxed text-ink-muted${!masterOn ? ' opacity-60' : ''}`}>Sweep known Plex / Jellyfin / Kodi cache files (posters, banners, NFOs, <span className="font-mono text-ink">.actors/</span>, per-episode thumbnails) so the folder can actually be removed. <strong className="text-ink">Disable</strong> for strict “only touch genuinely empty folders” behavior.</div>
+                    </div>
 
                     {/* Sub-options of the artifact sweep: user-defined names /
                         extensions, and the aggressive "delete non-video" mode. */}
@@ -1171,12 +1433,12 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                         delete. Only meaningful when the artifact sweep is on
                         (emptying a folder via rmdir is never data loss). */}
                     <NestedBox dimmed={!masterOn || !sweepOn}>
-                      <SettingRow
-                        label="Move removed items to a trash folder"
-                        desc={<>Instead of permanently deleting swept artifacts, <strong className="text-ink">move them to a trash folder</strong> so a mistaken sweep is recoverable from your file browser. Off → permanent delete. (Kira keeps its own trash because a container has no OS recycle bin.)</>}
-                      >
-                        <Toggle isSelected={trashOn} isDisabled={!masterOn || !sweepOn} onChange={() => saveKey('rename.cleanup_trash')(!trashOn)} className="mt-0.5" aria-label="Move removed items to a trash folder" />
-                      </SettingRow>
+                      <div className="flex flex-col gap-1.5">
+                        <CleanupRow rail={trashOn ? 'var(--conf-high)' : 'var(--conf-low)'} name="Move removed items to a trash folder" hint={trashOn ? 'recoverable' : 'permanent delete'}>
+                          <Toggle isSelected={trashOn} isDisabled={!masterOn || !sweepOn} onChange={() => saveKey('rename.cleanup_trash')(!trashOn)} aria-label="Move removed items to a trash folder" />
+                        </CleanupRow>
+                        <div className="px-0.5 text-[11.5px] leading-relaxed text-ink-muted">Instead of permanently deleting swept artifacts, <strong className="text-ink">move them to a trash folder</strong> so a mistaken sweep is recoverable from your file browser. Off → permanent delete. (Kira keeps its own trash because a container has no OS recycle bin.)</div>
+                      </div>
                       {trashOn ? (
                         <div className="mt-3">
                           <TrashDirField
@@ -1194,44 +1456,51 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                   </div>
                 </SectionCard>
 
-                {/* Transparency — exactly what gets swept. */}
-                <details className={`group overflow-hidden ${SETTINGS_CARD}`}>
-                  <summary className="flex cursor-pointer list-none items-center gap-3 p-4 [&::-webkit-details-marker]:hidden">
-                    <FeaturedIcon size="md" color="gray" icon={<IcShieldCheck />} />
-                    <div className="min-w-0 flex-1">
-                      <div className="text-[15px] font-semibold text-ink">What gets deleted</div>
-                      <div className="mt-1 text-[12.5px] leading-relaxed text-ink-muted">Exactly which files Kira sweeps — and what it never touches.</div>
-                    </div>
-                    <IcChevDown className="size-4 shrink-0 text-ink-soft transition-transform [details[open]_&]:rotate-180" />
-                  </summary>
-                  <div className={`flex flex-col gap-4 border-t px-4 py-4 ${SETTINGS_DIVIDER}`}>
+                {/* Transparency — lead with the reassurance, tuck the exact lists. */}
+                <section className="flex flex-col gap-4 rounded-2xl bg-secondary p-5 shadow-xs ring-1 ring-inset ring-secondary">
+                  <div className="flex items-center gap-2.5">
+                    <FeaturedIcon size="md" icon={<IcShieldCheck />} tint="var(--conf-high)" />
                     <div>
-                      <div className="mb-1.5 text-[12px] font-semibold text-ink">Deleted — exact filenames (case-insensitive)</div>
-                      <div className="font-mono text-[11.5px] leading-relaxed text-ink-soft">
-                        poster.jpg · banner.jpg · fanart.jpg · clearart.png · clearlogo.png · landscape.jpg · thumb.jpg · logo.jpg · disc.jpg · keyart.jpg · characterart.jpg · folder.jpg · cover.jpg · tvshow.nfo · season.nfo · movie.nfo · show.nfo · album.nfo · artist.nfo
-                      </div>
-                      <div className="mt-1 text-[11px] text-ink-faint">Both .jpg and .png variants are recognised.</div>
-                    </div>
-                    <div>
-                      <div className="mb-1.5 text-[12px] font-semibold text-ink">Deleted — pattern matches</div>
-                      <div className="font-mono text-[11.5px] leading-relaxed text-ink-soft">
-                        season01-poster.jpg · season-specials-banner.jpg · Show.S01E01-thumb.jpg · Movie (2023)-poster.jpg · Album-fanart.png · Show.S01E01-fanart-2.jpg · *.tbn (Kodi binary thumbnails) · *.nfo (only once every video has left the folder — an NFO without its video is orphaned metadata)
-                      </div>
-                    </div>
-                    <div>
-                      <div className="mb-1.5 text-[12px] font-semibold text-ink">Deleted — directories (recursive)</div>
-                      <div className="font-mono text-[11.5px] leading-relaxed text-ink-soft">
-                        .actors/ · .metadata/ · extrafanart/ · extrathumbs/ · backdrops/ · metadata/
-                      </div>
-                    </div>
-                    <div>
-                      <div className="mb-1.5 text-[12px] font-semibold text-conf-high">Never deleted</div>
-                      <div className="text-[12.5px] leading-relaxed text-ink-muted">
-                        Your own files (anything not on the lists above) — including <span className="font-mono text-ink">Subs/</span>, <span className="font-mono text-ink">Extras/</span>, <span className="font-mono text-ink">Featurettes/</span>, <span className="font-mono text-ink">Trailers/</span>, <span className="font-mono text-ink">Behind The Scenes/</span>, <span className="font-mono text-ink">Bonus/</span>, and any file not matching the recognised media-server naming conventions. If user content remains in a folder, the cleanup walk stops there — the folder stays.
-                      </div>
+                      <div className="text-[14px] font-semibold text-primary">What gets deleted</div>
+                      <div className="mt-0.5 text-[12px] text-tertiary">Exactly which files Kira sweeps — and what it never touches.</div>
                     </div>
                   </div>
-                </details>
+                  {/* Always-visible promise — on the one page that deletes files. */}
+                  <div className="rounded-xl px-3.5 py-3" style={{ background: 'var(--conf-high-bg)', boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--conf-high) 32%, transparent)' }}>
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.14em]" style={{ color: 'var(--conf-high)' }}>Never deleted</div>
+                    <div className="mt-1.5 text-[12.5px] leading-relaxed text-ink-muted">
+                      Your own files (anything not on the lists below) — including <span className="font-mono text-ink">Subs/</span>, <span className="font-mono text-ink">Extras/</span>, <span className="font-mono text-ink">Featurettes/</span>, <span className="font-mono text-ink">Trailers/</span>, <span className="font-mono text-ink">Behind The Scenes/</span>, <span className="font-mono text-ink">Bonus/</span>, and any file not matching the recognised media-server naming conventions. If user content remains in a folder, the cleanup walk stops there — the folder stays.
+                    </div>
+                  </div>
+                  {/* Exact sweep lists — tucked behind a disclosure. */}
+                  <details className="group">
+                    <summary className="flex cursor-pointer list-none items-center gap-2 text-[12px] font-medium text-tertiary transition-colors hover:text-primary [&::-webkit-details-marker]:hidden">
+                      <IcChevDown className="size-4 transition-transform group-open:rotate-180" />
+                      Show the exact sweep list
+                    </summary>
+                    <div className="mt-3 flex flex-col gap-4">
+                      <div>
+                        <div className="mb-1.5 text-[12px] font-semibold text-ink">Deleted — exact filenames (case-insensitive)</div>
+                        <div className="font-mono text-[11.5px] leading-relaxed text-ink-soft">
+                          poster.jpg · banner.jpg · fanart.jpg · clearart.png · clearlogo.png · landscape.jpg · thumb.jpg · logo.jpg · disc.jpg · keyart.jpg · characterart.jpg · folder.jpg · cover.jpg · tvshow.nfo · season.nfo · movie.nfo · show.nfo · album.nfo · artist.nfo
+                        </div>
+                        <div className="mt-1 text-[11px] text-ink-faint">Both .jpg and .png variants are recognised.</div>
+                      </div>
+                      <div>
+                        <div className="mb-1.5 text-[12px] font-semibold text-ink">Deleted — pattern matches</div>
+                        <div className="font-mono text-[11.5px] leading-relaxed text-ink-soft">
+                          season01-poster.jpg · season-specials-banner.jpg · Show.S01E01-thumb.jpg · Movie (2023)-poster.jpg · Album-fanart.png · Show.S01E01-fanart-2.jpg · *.tbn (Kodi binary thumbnails) · *.nfo (only once every video has left the folder — an NFO without its video is orphaned metadata)
+                        </div>
+                      </div>
+                      <div>
+                        <div className="mb-1.5 text-[12px] font-semibold text-ink">Deleted — directories (recursive)</div>
+                        <div className="font-mono text-[11.5px] leading-relaxed text-ink-soft">
+                          .actors/ · .metadata/ · extrafanart/ · extrathumbs/ · backdrops/ · metadata/
+                        </div>
+                      </div>
+                    </div>
+                  </details>
+                </section>
                 </div>
 
                 {/* Trash bin — browse / restore what the sweep recycled. */}
@@ -1252,69 +1521,90 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                   icon={<IcShieldCheck />}
                   title="Matching"
                   purpose="Which sources identify each kind of title, how confident a match must be before Kira trusts it, and the experimental boosts for close calls. Applies to new scans."
-                  status={<StatusPill tone={autoApprove ? 'accent' : 'neutral'}>{autoApprove ? `Auto ≥ ${autoThreshold}%` : 'Manual review'}</StatusPill>}
+                  status={<BadgeWithDot color={autoApprove ? 'success' : 'gray'} pulse={autoApprove}>{autoApprove ? `Auto ≥ ${autoThreshold}%` : 'Manual review'}</BadgeWithDot>}
                 />
               )}
             >
-              {/* Provider preference — moved here from Connections so the whole
-                  of matching (sources + confidence + boosts) lives in one home. */}
-              <SectionCard
-                icon={<IcLink />}
-                title="Preferred metadata source"
-                desc="Which provider identifies each kind of title. Kira tries your pick first and only falls back to the others if it has no confident match. Applies to new scans — re-identify a show or rescan to change matches you already have."
-              >
-                <div className="grid gap-5 md:grid-cols-3">
+              {/* ── FLOW HERO — the matching pipeline: identify → score → decide ── */}
+              <div className="overflow-hidden rounded-2xl bg-secondary px-5 py-4 shadow-xs ring-1 ring-inset ring-secondary">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-3">
+                  <div className="flex shrink-0 items-center gap-2.5 rounded-xl bg-tertiary px-3 py-2 ring-1 ring-inset ring-secondary">
+                    <FeaturedIcon size="sm" icon={<IcLink />} color="gray" />
+                    <div className="min-w-0"><div className="text-[12.5px] font-semibold text-primary">Identify</div><div className="text-[11px] text-tertiary">your source order</div></div>
+                  </div>
+                  <div className="hidden h-px min-w-[20px] flex-1 sm:block" style={{ background: 'var(--line-strong)' }} />
+                  <div className="flex shrink-0 items-center gap-2.5 rounded-xl bg-tertiary px-3 py-2 ring-1 ring-inset ring-secondary">
+                    <FeaturedIcon size="sm" icon={<IcShieldCheck />} color="gray" />
+                    <div className="min-w-0"><div className="text-[12.5px] font-semibold text-primary">Score</div><div className="text-[11px] text-tertiary">confidence tiers</div></div>
+                  </div>
+                  <div className="hidden h-px min-w-[20px] flex-1 sm:block" style={{ background: 'var(--line-strong)' }} />
+                  <div className="flex shrink-0 items-center gap-2 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--accent-deep)' }}>
+                    <span className="text-white [&_svg]:size-[16px]"><IcCheck /></span>
+                    <span className="text-[12px] font-semibold uppercase tracking-[0.06em] text-white">{autoApprove ? `Auto ≥ ${autoThreshold}%` : 'Review'}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* ── SOURCES — preferred metadata source, per media type (colour-owned) ── */}
+              <section className="mt-5 rounded-2xl bg-secondary p-5 shadow-xs ring-1 ring-inset ring-secondary">
+                <div className="flex items-center gap-2.5">
+                  <FeaturedIcon size="md" icon={<IcLink />} tint="var(--accent)" />
+                  <div>
+                    <div className="text-[14px] font-semibold text-primary">Preferred metadata source</div>
+                    <div className="mt-0.5 text-[12px] leading-relaxed text-tertiary">Which provider identifies each kind of title — Kira tries your top pick first, then falls back. Applies to new scans; re-identify or rescan to change existing matches.</div>
+                  </div>
+                </div>
+                <div className="mt-4 grid gap-4 md:grid-cols-3">
                   {[
-                    { mt: 'movie', label: 'Movies',
-                      hint: 'TMDB carries the richest movie data; TheTVDB is the fallback. Reorder to taste.' },
-                    { mt: 'tv', label: 'TV shows',
-                      hint: 'TheTVDB leads for TV seasons; TMDB is the fallback. Reorder to taste.' },
-                    { mt: 'anime', label: 'Anime',
-                      hint: (<><strong className="text-ink">AniDB</strong> — richest anime metadata + original titles, but splits each cour into its own card. <strong className="text-ink">TheTVDB</strong> — one unified series with seasons, best Plex / Jellyfin match. <strong className="text-ink">TMDB</strong> — broad English coverage.</>) },
+                    { mt: 'movie', label: 'Movies', color: '#4ec5b3',
+                      hint: 'TMDB carries the richest movie data; TheTVDB is the fallback.' },
+                    { mt: 'tv', label: 'TV shows', color: '#b3e5fc',
+                      hint: 'TheTVDB leads for TV seasons; TMDB is the fallback.' },
+                    { mt: 'anime', label: 'Anime', color: 'var(--media-anime)',
+                      hint: (<><strong className="text-secondary">AniDB</strong> — richest anime metadata + original titles, but splits each cour into its own card. <strong className="text-secondary">TheTVDB</strong> — unified seasons, best Plex / Jellyfin match. <strong className="text-secondary">TMDB</strong> — broad English coverage.</>) },
                   ].map(row => {
                     const order = providerOrder(row.mt);
                     const primary = order[0];
                     const primaryInfo = providers[primary];
                     const primaryNeedsKey = !!primaryInfo && !primaryInfo.configured && !primaryInfo.keyless;
                     return (
-                      <div key={row.mt} className="flex flex-col gap-2">
-                        <div className="text-[13px] font-semibold text-ink">{row.label}</div>
-                        {/* Reorderable provider list — top = preferred. Kira
-                            tries them in this order and keeps any provider you
-                            push down as a trailing fallback, so it's a preference,
-                            never a hard exclude. */}
+                      <div key={row.mt} className="relative flex flex-col gap-2 overflow-hidden rounded-xl bg-tertiary p-3 ring-1 ring-inset ring-secondary">
+                        {/* colour rail per media type */}
+                        <span aria-hidden className="absolute inset-x-0 top-0 h-0.5" style={{ background: row.color }} />
+                        <div className="text-[13px] font-semibold" style={{ color: row.color }}>{row.label}</div>
+                        {/* Reorderable provider list — top = preferred (a preference, never a hard exclude). */}
                         <ol className="flex flex-col gap-1.5">
                           {order.map((k, i) => {
                             const info = providers[k];
                             const needsKey = !!info && !info.configured && !info.keyless;
                             return (
-                              <li key={k} className="flex items-center gap-2 rounded-lg border border-line bg-surface-1 px-2.5 py-1.5">
-                                <span className="grid size-5 shrink-0 place-items-center rounded-md bg-surface-2 text-[11px] font-semibold tabular-nums text-ink-muted">{i + 1}</span>
-                                <span className="min-w-0 flex-1 truncate text-[13px] text-ink">
+                              <li key={k} className="flex items-center gap-2 rounded-lg bg-secondary px-2.5 py-1.5 ring-1 ring-inset ring-secondary">
+                                <span className="grid size-5 shrink-0 place-items-center rounded-md text-[11px] font-semibold tabular-nums" style={{ background: i === 0 ? `color-mix(in srgb, ${row.color} 18%, transparent)` : 'var(--glass-2)', color: i === 0 ? row.color : 'var(--color-text-tertiary)' }}>{i + 1}</span>
+                                <span className="min-w-0 flex-1 truncate text-[13px] text-primary">
                                   {provName(k)}
-                                  {i === 0 ? <span className="ml-1.5 text-[11px] font-medium text-accent">primary</span> : null}
-                                  {needsKey ? <span className="ml-1.5 text-[11px] text-conf-mid">needs key</span> : null}
+                                  {i === 0 ? <span className="ml-1.5 text-[11px] font-medium" style={{ color: row.color }}>primary</span> : null}
+                                  {needsKey ? <span className="ml-1.5 text-[11px] text-[var(--conf-mid)]">needs key</span> : null}
                                 </span>
                                 <span className="flex shrink-0 items-center gap-0.5">
                                   <button
                                     type="button" aria-label={`Move ${provName(k)} up`} disabled={i === 0}
                                     onClick={() => moveProvider(row.mt, i, -1)}
-                                    className="grid size-6 place-items-center rounded-md text-ink-soft transition hover:bg-surface-2 hover:text-ink disabled:pointer-events-none disabled:opacity-25"
+                                    className="grid size-6 place-items-center rounded-md text-tertiary transition hover:bg-primary_hover hover:text-primary disabled:pointer-events-none disabled:opacity-25"
                                   ><IcChevDown className="size-3.5 rotate-180" /></button>
                                   <button
                                     type="button" aria-label={`Move ${provName(k)} down`} disabled={i === order.length - 1}
                                     onClick={() => moveProvider(row.mt, i, 1)}
-                                    className="grid size-6 place-items-center rounded-md text-ink-soft transition hover:bg-surface-2 hover:text-ink disabled:pointer-events-none disabled:opacity-25"
+                                    className="grid size-6 place-items-center rounded-md text-tertiary transition hover:bg-primary_hover hover:text-primary disabled:pointer-events-none disabled:opacity-25"
                                   ><IcChevDown className="size-3.5" /></button>
                                 </span>
                               </li>
                             );
                           })}
                         </ol>
-                        <div className="text-[12px] leading-relaxed text-ink-muted">{row.hint}</div>
+                        <div className="text-[11.5px] leading-relaxed text-tertiary">{row.hint}</div>
                         {primaryNeedsKey && (
-                          <div className="text-[12px] leading-relaxed text-conf-mid">
-                            {provName(primary)} isn't configured yet — add its API key in Connections, or Kira falls back to the next source automatically.
+                          <div className="text-[11.5px] leading-relaxed text-[var(--conf-mid)]">
+                            {provName(primary)} isn&rsquo;t configured yet — add its key in Connections, or Kira falls back automatically.
                           </div>
                         )}
                       </div>
@@ -1322,12 +1612,9 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                   })}
                 </div>
 
-                {/* Anime enrichment source — AniDB identifies anime but carries
-                    sparse episode titles + no cast/studio data. Kira fills those
-                    in from this cross-ref source; the other is tried if this one
-                    has no Fribb mapping. */}
-                <div className="mt-5 flex flex-col gap-2 border-t border-line pt-4">
-                  <div className="text-[13px] font-semibold text-ink">Anime episode titles &amp; metadata</div>
+                {/* Anime cross-ref enrichment source. */}
+                <div className="mt-4 flex flex-col gap-2 border-t border-secondary pt-4">
+                  <div className="text-[13px] font-semibold text-primary">Anime episode titles &amp; metadata</div>
                   <div className="max-w-xs">
                     <SegmentedControl
                       fullWidth
@@ -1339,105 +1626,139 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                       ]}
                     />
                   </div>
-                  <div className="text-[12px] leading-relaxed text-ink-muted">
-                    When a title is matched on AniDB, Kira pulls episode names and cast / studio data from this source via the cross-reference. The other is tried automatically if this one has no mapping.
+                  <div className="text-[11.5px] leading-relaxed text-tertiary">
+                    When matched on AniDB, Kira pulls episode names + cast / studio data from this source via the cross-reference. The other is tried automatically if this one has no mapping.
                   </div>
                 </div>
-              </SectionCard>
+              </section>
 
-              {/* Confidence — auto-approve + where the badge cutoffs sit. */}
-              <div className="mt-5 mb-1 text-[13px] font-semibold text-ink">Confidence</div>
-              <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
-              {/* Auto-approve */}
-              <SectionCard
-                icon={<IcCheck />}
-                title="Auto-approve"
-                desc="Matches scoring above the threshold are approved automatically, skipping review."
-              >
-                <div className="flex flex-col gap-4">
-                  <SettingRow label="Enable auto-approve">
-                    <Toggle isSelected={autoApprove} onChange={() => setAutoApprove(!autoApprove)} aria-label="Enable auto-approve" />
-                  </SettingRow>
-                  <NestedBox dimmed={!autoApprove}>
-                    <SliderField
-                      label="Threshold"
-                      min={80}
-                      max={100}
-                      value={autoThreshold}
-                      disabled={!autoApprove}
-                      onChange={setAutoThreshold}
-                      color="var(--conf-high)"
-                      valueLabel={`≥ ${autoThreshold}%`}
-                    />
-                  </NestedBox>
+              {/* ── CONFIDENCE — a live tier bar, then auto-approve + the cutoffs ── */}
+              <div className="mt-5 flex flex-col gap-4">
+                {/* Confidence tier bar — Low (red) · Needs review (peach) · Strong (green) */}
+                <div className="rounded-2xl bg-secondary p-5 shadow-xs ring-1 ring-inset ring-secondary">
+                  <div className="flex items-center gap-2.5">
+                    <FeaturedIcon size="md" icon={<IcShieldCheck />} tint="var(--conf-high)" />
+                    <div>
+                      <div className="text-[14px] font-semibold text-primary">Confidence</div>
+                      <div className="mt-0.5 text-[12px] text-tertiary">How sure a match must be before Kira trusts it.</div>
+                    </div>
+                  </div>
+                  <div className="mt-4 flex h-2.5 w-full overflow-hidden rounded-full">
+                    <span style={{ width: `${midT}%`, background: 'var(--conf-low)' }} />
+                    <span style={{ width: `${Math.max(0, highT - midT)}%`, background: 'var(--conf-mid)' }} />
+                    <span style={{ width: `${Math.max(0, 100 - highT)}%`, background: 'var(--conf-high)' }} />
+                  </div>
+                  <div className="mt-2.5 flex flex-wrap justify-between gap-x-4 gap-y-1 text-[11.5px] text-tertiary">
+                    <span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full" style={{ background: 'var(--conf-low)' }} />Low &middot; &lt; {midT}%</span>
+                    <span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full" style={{ background: 'var(--conf-mid)' }} />Needs review &middot; {midT}–{highT}%</span>
+                    <span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full" style={{ background: 'var(--conf-high)' }} />Strong &middot; ≥ {highT}%</span>
+                  </div>
+                  {autoApprove ? <div className="mt-2.5 text-[11.5px] text-tertiary">Auto-approve fires at <span className="font-semibold text-[var(--accent)]">≥ {autoThreshold}%</span> — everything below waits in Review.</div> : null}
                 </div>
-              </SectionCard>
 
-              {/* Confidence thresholds — clamp High >= Med+5 and Med <= High-5
-                  so the buckets can't invert and collapse the Mid range. */}
-              <SectionCard
-                icon={<IcShieldCheck />}
-                title="Confidence thresholds"
-                desc="Where the green / amber / red cutoffs sit for the match badges."
-              >
-                <div className="flex flex-col gap-3.5">
-                  <SliderField
-                    label="High"
-                    dot="var(--conf-high)"
-                    min={Math.max(60, midT + 5)}
-                    max={100}
-                    value={highT}
-                    onChange={v => setHighT(Math.min(100, Math.max(midT + 5, v)))}
-                    color="var(--conf-high)"
-                    valueLabel={`≥ ${highT}%`}
-                  />
-                  <SliderField
-                    label="Med"
-                    dot="var(--conf-mid)"
-                    min={20}
-                    max={Math.min(80, highT - 5)}
-                    value={midT}
-                    onChange={v => setMidT(Math.max(20, Math.min(highT - 5, v)))}
-                    color="var(--conf-mid)"
-                    valueLabel={`≥ ${midT}%`}
-                  />
-                  <div className="flex items-center gap-3">
-                    <span className="inline-flex w-20 shrink-0 items-center gap-2 text-[13px] font-medium text-ink">
-                      <span className="size-2 rounded-full" style={{ background: 'var(--conf-low)' }} /> Low
-                    </span>
-                    <span className="flex-1 text-[12px] text-ink-soft">everything below the Med cutoff</span>
-                    <span className="w-16 shrink-0 text-right font-mono text-[12.5px] font-semibold text-conf-low">&lt; {midT}%</span>
+                <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
+                  {/* Auto-approve */}
+                  <div className="rounded-2xl bg-secondary p-5 shadow-xs ring-1 ring-inset ring-secondary" style={autoApprove ? { boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--conf-high) 38%, transparent)' } : undefined}>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-center gap-2.5">
+                        <FeaturedIcon size="md" icon={<IcCheck />} tint="var(--conf-high)" />
+                        <div>
+                          <div className="text-[14px] font-semibold text-primary">Auto-approve</div>
+                          <div className="mt-0.5 text-[12px] leading-relaxed text-tertiary">Matches above the threshold are approved automatically, skipping review.</div>
+                        </div>
+                      </div>
+                      <Toggle isSelected={autoApprove} onChange={() => setAutoApprove(!autoApprove)} aria-label="Enable auto-approve" />
+                    </div>
+                    <div className={`mt-4 ${!autoApprove ? 'pointer-events-none opacity-50' : ''}`}>
+                      <SliderField
+                        label="Threshold"
+                        min={80}
+                        max={100}
+                        value={autoThreshold}
+                        disabled={!autoApprove}
+                        onChange={setAutoThreshold}
+                        color="var(--conf-high)"
+                        valueLabel={`≥ ${autoThreshold}%`}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Tier cutoffs — clamp Strong >= Review+5 and Review <= Strong-5. */}
+                  <div className="rounded-2xl bg-secondary p-5 shadow-xs ring-1 ring-inset ring-secondary">
+                    <div className="flex items-center gap-2.5">
+                      <FeaturedIcon size="md" icon={<IcShieldCheck />} tint="var(--conf-mid)" />
+                      <div>
+                        <div className="text-[14px] font-semibold text-primary">Tier cutoffs</div>
+                        <div className="mt-0.5 text-[12px] text-tertiary">Where the green / amber / red badges sit.</div>
+                      </div>
+                    </div>
+                    <div className="mt-4 flex flex-col gap-3.5">
+                      <SliderField
+                        label="Strong"
+                        dot="var(--conf-high)"
+                        min={Math.max(60, midT + 5)}
+                        max={100}
+                        value={highT}
+                        onChange={v => setHighT(Math.min(100, Math.max(midT + 5, v)))}
+                        color="var(--conf-high)"
+                        valueLabel={`≥ ${highT}%`}
+                      />
+                      <SliderField
+                        label="Review"
+                        dot="var(--conf-mid)"
+                        min={20}
+                        max={Math.min(80, highT - 5)}
+                        value={midT}
+                        onChange={v => setMidT(Math.max(20, Math.min(highT - 5, v)))}
+                        color="var(--conf-mid)"
+                        valueLabel={`≥ ${midT}%`}
+                      />
+                      <div className="flex items-center gap-3">
+                        <span className="inline-flex w-20 shrink-0 items-center gap-2 text-[13px] font-medium text-primary">
+                          <span className="size-2 rounded-full" style={{ background: 'var(--conf-low)' }} /> Low
+                        </span>
+                        <span className="flex-1 text-[12px] text-tertiary">everything below the Review cutoff</span>
+                        <span className="w-16 shrink-0 text-right font-mono text-[12.5px] font-semibold text-[var(--conf-low)]">&lt; {midT}%</span>
+                      </div>
+                    </div>
                   </div>
                 </div>
-              </SectionCard>
               </div>
 
-              {/* Experimental boosts — folded in from the old Labs section. All
-                  off by default; each note says exactly what it trades. */}
-              <div className="mt-5 border-t border-line pt-4">
-                <div className="mb-3 flex items-center gap-2 text-[13px] font-semibold text-ink">
+              {/* ── BOOSTS — experimental tie-breakers (off by default) ── */}
+              <div className="mt-5">
+                <div className="mb-2.5 flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">
                   Experimental boosts <LabsChip>Off by default</LabsChip>
                 </div>
                 <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
-                  <SectionCard
-                    icon={<IcSearch />}
-                    title={<span className="flex items-center gap-2">Episode-title series boost <LabsChip>Experimental</LabsChip></span>}
-                    desc="When two same-titled shows tie, prefer the one whose episode list contains the filename's episode title. Bounded and TVDB / TMDB-only (never the rate-limited AniDB), so it can't stall scans. Mainly helps western TV with name collisions."
-                    headerExtra={<Toggle isSelected={boostOn} onChange={() => saveKey('labs.episode_title_boost')(!boostOn)} className="mt-0.5" aria-label="Episode-title series boost" />}
-                  />
+                  {/* Episode-title boost */}
+                  <div className="rounded-2xl bg-secondary p-5 shadow-xs ring-1 ring-inset ring-secondary">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex min-w-0 items-center gap-2.5">
+                        <FeaturedIcon size="md" icon={<IcSearch />} tint="var(--accent)" />
+                        <div className="flex items-center gap-2 text-[14px] font-semibold text-primary">Episode-title series boost <LabsChip>Experimental</LabsChip></div>
+                      </div>
+                      <Toggle isSelected={boostOn} onChange={() => saveKey('labs.episode_title_boost')(!boostOn)} aria-label="Episode-title series boost" />
+                    </div>
+                    <div className="mt-2.5 text-[12px] leading-relaxed text-tertiary">When two same-titled shows tie, prefer the one whose episode list contains the filename&rsquo;s episode title. Bounded and TVDB / TMDB-only (never the rate-limited AniDB), so it can&rsquo;t stall scans. Mainly helps western TV with name collisions.</div>
+                  </div>
 
-                  <SectionCard
-                    icon={<IcHistory />}
-                    title={<span className="flex items-center gap-2">Runtime corroboration <LabsChip>Needs MediaInfo</LabsChip></span>}
-                    desc={<>Nudge confidence up when the file's real duration matches the episode / movie runtime. Small effect, and only does anything once <strong className="text-ink">Read file metadata</strong> is enabled in <button type="button" onClick={() => setSection('advanced')} className="font-medium text-info underline underline-offset-2 transition-colors hover:text-ink">Advanced</button> (it needs the file's duration).</>}
-                    headerExtra={<Toggle isSelected={runtimeOn} isDisabled={!mediaInfoOn} onChange={() => saveKey('labs.runtime_corroboration')(!runtimeOn)} className="mt-0.5" aria-label="Runtime corroboration" />}
-                  >
+                  {/* Runtime corroboration */}
+                  <div className="rounded-2xl bg-secondary p-5 shadow-xs ring-1 ring-inset ring-secondary">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex min-w-0 items-center gap-2.5">
+                        <FeaturedIcon size="md" icon={<IcHistory />} tint="var(--accent)" />
+                        <div className="flex items-center gap-2 text-[14px] font-semibold text-primary">Runtime corroboration <LabsChip>Needs MediaInfo</LabsChip></div>
+                      </div>
+                      <Toggle isSelected={runtimeOn} isDisabled={!mediaInfoOn} onChange={() => saveKey('labs.runtime_corroboration')(!runtimeOn)} aria-label="Runtime corroboration" />
+                    </div>
+                    <div className="mt-2.5 text-[12px] leading-relaxed text-tertiary">Nudge confidence up when the file&rsquo;s real duration matches the episode / movie runtime. Small effect, and only does anything once <strong className="text-secondary">Read file metadata</strong> is enabled in Advanced (it needs the file&rsquo;s duration).</div>
                     {!mediaInfoOn ? (
-                      <div className="text-[12px] leading-relaxed text-conf-mid">
-                        Needs <strong className="text-ink">Read file metadata</strong> (Advanced) — this boost reads the file's real duration. Enable it there to use this.
+                      <div className="mt-2 text-[11.5px] leading-relaxed text-[var(--conf-mid)]">
+                        Enable <strong className="text-secondary">Read file metadata</strong> in <button type="button" onClick={() => setSection('advanced')} className="font-medium text-[var(--info)] underline underline-offset-2 transition-colors hover:text-primary">Advanced</button> to use this.
                       </div>
                     ) : null}
-                  </SectionCard>
+                  </div>
                 </div>
               </div>
             </SettingsLayout>
@@ -1456,17 +1777,35 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
           <div
             role="region"
             aria-label="Unsaved settings"
-            className="anim-pop pointer-events-auto flex items-center gap-3 rounded-2xl border border-white/[0.12] bg-[rgba(12,13,17,0.92)] px-4 py-3 shadow-[0_18px_60px_rgba(0,0,0,0.55)] backdrop-blur-2xl"
+            className="anim-pop pointer-events-auto flex max-w-[min(92vw,640px)] flex-col gap-2.5 rounded-2xl border border-white/[0.12] bg-[var(--panel-90)] px-4 py-3 shadow-[0_18px_60px_var(--scrim-60)] backdrop-blur-2xl"
           >
-            <span className="text-[13px] text-ink-muted">
-              <span className="font-semibold text-ink">{dirtyKeys.length}</span> unsaved {dirtyKeys.length === 1 ? 'change' : 'changes'}
-            </span>
-            <Button color="secondary" size="sm" onClick={discard} isDisabled={saveStatus === 'saving'}>
-              Cancel
-            </Button>
-            <Button color="primary" size="sm" onClick={commit} isDisabled={saveStatus === 'saving'}>
-              {saveStatus === 'saving' ? 'Saving…' : 'Save changes'}
-            </Button>
+            {/* Name what's pending so an edit made under a since-cleared filter
+                (or in another section) is always findable, not just counted. */}
+            {invalidUrls.length === 0 && dirtyLabels.length > 0 ? (
+              <div className="flex flex-wrap items-center gap-1.5">
+                {dirtyLabels.slice(0, 6).map((l, i) => (
+                  <span key={i} className="rounded-full bg-glass-2 px-2 py-0.5 text-[11px] font-medium text-ink-muted">{l}</span>
+                ))}
+                {dirtyLabels.length > 6 ? (
+                  <span className="text-[11px] text-ink-soft">+{dirtyLabels.length - 6} more</span>
+                ) : null}
+              </div>
+            ) : null}
+            <div className="flex items-center gap-3">
+              <span className="flex-1 text-[13px] text-ink-muted">
+                {invalidUrls.length > 0 ? (
+                  <span className="font-medium text-[var(--danger)]">Fix the invalid URL before saving</span>
+                ) : (
+                  <><span className="font-semibold text-ink">{dirtyKeys.length}</span> unsaved {dirtyKeys.length === 1 ? 'change' : 'changes'}</>
+                )}
+              </span>
+              <Button color="secondary" size="sm" onClick={discard} isDisabled={saveStatus === 'saving'}>
+                Cancel
+              </Button>
+              <Button color="primary" size="sm" onClick={commit} isDisabled={saveStatus === 'saving' || invalidUrls.length > 0}>
+                {saveStatus === 'saving' ? 'Saving…' : 'Save changes'}
+              </Button>
+            </div>
           </div>
         </div>
       ) : null}
@@ -1585,6 +1924,29 @@ function fmtAge(item: TrashItem): string {
 // Comma-separated editor for an array setting (cleanup custom filenames /
 // extensions). Holds an in-progress text buffer so typing commas doesn't fight
 // the array round-trip; commits the parsed, de-duped list on blur / Enter.
+// A cleanup-ladder rung — a bg-tertiary row with a left tier-colour rail and
+// the control on the right (matches the Subtitles cascade rows). `dim` greys a
+// gated rung; the underlying control still carries its own isDisabled so a
+// gated rung is inert, not merely faded.
+function CleanupRow({ rail, name, hint, dim, children }: {
+  rail?: string;
+  name: ReactNode;
+  hint?: ReactNode;
+  dim?: boolean;
+  children?: ReactNode;
+}) {
+  return (
+    <div className={`relative flex items-center justify-between gap-3 overflow-hidden rounded-xl bg-tertiary px-3.5 py-3 ring-1 ring-inset ring-secondary${dim ? ' opacity-60' : ''}`}>
+      {rail ? <span aria-hidden className="absolute inset-y-0 left-0 w-0.5" style={{ background: rail }} /> : null}
+      <span className="min-w-0 text-[13px] text-primary">
+        {name}
+        {hint ? <span className="ml-1.5 text-[11px] text-tertiary">{hint}</span> : null}
+      </span>
+      <div className="flex shrink-0 items-center gap-2">{children}</div>
+    </div>
+  );
+}
+
 function CommaListField({ value, placeholder, disabled, onSave }: {
   value: string[];
   placeholder?: string;
@@ -1713,6 +2075,7 @@ export function TrashBinCard({ rawSettings, saveKey, pushToast }: {
 
   return (
     <SectionCard
+      tint="var(--conf-high)"
       icon={<IcTrash />}
       title="Trash bin"
       desc={items.length > 0
@@ -1779,6 +2142,7 @@ export function TrashBinCard({ rawSettings, saveKey, pushToast }: {
           </div>
         ) : null}
         <SettingRow
+          settingKeys="rename.trash_retention_days"
           label="Auto-purge"
           desc="Permanently remove trashed items after this long. Checked at startup."
         >
