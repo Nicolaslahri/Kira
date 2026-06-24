@@ -118,6 +118,18 @@ function MusicCover({ ep, tint, dim }: { ep: LibEpisode; tint: [string, string];
   );
 }
 
+// Match transparency: how a music track resolved → a short label + explainer.
+// The fingerprint / ID methods are trustworthy; the positional/fuzzy ones
+// (track number, title) are flagged so a wrong match on a low-confidence row
+// is easy to spot.
+const MATCH_VIA: Record<string, { label: string; title: string; warn?: boolean }> = {
+  acoustid:  { label: 'AcoustID',    title: 'Matched by audio fingerprint (AcoustID) — identifies the actual recording regardless of tags' },
+  mbid:      { label: 'MusicBrainz', title: 'Matched directly by MusicBrainz release ID — a confident album match' },
+  recording: { label: 'recording',   title: 'Matched to a specific MusicBrainz recording' },
+  tracknum:  { label: 'track no.',    title: 'Matched by track number / position on the album — a positional guess; verify if the title looks off', warn: true },
+  title:     { label: 'title',        title: 'Matched by track-title similarity — verify if the confidence is low', warn: true },
+};
+
 interface MusicRowProps {
   row: PairedRowShape;
   item: LibraryItem;
@@ -259,6 +271,21 @@ function MusicRowImpl({ row, item, updateFile, onManualSearch, onOpenDupeModal, 
           {techSpec ? <Chip title="Audio quality" className="tabular-nums">{techSpec}</Chip> : null}
           {f.channels ? <Chip>{f.channels}</Chip> : null}
           {f.size ? <Chip className="tabular-nums">{f.size}</Chip> : null}
+          {/* Match transparency — HOW this track matched. Fuzzy methods
+              (track number / title) tint amber as a "verify me" cue. */}
+          {(() => {
+            const via = f.matchedVia ? MATCH_VIA[f.matchedVia] : undefined;
+            return via ? (
+              <Chip
+                title={via.title}
+                className={via.warn
+                  ? 'bg-[var(--conf-mid-bg)] text-[var(--conf-mid)] ring-[var(--conf-mid-32)]'
+                  : 'text-tertiary'}
+              >
+                via {via.label}
+              </Chip>
+            ) : null;
+          })()}
           {isDupePrimary ? (
             <button
               onClick={(ev) => { ev.stopPropagation(); if (row.episode && row.dupeAll) onOpenDupeModal(row.episode, row.dupeAll); }}

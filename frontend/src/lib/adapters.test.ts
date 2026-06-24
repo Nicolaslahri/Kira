@@ -114,6 +114,20 @@ describe('apiToMediaFile', () => {
     expect(f.match?.provider).toBeUndefined();   // placeholder — no real provider
     expect(f.match?.matchId).toBeUndefined();
   });
+
+  it('surfaces matched_via for music (the "via …" transparency chip source)', () => {
+    const f = apiToMediaFile(mkFile({
+      media_type: 'music',
+      matches: [mkMatch({ metadata: { music: true, matched_via: 'acoustid' } })],
+    }));
+    expect(f.matchedVia).toBe('acoustid');
+    // Non-music never carries it (the field is music-gated).
+    const g = apiToMediaFile(mkFile({
+      media_type: 'movie',
+      matches: [mkMatch({ metadata: { matched_via: 'acoustid' } })],
+    }));
+    expect(g.matchedVia).toBeUndefined();
+  });
 });
 
 describe('buildLibraryItems — grid clustering', () => {

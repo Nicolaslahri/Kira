@@ -131,6 +131,10 @@ export interface MediaFile {
   sampleRate?: number;       // Hz
   audioBitDepth?: number;    // bits
   lossless?: boolean;
+  /** How a music file matched — MusicBrainz `metadata_blob.matched_via`
+   *  (mbid | tracknum | recording | acoustid | title). Drives the popup's
+   *  "via …" match-transparency chip. */
+  matchedVia?: string;
   audio?: string[];
   /** Container duration in seconds (mediainfo). Drives the music popup's
    *  per-track time + the album total. */
@@ -288,6 +292,9 @@ export interface LibFile {
   sampleRate?: number;       // Hz
   audioBitDepth?: number;    // bits
   lossless?: boolean;        // authoritative lossless flag (vs the format-name guess)
+  /** How this music file matched (mbid | tracknum | recording | acoustid | title)
+   *  — drives the "via …" match-transparency chip in the popup track rows. */
+  matchedVia?: string;
   audio?: string[];
   /** Container duration in seconds (mediainfo). Drives the music popup's
    *  per-track time + the album total. */

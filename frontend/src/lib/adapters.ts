@@ -221,6 +221,8 @@ export function apiToMediaFile(api: ApiMediaFile): MediaFile {
     hdr: parsed.hdr ?? undefined,
     channels: parsed.channels ?? undefined,
     audioBitrate: typeof parsed.audio_bitrate === 'number' ? parsed.audio_bitrate : undefined,
+    // How this file matched (music) — surfaced as the popup's "via …" chip.
+    matchedVia: isMusic ? strOrU('matched_via') : undefined,
     sampleRate: typeof parsed.sample_rate === 'number' ? parsed.sample_rate : undefined,
     audioBitDepth: typeof parsed.audio_bit_depth === 'number' ? parsed.audio_bit_depth : undefined,
     lossless: typeof parsed.lossless === 'boolean' ? parsed.lossless : undefined,
@@ -415,6 +417,7 @@ function buildItem(group: MediaFile[]): LibraryItem {
       sampleRate: f.sampleRate,
       audioBitDepth: f.audioBitDepth,
       lossless: f.lossless,
+      matchedVia: f.matchedVia,
       audio: f.audio,
       audio_langs: f.audio_langs,
       sub_langs: f.sub_langs,
