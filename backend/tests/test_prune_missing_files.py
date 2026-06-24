@@ -85,6 +85,30 @@ async def test_prune_is_noop_when_nothing_missing(tmp_path, monkeypatch):
         assert len((await s.scalars(select(MediaFile.id))).all()) == 2
 
 
+@pytest.mark.asyncio
+async def test_prune_skips_root_that_walked_zero_files(tmp_path, monkeypatch):
+    """The NAS-disconnect guard: when a scan root walks ZERO files (a dropped
+    mount presenting as an empty-but-walkable dir), the tracked rows under it are
+    KEPT — even though stat() would confirm them gone. A disconnect must never be
+    read as 'the user deleted everything' and wipe the whole index."""
+    sm = await _session(tmp_path, monkeypatch)
+    root = tmp_path / "media"; root.mkdir()
+    # Rows for files that are NOT on disk (the share dropped → every stat = gone).
+    a = root / "a.S01E01.mkv"
+    b = root / "b.S01E02.mkv"
+    async with sm() as s:
+        for p in (a, b):
+            s.add(MediaFile(file_path=str(p), media_type="tv", status="matched",
+                            parsed_data={"title": "X"}))
+        await s.commit()
+    # The walk saw NOTHING this scan (mount dropped) — the catastrophic case.
+    async with sm() as s:
+        removed = await scans._prune_missing_files(s, [str(root)], set(), _norm)
+    assert removed == 0                       # guard tripped — nothing pruned
+    async with sm() as s:
+        assert len((await s.scalars(select(MediaFile.id))).all()) == 2
+
+
 def _alias_norm(drive_root: str, real_root: str):
     """Mirror the worker's alias-aware `_norm`: swap between a mapped-drive root
     spelling and its resolved form (what `Path('Z:/').resolve()` returns), and
@@ -146,15 +170,86 @@ async def test_prune_is_drive_letter_unc_alias_aware(tmp_path, monkeypatch):
 async def test_prune_posts_notification(tmp_path, monkeypatch):
     sm = await _session(tmp_path, monkeypatch)
     root = tmp_path / "media"; root.mkdir()
+    keep = root / "keep.S01E02.mkv"; keep.write_text("x")  # present + walked → root isn't "empty"
     gone = root / "gone.S01E01.mkv"  # never created
     async with sm() as s:
-        s.add(MediaFile(file_path=str(gone), media_type="tv", status="matched",
-                        parsed_data={"title": "X"}))
+        for p in (keep, gone):
+            s.add(MediaFile(file_path=str(p), media_type="tv", status="matched",
+                            parsed_data={"title": "X"}))
         await s.commit()
     async with sm() as s:
-        removed = await scans._prune_missing_files(s, [str(root)], set(), _norm)
+        removed = await scans._prune_missing_files(s, [str(root)], _norm(keep), _norm)
     assert removed == 1
     from kira.models import Notification
     async with sm() as s:
         notes = list(await s.scalars(select(Notification)))
     assert any("no longer on disk" in n.title for n in notes)
+
+
+@pytest.mark.asyncio
+async def test_prune_skips_errored_subtree_but_sweeps_clean_one(tmp_path, monkeypatch):
+    """Resilient sweep: a folder that errored this scan (passed via `error_paths`)
+    is EXCLUDED — a 'missing' row inside it is kept, because 'the walk didn't see
+    it' can't be trusted in an unreadable subtree — while a deleted file under a
+    cleanly-walked sibling folder is still pruned. One bad folder no longer
+    freezes all cleanup (the all-or-nothing-gate bug)."""
+    sm = await _session(tmp_path, monkeypatch)
+    root = tmp_path / "media"; root.mkdir()
+    clean = root / "CleanShow"; clean.mkdir()
+    flaky = root / "FlakyShow"; flaky.mkdir()
+
+    clean_keep = clean / "keep.S01E02.mkv"; clean_keep.write_text("x")  # present + walked
+    clean_gone = clean / "clean.S01E01.mkv"   # deleted on disk, under a clean folder
+    flaky_gone = flaky / "flaky.S01E01.mkv"   # also gone, but its folder errored this scan
+    async with sm() as s:
+        for p in (clean_keep, clean_gone, flaky_gone):
+            s.add(MediaFile(file_path=str(p), media_type="tv", status="matched",
+                            parsed_data={"title": "X"}))
+        await s.commit()
+
+    # The walk SAW clean_keep (so the root isn't zero-file → the disconnect guard
+    # doesn't trip); clean_gone reports gone; FlakyShow raised a scandir error.
+    async with sm() as s:
+        removed = await scans._prune_missing_files(
+            s, [str(root)], _norm(clean_keep), _norm, error_paths=[str(flaky)],
+        )
+    assert removed == 1   # only the clean-folder deletion
+
+    async with sm() as s:
+        paths = set((await s.scalars(select(MediaFile.file_path))).all())
+    assert str(clean_keep) in paths       # present + walked → kept
+    assert str(clean_gone) not in paths   # clean subtree → swept
+    assert str(flaky_gone) in paths       # errored subtree → kept (can't trust)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_endpoint_prunes_gone_review_files(tmp_path, monkeypatch):
+    """The walk-FREE /files/reconcile sweep (the on-refresh deletion check): a
+    review-stage row whose disk file is gone is dropped with no scan and no walk
+    (so no all-or-nothing gate); a present file is kept, and a post-rename
+    ("renamed") row is OUT of scope — left to the scan prune."""
+    from kira.api.files import reconcile_files
+
+    sm = await _session(tmp_path, monkeypatch)
+    root = tmp_path / "media"; root.mkdir()
+    present = root / "present.S01E01.mkv"; present.write_text("x")
+    gone = root / "gone.S01E02.mkv"               # never created → deleted on disk
+    renamed_gone = root / "renamed.S01E03.mkv"    # gone too, but already organized
+    async with sm() as s:
+        s.add(MediaFile(file_path=str(present), media_type="tv", status="matched",
+                        parsed_data={"title": "X"}))
+        s.add(MediaFile(file_path=str(gone), media_type="tv", status="matched",
+                        parsed_data={"title": "X"}))
+        s.add(MediaFile(file_path=str(renamed_gone), media_type="tv", status="renamed",
+                        parsed_data={"title": "X"}))
+        await s.commit()
+
+    async with sm() as s:
+        out = await reconcile_files(s)
+    assert out["removed"] == 1   # only the review-stage gone file
+
+    async with sm() as s:
+        paths = set((await s.scalars(select(MediaFile.file_path))).all())
+    assert str(present) in paths          # present → kept
+    assert str(gone) not in paths         # review-stage + gone → pruned on the spot
+    assert str(renamed_gone) in paths     # post-rename → out of scope (scan prune owns it)

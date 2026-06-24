@@ -11,6 +11,7 @@ import {
   IcTv, IcAnime, IcFilm, IcMusic, IcDisc, IcReview, IcCaption,
 } from '../lib/icons';
 import { MediaTypeIcon, EmptyState } from './ui';
+import { HeroCoverMosaic, distinctCovers } from './CoverPopup/HeroCoverMosaic';
 import { Button } from './base/buttons/button';
 import { FeaturedIcon } from './base/featured-icons/featured-icon';
 import { cn } from '../lib/utils';
@@ -117,6 +118,58 @@ function useSonarrQueueLibrary(): QueueMaps {
     return () => { cancelled = true; if (timer) clearTimeout(timer); };
   }, []);
   return maps;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Radarr live queue — drives the collection-ghost cover download fills
+// ─────────────────────────────────────────────────────────────────────
+
+export interface RadarrQueueEntry {
+  tmdb_id: number;
+  title: string | null;
+  status: string;
+  progress_pct: number;
+  eta_seconds: number | null;
+  release_title: string | null;
+  error_message: string | null;
+}
+
+const DL_STATUS_LABEL: Record<string, string> = {
+  queued: 'Queued', searching: 'Searching', downloading: 'Downloading',
+  importing: 'Importing', completed: 'Imported', failed: 'Failed', warning: 'Warning',
+};
+
+// Polls /integrations/radarr/queue while there are ghost cards on screen (the
+// `enabled` gate), so a library with no collection gaps pays nothing. Keyed by
+// tmdb id — a GhostCoverCard finds its own download by ghost.tmdbId. 5s cadence:
+// tight enough that the fill visibly climbs, loose enough to be invisible load.
+function useRadarrQueueLibrary(enabled: boolean): Map<number, RadarrQueueEntry> {
+  const [map, setMap] = useState<Map<number, RadarrQueueEntry>>(() => new Map());
+  useEffect(() => {
+    if (!enabled) { setMap(new Map()); return; }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let errCount = 0;
+    const tick = async () => {
+      try {
+        const r = await api.radarrQueue();
+        if (cancelled) return;
+        const m = new Map<number, RadarrQueueEntry>();
+        for (const it of r.items) m.set(it.tmdb_id, it as RadarrQueueEntry);
+        setMap(m);
+        errCount = 0;
+        timer = setTimeout(tick, 5000);
+      } catch {
+        if (cancelled) return;
+        errCount += 1;
+        if (errCount > 6) return;
+        timer = setTimeout(tick, errCount <= 2 ? 12000 : 30000);
+      }
+    };
+    void tick();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, [enabled]);
+  return map;
 }
 
 /** Per-card summary computed once at render time. Drives the cover-
@@ -279,7 +332,8 @@ export function CoverCard({
   const isMusic = item.mediaType === 'music';
   const tint = item.poster.tint;
   const mediaIcon = item.mediaType === 'movie' ? <IcFilm /> : item.mediaType === 'anime' ? <IcAnime /> : item.mediaType === 'music' ? <IcMusic /> : <IcTv />;
-  const missingSubsCount = item.files.filter(f => f.missingSubs && f.missingSubs.length > 0).length;
+  // Music has no subtitles — never show the "missing subs" (CC) badge for albums.
+  const missingSubsCount = isMusic ? 0 : item.files.filter(f => f.missingSubs && f.missingSubs.length > 0).length;
 
   // AniDB's title-dump search doesn't carry image URLs — fetch lazily.
   // Seed from the shared cache synchronously so cards re-render with the
@@ -289,6 +343,10 @@ export function CoverCard({
     anidbAid ? (getCachedAnidbPoster(String(anidbAid)) ?? null) : null
   );
   const effectivePosterUrl = item.posterUrl ?? lazyPoster;
+  // Music with ≥2 DISTINCT track covers (a Singles folder, a multi-edition album)
+  // → a compact contact-sheet mosaic on the card, mirroring the popup hero. One
+  // distinct cover (a normal album) falls through to the single-cover image.
+  const musicCovers = isMusic ? distinctCovers(item) : [];
   // Any poster that fails to load (404, dead host) falls back to the initials
   // card instead of a blank gradient. Reset when the URL changes so a fresh
   // poster gets a fair retry.
@@ -365,7 +423,9 @@ export function CoverCard({
           </>
         ) : (
           <>
-            {effectivePosterUrl && !imgFailed ? (
+            {isMusic && musicCovers.length >= 2 ? (
+              <HeroCoverMosaic covers={musicCovers} tint={tint} title={item.title} compact />
+            ) : effectivePosterUrl && !imgFailed ? (
               <img
                 src={effectivePosterUrl}
                 alt=""
@@ -442,6 +502,12 @@ export function CoverCard({
             ? (item.title || 'Unknown file')
             : (inFranchise ? (displayTitle ?? (item.title || '').replace(/\s*\(\d{4}\)\s*$/, '')) : item.title)}
         </div>
+        {/* Music: the artist gets its OWN full-width line. In the meta row below it
+            was sharing space with the year/track-count AND the hover action buttons
+            (~72px, always in-flow), squeezing "Justin Bieber" down to "J…". */}
+        {!item.noMatch && item.artist ? (
+          <div className="truncate text-[12px] font-medium text-secondary">{item.artist}</div>
+        ) : null}
         <div className="flex min-h-[18px] items-center gap-2 text-[11.5px] text-tertiary">
           <div className="flex min-w-0 flex-1 items-center gap-1.5 truncate [&>.dot-sep]:text-quaternary">
             {item.noMatch ? (
@@ -468,7 +534,7 @@ export function CoverCard({
               </>
             ) : (
               <>
-                {item.artist ? <span className="truncate font-medium text-secondary">{item.artist}</span> : null}
+                {/* artist moved to its own line above (music) */}
                 {seasonLabel
                   ? <span>{seasonLabel}</span>
                   : ((item.yearRange || item.year) ? <span>{item.yearRange || item.year}</span> : null)}
@@ -510,6 +576,161 @@ export function CoverCard({
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// GhostCoverCard — a collection part you DON'T own (#14). Dimmed cover with a
+// "Not in library" overlay + one-click "Get from Radarr" (released) or a
+// "Coming <year>" hint (upcoming). Carries no files — its own mini-component so
+// the real CoverCard's stats / select / queue logic stays untouched.
+// ─────────────────────────────────────────────────────────────────────
+
+function GhostCoverCard({
+  item, displayTitle, onGetMovie, queueItem,
+}: {
+  item: LibraryItem;
+  displayTitle?: string;
+  onGetMovie?: (tmdbId: number) => Promise<{ ok: boolean; detail: string | null }>;
+  queueItem?: RadarrQueueEntry;
+}) {
+  const ghost = item.ghost!;
+  const [state, setState] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
+  const [imgFailed, setImgFailed] = useState(false);
+  const title = displayTitle ?? item.title;
+  const tint = item.poster.tint;
+
+  // Radarr actively working on this movie → authoritative over the local click
+  // state. A `completed` entry is dropped (the file's about to import + scan in
+  // as a real card, so the ghost vanishes shortly).
+  const dl = queueItem && queueItem.status !== 'completed' ? queueItem : null;
+  const pct = dl ? Math.round(dl.progress_pct) : 0;
+  const dlLabel = dl ? (DL_STATUS_LABEL[dl.status] ?? 'Working') : '';
+
+  const handleGet = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!onGetMovie || state === 'loading' || state === 'done') return;
+    setState('loading');
+    try {
+      const r = await onGetMovie(ghost.tmdbId);
+      setState(r.ok ? 'done' : 'error');
+    } catch {
+      setState('error');
+    }
+  };
+
+  return (
+    <div
+      className="group/cc relative flex flex-col gap-2.5"
+      data-cardid={item.id}
+      title={`${title}${item.year ? ` (${item.year})` : ''}${dl ? ` — ${dlLabel} ${pct}%` : ' — not in your library'}`}
+    >
+      <div
+        className="relative flex aspect-[2/3] items-center justify-center overflow-hidden rounded-xl bg-[var(--panel)] text-center font-bold tracking-tight text-white shadow-md ring-1 ring-inset ring-secondary transition duration-200"
+        style={{ background: (!item.posterUrl || imgFailed) ? `linear-gradient(135deg, ${tint[0]}, ${tint[1]})` : undefined }}
+      >
+        {item.posterUrl && !imgFailed ? (
+          <img
+            src={item.posterUrl}
+            alt=""
+            loading="lazy"
+            referrerPolicy="no-referrer"
+            onError={() => setImgFailed(true)}
+            className={cn('absolute inset-0 z-0 block size-full object-cover', dl ? 'opacity-45' : 'opacity-30 grayscale')}
+          />
+        ) : (
+          <span className="relative z-[1] text-4xl leading-none opacity-40 drop-shadow-[0_2px_6px_var(--scrim-50)]">{item.poster.init}</span>
+        )}
+
+        {dl ? (
+          <>
+            {/* Download progress — fills the cover from the bottom up (Sonarr-style). */}
+            <div
+              aria-hidden="true"
+              className="absolute inset-x-0 bottom-0 z-[1] transition-[height] duration-700 ease-out"
+              style={{ height: `${Math.max(pct, 3)}%`, background: 'color-mix(in srgb, var(--brand) 45%, transparent)' }}
+            />
+            <div className="absolute inset-0 z-[2] flex flex-col items-center justify-center gap-1">
+              <span className="text-[26px] font-bold leading-none tabular-nums text-white drop-shadow-[0_2px_6px_var(--scrim-50)]">{pct}%</span>
+              <span className="inline-flex items-center gap-1 rounded-md bg-black/55 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white/90 ring-1 ring-inset ring-white/15 [&_svg]:size-3">
+                <IcDownload /> {dlLabel}
+              </span>
+            </div>
+          </>
+        ) : (
+          /* Overlay: "missing" label + the action. */
+          <div className="absolute inset-0 z-[2] flex flex-col items-center justify-center gap-2 bg-black/45 px-2 text-center backdrop-blur-[1px]">
+            <span className="rounded-md bg-black/55 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white/85 ring-1 ring-inset ring-white/15">Not in library</span>
+            {ghost.released ? (
+              <button
+                type="button"
+                onClick={handleGet}
+                disabled={!onGetMovie || state === 'loading' || state === 'done'}
+                className={cn(
+                  'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11.5px] font-semibold ring-1 ring-inset transition [&_svg]:size-3.5',
+                  state === 'done'
+                    ? 'bg-[color-mix(in_srgb,var(--color-fg-success-primary)_18%,transparent)] text-success-primary ring-[color-mix(in_srgb,var(--color-fg-success-primary)_45%,transparent)]'
+                    : state === 'error'
+                      ? 'bg-[color-mix(in_srgb,var(--color-fg-error-primary)_18%,transparent)] text-error-primary ring-[color-mix(in_srgb,var(--color-fg-error-primary)_45%,transparent)] hover:brightness-125'
+                      : 'bg-brand-solid text-white ring-transparent hover:bg-brand-solid_hover disabled:opacity-60',
+                )}
+              >
+                {state === 'done' ? <><IcCheck /> Requested</>
+                  : state === 'loading' ? 'Requesting…'
+                  : state === 'error' ? <><IcDownload /> Retry</>
+                  : <><IcDownload /> Get from Radarr</>}
+              </button>
+            ) : (
+              <span className="rounded-md bg-black/45 px-2 py-0.5 text-[11px] font-medium text-white/70">{item.year ? `Coming ${item.year}` : 'Unreleased'}</span>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="flex flex-col gap-1 px-0.5">
+        <div className="line-clamp-2 min-h-[2.4em] text-[13.5px] font-semibold leading-tight tracking-tight text-tertiary">{title}</div>
+        <div className="min-h-[18px] text-[11.5px] text-quaternary tabular-nums">{dl ? `${dlLabel}${pct ? ` · ${pct}%` : ''}` : (item.year ?? '')}</div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// CollectionGetAll — band-header "Get all N from Radarr" (#14). One click adds
+// every RELEASED missing film in a collection; each ghost cover then shows its
+// own download fill from the queue poll.
+// ─────────────────────────────────────────────────────────────────────
+
+function CollectionGetAll({
+  ghosts, onGetMovie,
+}: {
+  ghosts: LibraryItem[];
+  onGetMovie: (tmdbId: number) => Promise<{ ok: boolean; detail: string | null }>;
+}) {
+  const [state, setState] = useState<'idle' | 'busy' | 'done'>('idle');
+  const handle = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (state !== 'idle') return;
+    setState('busy');
+    await Promise.allSettled(
+      ghosts.map(g => (g.ghost ? onGetMovie(g.ghost.tmdbId) : Promise.resolve())),
+    );
+    setState('done');
+  };
+  return (
+    <button
+      type="button"
+      onClick={handle}
+      disabled={state !== 'idle'}
+      className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-brand-solid px-2.5 py-1 text-[11.5px] font-semibold text-white ring-1 ring-inset ring-transparent transition hover:bg-brand-solid_hover disabled:opacity-60 [&_svg]:size-3.5"
+      title={`Add the ${ghosts.length} missing released films in this collection to Radarr`}
+    >
+      {state === 'done'
+        ? <><IcCheck /> Requested {ghosts.length}</>
+        : state === 'busy'
+          ? 'Requesting…'
+          : <><IcDownload /> Get all {ghosts.length} from Radarr</>}
+    </button>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // LibraryGrid — sectioned grid wrapper
 // ─────────────────────────────────────────────────────────────────────
 
@@ -540,17 +761,24 @@ interface LibraryGridProps {
   onApprove: (item: LibraryItem) => void;
   onReject: (item: LibraryItem) => void;
   onManualSearch: (item: LibraryItem) => void;
+  /** One-click "Get from Radarr" for a collection ghost card (#14). Returns the
+   *  outcome so the ghost flips to "Requested". Omitted = ghosts render inert. */
+  onGetMovie?: (tmdbId: number) => Promise<{ ok: boolean; detail: string | null }>;
 }
 
 export function LibraryGrid({
   items, selected, setSelected, focusedId, setFocusedId,
   totalLibrarySize, onClearFilters, hydrated,
   scanRunning, scanProgress, scanMessage, scanFound,
-  onOpenCover, onApprove, onReject, onManualSearch,
+  onOpenCover, onApprove, onReject, onManualSearch, onGetMovie,
 }: LibraryGridProps) {
   // Live Sonarr queue — polled while this grid is mounted. Each card
   // gets its slice via the byTvdb / byAnidb lookups below.
   const sonarrQueueMaps = useSonarrQueueLibrary();
+  // Radarr download queue — only polled while there are ghost cards on screen
+  // (hasGhosts gate), so a library with no collection gaps pays nothing.
+  const hasGhosts = useMemo(() => items.some(it => it.ghost), [items]);
+  const radarrQueue = useRadarrQueueLibrary(hasGhosts);
   // Split items: no_match cards go to their own "Needs matching" section,
   // matched cards stay in their media-type section. Without this, the
   // 14-odd unmatched anime cards (e.g. all the One Pace seasons) mix in
@@ -726,8 +954,8 @@ export function LibraryGrid({
             {renderSectionBody(
               arr, sec.key,
               { selected, setSelected, focusedId, setFocusedId, anySelected,
-                onOpenCover, onApprove, onReject, onManualSearch,
-                sonarrQueueMaps, shelfGroupIds },
+                onOpenCover, onApprove, onReject, onManualSearch, onGetMovie,
+                sonarrQueueMaps, radarrQueue, shelfGroupIds },
             )}
           </section>
         );
@@ -753,8 +981,8 @@ export function LibraryGrid({
           {renderSectionBody(
             needsMatching, 'anime',
             { selected, setSelected, focusedId, setFocusedId, anySelected,
-              onOpenCover, onApprove, onReject, onManualSearch, sonarrQueueMaps,
-              shelfGroupIds },
+              onOpenCover, onApprove, onReject, onManualSearch, onGetMovie, sonarrQueueMaps,
+              radarrQueue, shelfGroupIds },
           )}
         </section>
       ) : null}
@@ -776,11 +1004,15 @@ interface SectionCtx {
   onApprove: (item: LibraryItem) => void;
   onReject: (item: LibraryItem) => void;
   onManualSearch: (item: LibraryItem) => void;
+  /** One-click "Get from Radarr" for ghost cards (#14). Undefined disables them. */
+  onGetMovie?: (tmdbId: number) => Promise<{ ok: boolean; detail: string | null }>;
   /** Live Sonarr queue maps — `useSonarrQueueLibrary()` output. Each
    *  CoverCard render site uses `lookupQueue(item)` below to pull its
    *  own slice. Keeping the maps on ctx avoids passing them through
    *  every intermediate prop while still scoping lookup to the grid. */
   sonarrQueueMaps: QueueMaps;
+  /** Radarr download queue (tmdb id → entry) — feeds the ghost cover fills. */
+  radarrQueue: Map<number, RadarrQueueEntry>;
   /** Group ids that should render as a franchise SHELF even at a single
    *  remaining member — a franchise that was once ≥2 in the grid and hasn't
    *  fully emptied (see `shelfGroupIds` in LibraryGrid). */
@@ -925,7 +1157,9 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
     if (!bucket.length) return;
     out.push(
       <div key={`flat-${cardIdx}`} className={`lib-grid ${shape}`}>
-        {bucket.map((item, i) => (
+        {bucket.map((item, i) => item.ghost ? (
+          <GhostCoverCard key={item.id} item={item} onGetMovie={ctx.onGetMovie} queueItem={ctx.radarrQueue.get(item.ghost.tmdbId)} />
+        ) : (
           <CoverCard
             key={item.id}
             item={item}
@@ -1038,9 +1272,20 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
       titleById.get(it.id) ?? stripYear(it.title || '');
     const totalSeasons = b.items.length;
     const totalEpisodes = b.items.reduce((s, it) => s + (it.episodes?.length ?? 0), 0);
-    const counter = totalEpisodes > 0
-      ? `${pluralize(totalSeasons, 'season')} · ${pluralize(totalEpisodes, 'episode')}`
-      : pluralize(totalSeasons, 'entry', 'entries');
+    const ghostCount = b.items.reduce((n, it) => n + (it.ghost ? 1 : 0), 0);
+    // Released missing films → offer a one-click "Get all N" on the band header
+    // (only worth it at ≥2; a single gap already has its own per-card button).
+    const releasedGhosts = b.items.filter(it => it.ghost?.released);
+    // Movie collection bands count FILMS + how many you're missing — not the
+    // TV-shaped "seasons · episodes" (a movie carries one fabricated episode,
+    // which otherwise read as "2 seasons · 1 episode" on a 2-film collection).
+    const counter = sectionKey === 'movie'
+      ? (ghostCount > 0
+          ? `${pluralize(totalSeasons, 'film')} · ${ghostCount} missing`
+          : pluralize(totalSeasons, 'film'))
+      : totalEpisodes > 0
+        ? `${pluralize(totalSeasons, 'season')} · ${pluralize(totalEpisodes, 'episode')}`
+        : pluralize(totalSeasons, 'entry', 'entries');
 
     out.push(
       <div key={`franchise-${b.key}-${bi}`} className="lib-franchise-group">
@@ -1051,9 +1296,14 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
           {/* Collection-shelf count chip: reads "N" seasons/entries at a
               glance. Pure presentational; mirrors the section-head count. */}
           <span className="lib-franchise-badge" aria-hidden="true">{totalSeasons}</span>
+          {ctx.onGetMovie && releasedGhosts.length >= 2 ? (
+            <CollectionGetAll ghosts={releasedGhosts} onGetMovie={ctx.onGetMovie} />
+          ) : null}
         </header>
         <div className={`lib-grid ${shape} lib-franchise-grid`}>
-          {sorted.map((item, i) => (
+          {sorted.map((item, i) => item.ghost ? (
+            <GhostCoverCard key={item.id} item={item} displayTitle={displayTitleFor(item)} onGetMovie={ctx.onGetMovie} queueItem={ctx.radarrQueue.get(item.ghost.tmdbId)} />
+          ) : (
             <CoverCard
               key={item.id}
               item={item}

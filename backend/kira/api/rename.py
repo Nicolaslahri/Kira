@@ -18,6 +18,7 @@ from sqlalchemy.orm import selectinload
 
 from kira.config import settings
 from kira.database import get_session
+from kira.longpath import long_path
 from kira.models import Match, MediaFile, Notification, RenameHistory, RenameIntent
 from kira.parser import ParsedFile
 from kira.renamer import (
@@ -647,12 +648,12 @@ async def _write_nfo_files(target: Path, parsed: ParsedFile, selected: Match, me
         # until the next rename. Mirrors the artwork path's _atomic_write.
         _tmp = p.with_name(p.name + ".kira-nfo-tmp")
         try:
-            _tmp.write_text(text, encoding="utf-8")
-            os.replace(_tmp, p)
+            Path(long_path(_tmp)).write_text(text, encoding="utf-8")
+            os.replace(long_path(_tmp), long_path(p))
         except Exception:
             try:
-                if _tmp.exists():
-                    _tmp.unlink()
+                if os.path.exists(long_path(_tmp)):
+                    os.unlink(long_path(_tmp))
             except OSError:
                 pass
             raise
@@ -739,7 +740,7 @@ async def _write_nfo_files(target: Path, parsed: ParsedFile, selected: Match, me
         # Write-if-absent — one tvshow.nfo per series, not per episode. NOT
         # tracked in `written`: it's shared across the series, so undoing one
         # episode must not delete it.
-        if not tv_path.exists():
+        if not os.path.exists(long_path(tv_path)):
             content = nfo.build_tvshow_nfo(show_name, year, meta, prov, pid, fields=fields,
                                            season_posters=season_posters)
             await asyncio.to_thread(_atomic_write_text, tv_path, content)
@@ -948,12 +949,12 @@ async def _download_artwork_with_client(
     from kira.download_guard import fetch_capped, sniff_image
 
     def _atomic_write(tmp: Path, final: Path, data: bytes) -> None:
-        tmp.write_bytes(data)
-        os.replace(tmp, final)
+        Path(long_path(tmp)).write_bytes(data)
+        os.replace(long_path(tmp), long_path(final))
 
     for url, dest, _shared in jobs:
         try:
-            if dest.exists():
+            if os.path.exists(long_path(dest)):
                 continue
             # Per-batch byte cache: a TV season shares one show clearlogo /
             # poster URL across every episode — fetch it ONCE, write it to
@@ -1294,6 +1295,11 @@ async def perform_rename(
     # index) for instant re-identification. Default ON; switchable for users
     # who don't want Kira attaching ANY metadata to their files.
     stamp_ids = await _resolve_bool_setting(session, "rename.stamp_ids", True)
+    # Write the matched metadata INTO music files' embedded tags (mutagen). For
+    # music the tags ARE the canonical metadata players read — so this is music's
+    # equivalent of NFO. Default ON; off for users who don't want Kira touching
+    # the bytes inside their audio files.
+    music_write_tags = await _resolve_bool_setting(session, "music.write_tags", True)
     nfo_fields = await _resolve_nfo_fields(session) if write_nfo else None
     download_artwork = await _resolve_bool_setting(session, "naming.download_artwork", False)
     # Artwork sources: provider poster/background always; fanart.tv (when a key
@@ -1368,7 +1374,16 @@ async def perform_rename(
     # rescan hook. Without it, Sonarr's next disk scan sees the old paths gone,
     # marks the episode files deleted, and may re-download monitored episodes.
     # (provider, provider_id) pairs; resolved to TVDB ids in the hook.
-    renamed_episode_series: set[tuple[str, str]] = set()
+    # (provider, provider_id) → (old_show_root, new_show_root). The roots let the
+    # Sonarr hook re-point a RENAMED series folder (not just rescan the stale
+    # path, which would orphan the files). All files of a series share the same
+    # roots, so last-write-wins is fine.
+    renamed_episode_series: dict[tuple[str, str], tuple[str, str]] = {}
+    # Movies whose files were RENAMED this batch — feeds the post-rename Radarr
+    # relink hook (the movie sibling of the Sonarr one). (provider, provider_id)
+    # → (old_movie_folder, new_movie_folder); resolved to Radarr by TMDB id in
+    # the hook. A movie's folder Radarr tracks is simply its file's parent dir.
+    renamed_movie: dict[tuple[str, str], tuple[str, str]] = {}
     # Every path Kira WROTE this batch (renamed videos + their NFO / artwork /
     # co-renamed sidecars), so the post-loop in-place junk sweep can protect our
     # own fresh output when it strips leftovers from a destination folder that
@@ -1404,11 +1419,30 @@ async def perform_rename(
         # never get Match rows in the first place.
         if selected is None or not selected.provider or not selected.provider_id:
             if parsed.media_type == "music":
-                err = "Music rename not supported yet — MusicBrainz provider is not implemented."
+                err = "No music match yet — enable Music matching in Settings → Advanced, then scan."
             else:
                 err = "No match to rename to — match the file first."
             results.append(RenameItemResult(file_id=fid, ok=False, error=err))
             return
+
+        # Music (isolated plugin, Phase 3): the matcher wrote the MusicBrainz-
+        # corrected metadata onto the Match (+ its metadata_blob). Overlay it onto
+        # the parsed COPY so the music naming template renders the corrected
+        # artist/album/title/track — not the raw filename parse. The TV/movie/anime
+        # logic below no-ops for music (its guards key on media_type / match_type
+        # == "tv_episode"), and music writes no NFO/artwork (nfo.plan_nfo_writes →
+        # {} for music). `parsed` is a per-file ParsedFile(**...) copy, so mutating
+        # it never touches the stored row.
+        if parsed.media_type == "music":
+            _mb = selected.metadata_blob or {}
+            parsed.artist = _mb.get("artist") or parsed.artist
+            parsed.album = _mb.get("album") or selected.series_name or parsed.album
+            parsed.track_title = selected.title or parsed.track_title
+            if selected.episode_number is not None:
+                parsed.track = selected.episode_number
+            if selected.year is not None:
+                parsed.year = selected.year
+
         library_title = selected.title or parsed.title
         library_year = selected.year if selected.year is not None else parsed.year
         # Per-season posters for the unified tvshow.nfo (anime franchises only —
@@ -1883,6 +1917,28 @@ async def perform_rename(
             ))
             return
 
+        # Music: write the matched metadata INTO the moved file's embedded tags.
+        # For music these tags ARE the canonical metadata (Plex/Jellyfin/Kodi read
+        # tags, not NFO), so this is music's equivalent of the NFO/sidecar writes
+        # the video path does below. Best-effort + off the event loop; a failure is
+        # logged, never fatal (the file is already correctly named + placed).
+        if parsed.media_type == "music" and music_write_tags:
+            from kira.music.tags import write_tags as _write_music_tags
+            _mb = selected.metadata_blob or {}
+            try:
+                wrote = await asyncio.to_thread(
+                    _write_music_tags, str(target),
+                    artist=_mb.get("artist"), album_artist=_mb.get("artist"),
+                    album=_mb.get("album"), title=_mb.get("title"),
+                    track_no=_mb.get("track_no"), disc_no=_mb.get("disc_no"),
+                    year=_mb.get("year"), mb_release_id=_mb.get("release_id"),
+                    mb_recording_id=_mb.get("recording_id"),
+                )
+                if not wrote:
+                    logger.warning(f"music: tag write skipped/failed for {target}")
+            except Exception as e:
+                logger.warning(f"music: tag write errored for {target}: {e!r}")
+
         # If we MOVEd, the source path no longer exists — update the row.
         if op == FileOp.MOVE:
             f.file_path = str(target)
@@ -2150,13 +2206,28 @@ async def perform_rename(
                 except Exception:
                     pass
                 return
-        # Successful episode rename → remember the series for the Sonarr
-        # rescan hook (movies don't apply; Sonarr keys series by TVDB id).
+        # Successful episode rename → remember the series + its OLD/NEW show
+        # folders for the Sonarr hook (movies don't apply; Sonarr keys series by
+        # TVDB id). The roots let the hook re-point a renamed folder, not just
+        # rescan a now-stale path.
         if (
             selected.match_type == "tv_episode"
             and selected.provider and selected.provider_id
         ):
-            renamed_episode_series.add((selected.provider, str(selected.provider_id)))
+            from kira.renamer.nfo import series_root_for
+            renamed_episode_series[(selected.provider, str(selected.provider_id))] = (
+                str(series_root_for(src)), str(series_root_for(target)),
+            )
+        elif (
+            selected.match_type == "movie"
+            and selected.provider and selected.provider_id
+        ):
+            # A movie's folder (what Radarr stores as its `path`) is the file's
+            # parent dir — no Season level to walk past. The relink only fires
+            # when the folder actually moved (guarded by old != new in the hook).
+            renamed_movie[(selected.provider, str(selected.provider_id))] = (
+                str(src.parent), str(target.parent),
+            )
         results.append(RenameItemResult(
             file_id=fid, ok=True, old_path=str(src), new_path=str(target),
             error=sidecar_msg,
@@ -2461,7 +2532,31 @@ async def perform_rename(
                 # #9: nudge Plex/Jellyfin to re-scan so the renames show up now.
                 try:
                     from kira.integrations.media_server import refresh_all
-                    await refresh_all(hook_session)
+                    _ms = await refresh_all(hook_session)
+                    # Surface the outcome so the nudge is no longer silent: a
+                    # success confirms "the renames should show up now", and a
+                    # failure names WHICH server and WHY (so a broken one is
+                    # visible instead of quietly doing nothing). Only fires when
+                    # at least one server is configured.
+                    if _ms:
+                        _ms_ok = [r["name"] for r in _ms if r["ok"]]
+                        _ms_bad = [r for r in _ms if not r["ok"]]
+                        if _ms_bad:
+                            _bits = []
+                            if _ms_ok:
+                                _bits.append(f"Refreshed {' and '.join(_ms_ok)}.")
+                            _bits.extend(f"{r['name']} failed — {r['detail']}." for r in _ms_bad)
+                            _ms_kind, _ms_title, _ms_body = "warning", "Library refresh — needs attention", " ".join(_bits)
+                        else:
+                            _ms_kind, _ms_title = "success", "Library refresh"
+                            _ms_body = f"Refreshed {' and '.join(_ms_ok)} — the renames should show up now."
+                        from kira.database import SessionLocal as _SL_ms
+                        try:
+                            async with _SL_ms() as _ms_ns:
+                                _ms_ns.add(Notification(kind=_ms_kind, title=_ms_title, body=_ms_body))
+                                await _ms_ns.commit()
+                        except Exception:
+                            pass
                 except Exception as e:
                     logger.warning(f"rename: media-server refresh failed (non-fatal): {e!r}")
                 # Sonarr rescan: tell Sonarr to re-scan each renamed series NOW,
@@ -2479,23 +2574,99 @@ async def perform_rename(
                         except Exception:
                             sonarr_cfg = None  # not configured — nothing to do
                         if sonarr_cfg is not None:
-                            tvdb_ids: set[int] = set()
-                            for prov, pid in renamed_episode_series:
+                            # Resolve each renamed series to a TVDB id, carrying its
+                            # OLD/NEW show folders so the hook can re-point a renamed
+                            # folder (not just rescan a stale path → orphaned files).
+                            tvdb_roots: dict[int, tuple[str, str]] = {}
+                            for (prov, pid), roots in renamed_episode_series.items():
                                 try:
                                     if prov == "tvdb":
-                                        tvdb_ids.add(int(pid))
+                                        tvdb_roots[int(pid)] = roots
                                     elif prov == "anidb":
                                         t = await AnimeMappings.tvdb_id(int(pid))
                                         if t:
-                                            tvdb_ids.add(int(t))
+                                            tvdb_roots[int(t)] = roots
                                 except (TypeError, ValueError):
                                     continue
-                            for tid in tvdb_ids:
-                                ok = await sonarr_mod.rescan_series_by_tvdb(sonarr_cfg, tid)
-                                if ok:
-                                    logger.info(f"rename: sonarr rescan queued for tvdb {tid}")
+                            repointed: list[str] = []
+                            for tid, (old_root, new_root) in tvdb_roots.items():
+                                ok, changed, detail = await sonarr_mod.relink_series(
+                                    sonarr_cfg, tid, old_root=old_root, new_root=new_root,
+                                )
+                                # "not in Sonarr" is the EXPECTED outcome for a series
+                                # you didn't get via Sonarr — a benign skip, so it logs
+                                # quietly; only real trouble (HTTP/transport) warns.
+                                _lvl = (logger.debug if detail == "not in Sonarr"
+                                        else logger.info if ok else logger.warning)
+                                _lvl(f"rename: sonarr relink for tvdb {tid} — {detail}")
+                                if changed:
+                                    base = new_root.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+                                    repointed.append(base or new_root)
+                            # Only notify when a path was actually MOVED (the new,
+                            # noteworthy action). A plain rescan stays silent.
+                            if repointed:
+                                from kira.database import SessionLocal as _SL_sn
+                                try:
+                                    async with _SL_sn() as _sn:
+                                        _sn.add(Notification(
+                                            kind="success",
+                                            title="Sonarr path updated",
+                                            body=(f"Re-pointed Sonarr to the new folder for "
+                                                  f"{', '.join(repointed)} so the files stay tracked."),
+                                        ))
+                                        await _sn.commit()
+                                except Exception:
+                                    pass
                     except Exception as e:
-                        logger.warning(f"rename: sonarr rescan hook failed (non-fatal): {e!r}")
+                        logger.warning(f"rename: sonarr relink hook failed (non-fatal): {e!r}")
+                # Radarr relink: the movie sibling of the Sonarr hook. When Kira
+                # renamed a movie FOLDER, re-point Radarr at it (moveFiles=false)
+                # so its next scan doesn't read the file as deleted + re-grab.
+                # Radarr is TMDB-keyed (exactly how Kira matches movies), so no
+                # cross-reference is needed. Best-effort; benign skip when a movie
+                # isn't in Radarr.
+                if renamed_movie:
+                    try:
+                        from kira.api.integrations import _load_radarr_config
+                        from kira.integrations import radarr as radarr_mod
+                        try:
+                            radarr_cfg = await _load_radarr_config(hook_session)
+                        except Exception:
+                            radarr_cfg = None  # not configured — nothing to do
+                        if radarr_cfg is not None:
+                            repointed_m: list[str] = []
+                            for (prov, pid), (old_root, new_root) in renamed_movie.items():
+                                if prov != "tmdb":
+                                    continue  # Radarr only knows movies by TMDB id
+                                try:
+                                    tmdb_id = int(pid)
+                                except (TypeError, ValueError):
+                                    continue
+                                ok, changed, detail = await radarr_mod.relink_movie(
+                                    radarr_cfg, tmdb_id, old_root=old_root, new_root=new_root,
+                                )
+                                _lvl = (logger.debug if detail == "not in Radarr"
+                                        else logger.info if ok else logger.warning)
+                                _lvl(f"rename: radarr relink for tmdb {tmdb_id} — {detail}")
+                                if changed:
+                                    base = new_root.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+                                    repointed_m.append(base or new_root)
+                            # Only notify when a path was actually MOVED.
+                            if repointed_m:
+                                from kira.database import SessionLocal as _SL_rd
+                                try:
+                                    async with _SL_rd() as _rd:
+                                        _rd.add(Notification(
+                                            kind="success",
+                                            title="Radarr path updated",
+                                            body=(f"Re-pointed Radarr to the new folder for "
+                                                  f"{', '.join(repointed_m)} so the files stay tracked."),
+                                        ))
+                                        await _rd.commit()
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        logger.warning(f"rename: radarr relink hook failed (non-fatal): {e!r}")
 
         # The files are moved and history is committed → the rename is DONE and
         # undoable right now. Schedule the network tail (notify → subtitle auto-

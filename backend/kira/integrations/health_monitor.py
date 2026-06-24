@@ -1,4 +1,4 @@
-"""Background health checker for external integrations (Sonarr / Plex / Jellyfin).
+"""Background health checker for external integrations (Sonarr / Radarr / Plex / Jellyfin).
 
 Tells the user when a configured integration's connection breaks WITHOUT them
 having to click "Test connection" in Settings. A periodic loop probes each
@@ -43,7 +43,7 @@ PROBE_TIMEOUT_SECONDS = 5.0
 
 # The integrations we monitor. Keys are the snapshot keys the endpoint returns
 # and the frontend polls on.
-INTEGRATION_KEYS = ("sonarr", "plex", "jellyfin")
+INTEGRATION_KEYS = ("sonarr", "radarr", "plex", "jellyfin")
 
 
 def _now_iso() -> str:
@@ -209,7 +209,7 @@ monitor = HealthMonitor()
 
 
 def _label(key: str) -> str:
-    return {"sonarr": "Sonarr", "plex": "Plex", "jellyfin": "Jellyfin"}.get(key, key.title())
+    return {"sonarr": "Sonarr", "radarr": "Radarr", "plex": "Plex", "jellyfin": "Jellyfin"}.get(key, key.title())
 
 
 async def _load_integration_configs(session) -> dict[str, Any]:
@@ -238,6 +238,19 @@ async def _load_integration_configs(session) -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         _log.debug("health monitor: sonarr config load skipped: %r", e)
 
+    # Radarr: same shape — `_load_radarr_config` raises HTTPException when the
+    # URL or key is unset, which cleanly means "unconfigured".
+    try:
+        from fastapi import HTTPException
+
+        from kira.api.integrations import _load_radarr_config
+        try:
+            configs["radarr"] = await _load_radarr_config(session)
+        except HTTPException:
+            pass  # not configured
+    except Exception as e:  # noqa: BLE001
+        _log.debug("health monitor: radarr config load skipped: %r", e)
+
     # Plex / Jellyfin: same "both fields present" gate refresh_all uses.
     try:
         from kira.settings_store import get_str
@@ -263,6 +276,8 @@ async def _probe(key: str, cfg: Any) -> tuple[bool, str]:
     URL / refused connection / non-2xx becomes (False, "<reason>")."""
     if key == "sonarr":
         return await _probe_sonarr(cfg)
+    if key == "radarr":
+        return await _probe_radarr(cfg)
     if key == "plex":
         return await _probe_plex(cfg["url"], cfg["token"])
     if key == "jellyfin":
@@ -285,6 +300,22 @@ async def _probe_sonarr(cfg: Any) -> tuple[bool, str]:
     except SonarrError as e:
         return False, str(e)
     except Exception as e:  # noqa: BLE001 — non-encodable key etc. (same trap as the test endpoint)
+        return False, f"{e}"
+
+
+async def _probe_radarr(cfg: Any) -> tuple[bool, str]:
+    """Reuse Radarr's `test_connection` with the short health-probe timeout —
+    the movie mirror of `_probe_sonarr`."""
+    from kira.integrations.radarr import RadarrError, test_connection
+    try:
+        status = await asyncio.wait_for(test_connection(cfg), timeout=PROBE_TIMEOUT_SECONDS)
+        version = status.get("version") if isinstance(status, dict) else None
+        return True, f"Connected (v{version})" if version else "Connected"
+    except asyncio.TimeoutError:
+        return False, f"Timed out after {PROBE_TIMEOUT_SECONDS:.0f}s"
+    except RadarrError as e:
+        return False, str(e)
+    except Exception as e:  # noqa: BLE001
         return False, f"{e}"
 
 

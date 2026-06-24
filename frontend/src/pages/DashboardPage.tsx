@@ -24,7 +24,7 @@ interface Props {
   state: AppState;
   openModal: (kind: NonNullable<ModalState>['kind'], payload?: unknown) => void;
   runScan: () => void;
-  runReparse: () => void;
+  runReparse: (scope?: { media_type?: string; file_ids?: number[] }) => void;
   setActive: (p: 'dashboard' | 'review' | 'history' | 'settings') => void;
   scanRoot: string;
 }
@@ -287,6 +287,18 @@ function SubtitleCoverageCard({ setActive }: { setActive: (p: 'dashboard' | 'rev
 
 export function DashboardPage({ state, openModal, runScan, runReparse, setActive, scanRoot: SCAN_ROOT }: Props) {
   void openModal; void SCAN_ROOT;
+  // Re-parse scope menu (whole library vs one media type). Per-album reparse lives
+  // in the cover popup; this is the bulk "just music / anime / …" entry point.
+  const [reparseOpen, setReparseOpen] = useState(false);
+  const reparseRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!reparseOpen) return;
+    const onDown = (ev: MouseEvent) => {
+      if (reparseRef.current && !reparseRef.current.contains(ev.target as Node)) setReparseOpen(false);
+    };
+    window.addEventListener('mousedown', onDown);
+    return () => window.removeEventListener('mousedown', onDown);
+  }, [reparseOpen]);
   const [history, setHistory] = useState<ApiHistoryEntry[]>([]);
   // Authoritative all-time rename count for the "Organized" KPI. `history` is
   // backend-capped (period:'all' returns at most N rows), so its length
@@ -491,17 +503,39 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
           </div>
 
           <div className="flex shrink-0 items-center gap-2.5">
-            <Button
-              size="md"
-              color="secondary"
-              iconLeading={IcRefresh}
-              isDisabled={scanning}
-              onClick={runReparse}
-              className="dash-hero-btn-secondary"
-              title="Re-run the parser + re-match the existing library in place — applies parsing/grouping improvements without losing manual picks."
-            >
-              Re-parse
-            </Button>
+            <div className="relative" ref={reparseRef}>
+              <Button
+                size="md"
+                color="secondary"
+                iconLeading={IcRefresh}
+                isDisabled={scanning}
+                onClick={() => setReparseOpen(v => !v)}
+                className="dash-hero-btn-secondary"
+                title="Re-run the parser + re-match + re-read tech tags in place — applies parsing/grouping improvements without losing manual picks. Pick the whole library or just one media type."
+              >
+                Re-parse ▾
+              </Button>
+              {reparseOpen ? (
+                <div className="absolute right-0 z-50 mt-1.5 min-w-[180px] overflow-hidden rounded-xl bg-secondary p-1 shadow-lg ring-1 ring-inset ring-secondary">
+                  {([
+                    ['Whole library', undefined],
+                    ['Music only', 'music'],
+                    ['Anime only', 'anime'],
+                    ['TV only', 'tv'],
+                    ['Movies only', 'movie'],
+                  ] as Array<[string, string | undefined]>).map(([label, mt]) => (
+                    <button
+                      key={label}
+                      type="button"
+                      onClick={() => { setReparseOpen(false); runReparse(mt ? { media_type: mt } : undefined); }}
+                      className="block w-full rounded-lg px-3 py-2 text-left text-[13px] font-medium text-secondary transition-colors hover:bg-tertiary hover:text-primary"
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
             <Button
               size="md"
               color="primary"

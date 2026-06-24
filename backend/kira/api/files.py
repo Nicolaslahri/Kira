@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -12,6 +13,8 @@ from kira.database import get_session
 from kira.models import MediaFile, RenameHistory, Setting
 from kira.schemas import FileStatusUpdate, MediaFileOut
 from kira.settings_store import unwrap_str as _unwrap_path  # canonical settings-value unwrap
+
+logger = logging.getLogger(__name__)
 
 VALID_STATUSES = {"pending", "matching", "matched", "approved", "rejected", "no_match", "discovered"}
 
@@ -113,6 +116,49 @@ async def verify_exist(
         if fp and await asyncio.to_thread(_gone, fp):
             missing.append(fid)
     return {"missing": missing}
+
+
+@router.post("/reconcile", response_model=dict[str, object])
+async def reconcile_files(session: AsyncSession = Depends(get_session)) -> dict:
+    """Walk-FREE deletion sweep: stat every pre-rename (review-stage) tracked file
+    and drop the ones CONFIRMED gone from disk. The frontend calls this on page
+    load, so a file you deleted clears on REFRESH — no scan needed, and immune to
+    the scan's "one unreadable folder skips the whole sweep" fragility (this stats
+    individual files, it never walks directories, so there's no all-or-nothing
+    gate).
+
+    NAS-blip-safe: only FileNotFoundError prunes; an OSError (permission / NAS
+    hiccup) keeps the row — a momentary blip never hides a real file. The row +
+    its Match go, RenameHistory is preserved (same as the scan prune / a manual
+    delete with keep_on_disk). Returns the removed file ids."""
+    rows = (await session.execute(
+        select(MediaFile.id, MediaFile.file_path).where(MediaFile.status.in_(VALID_STATUSES))
+    )).all()
+
+    def _gone(p: str) -> bool:
+        try:
+            Path(p).stat()
+            return False
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False  # permission / NAS blip → keep (never hide a real file)
+
+    removed: list[int] = []
+    for fid, fp in rows:
+        if not fp or not await asyncio.to_thread(_gone, fp):
+            continue
+        mf = await session.get(MediaFile, fid)
+        if mf is None:
+            continue
+        try:
+            await _delete_one(session, mf, keep_on_disk=True, roots=[])
+            removed.append(fid)
+        except Exception as e:  # noqa: BLE001 — one bad row never blocks the rest
+            logger.warning("reconcile: file %s failed (non-fatal): %r", fid, e)
+    if removed:
+        await session.commit()
+    return {"removed": len(removed), "ids": removed}
 
 
 @router.get("", response_model=list[MediaFileOut])

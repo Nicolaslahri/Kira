@@ -1,4 +1,4 @@
-import { useState, useEffect, type ReactNode, type Dispatch, type SetStateAction } from 'react';
+import { useState, useEffect, useRef, type ReactNode, type Dispatch, type SetStateAction } from 'react';
 import { IcTv, IcRefresh, IcEyeOff, IcEye, IcCheck, IcAlertTri, IcLink, IcSettings, IcFilm } from '../../lib/icons';
 import { Select } from '../../components/ui';
 import { SettingsLayout, NestedBox, FieldRow, SETTINGS_NESTED, SectionHeader } from '../../components/settings-blocks';
@@ -131,9 +131,16 @@ export function IntegrationsSection({
   const sonarrApiKey = strSetting(rawSettings, 'integrations.sonarr.api_key');
   const sonarrKeySet = secretSet(rawSettings, 'integrations.sonarr.api_key');
   const sonarrUrlBase = strSetting(rawSettings, 'integrations.sonarr.url_base');
+  // Radarr (outbound) — v1 reads just URL + API key (the relink hook needs no
+  // quality profiles / root folders). Mirrors the Sonarr connection fields.
+  const radarrUrl = strSetting(rawSettings, 'integrations.radarr.url');
+  const radarrApiKey = strSetting(rawSettings, 'integrations.radarr.api_key');
+  const radarrKeySet = secretSet(rawSettings, 'integrations.radarr.api_key');
+  const radarrUrlBase = strSetting(rawSettings, 'integrations.radarr.url_base');
   // Show/hide for the API key field — `password` masks chars by
   // default; eye toggle flips to plain text for a quick visual check.
   const [showApiKey, setShowApiKey] = useState(false);
+  const [showRadarrApiKey, setShowRadarrApiKey] = useState(false);
 
   // Pass 6 integrations — media-server refresh, inbound webhook, notification
   // fan-out. All optional; blank = that leg is off.
@@ -211,6 +218,12 @@ export function IntegrationsSection({
   const tvRoot = strSetting(rawSettings, 'integrations.sonarr.tv.root_folder_path') || legacyRoot;
   const animeQpId = readId('integrations.sonarr.anime.quality_profile_id') ?? legacyQpId;
   const animeRoot = strSetting(rawSettings, 'integrations.sonarr.anime.root_folder_path') || legacyRoot;
+  // Radarr add-to-Radarr defaults (single profile + root — movies have no flavor split).
+  const radarrQpId = readId('integrations.radarr.quality_profile_id');
+  const radarrRoot = strSetting(rawSettings, 'integrations.radarr.root_folder_path');
+  // Collection-completion toggles (#14). Default ON — the feature ships enabled.
+  const collectionsEnabled = (() => { const v = rawSettings['collections.enabled']; return typeof v === 'boolean' ? v : true; })();
+  const collectionsUnreleased = (() => { const v = rawSettings['collections.show_unreleased']; return typeof v === 'boolean' ? v : true; })();
 
   // Test state — held locally because the result is transient (only
   // valid while the user's looking at the form). Profiles + folders
@@ -222,6 +235,15 @@ export function IntegrationsSection({
   const [profiles, setProfiles] = useState<Array<{ id: number; name: string }>>([]);
   const [roots, setRoots] = useState<Array<{ path: string; freeSpace?: number | null }>>([]);
 
+  // Radarr test state — separate from Sonarr's (the two cards test independently).
+  const [radarrTesting, setRadarrTesting] = useState(false);
+  const [radarrTestStatus, setRadarrTestStatus] = useState<'idle' | 'ok' | 'fail'>('idle');
+  const [radarrTestDetail, setRadarrTestDetail] = useState<string | null>(null);
+  const [radarrVersion, setRadarrVersion] = useState<string | null>(null);
+  // Profiles + root folders for the "add to Radarr" defaults (collection ghosts).
+  const [radarrProfiles, setRadarrProfiles] = useState<Array<{ id: number; name: string }>>([]);
+  const [radarrRoots, setRadarrRoots] = useState<Array<{ path: string; freeSpace?: number | null }>>([]);
+
   // Background connection-health snapshot — keyed by integration ("sonarr" /
   // "plex" / "jellyfin"). Polled every ~60s while this page is mounted to drive
   // the header status dots, independent of the manual "Test connection" button.
@@ -230,23 +252,44 @@ export function IntegrationsSection({
   // On mount: if URL + key are already saved, fetch profiles + roots so
   // dropdowns aren't empty. Best-effort — silently skip on failure since
   // we don't want to nag the user with a toast on every page open.
+  // Ref-guarded + keyed on the creds so it fires exactly ONCE when settings
+  // HYDRATE — the bare `[]` form races an async settings load and then silently
+  // skips forever (which left these dropdowns blank even with a saved config).
+  // Never re-fires on later edits — the user's "Test" click handles refresh.
+  const sonarrPopulatedRef = useRef(false);
   useEffect(() => {
-    if (!sonarrUrl || !sonarrKeySet) return;
+    if (sonarrPopulatedRef.current || !sonarrUrl || !sonarrKeySet) return;
+    sonarrPopulatedRef.current = true;
     let cancelled = false;
     void api.testSonarr().then(r => {
-      if (cancelled) return;
-      if (r.ok) {
-        setTestStatus('ok');
-        setVersion(r.version);
-        setProfiles(r.quality_profiles ?? []);
-        setRoots(r.root_folders ?? []);
-      }
+      if (cancelled || !r.ok) return;
+      setTestStatus('ok');
+      setVersion(r.version);
+      setProfiles(r.quality_profiles ?? []);
+      setRoots(r.root_folders ?? []);
     }).catch(() => { /* silent */ });
     return () => { cancelled = true; };
-    // We intentionally only run this once on mount — the user's "Test"
-    // click handles refresh after credential edits.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [sonarrUrl, sonarrKeySet]);
+
+  // One-shot populate for Radarr's profile + root dropdowns (used by the
+  // collection-ghost "Get from Radarr" action). Ref-guarded + keyed on the creds
+  // so it fires exactly ONCE when settings HYDRATE — the bare `[]` form races an
+  // async settings load and then silently skips forever (which left these
+  // dropdowns blank even with a saved config). Never re-fires on later edits.
+  const radarrPopulatedRef = useRef(false);
+  useEffect(() => {
+    if (radarrPopulatedRef.current || !radarrUrl || !radarrKeySet) return;
+    radarrPopulatedRef.current = true;
+    let cancelled = false;
+    void api.testRadarr().then(r => {
+      if (cancelled || !r.ok) return;
+      setRadarrTestStatus('ok');
+      setRadarrVersion(r.version);
+      setRadarrProfiles(r.quality_profiles ?? []);
+      setRadarrRoots(r.root_folders ?? []);
+    }).catch(() => { /* silent */ });
+    return () => { cancelled = true; };
+  }, [radarrUrl, radarrKeySet]);
 
   // Background connection-health poll. Hits the cheap snapshot endpoint (no
   // outbound HTTP server-side) on mount + every 60s while the page is open, so
@@ -303,6 +346,35 @@ export function IntegrationsSection({
     }
   };
 
+  const runRadarrTest = async () => {
+    setRadarrTesting(true);
+    setRadarrTestStatus('idle');
+    setRadarrTestDetail(null);
+    try {
+      // Same inline-before-save technique + bullet guard as runTest (the masked
+      // secret has no editable plaintext, so an untouched field tests the SAVED key).
+      const realKey = radarrApiKey && !radarrApiKey.includes('•') ? radarrApiKey : undefined;
+      const r = await api.testRadarr({ url: radarrUrl || undefined, api_key: realKey });
+      if (r.ok) {
+        setRadarrTestStatus('ok');
+        setRadarrTestDetail(`Connected to Radarr v${r.version ?? '?'}.`);
+        setRadarrVersion(r.version);
+        setRadarrProfiles(r.quality_profiles ?? []);
+        setRadarrRoots(r.root_folders ?? []);
+      } else {
+        setRadarrTestStatus('fail');
+        setRadarrProfiles([]);
+        setRadarrRoots([]);
+        pushToast({ title: 'Radarr connection failed', sub: r.detail ?? undefined, kind: 'error' });
+      }
+    } catch (e) {
+      setRadarrTestStatus('fail');
+      pushToast({ title: 'Radarr test failed', sub: (e as Error).message, kind: 'error' });
+    } finally {
+      setRadarrTesting(false);
+    }
+  };
+
   const formatBytes = (bytes: number | null | undefined): string => {
     if (!bytes || !Number.isFinite(bytes)) return '';
     const gb = bytes / (1024 ** 3);
@@ -344,6 +416,19 @@ export function IntegrationsSection({
     : testStatus === 'fail' ? 'Failed'
     : sonarrHealth === 'failed' ? 'Offline'
     : sonarrConfigured ? 'Saved' : 'Not set up';
+
+  // Radarr — same badge logic, fed by its own Test result + the background poll.
+  const radarrConfigured = !!radarrUrl && radarrKeySet;
+  const radarrHealth = healthState(health['radarr'], radarrConfigured);
+  const radarrStatusColor: 'success' | 'error' | 'gray' =
+    radarrTestStatus === 'ok' || radarrHealth === 'ok' ? 'success'
+    : radarrTestStatus === 'fail' || radarrHealth === 'failed' ? 'error'
+    : 'gray';
+  const radarrStatusLabel =
+    radarrTestStatus === 'ok' || radarrHealth === 'ok' ? 'Connected'
+    : radarrTestStatus === 'fail' ? 'Failed'
+    : radarrHealth === 'failed' ? 'Offline'
+    : radarrConfigured ? 'Saved' : 'Not set up';
 
   // Inline label + control row used throughout the integrations forms
   // (URL / token / key fields). Delegates to the shared FieldRow primitive
@@ -394,7 +479,7 @@ export function IntegrationsSection({
         <SectionHeader
           icon={<IcLink />}
           title="Integrations"
-          purpose="Push actions OUT to tools in your media stack — Sonarr grabs, Plex / Jellyfin refreshes, inbound webhooks, and notifications. Radarr arrives with movie-collection grouping."
+          purpose="Push actions OUT to tools in your media stack — Sonarr grabs missing episodes, Sonarr & Radarr stay path-synced when Kira reorganizes a folder, Plex / Jellyfin refresh, plus inbound webhooks and notifications."
           status={(
             <BadgeWithDot color={testStatus === 'ok' ? 'success' : wiredCount > 0 ? 'warning' : 'gray'} pulse={testStatus === 'ok'}>
               {wiredCount > 0 ? `${wiredCount} configured` : 'None set up'}
@@ -589,20 +674,113 @@ export function IntegrationsSection({
         </div>
       </IntegrationCard>
 
-      {/* ── Radarr placeholder ───────────────────────────────────── */}
-      <div className="rounded-2xl border border-dashed border-white/[0.14] bg-white/[0.02] p-4">
-        <div className="flex items-start gap-3">
-          <FeaturedIcon size="md" tint={BRAND.radarr} icon={<IcFilm />} />
-          <div className="min-w-0 flex-1">
-            <div className="text-[15px] font-semibold text-ink-muted">Radarr (outbound)</div>
-            <div className="mt-1 text-[12.5px] leading-relaxed text-ink-soft">
-              Movies-side parallel of Sonarr's <span className="font-mono">Get missing</span> — activates once Kira can identify movie collections,
-              so "MCU Phase 4: 8/12" can fire a search for the missing 4 in one click. (Radarr's inbound webhook already works above.)
-            </div>
+      {/* ── Radarr (outbound) — keep Radarr's movie path in sync ─── */}
+      <IntegrationCard
+        tint={BRAND.radarr}
+        connected={radarrTestStatus === 'ok' || radarrHealth === 'ok'}
+        icon={<IcFilm />}
+        title="Radarr"
+        desc={<>When Kira reorganizes a movie's folder it re-points Radarr at the new path (and reverses it on undo), so Radarr keeps tracking the file instead of reading it as deleted + re-grabbing. URL + API key live in Radarr's <span className="font-mono text-ink">Settings → General → Security</span>.</>}
+        headerExtra={(
+          <div className="flex shrink-0 items-center gap-2.5">
+            <BadgeWithDot color={radarrStatusColor}>{radarrStatusLabel}</BadgeWithDot>
+            <Button
+              color="secondary"
+              size="sm"
+              iconLeading={IcRefresh}
+              isLoading={radarrTesting}
+              isDisabled={!radarrUrl || !radarrKeySet}
+              showTextWhileLoading
+              onClick={() => void runRadarrTest()}
+            >
+              Test connection
+            </Button>
           </div>
-          <BadgeWithDot color="gray">Coming soon</BadgeWithDot>
+        )}
+      >
+        <div className="flex flex-col gap-3">
+          {fieldRow('URL',
+            <Input wrapperClassName="flex-1" mono editGate value={radarrUrl} placeholder="http://radarr:7878" invalid={!isValidHttpUrl(radarrUrl)} aria-invalid={!isValidHttpUrl(radarrUrl)} title={!isValidHttpUrl(radarrUrl) ? 'Enter a full http(s) URL, e.g. http://radarr:7878' : undefined} onChange={e => saveKey('integrations.radarr.url')(e.target.value)} />
+          )}
+          {fieldRow('URL base',
+            <Input wrapperClassName="flex-1" mono editGate value={radarrUrlBase} placeholder="optional · e.g. /radarr (reverse-proxy setups)" onChange={e => saveKey('integrations.radarr.url_base')(e.target.value)} />
+          )}
+          {fieldRow('API key',
+            <Input
+              wrapperClassName="flex-1"
+              mono
+              editGate
+              type={showRadarrApiKey ? 'text' : 'password'}
+              value={radarrApiKey}
+              lockedDisplay={maskValue(rawSettings, 'integrations.radarr.api_key')}
+              placeholder={maskHint(rawSettings, 'integrations.radarr.api_key') ?? "from Radarr's General → Security page"}
+              autoComplete="off"
+              onChange={e => saveSecret(saveKey('integrations.radarr.api_key'))(e.target.value)}
+              trailing={
+                <button
+                  type="button"
+                  onClick={() => setShowRadarrApiKey(s => !s)}
+                  title={showRadarrApiKey ? 'Hide API key' : 'Show API key'}
+                  aria-label={showRadarrApiKey ? 'Hide API key' : 'Show API key'}
+                  className="grid size-6 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink [&_svg]:size-[14px]"
+                >
+                  {showRadarrApiKey ? <IcEyeOff /> : <IcEye />}
+                </button>
+              }
+            />
+          )}
         </div>
-      </div>
+
+        {radarrTestStatus === 'ok' ? (
+          <Alert color="success" icon={IcCheck} className="mt-3.5">
+            {radarrTestDetail ?? `Connected to Radarr${radarrVersion ? ` v${radarrVersion}` : ''}.`}
+          </Alert>
+        ) : null}
+
+        {/* Defaults Radarr uses when Kira ADDS a movie (the collection-ghost
+            "Get from Radarr" button). Only shown once a test populated the lists. */}
+        {(radarrProfiles.length > 0 || radarrRoots.length > 0) && (
+          <div className="mt-4 flex flex-col gap-3 border-t border-white/[0.1] pt-4">
+            <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-muted">Defaults for movies Kira adds</div>
+            {fieldRow('Quality',
+              <Select<number>
+                style={{ flex: 1, minWidth: 0 }}
+                value={radarrQpId ?? null}
+                onChange={v => saveKey('integrations.radarr.quality_profile_id')(v)}
+                placeholder="— pick a quality profile —"
+                options={radarrProfiles.map(p => ({ value: p.id, label: p.name }))}
+                aria-label="Radarr quality profile"
+              />
+            )}
+            {fieldRow('Root folder',
+              <Select<string>
+                style={{ flex: 1, minWidth: 0 }}
+                buttonClassName="mono"
+                value={radarrRoot || null}
+                onChange={v => saveKey('integrations.radarr.root_folder_path')(v)}
+                placeholder="— pick a root folder —"
+                options={radarrRoots.map(r => ({ value: r.path, label: r.path, secondary: formatBytes(r.freeSpace) || undefined }))}
+                aria-label="Radarr root folder"
+              />
+            )}
+            <div className="text-[11.5px] text-ink-soft">Used when you click <span className="font-mono text-ink">Get from Radarr</span> on a missing film in a collection (Review page).</div>
+          </div>
+        )}
+
+        {/* Collection completion (#14) — always shown (controls the feature
+            regardless of whether the connection's been tested). */}
+        <div className="mt-4 flex flex-col gap-3 border-t border-white/[0.1] pt-4">
+          <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-muted">Collection completion</div>
+          <div className={`flex items-center justify-between gap-3 px-3.5 py-2.5 ${SETTINGS_NESTED}`}>
+            <span className="text-[13px] text-ink">Show missing films in collections<span className="mt-0.5 block text-[11.5px] text-ink-soft">Ghost covers on the Review grid for films you're missing from a collection you partly own — one click to grab them.</span></span>
+            <Toggle isSelected={collectionsEnabled} onChange={() => saveKey('collections.enabled')(!collectionsEnabled)} aria-label="Show missing films in collections" />
+          </div>
+          <div className={`flex items-center justify-between gap-3 px-3.5 py-2.5 ${SETTINGS_NESTED} ${!collectionsEnabled ? 'opacity-50' : ''}`}>
+            <span className="text-[13px] text-ink">Include unreleased films<span className="mt-0.5 block text-[11.5px] text-ink-soft">Also show upcoming/announced films (as “Coming &lt;year&gt;”, no download button). Off = only films you can actually grab.</span></span>
+            <Toggle isSelected={collectionsEnabled && collectionsUnreleased} isDisabled={!collectionsEnabled} onChange={() => saveKey('collections.show_unreleased')(!collectionsUnreleased)} aria-label="Include unreleased films" />
+          </div>
+        </div>
+      </IntegrationCard>
         </div>
 
         <div className="flex flex-col gap-4">

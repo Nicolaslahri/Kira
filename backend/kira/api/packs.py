@@ -29,7 +29,7 @@ from kira.database import get_session
 from kira.models import MediaFile
 from kira.packs import loader as _loader
 from kira.packs import resolver as _resolver
-from kira.packs.apply import _parsed_of, try_pack_match
+from kira.packs.apply import _parsed_of, apply_packs_to_no_match
 from kira.packs.schema import (
     Pack,
     PackBinding,
@@ -193,7 +193,12 @@ async def add_pack(
     bindings = [b for b in bindings if url_hash(b.url) != key]  # replace same-URL
     bindings.append(binding)
     await _loader.save_bindings(session, bindings)
-    return _summary(binding, pack)
+    # Apply it to the existing no_match backlog right away, so the user doesn't
+    # have to click "Re-run on unmatched files" after adding a pack.
+    rescued = await apply_packs_to_no_match(session)
+    if rescued:
+        await session.commit()
+    return {**_summary(binding, pack), "rescued": rescued}
 
 
 @router.put("/{key}", response_model=dict[str, Any])
@@ -255,21 +260,20 @@ async def refresh_pack(
     updated = PackBinding.model_validate(data)
     bindings = [updated if url_hash(b.url) == key else b for b in bindings]
     await _loader.save_bindings(session, bindings)
-    return _summary(updated, pack)
+    # A refresh may have pulled in new/changed episodes — re-apply to the backlog.
+    rescued = await apply_packs_to_no_match(session)
+    if rescued:
+        await session.commit()
+    return {**_summary(updated, pack), "rescued": rescued}
 
 
 @router.post("/rescan", response_model=dict[str, Any])
 async def rescan_packs(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     """Apply the enabled packs to every file currently sitting in ``no_match`` —
-    so installing a pack fixes the existing library without a full re-scan."""
-    rescued = 0
-    for mf in await _no_match_files(session):
-        try:
-            if await try_pack_match(session, mf.id, mf):
-                mf.status = "matched"
-                rescued += 1
-        except Exception as e:
-            logger.warning("packs.rescan: file %s failed: %r", mf.id, e)
+    so installing a pack fixes the existing library without a full re-scan. A
+    normal scan now does this automatically too (and adding/refreshing a pack
+    applies it on the spot); this stays for an explicit on-demand re-run."""
+    rescued = await apply_packs_to_no_match(session)
     if rescued:
         await session.commit()
     return {"ok": True, "rescued": rescued}

@@ -33,6 +33,12 @@ _IGNORED_PREFIXES = (
 # whose names don't share a single prefix character.
 _IGNORED_NAMES = frozenset({"System Volume Information", "Thumbs.db", "lost+found"})
 
+# A leading dot normally means "hidden" (.git, .AppleDouble) and the segment is
+# skipped — but a few REAL titles legitimately start with one, most famously the
+# `.hack//` franchise (`.hack//SIGN`, `.hack//Roots`, `.hack//G.U.`). Carve those
+# out so they aren't silently dropped. Matched case-insensitively as a prefix.
+_DOT_KEEP_PREFIXES = (".hack",)
+
 # Phase 19: sample / extras / trailer exclusion. Scene releases ship a
 # tiny `sample.mkv` (5-50 MB preview), `trailer.mp4`, `proof.mkv`, and
 # Plex/Jellyfin extras folders (Featurettes/, Behind The Scenes/, …). Without
@@ -82,6 +88,17 @@ _WIN_REPARSE_POINT = 0x400
 _walk_errors = threading.local()
 
 
+def _record_walk_error(path: str | os.PathLike[str]) -> None:
+    """Append a path the walk had to skip to the thread-local error list — the same
+    one `_walk_onerror` feeds and `get_walk_errors()` reads. Used for skips that
+    `os.walk`'s own onerror callback never sees (the manual symlink/junction
+    descent), so a broken/unreachable target is SURFACED + spared by the prune
+    sweep instead of vanishing silently with the scan still 'completed'."""
+    if not hasattr(_walk_errors, "paths"):
+        _walk_errors.paths = []
+    _walk_errors.paths.append(str(path))
+
+
 def _walk_onerror(err: OSError) -> None:
     """`os.walk` delivers scandir() failures here when `onerror` is set.
 
@@ -95,9 +112,7 @@ def _walk_onerror(err: OSError) -> None:
     """
     filename = getattr(err, "filename", "<unknown>") or "<unknown>"
     logger.warning(f"[SCAN] walk OSError on {filename!r}: {err!r}")
-    if not hasattr(_walk_errors, "paths"):
-        _walk_errors.paths = []
-    _walk_errors.paths.append(str(filename))
+    _record_walk_error(filename)
 
 
 def get_walk_errors() -> list[str]:
@@ -145,6 +160,38 @@ def _is_reparse_or_symlink(p: Path) -> bool:
     return False
 
 
+def _ext_prefix(path_str: str) -> str:
+    r"""Force a Windows extended-length (`\\?\`) prefix so `os.walk`'s internal
+    `scandir` can descend into >260-char CHILD paths.
+
+    Unlike `longpath.long_path` this does NOT gate on length: the scan ROOT is
+    usually short ("Z:\\Anime"), and it's the deep children (long anime / light-
+    novel titles nested several folders down) that blow past MAX_PATH — but the
+    prefix has to be present from the root down for `scandir` to inherit it. The
+    caller strips it back off every yielded path (`_strip_ext_prefix`) so the
+    prefix never leaks into the DB / parser / renamer. No-op off Windows or when
+    already prefixed (so the primary Docker-on-Linux deployment is untouched)."""
+    if os.name != "nt":
+        return path_str
+    if path_str.startswith("\\\\?\\"):
+        return path_str
+    ap = os.path.abspath(path_str)
+    if ap.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + ap[2:]   # \\server\share\… → \\?\UNC\server\share\…
+    return "\\\\?\\" + ap
+
+
+def _strip_ext_prefix(path_str: str) -> str:
+    r"""Inverse of `_ext_prefix` — strip a `\\?\` / `\\?\UNC\` prefix so yielded
+    paths match the rest of the pipeline (DB, parser, renamer expect plain paths).
+    No-op when there's no prefix."""
+    if path_str.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path_str[len("\\\\?\\UNC\\"):]
+    if path_str.startswith("\\\\?\\"):
+        return path_str[len("\\\\?\\"):]
+    return path_str
+
+
 def walk(root: str | Path) -> Iterator[Path]:
     """Yield every media file under `root` (recursive).
 
@@ -180,6 +227,11 @@ def walk(root: str | Path) -> Iterator[Path]:
         return
 
     def _should_skip_part(part: str) -> bool:
+        # `.hack//SIGN` and friends legitimately lead with a dot — keep them
+        # (still honoring exact-name skips); everything else leading with a dot
+        # (.git, .AppleDouble) stays hidden/skipped.
+        if part.lower().startswith(_DOT_KEEP_PREFIXES):
+            return part in _IGNORED_NAMES
         return part.startswith(_IGNORED_PREFIXES) or part in _IGNORED_NAMES
 
     # os.walk(followlinks=False) means dir symlinks land in `dirnames` but
@@ -189,12 +241,19 @@ def walk(root: str | Path) -> Iterator[Path]:
     # scandir() failures. Default (no callback) would silently truncate
     # the walk — a Friday-night router reboot would hide 5,800 files and
     # the user would see scan.status='completed' with no indication.
+    # Long-path safety (Windows): feed os.walk an extended-length (`\\?\`) root so
+    # its internal scandir can descend into >260-char children — deep anime / light-
+    # novel trees routinely blow past MAX_PATH and were silently lost on the .exe
+    # build. We strip the prefix back off every yielded path (below) so it never
+    # leaks downstream. `rel_root` is the root run through the SAME abspath
+    # normalization as the dirpaths, so `relative_to` lines up. All no-ops off Windows.
+    rel_root = Path(_strip_ext_prefix(_ext_prefix(str(root_path))))
     for dirpath, dirnames, filenames in os.walk(
-        str(root_path), followlinks=False, onerror=_walk_onerror,
+        _ext_prefix(str(root_path)), followlinks=False, onerror=_walk_onerror,
     ):
-        dp = Path(dirpath)
+        dp = Path(_strip_ext_prefix(dirpath))
         # Skip the whole subtree if any segment matches an ignore rule.
-        if any(_should_skip_part(p) for p in dp.relative_to(root_path).parts):
+        if any(_should_skip_part(p) for p in dp.relative_to(rel_root).parts):
             dirnames[:] = []
             continue
 
@@ -215,7 +274,13 @@ def walk(root: str | Path) -> Iterator[Path]:
                 # short-circuit.
                 try:
                     st = child.stat()
-                except OSError:
+                except OSError as e:
+                    # Broken / unreachable symlink or junction target. os.walk
+                    # (followlinks=False) never touches it, so without recording it
+                    # the whole subtree vanishes silently and the scan still reads
+                    # 'completed'. Surface it like any other walk error.
+                    logger.warning(f"[SCAN] symlink/junction target unreadable, skipping {child}: {e!r}")
+                    _record_walk_error(child)
                     continue
                 key = (st.st_dev, st.st_ino)
                 if key in seen_dirs:

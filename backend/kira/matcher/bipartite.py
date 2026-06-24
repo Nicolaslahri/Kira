@@ -154,7 +154,16 @@ def assign_files_to_episodes(
     # ep.season=1; strict (23, 1158) misses but season-agnostic 1158
     # hits). Only fire for anime to avoid TV cross-season collisions.
     is_anime = any(getattr(p, "media_type", None) == "anime" for _, p in files)
-    if is_anime:
+    # Season-agnostic matching is only SAFE on a FLAT provider list (AniDB-style:
+    # one non-zero season where the local episode number IS the absolute, so
+    # ignoring the season can't pick the wrong one). On a MULTI-season list (TVDB)
+    # it would let a file whose declared season doesn't exist grab an unrelated
+    # season's identically-numbered episode (a mislabeled "S05E03" → S01E03).
+    # Multi-season absolute numbering is owned by Pass 3.5 (absolute_number)
+    # instead, so gating Pass 3 here loses no real rescue.
+    nonzero_seasons = {_ep_key(ep)[0] for ep in episodes if _ep_key(ep)[0] != 0}
+    provider_is_flat = len(nonzero_seasons) <= 1
+    if is_anime and provider_is_flat:
         for fid, parsed in files:
             if fid in claimed_fids:
                 continue

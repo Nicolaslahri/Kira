@@ -24,6 +24,15 @@ from kira.matcher.similarity import normalize
 from kira.parser import ParsedFile
 
 
+# Album names that are NOT a real album — a "Singles" / loose-tracks folder collects
+# unrelated songs, each its own single/collab. Compared against `normalize(album)`
+# (lowercased, hyphens→spaces). Shared with `kira.music.matcher`.
+SINGLES_ALBUM_MARKERS = {
+    "singles", "single", "non album tracks", "loose",
+    "misc", "miscellaneous", "unknown", "unknown album",
+}
+
+
 def compute_series_key(parsed: ParsedFile, file_path: str | None = None) -> str | None:
     """Build the clustering key for series consolidation.
 
@@ -80,9 +89,17 @@ def compute_series_key(parsed: ParsedFile, file_path: str | None = None) -> str 
 
         return f"{parsed.media_type}|{title_n}|{season}|{disambig}"
     if parsed.media_type == "music":
+        album_n = normalize(parsed.album) if parsed.album else ""
+        # A loose-singles folder collects unrelated songs (each a different
+        # single/collab artist). Cluster by the FOLDER so they form ONE "Singles"
+        # group instead of scattering into N one-file clusters that each get
+        # force-matched to a wrong release. (match_album skips album resolution for
+        # the same marker → per-recording matching keeps each song distinct.)
+        if album_n in SINGLES_ALBUM_MARKERS and file_path:
+            return f"music|singles|{Path(file_path).parent.as_posix().lower()}"
         if not (parsed.artist and parsed.album):
             return None
-        return f"music|{normalize(parsed.artist)}|{normalize(parsed.album)}"
+        return f"music|{normalize(parsed.artist)}|{album_n}"
     return None
 
 

@@ -111,7 +111,7 @@ export function MediaTypeIcon({ type }: { type: MediaType | string }) {
   return <IcFilm />;
 }
 
-export function Sidebar({ active, setActive, settingsSection, setSettingsSection, pendingCount, scanRunning, backendOk, mobileOpen = false, onClose, searchQuery, onSearchChange, onScan, onShortcuts }: {
+export function Sidebar({ active, setActive, settingsSection, setSettingsSection, pendingCount, scanRunning, backendOk, mobileOpen = false, onClose, searchQuery, onSearchChange, onScan, onStop, onShortcuts }: {
   active: Page;
   setActive: (p: Page) => void;
   settingsSection: string;
@@ -128,6 +128,8 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
   onSearchChange: (q: string) => void;
   /** Workspace scan trigger (moved here from the top bar). */
   onScan: () => void;
+  /** Stop the running scan — the button toggles to "Stop" while scanning. */
+  onStop?: () => void;
   /** Opens the keyboard-shortcuts modal (moved here from the top bar). */
   onShortcuts: () => void;
 }) {
@@ -318,11 +320,10 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
           color="primary"
           size="md"
           iconLeading={scanRunning ? IcSpin : IcScan}
-          isDisabled={scanRunning}
-          onClick={onScan}
+          onClick={scanRunning ? (onStop ?? onScan) : onScan}
           className="w-full justify-center"
         >
-          {scanRunning ? 'Scanning…' : 'Scan now'}
+          {scanRunning ? 'Stop scan' : 'Scan now'}
         </Button>
 
         <div className="flex items-center gap-2">

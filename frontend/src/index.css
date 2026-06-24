@@ -6574,9 +6574,10 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
    MUSIC GRID — More room per square card
    ════════════════════════════════════════════════════════════════════ */
 
-/* Library music section — wider columns */
+/* Library music section — wider columns (bigger square covers; the cover IS the
+   content for music, and the larger tile makes the cover mosaic legible). */
 .lib-grid.shape-square {
-  grid-template-columns: repeat(auto-fill, minmax(196px, 1fr)) !important;
+  grid-template-columns: repeat(auto-fill, minmax(212px, 1fr)) !important;
   gap: 18px !important;
 }
 

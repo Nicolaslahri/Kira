@@ -94,6 +94,27 @@ def test_enrich_parsed_fills_channels_and_audio() -> None:
     assert pf.audio == ["DTS"]
 
 
+def test_enrich_parsed_fills_music_tech_specs() -> None:
+    """Music audio specs (MediaInfo) → ParsedFile, including a legitimate
+    `lossless=False` (which the generic `_set` would have skipped) and a clean
+    parsed_data round-trip. `audio_bit_depth`, NOT `bit_depth` (the video field)."""
+    pf = ParsedFile(original_filename="track.flac", media_type="music", title="Track")
+    changed = mediainfo.enrich_parsed(
+        pf, {"audio_bitrate": 1024, "sample_rate": 96000, "audio_bit_depth": 24, "lossless": True},
+        authoritative=True,
+    )
+    assert changed
+    assert pf.audio_bitrate == 1024 and pf.sample_rate == 96000
+    assert pf.audio_bit_depth == 24 and pf.lossless is True
+    assert pf.bit_depth is None    # the VIDEO field must stay untouched
+    # round-trips through parsed_data unchanged
+    assert ParsedFile(**pf.to_dict()).audio_bit_depth == 24
+    # a lossy file: bitrate set, no bit depth, lossless=False is recorded
+    lossy = ParsedFile(original_filename="y.mp3", media_type="music", title="Y")
+    mediainfo.enrich_parsed(lossy, {"audio_bitrate": 320, "lossless": False}, authoritative=True)
+    assert lossy.audio_bitrate == 320 and lossy.audio_bit_depth is None and lossy.lossless is False
+
+
 def test_enrich_parsed_authoritative_overrides() -> None:
     # Filename claimed 720p/x264/stereo; the real file is 1080p/x265/5.1.
     pf = ParsedFile(

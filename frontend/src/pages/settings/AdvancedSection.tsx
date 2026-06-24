@@ -54,6 +54,8 @@ export function AdvancedSection({
   // small "vX.Y.Z out" link in the sidebar. The check is a single anonymous
   // GitHub API call from the BROWSER on app load — off = zero outbound calls.
   const updateCheck = rawSettings['advanced.update_check'] !== false;
+  const musicEnabled = rawSettings['music.enabled'] === true;
+  const musicWriteTags = rawSettings['music.write_tags'] !== false;   // default ON
   // Hidden file input for the settings-import flow — clicked via the Button.
   const importInputRef = useRef<HTMLInputElement>(null);
 
@@ -165,6 +167,22 @@ export function AdvancedSection({
           >
             <Toggle isSelected={stampIds} onChange={() => saveKey('rename.stamp_ids')(!stampIds)} className="mt-0.5" aria-label="Remember matches on files" />
           </SettingRow>
+          <SettingRow
+            settingKeys="music.enabled"
+            label="Music matching (experimental)"
+            desc={<>Identify audio files (FLAC / MP3 / M4A / OGG) via embedded tags + MusicBrainz — albums, tracks, cover art. A fully isolated subsystem: off by default, and it never touches movie / TV / anime matching. AcoustID fingerprinting for untagged files is coming.</>}
+          >
+            <Toggle isSelected={musicEnabled} onChange={() => saveKey('music.enabled')(!musicEnabled)} className="mt-0.5" aria-label="Enable music matching" />
+          </SettingRow>
+          {musicEnabled && (
+          <SettingRow
+            settingKeys="music.write_tags"
+            label="Write tags into music files"
+            desc={<>On rename, write the matched artist / album / title / track / year (+ MusicBrainz IDs) INTO each audio file's embedded tags. For music these tags <em>are</em> the canonical metadata Plex / Jellyfin / Kodi read — so this is music's equivalent of an NFO. Turn off to leave the bytes inside your files untouched.</>}
+          >
+            <Toggle isSelected={musicWriteTags} onChange={() => saveKey('music.write_tags')(!musicWriteTags)} className="mt-0.5" aria-label="Write tags into music files" />
+          </SettingRow>
+          )}
           <SettingRow
             settingKeys="rename.on_conflict"
             label="When a file already exists at the target"

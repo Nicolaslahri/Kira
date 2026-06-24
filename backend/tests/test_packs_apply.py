@@ -166,3 +166,64 @@ def test_fork_packs_get_distinct_group_ids():
     b = _binding(url="https://b.com/one-pace.json")
     assert _series_group_id(PACK, a) != _series_group_id(PACK, b)
     assert _series_group_id(PACK, a).startswith("pack:one-pace:")
+
+
+async def test_apply_packs_to_no_match_sweeps_backlog_only(monkeypatch):
+    """The scan / add / refresh backlog pass: rescues claimable no_match files
+    (→ 'matched'), leaves un-claimable ones at no_match, and NEVER touches a file
+    that's already matched (isolation — it only queries no_match rows)."""
+    from kira.packs.apply import apply_packs_to_no_match
+
+    Session = await _mem_sessionmaker()
+    claim = await _add_file(Session, "/anime/One Pace/rd05.mkv", _one_pace_parsed())
+    other = await _add_file(Session, "/tv/Breaking Bad/x.mkv",
+                            {"original_filename": "Breaking Bad S01E01.mkv",
+                             "media_type": "tv", "title": "Breaking Bad",
+                             "episode": 1, "season": 1})
+    async with Session() as s:  # a provider-matched file the pass must not touch
+        already = MediaFile(file_path="/anime/One Pace/rd06.mkv",
+                            parsed_data=_one_pace_parsed(), media_type="anime",
+                            status="matched")
+        s.add(already)
+        await s.flush()
+        already_id = already.id
+        await s.commit()
+
+    async def _load(session):
+        return [_binding()]
+
+    async def _get(binding, **kw):
+        return PACK
+
+    monkeypatch.setattr(_loader, "load_bindings", _load)
+    monkeypatch.setattr(_loader, "get_pack", _get)
+
+    async with Session() as s:
+        rescued = await apply_packs_to_no_match(s)
+        await s.commit()
+    assert rescued == 1   # only the One Pace no_match file
+
+    async with Session() as s:
+        statuses = {mf.id: mf.status for mf in await s.scalars(select(MediaFile))}
+    assert statuses[claim] == "matched"        # claimable backlog → rescued
+    assert statuses[other] == "no_match"       # un-claimable → left as-is
+    assert statuses[already_id] == "matched"   # already-matched → untouched (isolation)
+
+
+async def test_apply_packs_to_no_match_noop_without_bindings(monkeypatch):
+    """No pack installed → the backlog pass is a cheap no-op (the gate that keeps
+    every scan from scanning the no_match backlog when there are no packs)."""
+    from kira.packs.apply import apply_packs_to_no_match
+
+    Session = await _mem_sessionmaker()
+    fid = await _add_file(Session, "/anime/One Pace/rd05.mkv", _one_pace_parsed())
+
+    async def _load(session):
+        return []   # nothing installed
+    monkeypatch.setattr(_loader, "load_bindings", _load)
+
+    async with Session() as s:
+        assert await apply_packs_to_no_match(s) == 0
+    async with Session() as s:
+        mf = await s.get(MediaFile, fid)
+    assert mf.status == "no_match"   # untouched

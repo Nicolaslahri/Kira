@@ -6,6 +6,7 @@ import { SegmentedControl } from '../components/base/segmented/segmented-control
 import { ProviderCard, ProviderLogo, NamingTemplateTabs, SETTINGS_NESTED, SETTINGS_DIVIDER, SettingsLayout, SectionCard, SettingRow, NestedBox, SliderField, SectionHeader, SettingsFilter, StatusPill } from '../components/settings-blocks';
 import { Button } from '../components/base/buttons/button';
 import { FeaturedIcon } from '../components/base/featured-icons/featured-icon';
+import { FpcalcStatusRow } from '../components/FpcalcStatus';
 import { BadgeWithDot } from '../components/base/badges/badges';
 import { Toggle } from '../components/base/toggle/toggle';
 import { Input } from '../components/base/input/input';
@@ -112,6 +113,8 @@ const ARTWORK_KINDS: { key: string; label: string; dflt: boolean; fanartOnly?: b
 // because we want the warning surfaced even when keys are set.
 type BlockStatus = 'connected' | 'warning' | 'error' | 'disabled' | 'coming-soon' | 'not-configured';
 function deriveProviderStatus(info: ApiProvider | undefined, key: string): BlockStatus {
+  // MusicBrainz is keyless + built-in — always available, nothing to configure.
+  if (key === 'musicbrainz') return 'connected';
   if (!info) return 'not-configured';
   if (!info.implemented) return 'coming-soon';
   if (key === 'anidb') return 'warning'; // rate-limit caveat always visible
@@ -337,7 +340,10 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
   // their Connections cards collected credentials that did nothing (a setting
   // that lies). Hide them until music matching lands; flip to `true` to restore
   // both cards verbatim in one line.
-  const MUSIC_PROVIDERS_ENABLED = false;
+  const MUSIC_PROVIDERS_ENABLED = true;
+  // AcoustID fingerprinting isn't wired into the matcher yet (Phase 4) — keep its
+  // card hidden so Connections doesn't advertise a source that does nothing.
+  const ACOUSTID_ENABLED = true;
 
   // ── Provider preference (per media type) ─────────────────────────────────
   // Stored as `matching.provider_order.<type>` = the FULL ordered list of
@@ -795,25 +801,28 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                 onTest={makeTester('musicbrainz', pushToast, 'MusicBrainz')}
               />
 
+              {ACOUSTID_ENABLED && (<>
               <ProviderCard
                 providerKey="AcoustID" status={deriveProviderStatus(providers['acoustid'], 'acoustid')}
                 fields={[
                   { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.acoustid.api_key'),
                     lockedDisplay: maskValue(rawSettings, 'providers.acoustid.api_key'),
                     placeholder: keyIsSet('providers.acoustid.api_key')
-                      ? '••••••••••••••••  (key saved — enter a new one to replace)'
-                      : 'paste your acoustid.org API key', mono: true,
-                    desc: 'Used for audio-fingerprint matching when filename metadata is missing. Get a free key at acoustid.org.',
+                      ? '••••••••••••••••  (personal key saved — enter a new one to replace)'
+                      : 'optional — paste a personal acoustid.org key to override Kira’s', mono: true,
+                    desc: 'Optional — Kira ships an AcoustID app key, so fingerprinting works out of the box. Enter your own (free at acoustid.org) only to use a personal key.',
                     onSave: saveKey('providers.acoustid.api_key') },
                   { kind: 'toggle', label: 'Auto-fingerprint untagged files',
                     value: rawSettings['providers.acoustid.auto_fingerprint'] === true ? 'true' : 'false',
-                    desc: 'When enabled, music files without ID3 tags are fingerprinted and matched automatically.',
-                    disabled: !keyIsSet('providers.acoustid.api_key'),
-                    disabledReason: 'Add an AcoustID API key above to enable fingerprint matching.',
+                    desc: 'Match music files with no usable tags / filename by their AUDIO, as a last resort. Requires fpcalc (below).',
                     onSave: saveKey('providers.acoustid.auto_fingerprint') },
                 ]}
                 onTest={makeTester('acoustid', pushToast, 'AcoustID')}
               />
+              <div className="rounded-xl bg-secondary px-3.5 py-2.5 ring-1 ring-inset ring-secondary shadow-xs">
+                <FpcalcStatusRow />
+              </div>
+              </>)}
               </>)}
               </div>
 

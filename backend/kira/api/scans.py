@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -75,6 +76,13 @@ SCAN_WALK_BATCH = 256
 # We keep the in-process lock as a fast-fail belt for same-worker
 # double-clicks (no DB roundtrip needed when the conflict is local).
 _SCAN_LOCK = asyncio.Lock()
+
+# Live scan-worker tasks keyed by scan id, so the Stop button can cancel the
+# running scan: task.cancel() raises CancelledError at the worker's next await,
+# the worker marks the scan 'cancelled' (KEEPING what it found) and frees the
+# lock. In-process — Kira ships single-uvicorn (exe / docker); a multi-worker
+# setup would need a DB signal instead.
+_SCAN_TASKS: dict[int, asyncio.Task] = {}
 
 # Auto-expire DB lock entries older than 6 hours. A worker that crashed
 # mid-scan would otherwise leave the lock pinned forever; this lets a
@@ -1796,6 +1804,99 @@ async def _selected_match_is_anime(
     return False
 
 
+async def _match_music(session, fids: list[int]) -> None:
+    """Match a music cluster via the ISOLATED `kira.music` subsystem, then write
+    Match rows. Consulted ONLY at the `_match_phase` seam below, gated on the
+    `music.enabled` setting. Best-effort — any failure leaves the files `no_match`
+    and never raises into the scan worker. Music never touches the movie/TV/anime
+    cascade (and the cascade never processes music: engine.match short-circuits it).
+    """
+    import httpx
+    from sqlalchemy import delete as _sql_delete
+
+    from kira.music import matcher as _mm
+    from kira.music.tags import MusicTags, read_tags
+
+    inputs: list[_mm.MusicFile] = []
+    mfs: dict[int, MediaFile] = {}
+    for fid in fids:
+        mf = await session.get(MediaFile, fid)
+        if mf is None or not mf.file_path:
+            continue
+        mfs[fid] = mf
+        tags = read_tags(mf.file_path) or MusicTags()
+        parsed = mf.parsed_data or {}
+        inputs.append(_mm.MusicFile(
+            file_id=fid, tags=tags,
+            fb_artist=parsed.get("artist"),
+            fb_album=parsed.get("album"),
+            fb_title=parsed.get("track_title") or parsed.get("title"),
+            fb_track_no=parsed.get("track") or parsed.get("track_no"),
+            path=mf.file_path,
+        ))
+    if not inputs:
+        return
+
+    # AcoustID fingerprint fallback config — opt-in via the `providers.acoustid.
+    # auto_fingerprint` toggle (default OFF); gated on fpcalc being installed. The
+    # shipped Kira app key works out of the box (a `providers.acoustid.api_key`
+    # setting overrides it). None → the matcher skips the fallback entirely.
+    from kira.music import acoustid as _ac
+    from kira import fpcalc_setup as _fp
+    from kira.settings_store import get_raw, unwrap
+    _aid_key: str | None = None
+    try:
+        if bool(unwrap(await get_raw(session, "providers.acoustid.auto_fingerprint"))) and _fp.resolve_fpcalc():
+            _aid_key = unwrap(await get_raw(session, "providers.acoustid.api_key")) or _ac.PROJECT_KEY
+    except Exception as e:  # noqa: BLE001 — config read must never crash a scan
+        logger.warning(f"_match_music: AcoustID config read failed (skipping fingerprint): {e!r}")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            results = await _mm.match_album(client, inputs, acoustid_key=_aid_key)
+    except Exception as e:
+        logger.warning(f"_match_music: matcher failed for cluster {fids}: {e!r}")
+        results = []
+
+    for r in results:
+        mf = mfs.get(r.file_id)
+        if mf is None:
+            continue
+        await session.execute(_sql_delete(Match).where(Match.media_file_id == r.file_id))
+        if r.matched_via == "unpaired" or r.confidence <= 0:
+            mf.status = "no_match"
+            continue
+        session.add(Match(
+            media_file_id=r.file_id,
+            provider="musicbrainz",
+            provider_id=str(r.recording_id or r.release_id),
+            match_type="track",
+            confidence=r.confidence,
+            title=r.title,
+            year=r.year,
+            series_name=r.album,                       # album = the "show" equivalent
+            season_number=r.disc_no,                   # disc → "season"
+            episode_number=r.track_no,                 # track → "episode"
+            poster_url=r.cover_art_url,
+            series_group_id=f"musicbrainz:{r.release_id}",
+            is_selected=True,
+            # Non-NULL blob (carries the artist + corrected fields the rename uses)
+            # — also keeps music matches out of the metadata-IS-NULL heal sweep.
+            metadata_blob={
+                "music": True, "artist": r.artist, "album": r.album, "title": r.title,
+                "track_no": r.track_no, "disc_no": r.disc_no, "year": r.year,
+                "release_id": r.release_id, "recording_id": r.recording_id,
+                "matched_via": r.matched_via,
+            },
+        ))
+        mf.status = "matched"
+    if not results:   # matcher couldn't resolve the album → leave the cluster no_match
+        for fid, mf in mfs.items():
+            await session.execute(_sql_delete(Match).where(Match.media_file_id == fid))
+            mf.status = "no_match"
+    await session.commit()
+
+
 async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
     """Cluster `fids` by series_key, then match each cluster (≥2 files) or
     singleton, updating the Scan row's live progress. Returns the number of
@@ -1851,13 +1952,22 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
     # The title rescue below stays inline: it's matching-essential (a file with no
     # parseable title would otherwise never match at all) and bounded to those.
 
+    # Music subsystem gate, read ONCE. Music is an isolated plugin consulted only
+    # at the dispatch below; default OFF so it can't affect non-music users.
+    from kira.settings_store import get_raw, unwrap
+    _mval = unwrap(await get_raw(session, "music.enabled"))
+    music_enabled = _mval is True or (isinstance(_mval, str) and _mval.strip().lower() in ("true", "1", "yes", "on"))
+
     matched = 0
     for bucket_key, cfids in clusters.items():
         # Shimmer the cluster's rows while it resolves.
+        _rep_path: str | None = None
         for fid in cfids:
             mf = await session.get(MediaFile, fid)
             if mf:
                 mf.status = "matching"
+                if _rep_path is None and mf.file_path:
+                    _rep_path = mf.file_path
                 # Title rescue for files the filename couldn't identify — reads
                 # the container's embedded title and re-parses. Bounded to files
                 # with no usable title (they'd never match otherwise), so the one
@@ -1866,6 +1976,15 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
                     await _maybe_rescue_title_from_mediainfo(mf)
                 except Exception as e:
                     logger.warning(f"_match_phase: title rescue failed for {fid}: {e!r}")
+        # PB-jank: surface WHICH cluster is matching NOW, BEFORE we dispatch it.
+        # A rate-limited cluster (AniDB / MusicBrainz, ≤1 req/s plus episode-list
+        # fetches) can take tens of seconds; without a pre-dispatch write the
+        # current_path sat frozen the whole time, reading as "the scan hung".
+        # Folded into the existing shimmer commit — no extra DB round-trip.
+        if _rep_path:
+            _sc = await session.get(Scan, scan_id)
+            if _sc is not None:
+                _sc.current_path = _rep_path
         await session.commit()
         await asyncio.sleep(0)
 
@@ -1873,7 +1992,15 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
         # dispatcher clears matches first, which would discard the pack row.
         dispatch_fids = [f for f in cfids if f not in overridden] if overridden else cfids
         if dispatch_fids:
-            if isinstance(bucket_key, str) and len(dispatch_fids) >= 2:
+            # Music → the ISOLATED kira.music plugin (ONE seam, gated on
+            # music.enabled). It never reaches the movie/TV/anime cascade below
+            # (engine.match short-circuits music), so this branch can't affect it.
+            _first = await session.get(MediaFile, dispatch_fids[0])
+            if _first is not None and _first.media_type == "music":
+                if music_enabled:
+                    await _match_music(session, dispatch_fids)
+                # else: music off → leave as no_match (the status sweep handles it)
+            elif isinstance(bucket_key, str) and len(dispatch_fids) >= 2:
                 await _match_cluster(session, engine, dispatch_fids)
             else:
                 await _match_singleton(session, engine, dispatch_fids[0])
@@ -1970,7 +2097,7 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
 
 
 async def _prune_missing_files(
-    session, root_paths: list[str], walked_norm: set[str], norm_fn,
+    session, root_paths: list[str], walked_norm: set[str], norm_fn, *, error_paths: list[str] = (),
 ) -> int:
     """The OTHER half of a scan: drop tracked files that VANISHED from disk, so
     deleting a file (in Kira or your file manager) clears it from Review on the
@@ -1979,6 +2106,10 @@ async def _prune_missing_files(
     A row is pruned only when ALL hold:
       • its path is UNDER a root this scan walked (never touches libraries this
         scan didn't cover), AND
+      • its path is NOT under an `error_paths` subtree — a dead root or a folder
+        that raised a scandir error this scan. There "the walk didn't see it" is
+        untrustworthy (a mid-scan NAS disconnect makes PRESENT files stat as
+        gone), so we never prune inside it, AND
       • the walk didn't see it (fast pre-filter via `walked_norm`), AND
       • `stat()` raises FileNotFoundError — i.e. CONFIRMED gone. A permission /
         NAS error counts as "can't tell → keep", never as deleted.
@@ -1987,9 +2118,10 @@ async def _prune_missing_files(
     delete via `_delete_one(keep_on_disk=True)`); nothing is removed from disk —
     the file's already gone.
 
-    CALLER CONTRACT: invoke ONLY after a fully healthy walk (no unreachable root,
-    no scandir error) — otherwise an unreadable subtree makes present files look
-    missing and this would nuke them. Returns the number of rows pruned."""
+    RESILIENT: pass the scan's `error_paths` (walk_errors + dead_roots) and this
+    sweeps every CLEANLY-walked subtree while skipping only the unreadable ones,
+    so one bad folder no longer blocks ALL deletion cleanup. With no error_paths
+    it's the old "prune the whole walked scope" behavior. Returns rows pruned."""
     from kira.api.files import _delete_one
 
     def _confirmed_gone(p: str) -> bool:
@@ -2011,10 +2143,37 @@ async def _prune_missing_files(
     # swapped + both-slash forms (it carries the resolved root prefixes), so we
     # compare normalized prefixes instead of the raw string.
     root_prefixes = {f.rstrip("/\\") for r in root_paths for f in norm_fn(r)}
+    # Subtrees the walk couldn't fully read this scan (scandir errors + dead
+    # roots). A "missing" row inside one of these can't be trusted as deleted, so
+    # we exclude it — but everything under a cleanly-walked subtree is still swept.
+    error_prefixes = {f.rstrip("/\\") for e in error_paths for f in norm_fn(e)}
 
-    def _under_scanned_roots(p: str) -> bool:
-        for f in norm_fn(p):
-            for rp in root_prefixes:
+    # GUARD against the NAS-disconnect wipe: a root that walked ZERO files this
+    # scan is almost certainly a DISCONNECTED mount (a populated library doesn't
+    # spontaneously empty), NOT a user who deleted everything. A dropped mount can
+    # present as an empty-but-walkable dir with no scandir error — so it dodges the
+    # error_paths guard above, then every tracked file under it stat()s as
+    # FileNotFoundError and the whole index gets pruned (the exact data-loss the
+    # user hit). So treat a zero-file root exactly like an unreadable subtree:
+    # never prune inside it. A genuinely-emptied library just keeps its now-stale
+    # rows until a scan sees the folder non-empty — the SAFE direction to fail.
+    empty_root_prefixes = {
+        rp for rp in root_prefixes
+        if not any(
+            w == rp or w.startswith(rp + "/") or w.startswith(rp + "\\")
+            for w in walked_norm
+        )
+    }
+    if empty_root_prefixes:
+        logger.warning(
+            f"_prune_missing_files: {len(empty_root_prefixes)} scan root(s) walked ZERO "
+            f"files — treating as disconnected mounts, NOT pruning under them "
+            f"(reconnect + rescan to rebuild): {sorted(empty_root_prefixes)}"
+        )
+
+    def _under(p_norms: set[str], prefixes: set[str]) -> bool:
+        for f in p_norms:
+            for rp in prefixes:
                 if f == rp or f.startswith(rp + "/") or f.startswith(rp + "\\"):
                     return True
         return False
@@ -2022,9 +2181,16 @@ async def _prune_missing_files(
     rows = (await session.execute(select(MediaFile.id, MediaFile.file_path))).all()
     candidates: list[int] = []
     for fid, fp in rows:
-        if not fp or not _under_scanned_roots(fp):
+        if not fp:
+            continue
+        p_norms = norm_fn(fp)
+        if not _under(p_norms, root_prefixes):
             continue                     # outside the scanned scope (alias-aware)
-        if norm_fn(fp) & walked_norm:
+        if error_prefixes and _under(p_norms, error_prefixes):
+            continue                     # inside an unreadable subtree → can't trust → keep
+        if empty_root_prefixes and _under(p_norms, empty_root_prefixes):
+            continue                     # its root walked 0 files → likely disconnected → keep
+        if p_norms & walked_norm:
             continue                     # the walk saw it this scan → present
         if await asyncio.to_thread(_confirmed_gone, fp):
             candidates.append(fid)
@@ -2052,6 +2218,39 @@ async def _prune_missing_files(
         await session.commit()
         logger.info(f"_scan_worker: pruned {removed} file(s) gone from disk")
     return removed
+
+
+async def _resilient_commit(session, pending: list) -> list[tuple[str, str]]:
+    """Commit the session; if the batch commit fails, roll back and re-commit each
+    pending row INDIVIDUALLY so a single bad row drops only ITSELF — not the whole
+    SCAN_COMMIT_EVERY batch (the old behaviour silently lost up to 5 good files on
+    one row's conflict). A row that still fails alone is left uncommitted (its `id`
+    stays None → naturally excluded from the match set) and returned as
+    `(file_path, error)` so the caller can surface it. Never raises."""
+    try:
+        await session.commit()
+        return []
+    except Exception as batch_err:  # noqa: BLE001
+        logger.warning(
+            f"_scan ingest: batch commit failed ({batch_err!r}) — retrying "
+            f"{len(pending)} row(s) individually so good files aren't lost"
+        )
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        dropped: list[tuple[str, str]] = []
+        for mf in pending:
+            session.add(mf)
+            try:
+                await session.commit()
+            except Exception as row_err:  # noqa: BLE001
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
+                dropped.append((getattr(mf, "file_path", "?"), str(row_err)))
+        return dropped
 
 
 def _drain_walk_batch(
@@ -2120,6 +2319,25 @@ def _drain_walk_batch(
     return survivors, False
 
 
+async def _active_rename_targets(session) -> set[str]:
+    """`new_path` of every NON-undone rename whose MediaFile STILL EXISTS — the
+    set the discovery drainer skips so a renamed file isn't re-ingested as a
+    phantom duplicate (which would then fail to rename: "source does not exist").
+
+    Gated on a LIVE MediaFile: a wiped-but-renamed file (media_files cleared while
+    rename_history was kept — the NAS-disconnect prune case) has a dangling/NULL
+    `media_file_id`, so it's EXCLUDED here and gets re-ingested on the next scan
+    instead of being silently dropped forever (the Wednesday S02E01/E02 bug)."""
+    from kira.models import RenameHistory
+    rows = (await session.scalars(
+        select(RenameHistory.new_path).where(
+            RenameHistory.undone_at.is_(None),
+            RenameHistory.media_file_id.in_(select(MediaFile.id)),
+        )
+    )).all()
+    return {p for p in rows if p}
+
+
 async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] | None:
     """Walk the tree, parse each file, then match each new file in turn.
 
@@ -2155,12 +2373,13 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
         # the scanner re-discovers renamed files as "new" MediaFile rows.
         # Those phantoms then fail to rename ("source does not exist")
         # because the user already renamed them once.
-        from kira.models import RenameHistory
-        renamed_paths_raw = set(
-            (await session.scalars(
-                select(RenameHistory.new_path).where(RenameHistory.undone_at.is_(None))
-            )).all()
-        )
+        # Skip a rename target ONLY while its MediaFile still exists. After a
+        # library WIPE (a NAS-disconnect prune cleared media_files but KEPT
+        # rename_history) the renamed file is no longer tracked — its
+        # media_file_id dangles / NULLs — so it MUST be re-ingested, not skipped.
+        # Without this gate a re-scan permanently drops every previously-renamed
+        # file after a wipe (the user's missing Wednesday S02E01/E02).
+        renamed_paths_raw = await _active_rename_targets(session)
         # Path-normalization bug-fix: the rename engine writes RESOLVED
         # paths to MediaFile.file_path and RenameHistory.new_path. On
         # Windows with a mapped drive (Z:\ → \\nas\share), the stored
@@ -2289,6 +2508,12 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
             # cancellation, where an in-flight batch is bounded so it drains
             # quickly and the loop is free again at once.
             walk_errors: list[str] = []
+            # Per-batch ingest resilience: `_pending` holds the rows added since the
+            # last commit; `ingest_dropped` collects any a resilient commit couldn't
+            # save even alone (id stays None → excluded from the match set; surfaced
+            # to the user at the end).
+            _pending: list = []
+            ingest_dropped: list[tuple[str, str]] = []
             loop = asyncio.get_running_loop()
             walk_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="kira-scan-walk"
@@ -2298,7 +2523,13 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
                 # where scanner.walk() will populate it.
                 await loop.run_in_executor(walk_executor, scanner.reset_walk_errors)
                 for root_path in root_paths:
-                    if not _root_reachable(root_path):
+                    # Off the event loop: a dead/unmounted NAS makes is_dir() block
+                    # for the full SMB/network timeout, freezing the whole API. The
+                    # walk thread already exists — run the reachability probe there.
+                    reachable = await loop.run_in_executor(
+                        walk_executor, _root_reachable, root_path
+                    )
+                    if not reachable:
                         dead_roots.append(str(root_path))
                         continue
                     # Lazy generator — every next() (os.walk stepping) and the
@@ -2343,13 +2574,17 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
                             )
                             session.add(mf)
                             new_files.append(mf)
+                            _pending.append(mf)
                             count += 1
                             if count % SCAN_COMMIT_EVERY == 0:
                                 scan = await session.get(Scan, scan_id)
                                 if scan:
                                     scan.file_count = count
                                     scan.current_path = str(path)
-                                await session.commit()
+                                # Resilient: one bad row drops only itself, never the
+                                # whole batch of (up to) SCAN_COMMIT_EVERY good files.
+                                ingest_dropped += await _resilient_commit(session, _pending)
+                                _pending = []
                                 await asyncio.sleep(0)
                         if exhausted:
                             break
@@ -2373,16 +2608,37 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
             # The walk above is the "mark"; this is the "sweep". A tracked file
             # under a scanned root that the walk didn't find AND that stat()
             # confirms is gone gets dropped, so a deleted file auto-clears from
-            # Review. ONLY when the walk was fully healthy: a dead root or a
-            # scandir error means part of the tree was unreadable, so "not seen"
-            # ≠ "deleted" and pruning would wipe present files (NAS-blip guard).
-            if not dead_roots and not walk_errors:
-                try:
-                    await _prune_missing_files(
-                        session, root_paths, walked_paths_this_scan, _norm,
-                    )
-                except Exception as e:
-                    logger.warning(f"_scan_worker: prune-missing failed (non-fatal): {e!r}")
+            # Review. RESILIENT: subtrees that errored this scan (a dead root or a
+            # scandir failure) are EXCLUDED — there "not seen" ≠ "deleted" (the
+            # NAS-blip guard) — but every cleanly-walked subtree is still swept, so
+            # one unreadable folder no longer blocks ALL deletion cleanup the way
+            # the old "skip the whole sweep on any error" gate did.
+            try:
+                await _prune_missing_files(
+                    session, root_paths, walked_paths_this_scan, _norm,
+                    error_paths=walk_errors + dead_roots,
+                )
+            except Exception as e:
+                logger.warning(f"_scan_worker: prune-missing failed (non-fatal): {e!r}")
+
+            # ── Surface ingest issues the user would otherwise never see ──────
+            # `walk_errors` = folders scandir() couldn't read (already used above to
+            # spare them from the prune); `ingest_dropped` = rows a resilient commit
+            # couldn't save. Both leave files un-indexed silently, so tell the user
+            # instead of swallowing it — they'll be retried on the next scan.
+            if walk_errors or ingest_dropped:
+                _wn, _dn = len(walk_errors), len(ingest_dropped)
+                _bits: list[str] = []
+                if _wn:
+                    _bits.append(f"{_wn} folder{'s' if _wn != 1 else ''} couldn't be read")
+                if _dn:
+                    _bits.append(f"{_dn} file{'s' if _dn != 1 else ''} couldn't be indexed")
+                _sample = (walk_errors[:2] + [p for p, _ in ingest_dropped[:2]])[:3]
+                _body = " · ".join(_bits)
+                if _sample:
+                    _body += " — e.g. " + ", ".join(_sample)
+                _body += ". They'll be retried on the next scan."
+                await _post_notification("warning", "Scan finished with issues", _body)
 
             # RESUME: also match files a prior interrupted scan left in
             # "discovered" (boot reset stuck "matching" → "discovered"). The
@@ -2444,16 +2700,39 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
                 i for (i, fp) in (await session.execute(_stmt)).all()
                 if i not in _new_set and fp and path_under_roots(fp, _roots)
             ]
-            match_ids = all_new + _leftover
+
+            # Smart rescan: ALSO retry files that previously ended `no_match` (the
+            # "Needs matching" section). A rescan should pick up files that failed
+            # to match before — a provider key added since, a transient provider
+            # outage, a pack installed — WITHOUT touching already-matched files
+            # (matched / approved / renamed are never put in `match_ids`, so their
+            # match is never disturbed). This is "match the Needs-matching ones
+            # while looking for new files", short of a full reparse-everything.
+            _nm_stmt = select(MediaFile.id, MediaFile.file_path).where(
+                MediaFile.status == "no_match"
+            )
+            if _like_clauses:
+                _nm_stmt = _nm_stmt.where(or_(*_like_clauses))
+            _no_match = [
+                i for (i, fp) in (await session.execute(_nm_stmt)).all()
+                if i not in _new_set and fp and path_under_roots(fp, _roots)
+            ]
+            match_ids = all_new + _leftover + _no_match
             if _leftover:
                 logger.info(f"_scan_worker: resuming {len(_leftover)} leftover file(s) from a prior interrupted scan")
+            if _no_match:
+                logger.info(f"_scan_worker: retrying {len(_no_match)} previously-unmatched (Needs-matching) file(s)")
 
             scan = await session.get(Scan, scan_id)
             if scan:
-                scan.file_count = count
+                # file_count = the REAL work this scan does (new discoveries +
+                # resumed leftovers + retried no_match), not just brand-new
+                # survivors. On a re-scan of an indexed library `count` (new files)
+                # is ~0, which read to the user as "0 files found" the whole scan.
+                scan.file_count = max(count, len(match_ids))
                 # PB-4: progress denominator = everything we'll match (new +
-                # resumed leftover), so the bar reflects real work, not 100%-in-
-                # 2-seconds when only leftover files remain.
+                # resumed leftover + no_match retries), so the bar reflects real
+                # work, not 100%-in-2-seconds when only a few files remain.
                 scan.estimated_total = len(match_ids)
                 scan.current_path = None
                 scan.status = "matching"
@@ -2483,6 +2762,23 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
                 # `match_ids` = this scan's new files + any leftover "discovered"
                 # files resumed from a prior interrupted scan.
                 matched = await _match_phase(session, engine, match_ids, scan_id)
+
+            # Kira Packs: re-offer installed packs to the EXISTING no_match
+            # backlog too — not just this scan's new files (those already got the
+            # per-file fallback seam in `_match_phase`). A pack match is a cheap
+            # LOCAL regex/title check with ZERO provider calls, so this is safe on
+            # every scan: a pack you added AFTER files were already no_match now
+            # clears them on the next scan, with no Packs-page trip. Skipped when
+            # no pack is installed; isolation holds (only no_match files touched).
+            try:
+                from kira.packs.apply import apply_packs_to_no_match
+                pack_rescued = await apply_packs_to_no_match(session)
+                if pack_rescued:
+                    matched += pack_rescued
+                    await session.commit()
+                    logger.info(f"_scan_worker: packs rescued {pack_rescued} backlog file(s)")
+            except Exception as e:
+                logger.warning(f"_scan_worker: pack backlog pass failed (non-fatal): {e!r}")
 
             # EE-2: did the directory walk hit any unreachable paths?
             # If so, the scan technically completed but is INCOMPLETE.
@@ -2515,7 +2811,9 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
                     body=(
                         "Some directories couldn't be read. Common causes: "
                         "NAS disconnect, permission change, drive ejected mid-scan. "
-                        "Re-scan once the filesystem is stable.\n\n"
+                        "Files you've deleted from INSIDE these folders stay listed "
+                        "until they're readable again (the rest of the library still "
+                        "clears). Re-scan once the filesystem is stable.\n\n"
                         + "\n".join(shown) + more
                     )[:1000],
                 ))
@@ -2726,6 +3024,21 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
         try:
             try:
                 auto_rename_ids = await _scan_worker(scan_id, root_paths)
+            except asyncio.CancelledError:
+                # User clicked Stop. Mark the scan 'cancelled' and KEEP whatever was
+                # discovered so far (unlike the failure path below, which deletes the
+                # scan's rows). The outer finally still releases the lock; re-raise so
+                # the task ends cancelled.
+                try:
+                    async with SessionLocal() as _cx_sess:
+                        _cx = await _cx_sess.get(Scan, scan_id)
+                        if _cx is not None and _cx.status in ("scanning", "matching"):
+                            _cx.status = "cancelled"
+                            _cx.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                            await _cx_sess.commit()
+                except Exception as _ce:
+                    logger.warning(f"_scan_worker_locked: marking cancelled failed: {_ce!r}")
+                raise
             except Exception as e:
                 async with SessionLocal() as cleanup:
                     # Delete dependent Match rows FIRST. The matches FK has no
@@ -2777,8 +3090,14 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
             logger.warning(f"_scan_worker_locked: auto_rename hook failed (non-fatal): {e!r}")
 
 
-async def _reparse_worker(scan_id: int) -> None:
-    """In-place re-parse of the EXISTING library.
+async def _reparse_worker(scan_id: int, media_type: str | None = None, file_ids: list[int] | None = None) -> None:
+    """In-place re-parse of the EXISTING library — or a SCOPE of it.
+
+    `file_ids` (one album/show/movie) or `media_type` ("music"/"anime"/"tv"/
+    "movie") narrows the set; neither → the whole library. Everything below
+    operates on the resulting `all_ids`, so re-parse + re-match + the MediaInfo
+    re-enrich all stay confined to the scope (a per-album reparse re-reads only
+    that album's container tags — seconds, not a whole-library pass).
 
     A normal re-scan SKIPS files already in the DB, so parser improvements
     (named-season parsing, specials, title cleanup) and folder-level series
@@ -2790,7 +3109,12 @@ async def _reparse_worker(scan_id: int) -> None:
     """
     async with SessionLocal() as session:
         try:
-            all_ids = list((await session.scalars(select(MediaFile.id))).all())
+            _stmt = select(MediaFile.id)
+            if file_ids:
+                _stmt = _stmt.where(MediaFile.id.in_(file_ids))
+            elif media_type:
+                _stmt = _stmt.where(MediaFile.media_type == media_type)
+            all_ids = list((await session.scalars(_stmt)).all())
             total = len(all_ids)
             scan = await session.get(Scan, scan_id)
             if scan:
@@ -2891,7 +3215,7 @@ async def _reparse_worker(scan_id: int) -> None:
                 logger.warning(f"_reparse_worker: recording failure status failed: {_e2!r}")
 
 
-async def _reparse_worker_locked(scan_id: int) -> None:
+async def _reparse_worker_locked(scan_id: int, media_type: str | None = None, file_ids: list[int] | None = None) -> None:
     """Process-locked wrapper around `_reparse_worker`.
 
     Unlike `_scan_worker_locked` it NEVER deletes MediaFile rows on failure —
@@ -2900,7 +3224,7 @@ async def _reparse_worker_locked(scan_id: int) -> None:
     """
     async with _SCAN_LOCK:
         try:
-            await _reparse_worker(scan_id)
+            await _reparse_worker(scan_id, media_type, file_ids)
         finally:
             try:
                 await _release_db_scan_lock()
@@ -2908,9 +3232,17 @@ async def _reparse_worker_locked(scan_id: int) -> None:
                 logger.warning(f"_reparse_worker_locked: failed to release scan lock: {e!r}")
 
 
+class ReparseScope(BaseModel):
+    """Narrow a reparse to a media TYPE (just music / anime / tv / movies) or a
+    specific set of FILES (one album / show / movie). Both null → whole library."""
+    media_type: str | None = None        # "music" | "anime" | "tv" | "movie"
+    file_ids: list[int] | None = None
+
+
 @router.post("/reparse", response_model=ScanOut, status_code=201)
 async def reparse_library(
     background: BackgroundTasks,
+    scope: ReparseScope | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> Scan:
     """Re-parse the EXISTING library in place and re-match it.
@@ -2920,6 +3252,10 @@ async def reparse_library(
     destructive DB reset. Manual pins + rename history are preserved. Uses
     the same single-scan lock as create_scan (409 if a scan is running).
     """
+    media_type = scope.media_type if scope else None
+    file_ids = scope.file_ids if scope else None
+    if media_type and media_type not in ("music", "anime", "tv", "movie"):
+        raise HTTPException(400, f"invalid media_type {media_type!r} — must be music/anime/tv/movie")
     if _SCAN_LOCK.locked():
         raise HTTPException(409, "A scan is already running. Please wait for it to complete.")
 
@@ -2939,11 +3275,16 @@ async def reparse_library(
         raise HTTPException(409, "A scan is already running. Please wait for it to complete.")
 
     try:
-        scan = Scan(root_path="(re-parse existing library)", status="scanning")
+        label = (
+            f"(re-parse {media_type})" if media_type
+            else "(re-parse selected files)" if file_ids
+            else "(re-parse existing library)"
+        )
+        scan = Scan(root_path=label, status="scanning")
         session.add(scan)
         await session.commit()
         await session.refresh(scan)
-        background.add_task(_reparse_worker_locked, scan.id)
+        background.add_task(_reparse_worker_locked, scan.id, media_type, file_ids)
         return scan
     except Exception:
         try:
@@ -3033,7 +3374,9 @@ async def _start_scan(paths: list[str], source: str = "manual") -> int | None:
     # NB: source is persisted on the Scan row (above); the worker reads it
     # back from the DB at completion to decide whether to fire the auto-scan
     # notification. _scan_worker_locked therefore takes only (id, roots).
-    spawn_tracked(_scan_worker_locked(scan_id, effective_roots), label="scan_worker")
+    task = spawn_tracked(_scan_worker_locked(scan_id, effective_roots), label="scan_worker")
+    _SCAN_TASKS[scan_id] = task
+    task.add_done_callback(lambda t, sid=scan_id: _SCAN_TASKS.pop(sid, None))
     return scan_id
 
 
@@ -3105,6 +3448,42 @@ async def create_scan(
     if scan is None:
         raise HTTPException(500, "Scan row vanished after creation.")
     return scan
+
+
+@router.post("/{scan_id}/cancel", response_model=dict)
+async def cancel_scan(
+    scan_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Stop a running scan (the Stop button).
+
+    Cancels the worker at its next await — it marks the scan 'cancelled', KEEPS
+    whatever it discovered, and frees the lock (bounded latency: a few seconds /
+    one cluster). If there's no live task (a stale lock from a crashed worker —
+    the "already scanning but nothing's showing" phantom), this also force-marks
+    the scan cancelled and releases the lock so the UI unsticks immediately.
+    """
+    scan = await session.get(Scan, scan_id)
+    if scan is None:
+        raise HTTPException(404, "Scan not found.")
+    if scan.status not in ("scanning", "matching"):
+        return {"ok": True, "status": scan.status, "already_done": True}
+
+    task = _SCAN_TASKS.get(scan_id)
+    if task is not None and not task.done():
+        task.cancel()
+        return {"ok": True, "status": "cancelling"}
+
+    # No live task for a scan the DB still calls running → a stale lock. Force it
+    # cancelled + release the lock so the user isn't stuck behind a phantom scan.
+    scan.status = "cancelled"
+    scan.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    await session.commit()
+    try:
+        await _release_db_scan_lock()
+    except Exception as e:
+        logger.warning(f"cancel_scan: stale-lock release failed: {e!r}")
+    return {"ok": True, "status": "cancelled", "forced": True}
 
 
 @router.get("", response_model=list[ScanOut])

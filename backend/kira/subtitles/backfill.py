@@ -361,6 +361,8 @@ def needed_languages(parsed: dict | None, wanted: list[str]) -> list[str]:
     """Wanted languages not already present (embedded or sidecar). Unlike the
     coverage chip this ignores the 'inspected' gate — the user explicitly asked
     to fetch, and the aggregator self-skips anything truly on disk anyway."""
+    if (parsed or {}).get("media_type") == "music":
+        return []   # music has no subtitles — never target it for backfill
     present = present_languages(parsed)
     return [w for w in wanted if normalize_lang(w) not in present]
 

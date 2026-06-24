@@ -19,6 +19,7 @@ from kira.log import setup_logging
 setup_logging()
 from kira import net as _net  # noqa: F401  (import side-effect: net.install())
 
+from kira.api import collections as collections_api
 from kira.api import files as files_api
 from kira.api import health as health_api
 from kira.api import history as history_api
@@ -437,6 +438,7 @@ app.include_router(webhooks_api.router, prefix="/api/v1")
 app.include_router(subtitles_api.router, prefix="/api/v1")
 app.include_router(images_api.router, prefix="/api/v1")
 app.include_router(packs_api.router, prefix="/api/v1")
+app.include_router(collections_api.router, prefix="/api/v1")
 
 
 # ─────────────────────────────────────────────────────────────────────

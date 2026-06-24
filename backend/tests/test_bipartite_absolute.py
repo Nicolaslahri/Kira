@@ -56,6 +56,29 @@ def test_longrunner_sxe_keeps_absolute_episode():
         assert out[100 + i].episode_title == eps[i]["title"]   # title still correct
 
 
+def test_pass3_skips_multiseason_to_avoid_cross_season_hijack():
+    """Pass 3 (season-agnostic) must NOT fire on a MULTI-season provider list. A
+    file labelled for a season the provider doesn't have ("S05E03" when the show
+    has S01-S02) would otherwise grab an unrelated season's identically-numbered
+    episode (→ S01E03). On a multi-season list it stays UNPAIRED (the user fixes
+    it); real multi-season absolute numbering is owned by Pass 3.5."""
+    multi = [_ep(s, e, f"S{s}E{e}", absolute_number=(s - 1) * 20 + e)
+             for s in (1, 2) for e in range(1, 21)]
+    files = [(i, _pf(5, e, abs_ep=None)) for i, e in ((1, 3), (2, 7), (3, 11))]
+    out = assign_files_to_episodes(files, multi)
+    assert all(out[i].matched_via == "unpaired" for i in (1, 2, 3))
+
+
+def test_pass3_still_rescues_flat_list():
+    """The flat-AniDB rescue is PRESERVED: on a single-season list (local episode
+    == absolute), a season-agnostic SxE number ("S23E13") still pairs by episode."""
+    flat = [_ep(1, n, f"ep{n}", absolute_number=n) for n in range(1, 16)]
+    files = [(i, _pf(23, e, abs_ep=None)) for i, e in ((1, 13), (2, 14), (3, 15))]
+    out = assign_files_to_episodes(files, flat)
+    assert all(out[i].matched_via == "episode_number" and out[i].episode_season == 1 for i in (1, 2, 3))
+    assert sorted(out[i].episode_number for i in (1, 2, 3)) == [13, 14, 15]
+
+
 def test_bracket_absolute_stores_absolute():
     """Bracket/dash form sets parsed.absolute_episode → Pass 2 must store the
     absolute (1156..1158), not the local index 1..3."""

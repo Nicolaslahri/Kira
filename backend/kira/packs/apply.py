@@ -159,3 +159,37 @@ async def any_override_bindings(session) -> bool:
         b.enabled and b.authority == "override"
         for b in await _loader.load_bindings(session)
     )
+
+
+async def any_enabled_bindings(session) -> bool:
+    """Cheap guard: is ANY pack installed + enabled? Lets the scan skip the
+    no_match backlog pass entirely when there are no packs (the common case)."""
+    return any(b.enabled for b in await _loader.load_bindings(session))
+
+
+async def apply_packs_to_no_match(session) -> int:
+    """Re-offer every enabled pack to the CURRENT no_match backlog and return how
+    many it rescued (status → ``matched``). A pack match is a LOCAL regex/title
+    check with ZERO provider calls, so this is cheap enough to run on every scan
+    as well as from the manual rescan and the add/refresh-pack flows — meaning a
+    pack added AFTER files were already no_match clears them on the next scan,
+    no Packs-page trip needed. Does NOT commit (the caller owns the transaction).
+
+    Isolation holds by construction: it only ever touches ``no_match`` rows, the
+    same seam as the scan's per-file fallback — a pack can never alter a title a
+    provider already matched."""
+    if not await any_enabled_bindings(session):
+        return 0
+    from sqlalchemy import select
+    rows = list(await session.scalars(
+        select(MediaFile).where(MediaFile.status == "no_match")
+    ))
+    rescued = 0
+    for mf in rows:
+        try:
+            if await try_pack_match(session, mf.id, mf):
+                mf.status = "matched"
+                rescued += 1
+        except Exception as e:  # noqa: BLE001 — best-effort, one bad file never blocks the rest
+            logger.warning("apply_packs_to_no_match: file %s failed (non-fatal): %r", mf.id, e)
+    return rescued

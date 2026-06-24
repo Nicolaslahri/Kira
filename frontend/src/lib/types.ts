@@ -24,6 +24,9 @@ export interface MatchData {
   seriesGroupId?: string;
   /** #14: TMDB movie-collection display name, when the film belongs to one. */
   collectionName?: string | null;
+  /** #14: TMDB movie-collection id — the band key grouping a collection's films
+   *  (and its missing-part ghost cards) together on the Review grid. */
+  collectionId?: string | null;
   tmdbId?: number | null;
   runtime?: number;
   poster?: PosterData;
@@ -123,7 +126,15 @@ export interface MediaFile {
    *  layout, primary audio codec(s). Surfaced as chips + used by the ranker. */
   hdr?: string;
   channels?: string;
+  /** Music audio tech specs (MediaInfo) — flow through to LibFile / the popup rows. */
+  audioBitrate?: number;     // kbps
+  sampleRate?: number;       // Hz
+  audioBitDepth?: number;    // bits
+  lossless?: boolean;
   audio?: string[];
+  /** Container duration in seconds (mediainfo). Drives the music popup's
+   *  per-track time + the album total. */
+  durationSec?: number;
   /** Per-track languages (ISO-639-2/B) read from the container → dual-audio /
    *  multi-sub chips. */
   audio_langs?: string[];
@@ -272,7 +283,15 @@ export interface LibFile {
    *  the dedupe ranker (HDR > SDR, more channels win). */
   hdr?: string;
   channels?: string;
+  /** Music audio tech specs (MediaInfo) — shown in the popup track rows. */
+  audioBitrate?: number;     // kbps
+  sampleRate?: number;       // Hz
+  audioBitDepth?: number;    // bits
+  lossless?: boolean;        // authoritative lossless flag (vs the format-name guess)
   audio?: string[];
+  /** Container duration in seconds (mediainfo). Drives the music popup's
+   *  per-track time + the album total. */
+  durationSec?: number;
   /** Per-track languages (ISO-639-2/B) read from the container → dual-audio /
    *  multi-sub chips. */
   audio_langs?: string[];
@@ -307,9 +326,21 @@ export interface LibEpisode {
   airDate?: string;
   runtime?: number;
   overview?: string;
-  duration?: string; // music tracks
+  duration?: string;     // music tracks — formatted "m:ss"
+  durationSec?: number;  // raw seconds, for summing the album total
   /** Track number for albums (same data as `episode` but named per convention). */
   track?: number;
+  /** Per-track artist (music) — surfaces collabs ("… — Ariana Grande & Justin
+   *  Bieber") in the popup rows; shown only when it differs from the album artist. */
+  artist?: string;
+  /** Per-track cover art (music) — the recording's own release cover (raw URL;
+   *  route through posterSrc()→/img at render). A "Singles" folder has a DISTINCT
+   *  cover per track → feeds both the Hero cover mosaic and the edge-to-edge row art. */
+  coverUrl?: string | null;
+  /** Music cross-album duplicate: set on a LOOSE single's track when the same song
+   *  also lives on a REAL album you have → the album title, surfaced as an "Also on
+   *  …" badge so a Singles folder doesn't silently duplicate album tracks. */
+  dupOf?: string | null;
 }
 
 /** The atomic unit on the Review page — series, movie, or album. */
@@ -346,6 +377,15 @@ export interface LibraryItem {
    *  set, the franchise band heading uses it instead of the earliest film's
    *  title. Only populated for movies that belong to a collection. */
   collectionName?: string | null;
+  /** #14: TMDB movie-collection id — the band key. ReviewPage rewrites a
+   *  collection's owned films to share this as `seriesGroupId` (so they shelf
+   *  together) and appends ghost cards for the missing parts. */
+  collectionId?: string | null;
+  /** #14: set on a GHOST card — a collection part you DON'T own, rendered as a
+   *  dimmed cover with a one-click "Get from Radarr". Ghosts carry no files;
+   *  the grid renders them via a dedicated branch. `released` gates the button
+   *  (an unreleased part shows "Coming <year>" instead). */
+  ghost?: { tmdbId: number; released: boolean };
   /** Per-cluster key from the backend (`tv|breaking bad|1`). Distinct from
    *  the franchise `seriesGroupId`; used to re-find the same item after a
    *  re-match shifts its synthesized `id`. */

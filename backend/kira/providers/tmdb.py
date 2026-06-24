@@ -36,6 +36,12 @@ class TMDBProvider(MetadataProvider):
     _POSTER_CACHE_MISS = object()
     _season_poster_cache: ClassVar[TTLCache] = TTLCache(maxsize=2048, ttl=24 * 3600)
 
+    # #14 collection-completion: the `/collection/{id}` parts list rarely changes,
+    # so cache it — the Review page's "missing in collection" diff would otherwise
+    # re-hit TMDB once per collection on every load. Class-level (shared across the
+    # per-session provider rebuilds the factory does).
+    _collection_cache: ClassVar[TTLCache] = TTLCache(maxsize=512, ttl=24 * 3600)
+
     async def search_movie(self, title: str, year: int | None = None) -> list[MovieResult]:
         params = {"query": title, **self._auth_params()}
         if year is not None:
@@ -167,6 +173,51 @@ class TMDBProvider(MetadataProvider):
             "collection_id": coll_id,        # #14
             "collection_name": coll_name,    # #14
         }
+
+    async def get_collection(self, collection_id: str) -> dict[str, Any]:
+        """Fetch a TMDB movie collection's full member list ("parts").
+
+        Powers the Review page's collection-completion feature: Kira already knows
+        which collection a movie you OWN belongs to (`Match.collection_id`); this
+        returns ALL parts so the UI can show the ones you're MISSING (and offer a
+        one-click "Get from Radarr"). Returns {} on any error — the feature then
+        simply shows no gaps. Cached 24h (`_collection_cache`)."""
+        cid = str(collection_id)
+        cached = self._collection_cache.get(cid)
+        if cached is not None:
+            return cached
+        try:
+            r = await self.client.get(
+                f"{self.base_url}/collection/{cid}",
+                params={**self._auth_params(), "language": self.language},
+                headers=self._auth_headers(),
+                timeout=15.0,
+            )
+            r.raise_for_status()
+        except Exception:
+            return {}
+        d = r.json()
+        parts: list[dict[str, Any]] = []
+        for p in d.get("parts") or []:
+            if not isinstance(p, dict) or not p.get("id"):
+                continue
+            parts.append({
+                "tmdb_id": str(p["id"]),
+                "title": p.get("title") or p.get("original_title") or "",
+                "year": _year_from(p.get("release_date")),
+                "poster_url": _poster_url(p.get("poster_path")),
+                # Raw ISO date (or None) — the endpoint decides "released" vs
+                # "upcoming" against today so the provider stays time-agnostic.
+                "release_date": p.get("release_date") or None,
+            })
+        result = {
+            "id": str(d.get("id") or cid),
+            "name": d.get("name"),
+            "poster_url": _poster_url(d.get("poster_path")),
+            "parts": parts,
+        }
+        self._collection_cache[cid] = result
+        return result
 
     async def get_season_poster(self, series_id: str, season_number: int) -> str | None:
         """Return the poster URL for a SPECIFIC season of a TMDB TV series.

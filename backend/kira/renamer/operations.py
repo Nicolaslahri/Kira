@@ -12,6 +12,7 @@ import shutil
 from enum import Enum
 from pathlib import Path
 
+from kira.longpath import long_path
 from kira.scanner import MEDIA_EXTENSIONS
 
 
@@ -506,8 +507,8 @@ def _ensure_space(src: Path, dst: Path) -> None:
     partial for the user to hand-delete. Best-effort: if src/dst can't be
     stat'd we skip the check and let the write itself surface any error."""
     try:
-        need = src.stat().st_size
-        free = shutil.disk_usage(dst.parent).free
+        need = os.stat(long_path(src)).st_size
+        free = shutil.disk_usage(long_path(dst.parent)).free
     except OSError:
         return
     if need + _SPACE_MARGIN > free:
@@ -636,14 +637,14 @@ def execute_op(
                         if str(src) != str(dst):
                             try:
                                 tmp = dst.with_name(dst.name + ".kira-casefix-tmp")
-                                os.rename(str(src), str(tmp))
-                                os.rename(str(tmp), str(dst))
+                                os.rename(long_path(src), long_path(tmp))
+                                os.rename(long_path(tmp), long_path(dst))
                             except OSError:
                                 pass  # best-effort; leave as-is rather than risk loss
                         return artifacts_cleaned
                     # Two distinct paths sharing one inode — genuine hardlink
                     # case. Safe to unlink the source; bytes remain at dst.
-                    src.unlink()
+                    os.unlink(long_path(src))
                     if cleanup_empty_source:
                         artifacts_cleaned += _cleanup_empty_source_parents(
                             src.parent, cleanup_stop_at, cleanup_max_levels,
@@ -708,12 +709,12 @@ def execute_op(
             # where dst is missing or half-written.)
             tmp = dst.with_name(dst.name + ".kira-copy-tmp")
             try:
-                shutil.copy2(str(src), str(tmp))
-                os.replace(str(tmp), str(dst))
+                shutil.copy2(long_path(src), long_path(tmp))
+                os.replace(long_path(tmp), long_path(dst))
             except Exception:
                 try:
-                    if tmp.exists():
-                        tmp.unlink()
+                    if os.path.exists(long_path(tmp)):
+                        os.unlink(long_path(tmp))
                 except OSError:
                     pass
                 raise
@@ -722,9 +723,9 @@ def execute_op(
             # paths) when enabled; absolute otherwise. Computed from dst's
             # directory so the link resolves correctly in place.
             link_target = os.path.relpath(str(src), str(dst.parent)) if symlink_relative else str(src)
-            os.symlink(link_target, str(dst))
+            os.symlink(link_target, long_path(dst))
         elif op == FileOp.HARDLINK:
-            os.link(str(src), str(dst))
+            os.link(long_path(src), long_path(dst))
         else:
             raise ValueError(f"Unknown FileOp: {op}")
 
@@ -761,7 +762,7 @@ def _mkdir_tracked(dst_parent: Path) -> list[Path]:
     # Stop at root or at the first existing ancestor.
     p = dst_parent
     while True:
-        if p.exists():
+        if os.path.exists(long_path(p)):
             break
         created.append(p)
         if p.parent == p:  # filesystem root, can't go higher
@@ -769,7 +770,7 @@ def _mkdir_tracked(dst_parent: Path) -> list[Path]:
         p = p.parent
     # Now actually create them all (`exist_ok=True` makes this idempotent
     # under a race with another worker that beat us to it).
-    dst_parent.mkdir(parents=True, exist_ok=True)
+    os.makedirs(long_path(dst_parent), exist_ok=True)
     return created
 
 
@@ -790,15 +791,15 @@ def _move_to_trash(entry: Path, trash_root: Path) -> bool:
     `poster.jpg` files from different shows don't collide; a numeric suffix
     breaks any remaining tie."""
     try:
-        trash_root.mkdir(parents=True, exist_ok=True)
+        os.makedirs(long_path(trash_root), exist_ok=True)
         base = f"{entry.parent.name}__{entry.name}" if entry.parent.name else entry.name
         target = trash_root / base
         n = 1
-        while target.exists():
+        while os.path.exists(long_path(target)):
             target = trash_root / f"{base}.{n}"
             n += 1
         original = str(entry)
-        shutil.move(str(entry), str(target))
+        shutil.move(long_path(entry), long_path(target))
         # Provenance manifest — one JSON line per trashed item. The trashed
         # NAME is flattened (`<parent>__<name>`), so without this the original
         # location is lost and the trash UI can't offer "Restore". Best-effort:
@@ -1096,7 +1097,7 @@ def _atomic_move(src: Path, dst: Path) -> None:
     partial dst removed. No silent half-states.
     """
     try:
-        os.rename(str(src), str(dst))
+        os.rename(long_path(src), long_path(dst))
         return
     except OSError as e:
         # EXDEV (Unix) / WinError 17 ERROR_NOT_SAME_DEVICE — cross-device.
@@ -1121,7 +1122,7 @@ def _atomic_move(src: Path, dst: Path) -> None:
     _ensure_space(src, dst)          # cross-device move duplicates bytes — refuse if it won't fit
     try:
         h_src = hashlib.blake2b()
-        with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        with open(long_path(src), "rb") as fsrc, open(long_path(dst), "wb") as fdst:
             while True:
                 chunk = fsrc.read(_CHUNK)
                 if not chunk:
@@ -1131,12 +1132,12 @@ def _atomic_move(src: Path, dst: Path) -> None:
             fdst.flush()
             os.fsync(fdst.fileno())   # commit the WRITE fd before it closes
         try:
-            shutil.copystat(str(src), str(dst))  # mtime/mode like copy2 — best effort
+            shutil.copystat(long_path(src), long_path(dst))  # mtime/mode like copy2 — best effort
         except OSError:
             pass
         # Re-read the destination from disk and compare content hashes.
         h_dst = hashlib.blake2b()
-        with open(dst, "rb") as f:
+        with open(long_path(dst), "rb") as f:
             while True:
                 chunk = f.read(_CHUNK)
                 if not chunk:
@@ -1145,13 +1146,13 @@ def _atomic_move(src: Path, dst: Path) -> None:
         if h_dst.digest() != h_src.digest():
             raise OSError(f"Cross-device copy verification failed (content mismatch): {src} -> {dst}")
         # Content confirmed durable at dst — only now is it safe to delete src.
-        src.unlink()
+        os.unlink(long_path(src))
     except Exception:
         # Roll back partial destination so the next attempt isn't blocked
         # by a half-baked file and the source remains the canonical copy.
         try:
-            if dst.exists():
-                dst.unlink()
+            if os.path.exists(long_path(dst)):
+                os.unlink(long_path(dst))
         except OSError:
             pass
         raise
@@ -1178,7 +1179,7 @@ def undo_op(op: FileOp, src: Path, dst: Path) -> None:
                 f"Cannot undo move — original location {src} is now occupied by a "
                 f"different file; move or remove it first."
             )
-        src.parent.mkdir(parents=True, exist_ok=True)
+        os.makedirs(long_path(src.parent), exist_ok=True)
         # Use the SAME hardened move as the forward path: same-FS os.rename, else
         # cross-device copy → fsync → hash-verify → unlink, with rollback. Undo
         # runs on the ONLY remaining copy, so a plain shutil.move (unverified

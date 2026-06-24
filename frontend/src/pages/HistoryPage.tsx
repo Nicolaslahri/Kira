@@ -233,6 +233,10 @@ export function HistoryPage({ pushToast }: Props) {
       await api.undoHistory(id);
       markRestored([id]);
       pushToast({ title: 'Rename undone', sub: 'File restored to its original location.', kind: 'success' });
+      // The undo flipped the file's status back to "matched" (the Review queue).
+      // Tell the rest of the app so the Review cover recovers IMMEDIATELY instead
+      // of staying stuck on "Renamed" until a manual page reload.
+      try { window.dispatchEvent(new Event('kira:files-changed')); } catch { /* no window */ }
       void refresh();
     } catch (e) {
       pushToast({ title: 'Undo failed', sub: (e as Error).message, kind: 'error' });
@@ -261,6 +265,8 @@ export function HistoryPage({ pushToast }: Props) {
         kind: res.failed > 0 ? 'error' : 'success',
       });
       setSelected(new Set());
+      // Refresh the Review covers too (undone files are back in the queue).
+      try { window.dispatchEvent(new Event('kira:files-changed')); } catch { /* no window */ }
       void refresh();
     } catch (e) {
       pushToast({ title: 'Bulk undo failed', sub: (e as Error).message, kind: 'error' });

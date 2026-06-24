@@ -602,11 +602,23 @@ export default function App() {
     try {
       scan = await api.createScan(effectiveRoot, allRoots);
     } catch (err) {
+      const msg = (err as Error).message;
+      // Phantom "already scanning": a scan IS running (a watcher/auto scan, or one
+      // started in another tab) but this UI never knew — so the backend 409'd and
+      // we'd otherwise just toast an error with no progress shown. ADOPT the
+      // running scan and show its progress instead (no refresh needed).
+      if (/already running|\b409\b/i.test(msg)) {
+        try {
+          const scans = await api.listScans();
+          const running = scans.find(s => s.status === 'scanning' || s.status === 'matching');
+          if (running) { await trackScan(running.id); return; }
+        } catch { /* fall through to the error toast */ }
+      }
       pushToast({
         title: 'Scan failed',
-        sub: (err as Error).message.includes('Failed to fetch')
+        sub: msg.includes('Failed to fetch')
           ? 'Backend not reachable — is uvicorn running on :8000?'
-          : (err as Error).message,
+          : msg,
         kind: 'error',
       });
       setState(s => ({ ...s, scanRunning: false }));
@@ -615,12 +627,36 @@ export default function App() {
     await trackScan(scan.id);
   }, [state.scanRunning, pushToast, refreshFiles, trackScan]);
 
+  // Stop the running scan (the Sidebar button toggles to "Stop" while scanning).
+  // Finds the live scan + cancels it; the worker stops at its next step, keeps
+  // what it found, and frees the lock. Also unsticks a phantom/stale lock.
+  const stopScan = useCallback(async () => {
+    try {
+      const scans = await api.listScans();
+      const running = scans.find(s => s.status === 'scanning' || s.status === 'matching');
+      if (!running) {
+        // Nothing actually running — clear any stale local flag so the button frees up.
+        setState(s => ({ ...s, scanRunning: false }));
+        pushToast({ title: 'No scan running', sub: 'Cleared the stuck indicator.', kind: 'success' });
+        return;
+      }
+      const r = await api.cancelScan(running.id);
+      pushToast({
+        title: r.forced ? 'Cleared a stuck scan' : 'Stopping scan…',
+        sub: r.forced ? 'No active worker was behind it — freed the lock.' : 'Finishing the current step, then stopping.',
+        kind: 'success',
+      });
+    } catch (e) {
+      pushToast({ title: 'Couldn’t stop the scan', sub: (e as Error).message, kind: 'error' });
+    }
+  }, [pushToast]);
+
   // Re-parse the EXISTING library in place. A normal scan skips
   // already-indexed files, so parser + folder-lock improvements only reach
   // NEW files; this re-runs the parser on every stored file and re-matches
   // non-manual ones (manual pins + history preserved). Reuses the scan
   // banner — the backend returns a Scan row we poll exactly like a scan.
-  const runReparse = useCallback(async () => {
+  const runReparse = useCallback(async (scope?: { media_type?: string; file_ids?: number[] }) => {
     if (state.scanRunning) {
       pushToast({
         title: 'Busy',
@@ -631,12 +667,14 @@ export default function App() {
     }
     setState(s => ({
       ...s, scanRunning: true, scanProgress: 0, scanFound: 0, scanPhase: 'scanning',
-      scanMessage: 'Re-parsing library…',
+      scanMessage: scope?.media_type ? `Re-parsing ${scope.media_type}…`
+        : scope?.file_ids ? 'Re-parsing selected…'
+        : 'Re-parsing library…',
     }));
     try {
       scanStartedAtRef.current = Date.now();
       lastProgressAtRef.current = Date.now();
-      const scan = await api.reparseLibrary();
+      const scan = await api.reparseLibrary(scope);
       let done = false;
       while (!done) {
         await new Promise(r => setTimeout(r, 800));
@@ -805,6 +843,16 @@ export default function App() {
       if (retry) clearTimeout(retry);
     };
   }, []);  // subscribe ONCE — refs above keep the callback reading live values
+
+  // Scoped reparse: the cover popup (per-album) and the Dashboard menu (per-type)
+  // fire `kira:reparse` with an optional {media_type|file_ids} scope → run it
+  // through the same handler so the scan banner + polling work identically.
+  useEffect(() => {
+    const onReparse = (e: Event) =>
+      void runReparse((e as CustomEvent).detail as { media_type?: string; file_ids?: number[] } | undefined);
+    window.addEventListener('kira:reparse', onReparse);
+    return () => window.removeEventListener('kira:reparse', onReparse);
+  }, [runReparse]);
 
   // ── Action handlers (backed by the API; local state mirrors the response) ──
   // Defined here, BEFORE the keyboard useEffect, so the effect's dependency
@@ -1317,7 +1365,7 @@ export default function App() {
         }} />
       )}
       <div className="relative z-[1] min-h-screen lg:grid lg:grid-cols-[var(--side-w)_1fr]">
-        <Sidebar active={active} setActive={setActive} settingsSection={settingsSection} setSettingsSection={setSettingsSection} pendingCount={pendingCount} scanRunning={state.scanRunning} backendOk={backendOk} mobileOpen={mobileNavOpen} onClose={() => setMobileNavOpen(false)} searchQuery={searchQuery} onSearchChange={handleSearchChange} onScan={runScan} onShortcuts={() => openModal('shortcuts')} />
+        <Sidebar active={active} setActive={setActive} settingsSection={settingsSection} setSettingsSection={setSettingsSection} pendingCount={pendingCount} scanRunning={state.scanRunning} backendOk={backendOk} mobileOpen={mobileNavOpen} onClose={() => setMobileNavOpen(false)} searchQuery={searchQuery} onSearchChange={handleSearchChange} onScan={runScan} onStop={stopScan} onShortcuts={() => openModal('shortcuts')} />
         {/* Mobile drawer backdrop — tap to dismiss (hidden on lg+) */}
         {mobileNavOpen ? (
           <div className="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm lg:hidden" onClick={() => setMobileNavOpen(false)} />

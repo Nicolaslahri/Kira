@@ -204,6 +204,57 @@ def test_audio_extension_routes_to_music() -> None:
     assert pf.media_type == "music"
 
 
+def test_music_folder_strips_leading_year_prefix() -> None:
+    """A "(YYYY) - Artist - Album" folder must NOT take the year as the artist.
+    Before the fix "(2010) - Justin Bieber - My World 2.0" parsed artist="(2010)"
+    + album="Justin Bieber - My World 2.0", so the MusicBrainz album lookup failed
+    and the album dropped to the loose per-track recording fallback (78%)."""
+    for folder in (
+        "(2010) - Justin Bieber - My World 2.0",
+        "2010 - Justin Bieber - My World 2.0",
+        "[2010] - Justin Bieber - My World 2.0",
+    ):
+        pf = parse_filename("01. Baby.flac", parent_path=f"/music/{folder}")
+        assert pf.artist == "Justin Bieber", folder
+        assert pf.album == "My World 2.0", folder
+        assert pf.year == 2010, folder
+    # No year prefix → unchanged "Artist - Album" split.
+    pf = parse_filename("01. Sorry.flac", parent_path="/music/Justin Bieber - Purpose")
+    assert pf.artist == "Justin Bieber" and pf.album == "Purpose"
+
+
+def test_music_parser_structural_robustness() -> None:
+    """The folder-baseline-first rewrite — five real folder/filename shapes that
+    used to fracture artist/album state."""
+    # R1: hyphenated artist in the filename prefix must NOT split into artist/album
+    #     when it IS the folder's artist; the album comes from the folder.
+    pf = parse_filename("Jay - Z - 01 - The Ruler's Back.mp3", parent_path="/Music/Jay-Z/The Blueprint")
+    assert pf.artist == "Jay-Z" and pf.album == "The Blueprint" and pf.track_title == "The Ruler's Back"
+
+    # R2: a bracketed year prefix with a SPACE (no dash) — "(1994) Nas - Illmatic".
+    pf = parse_filename("01 - NY State of Mind.mp3", parent_path="/Downloads/(1994) Nas - Illmatic")
+    assert pf.artist == "Nas" and pf.album == "Illmatic" and pf.year == 1994
+
+    # R3: a bare "Artist - Title" single with no track number.
+    pf = parse_filename("Daft Punk - Get Lucky.mp3", parent_path="/Downloads")
+    assert pf.artist == "Daft Punk" and pf.track_title == "Get Lucky"
+    # …but a hyphenated single WORD ("Get-Lucky") must NOT be split (spaces required).
+    pf = parse_filename("Get-Lucky.mp3", parent_path="/Downloads")
+    assert pf.artist is None
+
+    # R4: scene/quality brackets in the folder must be stripped (year kept).
+    pf = parse_filename("01 - 15 Step.flac", parent_path="/Music/Radiohead - In Rainbows [FLAC] [WEB] [2007]")
+    assert pf.artist == "Radiohead" and pf.album == "In Rainbows" and pf.year == 2007
+
+    # R5: a "CD 1" disc subfolder must be stepped over (album/artist one level up).
+    pf = parse_filename("01 - Back in the USSR.mp3", parent_path="/Music/The Beatles/The White Album/CD 1")
+    assert pf.artist == "The Beatles" and pf.album == "The White Album"
+
+    # Regression: the canonical Artist/Album/NN layout still resolves.
+    pf = parse_filename("03 - Aerodynamic.flac", parent_path="/Music/Daft Punk/Discovery")
+    assert pf.artist == "Daft Punk" and pf.album == "Discovery"
+
+
 def test_parent_folder_path_hints_anime() -> None:
     """An /anime/ ancestor classifies as anime even without [Group] tag."""
     pf = parse_filename("Some Show - 12.mkv", parent_path="/media/downloads/anime")

@@ -681,6 +681,126 @@ async def _cleanup_undo_vacated_folders(session: AsyncSession, entry: RenameHist
         return 0
 
 
+async def _relink_sonarr_after_undo(session: AsyncSession, entries: list[RenameHistory]) -> None:
+    """Reverse of the rename hook: after undoing renames, re-point Sonarr at the
+    RESTORED series folder so its files don't orphan. Resolves the series inline
+    (fast DB reads) then fires the Sonarr calls as a BACKGROUND task, so a slow /
+    unreachable Sonarr never delays the undo response. Best-effort, never raises.
+
+    Only re-points when the renamed folder is now FULLY vacated — a partial undo
+    that leaves some episodes in the new folder is left alone (re-pointing then
+    would orphan the ones still there)."""
+    try:
+        from kira.api.integrations import _load_sonarr_config
+        from kira.providers.anime_mappings import AnimeMappings
+        from kira.renamer.nfo import series_root_for
+        try:
+            cfg = await _load_sonarr_config(session)
+        except Exception:
+            return  # Sonarr not configured — nothing to do
+        # tvdb id → (Sonarr's CURRENT folder, the RESTORED folder). Roots are
+        # reversed vs the forward hook: undo moved the file new_path → old_path.
+        tvdb_roots: dict[int, tuple[str, str]] = {}
+        for entry in entries:
+            if entry is None or entry.parent_id is not None or entry.match_id is None:
+                continue
+            match = await session.get(Match, entry.match_id)
+            if match is None or match.match_type != "tv_episode" or not match.provider_id:
+                continue
+            cur_root = str(series_root_for(Path(entry.new_path)))       # where Sonarr points now
+            restored_root = str(series_root_for(Path(entry.old_path)))  # back to here
+            if cur_root == restored_root:
+                continue  # folder name didn't change → only the file moved
+            if Path(cur_root).exists():
+                # Renamed folder still holds files (a PARTIAL undo) — leave Sonarr
+                # pointing there; only re-point once it's fully vacated.
+                continue
+            try:
+                if match.provider == "tvdb":
+                    tvdb_roots[int(match.provider_id)] = (cur_root, restored_root)
+                elif match.provider == "anidb":
+                    t = await AnimeMappings.tvdb_id(int(match.provider_id))
+                    if t:
+                        tvdb_roots[int(t)] = (cur_root, restored_root)
+            except (TypeError, ValueError):
+                continue
+        if not tvdb_roots:
+            return
+        from kira.integrations import sonarr as sonarr_mod
+        from kira.tasks import spawn_tracked
+
+        async def _bg() -> None:
+            for tid, (old_root, new_root) in tvdb_roots.items():
+                try:
+                    ok, _changed, detail = await sonarr_mod.relink_series(
+                        cfg, tid, old_root=old_root, new_root=new_root)
+                    # "not in Sonarr" is a benign skip (a series you didn't get via
+                    # Sonarr) → log quietly; only real trouble warns.
+                    _lvl = (logger.debug if detail == "not in Sonarr"
+                            else logger.info if ok else logger.warning)
+                    _lvl(f"undo: sonarr relink for tvdb {tid} — {detail}")
+                except Exception as e:  # noqa: BLE001 — best-effort
+                    logger.warning(f"undo: sonarr relink for tvdb {tid} failed: {e!r}")
+
+        spawn_tracked(_bg(), "undo-sonarr-relink")
+    except Exception as e:  # noqa: BLE001 — best-effort
+        logger.warning(f"undo: sonarr relink prep failed (non-fatal): {e!r}")
+
+
+async def _relink_radarr_after_undo(session: AsyncSession, entries: list[RenameHistory]) -> None:
+    """Movie sibling of `_relink_sonarr_after_undo`: after undoing movie renames,
+    re-point Radarr at the RESTORED movie folder so its files don't orphan. Same
+    discipline — resolve inline (fast DB reads), fire the Radarr calls as a
+    BACKGROUND task, and only re-point a folder that's now FULLY vacated (a
+    partial undo is left alone). Radarr is TMDB-keyed. Best-effort, never raises."""
+    try:
+        from kira.api.integrations import _load_radarr_config
+        try:
+            cfg = await _load_radarr_config(session)
+        except Exception:
+            return  # Radarr not configured — nothing to do
+        # tmdb id → (Radarr's CURRENT folder, the RESTORED folder). Roots reversed
+        # vs the forward hook. A movie's folder is simply its file's parent dir.
+        tmdb_roots: dict[int, tuple[str, str]] = {}
+        for entry in entries:
+            if entry is None or entry.parent_id is not None or entry.match_id is None:
+                continue
+            match = await session.get(Match, entry.match_id)
+            if match is None or match.match_type != "movie" or not match.provider_id:
+                continue
+            if match.provider != "tmdb":
+                continue  # Radarr only knows movies by TMDB id
+            cur_root = str(Path(entry.new_path).parent)       # where Radarr points now
+            restored_root = str(Path(entry.old_path).parent)  # back to here
+            if cur_root == restored_root:
+                continue  # folder name didn't change → only the file moved
+            if Path(cur_root).exists():
+                continue  # PARTIAL undo — folder still holds files; leave Radarr alone
+            try:
+                tmdb_roots[int(match.provider_id)] = (cur_root, restored_root)
+            except (TypeError, ValueError):
+                continue
+        if not tmdb_roots:
+            return
+        from kira.integrations import radarr as radarr_mod
+        from kira.tasks import spawn_tracked
+
+        async def _bg() -> None:
+            for tid, (old_root, new_root) in tmdb_roots.items():
+                try:
+                    ok, _changed, detail = await radarr_mod.relink_movie(
+                        cfg, tid, old_root=old_root, new_root=new_root)
+                    _lvl = (logger.debug if detail == "not in Radarr"
+                            else logger.info if ok else logger.warning)
+                    _lvl(f"undo: radarr relink for tmdb {tid} — {detail}")
+                except Exception as e:  # noqa: BLE001 — best-effort
+                    logger.warning(f"undo: radarr relink for tmdb {tid} failed: {e!r}")
+
+        spawn_tracked(_bg(), "undo-radarr-relink")
+    except Exception as e:  # noqa: BLE001 — best-effort
+        logger.warning(f"undo: radarr relink prep failed (non-fatal): {e!r}")
+
+
 @router.post("/{entry_id}/undo", response_model=HistoryOut)
 async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)) -> RenameHistory:
     entry = await session.get(RenameHistory, entry_id)
@@ -747,6 +867,10 @@ async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)
         )
         # Remove the now-empty Show/Season folders Kira created for this rename.
         folders_removed = await _cleanup_undo_vacated_folders(session, entry)
+    # Re-point Sonarr/Radarr at the restored folder (reverse of the rename hook)
+    # so an undone folder-rename doesn't orphan the files. Backgrounded + best-effort.
+    await _relink_sonarr_after_undo(session, [entry])
+    await _relink_radarr_after_undo(session, [entry])
     body = f"Restored to {entry.old_path}"
     if sub_ok:
         body += f" (+ {sub_ok} sidecar{'s' if sub_ok != 1 else ''})"
@@ -791,6 +915,7 @@ async def undo_bulk(
     sidecar_succeeded = 0
     sidecar_failed = 0
     assets_removed = 0
+    undone_parents: list[RenameHistory] = []
     from kira.api.cleanup import _resolve_trash_root
     from kira.api.files import _managed_roots_aliased
     # Alias-aware (drive-letter ↔ UNC) — same as single undo (undo_entry). Without
@@ -851,8 +976,13 @@ async def undo_bulk(
                     entry, bulk_roots, trash_root=bulk_trash_root, session=session,
                 )
                 await _cleanup_undo_vacated_folders(session, entry)
+                undone_parents.append(entry)
         except Exception:
             failed += 1
+    # Re-point Sonarr/Radarr at the restored folders for fully-undone titles
+    # (reverse of the rename hook). Backgrounded + best-effort.
+    await _relink_sonarr_after_undo(session, undone_parents)
+    await _relink_radarr_after_undo(session, undone_parents)
     await session.commit()
     out = {"succeeded": succeeded, "failed": failed}
     if sidecar_succeeded or sidecar_failed:

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, type ReactNode } from 'react';
 import type { LibraryItem, LibEpisode, LibFile } from '../../lib/types';
 import { IcX, IcTrash, IcAlertTri } from '../../lib/icons';
 import { inferQuality, inferSource, audioLangChip, subLangChip } from './quality';
@@ -94,10 +94,12 @@ export function DupesResolverModal({ item, episode, files, onClose, onRequestDel
           </div>
           <div style={{ flex: 1, minWidth: 0 }}>
             <h3 style={{ margin: '0 0 4px 0', fontSize: 17, fontWeight: 600, display: 'flex', alignItems: 'baseline', gap: 10 }}>
-              Duplicate files for {episode.season ? `S${String(episode.season).padStart(2, '0')}E${String(episode.episode).padStart(2, '0')}` : `Episode ${episode.episode}`}
+              Duplicate files for {item.kind === 'album'
+                ? `Track ${episode.track ?? episode.episode}`
+                : (episode.season ? `S${String(episode.season).padStart(2, '0')}E${String(episode.episode).padStart(2, '0')}` : `Episode ${episode.episode}`)}
             </h3>
             <div style={{ fontSize: 13, color: 'var(--ink-2)' }}>
-              {episode.title || `Episode ${episode.episode}`}
+              {episode.title || (item.kind === 'album' ? `Track ${episode.track ?? episode.episode}` : `Episode ${episode.episode}`)}
               <span style={{ color: 'var(--ink-3)', marginLeft: 8 }}>
                 · Keep one copy, delete the other {losers.length}
               </span>
@@ -456,13 +458,21 @@ interface BulkDeleteConfirmModalProps {
   files: LibFile[];
   /** How many copies are being KEPT (one best per duplicated episode). */
   keepCount: number;
-  /** How many episodes this spans (for the summary line). */
+  /** How many episodes (or tracks, for music) this spans — summary line. */
   epCount: number;
+  /** Noun for the spanned unit — "episode" for TV/anime, "track" for music. */
+  noun?: string;
+  /** Override the default "Delete N duplicate files?" headline (e.g. the music
+   *  cross-album "Delete N duplicate singles?" flow). */
+  headline?: string;
+  /** Override the default "keeping the best copy …" body when the kept copies
+   *  live elsewhere (cross-album dupes keep the album versions in other cards). */
+  detail?: ReactNode;
   onCancel: () => void;
   onConfirm: () => void;
 }
 
-export function BulkDeleteConfirmModal({ files, keepCount, epCount, onCancel, onConfirm }: BulkDeleteConfirmModalProps) {
+export function BulkDeleteConfirmModal({ files, keepCount, epCount, noun = 'episode', headline, detail, onCancel, onConfirm }: BulkDeleteConfirmModalProps) {
   const [acknowledged, setAcknowledged] = useState(false);
   const n = files.length;
   // Escape cancels — destructive prompts must be dismissible by keyboard.
@@ -509,14 +519,16 @@ export function BulkDeleteConfirmModal({ files, keepCount, epCount, onCancel, on
             <IcTrash />
           </span>
           <h3 style={{ margin: 0, fontSize: 17, color: 'var(--ink)', fontWeight: 600 }}>
-            Delete {n} duplicate file{n === 1 ? '' : 's'}?
+            {headline ?? <>Delete {n} duplicate file{n === 1 ? '' : 's'}?</>}
           </h3>
         </div>
         <p style={{ color: 'var(--ink-2)', fontSize: 13, margin: '0 0 14px 0', lineHeight: 1.5 }}>
-          {epCount > 1
-            ? <>Keeping the best copy of each of <strong>{keepCount}</strong> episode{keepCount === 1 ? '' : 's'} and removing the other <strong>{n}</strong> file{n === 1 ? '' : 's'} from disk. </>
-            : <>Keeping the copy you chose and removing the other <strong>{n}</strong> file{n === 1 ? '' : 's'} from disk. </>}
-          This cannot be undone.
+          {detail ?? <>
+            {epCount > 1
+              ? <>Keeping the best copy of each of <strong>{keepCount}</strong> {noun}{keepCount === 1 ? '' : 's'} and removing the other <strong>{n}</strong> file{n === 1 ? '' : 's'} from disk. </>
+              : <>Keeping the copy you chose and removing the other <strong>{n}</strong> file{n === 1 ? '' : 's'} from disk. </>}
+            This cannot be undone.
+          </>}
         </p>
         <div
           style={{

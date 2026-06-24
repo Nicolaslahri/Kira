@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, type ReactNode } from 'react';
+import { useState, useMemo, useEffect, useRef, type ReactNode } from 'react';
 import type { AppState, MediaFile, ModalState, LibraryItem } from '../lib/types';
 import { IcCheck, IcX, IcSparkles, IcPlay, IcFilm, IcTv, IcAnime, IcMusic, IcSearch } from '../lib/icons';
 import { cn } from '../lib/utils';
@@ -8,6 +8,8 @@ import { CoverPopup } from '../components/CoverPopup';
 import { ManualSearchModal } from '../components/modals';
 import { buildLibraryItems } from '../lib/adapters';
 import { confLevel, getConfBands } from '../lib/confBands';
+import { api, posterSrc } from '../lib/api';
+import { poster } from '../lib/data';
 
 // Colour-coded filter chip — a detached toggle that lights up in its OWN
 // semantic colour when active (tinted fill + colour ring + colour label/count),
@@ -72,6 +74,59 @@ interface Props {
   renameFilesDirectly?: (fileIds: string[]) => void | Promise<void>;
 }
 
+// A "collection gap" = the missing parts of a TMDB collection you partially own
+// (from GET /collections). ReviewPage merges these into the grid: owned films get
+// the collection band key; missing parts become ghost cards.
+type CollectionGap = {
+  collection_id: string;
+  name: string | null;
+  owned: number;
+  total: number;
+  missing: Array<{ tmdb_id: string; title: string | null; year: number | null; poster_url: string | null; released: boolean }>;
+};
+
+// Persist the last-known collection gaps so a page REFRESH paints the grid WITH the
+// collection bands + ghost covers on the FIRST frame — instead of fetching them
+// ~300ms later and merging, which relocates owned films into a band and scrolls the
+// viewport onto the collections (the "randomly scrolled to collections" bug). The
+// background fetch then corrects only on a genuine change (the sig guard makes an
+// unchanged result a no-op, so the cache hit never reflows).
+const COLLECTIONS_CACHE_KEY = 'kira:collections-v1';
+function collectionsSig(cs: CollectionGap[]): string {
+  return JSON.stringify([...cs].sort((a, b) => a.collection_id.localeCompare(b.collection_id)));
+}
+function readCachedCollections(): CollectionGap[] {
+  try {
+    const raw = localStorage.getItem(COLLECTIONS_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return Array.isArray(parsed) ? (parsed as CollectionGap[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+// Build a GHOST LibraryItem for a collection part the user doesn't own. No files;
+// the grid renders it dimmed with a one-click "Get from Radarr". It shares the
+// collection's band key so it shelves next to the films they DO have.
+function ghostItem(c: CollectionGap, m: CollectionGap['missing'][number], bandKey: string): LibraryItem {
+  const title = m.title || 'Untitled';
+  return {
+    id: `ghost:tmdb:${m.tmdb_id}`,
+    kind: 'movie',
+    mediaType: 'movie',
+    title,
+    year: m.year ?? null,
+    poster: poster(title, m.year ?? null),
+    posterUrl: posterSrc(m.poster_url),
+    seriesGroupId: bandKey,
+    collectionId: c.collection_id,
+    collectionName: c.name,
+    ghost: { tmdbId: Number(m.tmdb_id), released: m.released },
+    episodes: [],
+    files: [],
+  };
+}
+
 export function ReviewPage({
   state, openModal, focusedId, setFocusedId,
   setFileStatus, setFileStatusBulk, searchQuery, pushToast, onBulkManualMatch,
@@ -94,6 +149,16 @@ export function ReviewPage({
   // click. A single boolean is enough — the UI only needs "is a rename
   // happening", not which one.
   const [renaming, setRenaming] = useState(false);
+  // Movie-collection gaps (#14) — populated from GET /collections when Radarr is
+  // configured (see the fetch effect below). Drives the ghost covers in the grid.
+  // Seed from the localStorage cache so a page refresh paints the grid WITH the
+  // collection bands/ghosts on the first frame (no late merge + relocation).
+  const [collections, setCollections] = useState<CollectionGap[]>(readCachedCollections);
+  // Sig baseline = the cached collections' signature (lazy, once). Lets the fetch
+  // skip a no-op setCollections — re-running the displayItems merge would regroup
+  // films into a band + re-insert ghosts → reflow the grid + scroll to collections.
+  const collectionsSigRef = useRef<string | null>(null);
+  if (collectionsSigRef.current === null) collectionsSigRef.current = collectionsSig(collections);
 
   // ── Apply filters to flat files first, then group into LibraryItems ────
   const visibleFiles = useMemo(() => {
@@ -137,6 +202,53 @@ export function ReviewPage({
     () => buildLibraryItems(visibleFiles),
     [visibleFiles]
   );
+
+  // Merge collection gaps into the grid: rewrite a collection's owned films to
+  // share a band key (so they shelf together) + append ghost cards for the
+  // missing parts. Only collections WITH gaps reach here (the endpoint omits
+  // complete ones), so non-collection movies + non-Radarr users are untouched.
+  const itemsWithGaps: LibraryItem[] = useMemo(() => {
+    if (collections.length === 0) return items;
+    const byColl = new Map(collections.map(c => [c.collection_id, c] as const));
+    const bandKey = (cid: string) => `tmdb-collection:${cid}`;
+    // Rebrand a collection's owned films into the band AND record which
+    // collections still have an owned film visible after the active filters
+    // (the status / confidence / media-type pills feed `items`).
+    const visibleColls = new Set<string>();
+    const out: LibraryItem[] = items.map(it => {
+      if (it.kind === 'movie' && it.collectionId && byColl.has(it.collectionId)) {
+        visibleColls.add(it.collectionId);
+        return { ...it, seriesGroupId: bandKey(it.collectionId), collectionName: it.collectionName ?? byColl.get(it.collectionId)!.name };
+      }
+      return it;
+    });
+    // Append the missing-film ghosts ONLY for collections whose owned film passed
+    // the filters — so the ghost covers FOLLOW the sort/filter pills with their
+    // band instead of floating in unconditionally (which orphaned them under the
+    // wrong pill / media type and made the collections look unsorted).
+    for (const c of collections) {
+      if (!visibleColls.has(c.collection_id)) continue;
+      const key = bandKey(c.collection_id);
+      for (const m of c.missing) out.push(ghostItem(c, m, key));
+    }
+    return out;
+  }, [items, collections]);
+
+  // One-click "Get from Radarr" for a ghost cover. Adds the movie (or searches
+  // it if already in Radarr) + toasts the outcome; returns the result so the
+  // ghost card can flip to "Requested".
+  const handleGetMovie = async (tmdbId: number): Promise<{ ok: boolean; detail: string | null }> => {
+    try {
+      const r = await api.addMovieToRadarr(tmdbId);
+      pushToast?.(r.ok
+        ? { title: r.added ? 'Added to Radarr' : 'Searching in Radarr', sub: r.detail ?? undefined, kind: 'success' }
+        : { title: 'Radarr request failed', sub: r.detail ?? undefined, kind: 'error' });
+      return { ok: r.ok, detail: r.detail };
+    } catch (e) {
+      pushToast?.({ title: 'Radarr request failed', sub: (e as Error).message, kind: 'error' });
+      return { ok: false, detail: (e as Error).message };
+    }
+  };
 
   // Build a SECOND view of items from ALL files (no status filter) so the
   // popup can render the full cluster — approved/renamed/rejected files
@@ -214,6 +326,73 @@ export function ReviewPage({
     window.addEventListener('kira:rename-success', onRename);
     return () => window.removeEventListener('kira:rename-success', onRename);
   }, []);
+
+  // Walk-free deletion check on load: ask the backend to drop any review-stage
+  // file whose disk copy is gone (POST /files/reconcile). So a file you deleted
+  // clears on REFRESH without a scan — and without the scan's "one unreadable
+  // folder skips the whole sweep" fragility. Fire-and-forget; a removal fires
+  // kira:files-changed, which reloads the list.
+  useEffect(() => {
+    let cancelled = false;
+    void api.reconcileFiles()
+      .then(r => {
+        if (!cancelled && r.removed > 0) {
+          try { window.dispatchEvent(new Event('kira:files-changed')); } catch { /* no window */ }
+        }
+      })
+      .catch(() => { /* best-effort; the scan prune is the backstop */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Latest scanRunning, read via a ref inside the fetch so the effect's deps can
+  // stay `[]` (a changing-size deps array trips React's Fast-Refresh rule).
+  const scanRunningRef = useRef(state.scanRunning);
+  scanRunningRef.current = state.scanRunning;
+
+  // Fetch movie-collection gaps (#14) when Radarr is configured. Mount + on
+  // kira:files-changed (a newly-added movie may close a gap). Gated on Radarr so
+  // we never tease a gap the user can't act on; best-effort (silent on failure).
+  useEffect(() => {
+    // Keyed on `state.scanRunning`: the true→false transition (scan finished) is
+    // what RE-FETCHES the collections once the data settles. The old `[]` deps +
+    // "skip while scanning" meant a fetch that fired during a scan left the ghosts
+    // hidden until a full page refresh re-mounted this — the bug the user hit.
+    if (state.scanRunning) return;   // mid-scan: no fetch, no listener (cleaned up below)
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const load = async () => {
+      try {
+        const health = await api.integrationsHealth();
+        if (!health['radarr']) return;   // unconfigured / health not yet polled — keep last-known
+        const r = await api.getCollections();
+        // Accept an empty set ONLY when not mid-scan (movie matches detach+reinsert
+        // mid-scan emits a transient-empty that would flash the ghosts away).
+        // Otherwise keep the last-known set rather than clearing it.
+        if (!cancelled && (r.collections.length > 0 || !scanRunningRef.current)) {
+          // Only commit when the data ACTUALLY changed. This effect re-fetches on
+          // every kira:files-changed (TV approvals, undo, the scan tail) — none of
+          // which alter movie collections — and a fresh array re-runs the merge and
+          // reflows the grid (the "randomly scrolled to collections" bug). The sig
+          // sorts by id so a non-deterministic backend order can't false-trigger.
+          const sig = collectionsSig(r.collections);
+          if (sig !== collectionsSigRef.current) {
+            collectionsSigRef.current = sig;
+            setCollections(r.collections);
+            try { localStorage.setItem(COLLECTIONS_CACHE_KEY, JSON.stringify(r.collections)); } catch { /* quota / private mode */ }
+          }
+        }
+      } catch {
+        // Transient network/health blip — keep the last-known ghosts rather than
+        // flashing them away (the bug was: every blip cleared them until a refresh).
+      }
+    };
+    // Debounce the kira:files-changed burst (the scan tail fires several) into a
+    // single settled fetch.
+    const schedule = () => { if (timer) clearTimeout(timer); timer = setTimeout(() => void load(), 400); };
+    void load();
+    window.addEventListener('kira:files-changed', schedule);
+    return () => { cancelled = true; if (timer) clearTimeout(timer); window.removeEventListener('kira:files-changed', schedule); };
+  }, [state.scanRunning]);
 
   // ── Counts for filter pills ───────────────────────────────────────────
   const counts = useMemo(() => {
@@ -539,7 +718,8 @@ export function ReviewPage({
       ) : null}
 
       <LibraryGrid
-        items={items}
+        items={itemsWithGaps}
+        onGetMovie={handleGetMovie}
         selected={selected}
         setSelected={setSelected}
         focusedId={focusedId}

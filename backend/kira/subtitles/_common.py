@@ -18,6 +18,7 @@ import zipfile
 from collections.abc import Iterable
 from pathlib import Path
 
+from kira.longpath import long_path
 from kira.subtitles.naming import subtitle_sidecar_name
 from kira.subtitles.embedded import normalize_lang
 
@@ -77,7 +78,7 @@ def find_sidecar(video_path: str, lang: str) -> str | None:
     None. Used to short-circuit a re-fetch of a language already on disk."""
     for e in _SIDECAR_EXTS:
         p = Path(video_path).with_name(subtitle_sidecar_name(video_path, lang, ext=e))
-        if p.exists():
+        if os.path.exists(long_path(p)):
             return str(p)
     return None
 
@@ -94,20 +95,20 @@ def save_sidecar(video_path: str, lang: str, data: bytes, ext: str = "srt",
     dest = Path(video_path).with_name(subtitle_sidecar_name(video_path, lang, ext=ext))
     if dest.is_symlink():
         return None
-    if dest.exists() and not overwrite:
+    if os.path.exists(long_path(dest)) and not overwrite:
         return None
     tmp = dest.with_name(dest.name + ".part")
     try:
         if tmp.is_symlink():
             tmp.unlink()
-        tmp.write_bytes(data)
-        os.replace(tmp, dest)
+        Path(long_path(tmp)).write_bytes(data)
+        os.replace(long_path(tmp), long_path(dest))
         return str(dest)
     except Exception as e:
         _log.warning("save %s sidecar failed: %r", lang, e)
         try:
-            if tmp.exists():
-                tmp.unlink()
+            if os.path.exists(long_path(tmp)):
+                os.unlink(long_path(tmp))
         except OSError:
             pass
         return None

@@ -804,15 +804,18 @@ async def test_sonarr_rescan_hook_fires_for_renamed_episodes(tmp_path, monkeypat
         fid = mf.id
 
     calls: list[int] = []
+    seen_roots: list = []
 
-    async def spy(cfg, tvdb_id):
+    async def spy(cfg, tvdb_id, *, old_root=None, new_root=None):
         calls.append(int(tvdb_id))
-        return True
-    monkeypatch.setattr("kira.integrations.sonarr.rescan_series_by_tvdb", spy)
+        seen_roots.append((old_root, new_root))
+        return True, False, "rescanned"
+    monkeypatch.setattr("kira.integrations.sonarr.relink_series", spy)
 
     res = await _run(sm, RenameRequest(file_ids=[fid], profile="Plex", op="move"))
     assert res.succeeded == 1, res
-    assert calls == [123456], f"sonarr rescan should fire once for the series, got {calls}"
+    assert calls == [123456], f"sonarr relink should fire once for the series, got {calls}"
+    assert seen_roots and all(r[1] for r in seen_roots), "hook must thread the new show root to relink_series"
 
 
 @pytest.mark.asyncio
@@ -821,14 +824,14 @@ async def test_sonarr_rescan_hook_silent_when_unconfigured(tmp_path, monkeypatch
     sm, fid, src, srt = await _setup(tmp_path, monkeypatch, write_nfo=False)
     calls: list[int] = []
 
-    async def spy(cfg, tvdb_id):
+    async def spy(cfg, tvdb_id, *, old_root=None, new_root=None):
         calls.append(int(tvdb_id))
-        return True
-    monkeypatch.setattr("kira.integrations.sonarr.rescan_series_by_tvdb", spy)
+        return True, False, "rescanned"
+    monkeypatch.setattr("kira.integrations.sonarr.relink_series", spy)
 
     res = await _run(sm, RenameRequest(file_ids=[fid], profile="Plex", op="move"))
     assert res.succeeded == 1
-    assert calls == [], "movie + unconfigured Sonarr must not trigger a rescan"
+    assert calls == [], "movie + unconfigured Sonarr must not trigger a relink"
 
 
 @pytest.mark.asyncio
@@ -869,12 +872,12 @@ async def test_post_rename_network_tail_is_backgrounded(tmp_path, monkeypatch):
 
     calls: list[int] = []
 
-    async def spy(cfg, tvdb_id):
+    async def spy(cfg, tvdb_id, *, old_root=None, new_root=None):
         calls.append(int(tvdb_id))
-        return True
+        return True, False, "rescanned"
 
     monkeypatch.setattr("kira.notify.fan_out", gated_fanout)
-    monkeypatch.setattr("kira.integrations.sonarr.rescan_series_by_tvdb", spy)
+    monkeypatch.setattr("kira.integrations.sonarr.relink_series", spy)
 
     async with sm() as s:
         res = await perform_rename(RenameRequest(file_ids=[fid], profile="Plex", op="move"), s)
@@ -889,3 +892,95 @@ async def test_post_rename_network_tail_is_backgrounded(tmp_path, monkeypatch):
     gate.set()
     await drain_background_tasks()
     assert calls == [123456], "backgrounded Sonarr rescan should run once the tail drains"
+
+
+@pytest.mark.asyncio
+async def test_undo_relinks_sonarr_to_restored_folder(tmp_path, monkeypatch):
+    # Undo re-points Sonarr back to the OLD (restored) folder — the REVERSE of the
+    # rename hook — but only when the renamed folder is fully vacated. We assert
+    # the reversed roots reach relink_series (the move itself is unit-tested).
+    from kira.api.history import _relink_sonarr_after_undo
+    from kira.tasks import drain_background_tasks
+
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    old_root = tmp_path / "tv" / "Some Show"
+    old_root.mkdir(parents=True)                    # restored folder exists…
+    new_path = tmp_path / "tv" / "Some Show (2020)" / "Season 01" / "Some Show (2020) - S01E01.mkv"
+    old_path = old_root / "Some.Show.S01E01.mkv"    # …new folder does NOT → "fully vacated"
+    async with sm() as s:
+        s.add(Setting(key="integrations.sonarr.url", value="http://localhost:8989"))
+        s.add(Setting(key="integrations.sonarr.api_key", value="k"))
+        mf = MediaFile(file_path=str(old_path), parsed_data={}, media_type="tv", status="matched")
+        s.add(mf)
+        await s.flush()
+        m = Match(media_file_id=mf.id, provider="tvdb", provider_id="123456",
+                  match_type="tv_episode", confidence=0.9, is_selected=True)
+        s.add(m)
+        await s.flush()
+        h = RenameHistory(media_file_id=mf.id, match_id=m.id, old_path=str(old_path),
+                          new_path=str(new_path), operation="move", media_type="tv")
+        s.add(h)
+        await s.commit()
+        hid = h.id
+
+    seen: list = []
+
+    async def spy(cfg, tvdb_id, *, old_root=None, new_root=None):
+        seen.append((int(tvdb_id), old_root, new_root))
+        return True, True, "path → x"
+    monkeypatch.setattr("kira.integrations.sonarr.relink_series", spy)
+
+    async with sm() as s:
+        entry = await s.get(RenameHistory, hid)
+        await _relink_sonarr_after_undo(s, [entry])
+    await drain_background_tasks()
+
+    assert len(seen) == 1, seen
+    tid, cur, restored = seen[0]
+    assert tid == 123456
+    # Reversed vs the forward hook: Sonarr is at the NEW folder, restore to OLD.
+    assert cur.replace("\\", "/").endswith("Some Show (2020)")
+    assert restored.replace("\\", "/").endswith("/Some Show")
+
+
+@pytest.mark.asyncio
+async def test_undo_skips_sonarr_when_folder_still_populated(tmp_path, monkeypatch):
+    # Partial undo: the renamed folder still holds files → leave Sonarr pointing
+    # there (re-pointing now would orphan the episodes still in the new folder).
+    from kira.api.history import _relink_sonarr_after_undo
+    from kira.tasks import drain_background_tasks
+
+    sm = await _fresh_db(tmp_path, monkeypatch)
+    new_root = tmp_path / "tv" / "Some Show (2020)"
+    (new_root / "Season 01").mkdir(parents=True)    # new folder STILL EXISTS (populated)
+    new_path = new_root / "Season 01" / "Some Show (2020) - S01E01.mkv"
+    old_path = tmp_path / "tv" / "Some Show" / "Some.Show.S01E01.mkv"
+    async with sm() as s:
+        s.add(Setting(key="integrations.sonarr.url", value="http://localhost:8989"))
+        s.add(Setting(key="integrations.sonarr.api_key", value="k"))
+        mf = MediaFile(file_path=str(old_path), parsed_data={}, media_type="tv", status="matched")
+        s.add(mf)
+        await s.flush()
+        m = Match(media_file_id=mf.id, provider="tvdb", provider_id="123456",
+                  match_type="tv_episode", confidence=0.9, is_selected=True)
+        s.add(m)
+        await s.flush()
+        h = RenameHistory(media_file_id=mf.id, match_id=m.id, old_path=str(old_path),
+                          new_path=str(new_path), operation="move", media_type="tv")
+        s.add(h)
+        await s.commit()
+        hid = h.id
+
+    seen: list = []
+
+    async def spy(cfg, tvdb_id, *, old_root=None, new_root=None):
+        seen.append(int(tvdb_id))
+        return True, True, "x"
+    monkeypatch.setattr("kira.integrations.sonarr.relink_series", spy)
+
+    async with sm() as s:
+        entry = await s.get(RenameHistory, hid)
+        await _relink_sonarr_after_undo(s, [entry])
+    await drain_background_tasks()
+
+    assert seen == [], "must NOT re-point Sonarr while the renamed folder is still populated"

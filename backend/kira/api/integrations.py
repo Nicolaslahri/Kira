@@ -44,6 +44,7 @@ from kira.integrations.sonarr import (
     send_missing_episodes,
     test_connection,
 )
+from kira.integrations import radarr as radarr_mod
 from kira.models import Match, Setting
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,46 @@ async def _load_sonarr_config(
     )
 
 
+async def _load_radarr_config(session: AsyncSession) -> radarr_mod.RadarrConfig:
+    """Build a RadarrConfig from saved Settings (`integrations.radarr.*`).
+    Raises HTTPException 400 when URL or API key isn't configured.
+
+    Simpler than the Sonarr loader: movies have no anime/TV flavor split, no
+    series type, season folders, or new-season monitoring — just the connection,
+    plus one quality profile + root folder kept for a future add-to-Radarr (the
+    relink hooks don't read them). Mirrors `_load_sonarr_config`'s URL validation
+    and reverse-proxy `url_base` handling.
+    """
+    url = await _resolve_setting(session, "integrations.radarr.url")
+    api_key = await _resolve_setting(session, "integrations.radarr.api_key")
+    if not isinstance(url, str) or not url.strip():
+        raise HTTPException(400, "Radarr URL isn't configured.")
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise HTTPException(400, "Radarr API key isn't configured.")
+    from urllib.parse import urlparse
+    _parsed = urlparse(url.strip())
+    if _parsed.scheme not in ("http", "https") or not _parsed.netloc:
+        raise HTTPException(400, "Radarr URL must be a valid http(s):// address.")
+
+    qpid = await _resolve_setting(session, "integrations.radarr.quality_profile_id")
+    rfp = await _resolve_setting(session, "integrations.radarr.root_folder_path")
+
+    url_base = await _resolve_setting(session, "integrations.radarr.url_base")
+    base_url = url.strip().rstrip("/")
+    if isinstance(url_base, str) and url_base.strip():
+        suffix = url_base.strip()
+        if not suffix.startswith("/"):
+            suffix = "/" + suffix
+        base_url = base_url + suffix.rstrip("/")
+
+    return radarr_mod.RadarrConfig(
+        base_url=base_url,
+        api_key=api_key.strip(),
+        quality_profile_id=int(qpid) if isinstance(qpid, (int, str)) and str(qpid).isdigit() else None,
+        root_folder_path=rfp if isinstance(rfp, str) and rfp.strip() else None,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────
 # /health — background connection-health snapshot
 # ─────────────────────────────────────────────────────────────────────
@@ -261,6 +302,156 @@ async def sonarr_test(
         # CORS headers, surfacing as a misleading "Failed to fetch" instead of a
         # real message. Return it as a normal failed test.
         return SonarrTestResponse(ok=False, detail=f"Sonarr test failed: {e}")
+
+
+class RadarrTestResponse(BaseModel):
+    ok: bool
+    detail: str | None = None
+    version: str | None = None
+    quality_profiles: list[dict[str, Any]] | None = None
+    root_folders: list[dict[str, Any]] | None = None
+
+
+@router.post("/radarr/test", response_model=RadarrTestResponse)
+async def radarr_test(
+    payload: SonarrTestRequest,
+    session: AsyncSession = Depends(get_session),
+) -> RadarrTestResponse:
+    """Confirm Radarr is reachable AND surface its quality profiles + root
+    folders so the Settings UI can populate dropdowns (mirror of /sonarr/test).
+
+    Accepts inline `url`/`api_key` overrides — the "Test connection" button
+    posts the current form values BEFORE saving, so the user gets immediate
+    feedback without committing a possibly-wrong config first.
+    """
+    if payload.url and payload.api_key:
+        cfg = radarr_mod.RadarrConfig(base_url=payload.url.strip(), api_key=payload.api_key.strip())
+    else:
+        try:
+            cfg = await _load_radarr_config(session)
+        except HTTPException as e:
+            return RadarrTestResponse(ok=False, detail=str(e.detail))
+
+    try:
+        status = await radarr_mod.test_connection(cfg)
+        qps: list[dict[str, Any]] = []
+        rfs: list[dict[str, Any]] = []
+        try:
+            qps = await radarr_mod.list_quality_profiles(cfg)
+        except radarr_mod.RadarrError:
+            pass
+        try:
+            rfs = await radarr_mod.list_root_folders(cfg)
+        except radarr_mod.RadarrError:
+            pass
+        return RadarrTestResponse(
+            ok=True,
+            version=status.get("version") if isinstance(status, dict) else None,
+            quality_profiles=[{"id": q.get("id"), "name": q.get("name")} for q in qps if isinstance(q, dict)],
+            root_folders=[{"path": r.get("path"), "freeSpace": r.get("freeSpace")} for r in rfs if isinstance(r, dict)],
+        )
+    except radarr_mod.RadarrError as e:
+        return RadarrTestResponse(ok=False, detail=str(e))
+    except Exception as e:
+        # Same safety net as sonarr_test: a "Test connection" must never raise an
+        # uncaught 500 (cross-origin, that surfaces as a misleading "Failed to
+        # fetch" without CORS headers). Return it as a normal failed test.
+        return RadarrTestResponse(ok=False, detail=f"Radarr test failed: {e}")
+
+
+class AddMovieRequest(BaseModel):
+    tmdb_id: int
+
+
+class AddMovieResponse(BaseModel):
+    ok: bool
+    added: bool = False   # True = fresh add; False = already in Radarr, just searched
+    detail: str | None = None
+
+
+@router.post("/radarr/add-movie", response_model=AddMovieResponse)
+async def radarr_add_movie(
+    payload: AddMovieRequest,
+    session: AsyncSession = Depends(get_session),
+) -> AddMovieResponse:
+    """Add a movie to Radarr by TMDB id + trigger a search — the collection-
+    completion "Get from Radarr" button. Synchronous: the add + search are a
+    couple of quick calls (Radarr runs the actual grab server-side via
+    `addOptions.searchForMovie`), so we return the outcome for an immediate toast.
+    """
+    try:
+        cfg = await _load_radarr_config(session)
+    except HTTPException as e:
+        return AddMovieResponse(ok=False, detail=str(e.detail))
+    try:
+        ok, added, detail = await radarr_mod.add_movie(cfg, payload.tmdb_id)
+        return AddMovieResponse(ok=ok, added=added, detail=detail)
+    except radarr_mod.RadarrError as e:
+        return AddMovieResponse(ok=False, detail=str(e))
+    except Exception as e:
+        return AddMovieResponse(ok=False, detail=f"Radarr add failed: {e}")
+
+
+# ── Radarr live download queue (collection-ghost cover progress fills) ──────
+_RADARR_QUEUE_CACHE: dict[str, tuple[list[Any], float]] = {}
+_RADARR_QUEUE_LOCK = asyncio.Lock()
+_RADARR_QUEUE_TTL_SEC = 1.0
+
+
+async def _get_cached_radarr_queue(cfg: radarr_mod.RadarrConfig) -> list[Any]:
+    """Cached Radarr queue fetch (mirror of `_get_cached_queue`) — coalesces the
+    grid poll so rapid ticks don't hammer Radarr. Keyed by config identity."""
+    now = time.monotonic()
+    key = f"{cfg.base_url}\x00{cfg.api_key}"
+    cached = _RADARR_QUEUE_CACHE.get(key)
+    if cached is not None and (now - cached[1]) < _RADARR_QUEUE_TTL_SEC:
+        return cached[0]
+    async with _RADARR_QUEUE_LOCK:
+        cached = _RADARR_QUEUE_CACHE.get(key)
+        if cached is not None and (time.monotonic() - cached[1]) < _RADARR_QUEUE_TTL_SEC:
+            return cached[0]
+        items = await radarr_mod.get_queue(cfg)
+        _RADARR_QUEUE_CACHE.clear()
+        _RADARR_QUEUE_CACHE[key] = (items, time.monotonic())
+        return items
+
+
+class RadarrQueueItemOut(BaseModel):
+    tmdb_id: int
+    title: str | None = None
+    status: str
+    progress_pct: float
+    eta_seconds: int | None = None
+    release_title: str | None = None
+    error_message: str | None = None
+
+
+class RadarrQueueResponse(BaseModel):
+    items: list[RadarrQueueItemOut]
+    cached_at: float
+
+
+@router.get("/radarr/queue", response_model=RadarrQueueResponse)
+async def radarr_queue(session: AsyncSession = Depends(get_session)) -> RadarrQueueResponse:
+    """Radarr's active download queue, keyed by tmdb id — drives the collection-
+    ghost cover progress fills. Returns empty (never 4xx) when Radarr isn't
+    configured or is unreachable, so the grid poll degrades silently."""
+    try:
+        cfg = await _load_radarr_config(session)
+    except HTTPException:
+        return RadarrQueueResponse(items=[], cached_at=time.monotonic())
+    try:
+        items = await _get_cached_radarr_queue(cfg)
+    except radarr_mod.RadarrError:
+        return RadarrQueueResponse(items=[], cached_at=time.monotonic())
+    return RadarrQueueResponse(
+        items=[RadarrQueueItemOut(
+            tmdb_id=i.tmdb_id, title=i.title, status=i.status,
+            progress_pct=i.progress_pct, eta_seconds=i.eta_seconds,
+            release_title=i.release_title, error_message=i.error_message,
+        ) for i in items],
+        cached_at=time.monotonic(),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────

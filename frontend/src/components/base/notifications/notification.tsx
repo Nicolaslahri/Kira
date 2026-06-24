@@ -52,13 +52,17 @@ export function notify(t: { title: string; sub?: string; kind?: NotifyKind }) {
   );
 }
 
-/** Sonner host — mount once. `offset` lifts the toast stack above the activity
- *  pill / scan bar when one is showing (they share the bottom-right corner). */
+/** Sonner host — mount once. `offset` is the BOTTOM gap that lifts the toast
+ *  stack above the activity pill / scan bar sharing the bottom-right corner. The
+ *  RIGHT edge is pinned to 1.5rem so the toasts line up in ONE column with that
+ *  pill (`right-6`): Sonner applies a bare `offset` number to every edge, which
+ *  pushed the whole stack left whenever the pill grew the bottom offset. */
 export function NotificationToaster({ offset = 24 }: { offset?: number }) {
   return (
     <Toaster
       position="bottom-right"
-      offset={offset}
+      offset={{ right: '1.5rem', bottom: offset }}
+      mobileOffset={{ right: '1rem', bottom: offset }}
       gap={10}
       visibleToasts={6}
       toastOptions={{ unstyled: true }}

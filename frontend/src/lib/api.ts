@@ -5,7 +5,13 @@ const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http:
  *  direct, so they're left untouched — only AniDB's slow CDN is proxied. */
 export function posterSrc(url: string | null | undefined): string | null {
   if (!url) return null;
-  if (url.includes('cdn.anidb.net')) {
+  // Route slow / redirect-heavy poster hosts through Kira's caching image proxy:
+  //  • AniDB's CDN (cdn.anidb.net) — measured ~12× slower than other CDNs.
+  //  • Cover Art Archive (coverartarchive.org) — every music cover 302-redirects
+  //    to archive.org, which is notoriously slow; un-proxied, that round-trip
+  //    happens on EVERY load. The proxy fetches once, caches to disk, then serves
+  //    from localhost — so music covers load instantly after the first fetch.
+  if (url.includes('cdn.anidb.net') || url.includes('coverartarchive.org')) {
     return `${API_BASE}/img?u=${encodeURIComponent(url)}`;
   }
   return url;
@@ -51,6 +57,7 @@ export interface ApiParsedData {
   album?: string | null;
   track?: number | null;
   track_title?: string | null;
+  genre?: string | null;   // music tag genre (parsed-data fallback for the popup)
   release_group?: string | null;
   quality?: string | null;
   source?: string | null;
@@ -64,6 +71,11 @@ export interface ApiParsedData {
   hdr?: string | null;
   channels?: string | null;
   audio?: string[] | null;
+  // Music audio tech specs (MediaInfo). `audio_bit_depth`, NOT `bit_depth` above.
+  audio_bitrate?: number | null;     // kbps
+  sample_rate?: number | null;       // Hz
+  audio_bit_depth?: number | null;   // bits
+  lossless?: boolean | null;
   /** Per-track LANGUAGES read from the container (ISO-639-2/B codes, e.g.
    *  ["jpn","eng"]), in track order. Power the dual-audio / multi-sub chips.
    *  Empty/absent until the background MediaInfo pass runs. */
@@ -304,6 +316,9 @@ export interface ApiFfmpegStatus {
   installing: boolean;
 }
 
+// fpcalc (Chromaprint) status has the identical shape — drives the AcoustID row.
+export type ApiFpcalcStatus = ApiFfmpegStatus;
+
 export interface ApiSubtitleAsset {
   id: number;
   media_file_id: number | null;
@@ -420,6 +435,11 @@ export const api = {
   },
   listScans: () => request<ApiScan[]>('/scans'),
   getScan: (id: number) => request<ApiScan>(`/scans/${id}`),
+  /** Stop a running scan (the Stop button). The worker cancels at its next
+   *  await, keeps what it found, and frees the lock; also force-unsticks a
+   *  stale lock when there's no live task behind it. */
+  cancelScan: (id: number) =>
+    request<{ ok: boolean; status: string; forced?: boolean }>(`/scans/${id}/cancel`, { method: 'POST' }),
   /** Background-activity snapshot — boot recovery summary + any running
    *  heal / warm-up job. Polled by the header activity indicator. */
   getActivity: () => request<ApiActivity>('/activity'),
@@ -495,13 +515,21 @@ export const api = {
    *  progress + final state narrate through the activity pill. */
   installFfmpeg: () =>
     request<ApiFfmpegStatus>('/ffmpeg/install', { method: 'POST' }),
+
+  fpcalcStatus: () =>
+    request<ApiFpcalcStatus>('/fpcalc'),
+  installFpcalc: () =>
+    request<ApiFpcalcStatus>('/fpcalc/install', { method: 'POST' }),
   /** Re-parse the EXISTING library in place and re-match it. A normal scan
    *  skips already-indexed files, so parser + folder-lock improvements only
    *  reach NEW files; this re-runs the parser on every stored file so they
    *  apply to the current library without a destructive DB reset. Manual
    *  pins + rename history are preserved. Returns a Scan row to poll. */
-  reparseLibrary: () =>
-    request<ApiScan>('/scans/reparse', { method: 'POST' }),
+  /** Re-parse + re-match + re-read MediaInfo. Scope to a media type
+   *  (`{media_type:'music'}`) or specific files (`{file_ids:[…]}`, e.g. one album);
+   *  omit for the whole library. */
+  reparseLibrary: (scope?: { media_type?: string; file_ids?: number[] }) =>
+    request<ApiScan>('/scans/reparse', { method: 'POST', body: JSON.stringify(scope ?? {}) }),
   /** Hard-delete a MediaFile and remove the underlying file from disk.
    *  Irreversible. UI must show a confirm dialog before calling this —
    *  the backend also requires ?confirm=true as a second guard. */
@@ -531,6 +559,11 @@ export const api = {
       '/files/verify-exist',
       { method: 'POST', body: JSON.stringify({ ids: fileIds }) },
     ),
+  /** Walk-free deletion sweep: stat every review-stage tracked file and drop the
+   *  ones gone from disk. Called on page load so a deleted file clears on refresh
+   *  without a scan (and without the scan's all-or-nothing walk fragility). */
+  reconcileFiles: () =>
+    request<{ removed: number; ids: number[] }>('/files/reconcile', { method: 'POST' }),
   rematchAll: (params?: { media_type?: string; limit?: number }) => {
     const q = new URLSearchParams();
     if (params?.media_type) q.set('media_type', params.media_type);
@@ -698,6 +731,47 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body ?? {}),
     }),
+
+  /** Same as testSonarr, for Radarr. v1 only needs the connection proven (the
+   *  relink hook reads just url + api_key); quality_profiles / root_folders come
+   *  back for a future "add to Radarr" but aren't consumed by the card yet. */
+  testRadarr: (body?: { url?: string; api_key?: string }) =>
+    request<{
+      ok: boolean;
+      detail: string | null;
+      version: string | null;
+      quality_profiles: Array<{ id: number; name: string }> | null;
+      root_folders: Array<{ path: string; freeSpace?: number | null }> | null;
+    }>('/integrations/radarr/test', {
+      method: 'POST',
+      body: JSON.stringify(body ?? {}),
+    }),
+
+  /** Movie-collection completion: for each TMDB collection you partially own,
+   *  the parts you're MISSING (with a `released` flag). Empty when there's no
+   *  TMDB key or no partially-owned collections. */
+  getCollections: () =>
+    request<{ collections: Array<{
+      collection_id: string;
+      name: string | null;
+      owned: number;
+      total: number;
+      missing: Array<{ tmdb_id: string; title: string | null; year: number | null; poster_url: string | null; released: boolean }>;
+    }> }>('/collections'),
+
+  /** Add a movie to Radarr by TMDB id + trigger a search — the collection-ghost
+   *  "Get from Radarr" button. `added`=false means it was already in Radarr and
+   *  we just (re)searched it. */
+  addMovieToRadarr: (tmdbId: number) =>
+    request<{ ok: boolean; added: boolean; detail: string | null }>('/integrations/radarr/add-movie', {
+      method: 'POST',
+      body: JSON.stringify({ tmdb_id: tmdbId }),
+    }),
+
+  /** Radarr's active download queue (keyed by tmdb id) — drives the collection-
+   *  ghost cover progress fills. Empty when Radarr isn't configured/reachable. */
+  radarrQueue: () =>
+    request<{ items: Array<{ tmdb_id: number; title: string | null; status: string; progress_pct: number; eta_seconds: number | null; release_title: string | null; error_message: string | null }>; cached_at: number }>('/integrations/radarr/queue'),
 
   /** Background connection-health snapshot for the configured integrations.
    *  Driven by the backend's HealthMonitor loop (probes every ~5 min); this
@@ -1013,6 +1087,9 @@ export interface ApiPack {
   episode_count?: number;
   season_count?: number;
   sub_count?: number;
+  /** Present on add / refresh responses: how many no_match files the pack just
+   *  rescued on the spot, so the UI can refresh Review and toast it. */
+  rescued?: number;
 }
 
 export interface ApiPackValidate extends ApiPack {

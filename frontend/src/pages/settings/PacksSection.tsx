@@ -85,8 +85,18 @@ export function PacksSection({ pushToast }: { pushToast: PushToast }) {
   const runAdd = async () => {
     setAdding(true);
     try {
-      await api.addPack({ url });
-      pushToast({ title: 'Pack added', sub: preview?.name ?? url, kind: 'success' });
+      const r = await api.addPack({ url });
+      const rescued = r.rescued ?? 0;
+      pushToast({
+        title: 'Pack added',
+        sub: rescued > 0
+          ? `${preview?.name ?? url} — rescued ${rescued} unmatched file${rescued === 1 ? '' : 's'}`
+          : (preview?.name ?? url),
+        kind: 'success',
+      });
+      // The pack auto-applied to the no_match backlog → refresh Review so the
+      // newly-matched files show up without a manual rescan.
+      if (rescued > 0) { try { window.dispatchEvent(new Event('kira:files-changed')); } catch { /* no window */ } }
       setUrl('');
       setPreview(null);
       await reload();
@@ -145,7 +155,11 @@ export function PacksSection({ pushToast }: { pushToast: PushToast }) {
     setBusyKey(key);
     try {
       const r = await api.refreshPack(key);
-      pushToast(r.last_error ? { title: 'Refresh failed', sub: r.last_error, kind: 'error' } : { title: 'Pack refreshed', kind: 'success' });
+      const rescued = r.rescued ?? 0;
+      pushToast(r.last_error
+        ? { title: 'Refresh failed', sub: r.last_error, kind: 'error' }
+        : { title: 'Pack refreshed', sub: rescued > 0 ? `Rescued ${rescued} unmatched file${rescued === 1 ? '' : 's'}` : undefined, kind: 'success' });
+      if (rescued > 0) { try { window.dispatchEvent(new Event('kira:files-changed')); } catch { /* no window */ } }
       await reload();
     } catch (e) {
       pushToast({ title: 'Refresh failed', sub: (e as Error).message, kind: 'error' });

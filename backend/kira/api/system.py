@@ -174,6 +174,31 @@ async def install_ffmpeg_endpoint() -> dict:
     return status
 
 
+@router.get("/fpcalc")
+async def get_fpcalc_status() -> dict:
+    """Is fpcalc (Chromaprint) usable, and can this platform one-click install it?
+    Drives the Settings → AcoustID status row (fingerprint matching needs it)."""
+    from kira.fpcalc_setup import fpcalc_status
+    return fpcalc_status()
+
+
+@router.post("/fpcalc/install")
+async def install_fpcalc_endpoint() -> dict:
+    """One-click managed fpcalc: download the Chromaprint release into Kira's own
+    ./tools/ dir — no PATH edits. Fire-and-forget; progress narrates via /activity."""
+    from kira.fpcalc_setup import FPCALC_INSTALL_JOB, fpcalc_status, install_fpcalc
+    from kira.tasks import spawn_tracked
+    status = fpcalc_status()
+    if status["available"]:
+        return status
+    if not status["installable"]:
+        raise HTTPException(400, "No one-click fpcalc build for this platform — install chromaprint manually.")
+    if not status["installing"]:
+        spawn_tracked(install_fpcalc(), label=FPCALC_INSTALL_JOB)
+        status["installing"] = True
+    return status
+
+
 @router.post("/matches/reset")
 async def reset_matches(
     confirm: str = Query(..., description="Must equal 'RESET' to proceed"),

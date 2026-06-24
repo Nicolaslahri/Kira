@@ -63,6 +63,17 @@ async def _rematch_one(
         .where(MediaFile.id == media_file.id)
     )
 
+    # Pack matches (provider="pack") are USER-AUTHORITATIVE and complete by
+    # construction — a re-discovery would WIPE them (the providers deliberately
+    # floor fan-edits like One Pace to no_match). Leave a selected pack match
+    # entirely intact: no re-match, no enrichment. This guards EVERY caller of
+    # this function (boot heal, /rematch-all, sonarr-heal), not just the heal
+    # query's own provider!=pack filter — defense in depth for the same bug.
+    if refreshed is not None and any(
+        m.is_selected and m.provider == "pack" for m in refreshed.matches
+    ):
+        return 0
+
     # ── Separation of Discovery from Enrichment ───────────────────────
     # `_rematch_one` historically conflated two concerns: re-running
     # `engine.match()` to (re)discover the series identity, and
@@ -2233,6 +2244,14 @@ async def _auto_heal_stale_matches() -> None:
                 .where(
                     MediaFile.id > last_processed_id,
                     Match.is_selected.is_(True),
+                    # Pack matches (provider="pack") are USER-AUTHORITATIVE — they
+                    # must NEVER be re-discovered via the providers, which by design
+                    # floor fan-edits like One Pace to no_match. They legitimately
+                    # carry a NULL metadata_blob, which would otherwise match the
+                    # stale-row filter below and get wiped to no_match on every boot
+                    # heal (the "One Pace keeps going unmatched" bug — a manual scan
+                    # re-applies the pack, but heal doesn't, so it kept reverting).
+                    Match.provider != "pack",
                     # NOTE: manual pins are INCLUDED in the heal query.
                     # Previously `Match.is_manual.is_(False)` excluded
                     # them entirely, which was safe-but-wasteful when
@@ -2329,17 +2348,15 @@ async def _auto_heal_stale_matches() -> None:
         logger.info("auto_heal: done.")
         activity.end("heal")
         if total_healed > 0:
-            try:
-                from kira.models import Notification
-                async with SessionLocal() as n_sess:
-                    n_sess.add(Notification(
-                        kind="info",
-                        title=f"Auto-heal: {total_healed} file{'s' if total_healed != 1 else ''} refreshed",
-                        body="Stale matches were automatically re-matched with the latest engine.",
-                    ))
-                    await n_sess.commit()
-            except Exception:
-                pass
+            # Auto-heal is ROUTINE background maintenance (runs on boot + on the
+            # heal-version bump). Log it, but do NOT pop a notification at the user
+            # every time — that's the "random autoheal popup" they asked us to stop.
+            # The refreshed matches simply appear in Review; the activity pill above
+            # already narrated the work while it ran.
+            logger.info(
+                f"auto_heal: {total_healed} stale match(es) refreshed "
+                f"(silent — no user notification)."
+            )
 
 
 async def _bulk_rematch_worker(fids: list[int], force: bool = False) -> None:

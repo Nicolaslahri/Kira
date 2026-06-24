@@ -169,17 +169,18 @@ async def test_clean_scan_runs_offloop_and_prunes(tmp_path, monkeypatch):
     assert ticks["n"] > 0, "event loop starved during the walk → it ran on-loop!"
 
 
-async def test_walk_error_downgrades_status_and_skips_prune(tmp_path, monkeypatch):
+async def test_walk_error_downgrades_status_but_still_sweeps_clean_subtrees(tmp_path, monkeypatch):
     root = tmp_path / "lib2"
     root.mkdir()
     (root / "real.mkv").write_bytes(b"x" * 10)
     sm = await _fresh_db(tmp_path, monkeypatch)
     _stub_match(monkeypatch)
 
-    prune_called = {"n": 0}
+    prune_calls = {"n": 0, "error_paths": []}
 
-    async def _tracking_prune(*a, **k):
-        prune_called["n"] += 1
+    async def _tracking_prune(session, root_paths, walked, norm_fn, *, error_paths=()):
+        prune_calls["n"] += 1
+        prune_calls["error_paths"] = list(error_paths)
         return 0
 
     monkeypatch.setattr(scans, "_prune_missing_files", _tracking_prune)
@@ -212,5 +213,12 @@ async def test_walk_error_downgrades_status_and_skips_prune(tmp_path, monkeypatc
         f"a walk error must downgrade to completed_partial, got {scan.status!r} — "
         "thread-local walk-error capture across the executor is BROKEN"
     )
-    assert prune_called["n"] == 0, "prune MUST be skipped when the walk errored"
+    # RESILIENT sweep: the prune now RUNS (it used to be skipped wholesale on ANY
+    # walk error, which froze all deleted-file cleanup) — but the errored folder
+    # is handed in as `error_paths` so that subtree is excluded while the rest of
+    # the library is still swept.
+    assert prune_calls["n"] == 1, "prune must still run so clean subtrees get swept"
+    assert any("unreadable" in p for p in prune_calls["error_paths"]), (
+        "the errored folder must be passed to the sweep so it's excluded from pruning"
+    )
     assert len(rows) == 1, "the real file should still be tracked"

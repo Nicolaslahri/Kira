@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, type ApiActivity, type ApiActivityJob } from '../lib/api';
 import { IcSpin, IcCheck, IcAlertTri, IcX } from '../lib/icons';
+import { FeaturedIcon } from './base/featured-icons/featured-icon';
 
 type PushToast = (t: { title: string; sub?: string; kind?: 'success' | 'error' }) => void;
 
@@ -73,6 +74,10 @@ export function useActivity(pushToast: PushToast): {
               // Settings/onboarding ffmpeg rows re-check their status.
               window.dispatchEvent(new Event('kira:ffmpeg-changed'));
             }
+            if (j.name === 'fpcalc_install' && j.state === 'done') {
+              // Settings AcoustID row re-checks its fpcalc status.
+              window.dispatchEvent(new Event('kira:fpcalc-changed'));
+            }
           }
           if (!bootShown.current && a.boot && a.boot.files_reset > 0) {
             bootShown.current = true;
@@ -127,9 +132,11 @@ export function useActivity(pushToast: PushToast): {
 }
 
 /**
- * Bottom-left glass pill matching ScanProgress's surface, shown in the Toast
- * `leading` slot. Three live states, all driven by the poll — no refresh:
- *   running → spinner + narrated label + N/M counter
+ * Bottom-right activity card. Shares its chrome verbatim with the notification
+ * toast (NotificationCard) — same card, FeaturedIcon chip, and typography — so
+ * the two read as one design and stack in one column. Three live states, all
+ * driven by the poll — no refresh:
+ *   running → indigo spinner + narrated label + N/M counter
  *   done    → green check + outcome line (backend expires it after ~15s)
  *   error   → red alert + explanation, sticky until dismissed
  */
@@ -139,33 +146,32 @@ export function ActivityPill({ job, onDismiss }: { job: ApiActivityJob; onDismis
     : null;
   const state = job.active ? 'running' : job.state;
 
-  const edge = state === 'error' ? 'var(--conf-low)'
-    : state === 'done' ? 'var(--conf-high)'
-    : 'var(--brand-grad)';
-  const iconBox = state === 'error'
-    ? 'bg-[var(--conf-low-16)] text-[var(--conf-low)]'
-    : state === 'done'
-      ? 'bg-[var(--accent-soft)] text-[var(--conf-high)]'
-      : 'bg-[var(--surface-3)] text-accent [&_svg]:animate-[spin_1.1s_linear_infinite]';
+  // Same chrome as the notification toast: a FeaturedIcon chip carries the live/
+  // outcome colour (indigo spinner → green done → red error), so no separate top
+  // accent line is needed and the two surfaces read as one.
+  const iconColor: 'brand' | 'success' | 'error' =
+    state === 'error' ? 'error' : state === 'done' ? 'success' : 'brand';
+  const iconEl = state === 'error' ? <IcAlertTri /> : state === 'done' ? <IcCheck /> : <IcSpin />;
 
   return (
     <div
-      className="anim-pop relative flex max-w-[440px] items-center gap-3 overflow-hidden rounded-2xl border border-[var(--border-2)] bg-[var(--panel-75)] px-4 py-3 shadow-[var(--shadow-3)] backdrop-blur-2xl"
+      className="anim-pop pointer-events-auto flex w-[360px] max-w-[calc(100vw-2rem)] items-start gap-3 rounded-xl border border-secondary bg-[var(--panel-90)] px-3.5 py-3 shadow-[var(--shadow-3)] backdrop-blur-2xl"
       role={state === 'error' ? 'alert' : 'status'}
       aria-live="polite"
     >
-      {/* Top-edge accent — brand while live, green/red for the outcome. */}
-      <span aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 h-px" style={{ background: edge, opacity: 0.6 }} />
-      <span className={`grid size-7 shrink-0 place-items-center rounded-lg [&_svg]:size-3.5 ${iconBox}`}>
-        {state === 'error' ? <IcAlertTri /> : state === 'done' ? <IcCheck /> : <IcSpin />}
-      </span>
-      <div className="min-w-0">
-        <div className="text-[13px] font-semibold text-ink">
+      <FeaturedIcon
+        size="md"
+        color={iconColor}
+        icon={iconEl}
+        className={state === 'running' ? '[&_svg]:animate-[spin_1.1s_linear_infinite]' : undefined}
+      />
+      <div className="min-w-0 flex-1 pt-px">
+        <div className="text-[13px] font-semibold text-primary">
           {state === 'running' ? job.label : state === 'error' ? 'Something needs attention' : 'Done'}
         </div>
-        <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-muted">
+        <div className="mt-0.5 text-[12px] leading-relaxed text-secondary">
           {state === 'running'
-            ? <>Working in the background{count ? <> · <span className="font-mono tabular-nums text-ink-soft">{count}</span></> : null}</>
+            ? <>Working in the background{count ? <> · <span className="font-mono tabular-nums text-tertiary">{count}</span></> : null}</>
             : (job.detail ?? job.label)}
         </div>
       </div>
@@ -173,7 +179,8 @@ export function ActivityPill({ job, onDismiss }: { job: ApiActivityJob; onDismis
           deliberately stick around long enough to be read. */}
       {state !== 'running' && onDismiss ? (
         <button
-          className="press ml-1 grid size-6 shrink-0 place-items-center self-start rounded-md text-ink-soft transition hover:bg-white/[0.07] hover:text-ink [&_svg]:size-3"
+          type="button"
+          className="-mr-1 -mt-0.5 grid size-6 shrink-0 place-items-center rounded-md text-tertiary transition-colors hover:bg-primary_hover hover:text-primary [&_svg]:size-[14px]"
           onClick={() => onDismiss(job)}
           aria-label="Dismiss"
           title="Dismiss"

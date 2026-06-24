@@ -295,6 +295,21 @@ def _extract_tracks(info) -> dict[str, Any] | None:
                 )
                 if ac:
                     out["audio"] = ac
+                # Music tech specs — surfaced in the popup track rows. (Stored under
+                # `audio_bit_depth`, never `bit_depth` — that key is the video color
+                # depth used by the dedupe ranker / variant key.)
+                br = _safe_int(getattr(track, "bit_rate", None))
+                if br and br > 0:
+                    out["audio_bitrate"] = round(br / 1000)        # kbps
+                sr = _safe_int(getattr(track, "sampling_rate", None))
+                if sr and sr > 0:
+                    out["sample_rate"] = sr                        # Hz
+                bd = _safe_int(getattr(track, "bit_depth", None))
+                if bd and bd > 0:
+                    out["audio_bit_depth"] = bd                    # bits
+                cm = getattr(track, "compression_mode", None)
+                if isinstance(cm, str) and cm:
+                    out["lossless"] = cm.strip().lower() == "lossless"
             lang = normalize_language(getattr(track, "language", None))
             if lang and lang not in audio_langs:
                 audio_langs.append(lang)
@@ -371,6 +386,16 @@ def enrich_parsed(parsed, mi: dict[str, Any] | None, authoritative: bool = False
     changed |= _set("codec", "codec", parsed.codec)
     changed |= _set("hdr", "hdr", parsed.hdr)
     changed |= _set("channels", "channels", parsed.channels)
+    # Music tech specs (ints — `_set` treats 0/None as absent, which is correct here).
+    changed |= _set("audio_bitrate", "audio_bitrate", getattr(parsed, "audio_bitrate", None))
+    changed |= _set("sample_rate", "sample_rate", getattr(parsed, "sample_rate", None))
+    changed |= _set("audio_bit_depth", "audio_bit_depth", getattr(parsed, "audio_bit_depth", None))
+    # lossless is a bool — `_set` would skip a legitimate `False`, so merge directly.
+    if "lossless" in mi:
+        mi_ll = bool(mi["lossless"])
+        if (authoritative or getattr(parsed, "lossless", None) is None) and parsed.lossless != mi_ll:
+            parsed.lossless = mi_ll
+            changed = True
 
     # Duration (seconds) is NEVER carried by a filename, so it's always a
     # pure fill — there's nothing for it to conflict with. Set it whenever

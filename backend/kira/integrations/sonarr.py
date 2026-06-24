@@ -23,6 +23,8 @@ from typing import Any, Literal
 
 import httpx
 
+from kira.integrations.arr_paths import translate_path as _translate_path
+
 logger = logging.getLogger(__name__)
 
 # Sonarr's API timeout is conservatively short. Their endpoints typically
@@ -157,6 +159,71 @@ async def rescan_series_by_tvdb(cfg: SonarrConfig, tvdb_id: int) -> bool:
     except Exception as e:
         logger.warning(f"sonarr: post-rename rescan for tvdb {tvdb_id} failed (non-fatal): {e!r}")
         return False
+
+
+# `_translate_path` (the Kira↔*arr mount bridge) now lives in
+# `kira.integrations.arr_paths.translate_path`, shared with Radarr, and is
+# imported above as `_translate_path` for back-compat with this module's callers
+# and tests.
+
+
+async def relink_series(
+    cfg: SonarrConfig,
+    tvdb_id: int,
+    *,
+    old_root: str | None = None,
+    new_root: str | None = None,
+) -> tuple[bool, bool, str]:
+    """Keep Sonarr's series path in sync with Kira's folder, THEN rescan.
+
+    Supersedes a bare `rescan_series_by_tvdb` for the rename/undo hooks: when
+    Kira renames a series FOLDER, Sonarr's stored path goes stale — its next
+    scan finds the old path gone, marks every episode file deleted, and (if
+    monitored) may re-grab them. We translate Kira's NEW folder into Sonarr's
+    path namespace and `PUT` it with `moveFiles=false` (Kira already moved the
+    files), so Sonarr re-links them in place. Undo passes the roots reversed.
+
+    Returns (ok, changed, detail): `ok` = the rescan was accepted; `changed` =
+    the stored path was actually updated; `detail` is a short human string for
+    the notification. Best-effort — never raises."""
+    try:
+        async with _client(cfg) as c:
+            series = await _find_series_by_tvdb(c, int(tvdb_id))
+            if not series or not series.get("id"):
+                return False, False, "not in Sonarr"
+            changed = False
+            note = ""
+            arr_old = series.get("path") or ""
+            if old_root and new_root and old_root != new_root and arr_old:
+                arr_new = _translate_path(arr_old, old_root, new_root)
+                if arr_new is None:
+                    note = "couldn't map the new path"
+                elif arr_new != arr_old:
+                    series["path"] = arr_new
+                    pr = await c.put(
+                        f"api/v3/series/{series['id']}",
+                        params={"moveFiles": "false"},
+                        json=series,
+                    )
+                    if pr.status_code in (200, 202):
+                        changed = True
+                    else:
+                        note = f"path update failed (HTTP {pr.status_code})"
+            cmd = await c.post(
+                "api/v3/command",
+                json={"name": "RescanSeries", "seriesId": series["id"]},
+            )
+            ok = cmd.status_code in (200, 201)
+            if changed:
+                detail = f"path → {series['path']}"
+            elif note:
+                detail = f"{note}; rescanned"
+            else:
+                detail = "rescanned"
+            return ok, changed, detail
+    except Exception as e:
+        logger.warning(f"sonarr: relink for tvdb {tvdb_id} failed (non-fatal): {e!r}")
+        return False, False, f"error ({type(e).__name__})"
 
 
 async def list_quality_profiles(cfg: SonarrConfig) -> list[dict[str, Any]]:

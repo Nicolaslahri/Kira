@@ -386,10 +386,16 @@ class TVDBProvider(MetadataProvider):
         if not overview:
             overview = payload.get("overview")
 
+        # Title: PREFER the English name over the Japanese master `name`, exactly
+        # like the overview handled above (see _pick_title). So an embedded-id
+        # match on a Sonarr `{tvdb-…}` anime reads "Modaete yo, Adam-kun", not
+        # "悶えてよ、アダムくん".
+        title = _pick_title(payload, aliases)
+
         # Phase 14: identity fields for the embedded-ID bypass.
         _fa = (payload.get("firstAired") or "")[:4]
         result: dict[str, Any] = {
-            "title": payload.get("name"),
+            "title": title,
             "year": int(_fa) if _fa.isdigit() else None,
             "poster_url": payload.get("image"),
             "aliases": aliases,
@@ -693,6 +699,36 @@ def _clean_aliases(raw: Any) -> list[str] | None:
     seen: set[str] = set()
     deduped = [a for a in out if not (a in seen or seen.add(a))]
     return deduped or None
+
+
+def _has_cjk(s: str) -> bool:
+    """True if the string contains Japanese / Chinese / Korean characters. Used
+    to decide whether a TVDB master `name` (a Japan-origin anime's master record
+    is in Japanese) should be displaced by an English/romaji alias."""
+    return any(
+        "぀" <= c <= "ヿ"     # Hiragana + Katakana
+        or "㐀" <= c <= "鿿"  # CJK Unified (incl. Ext-A)
+        or "가" <= c <= "힯"  # Hangul
+        or "豈" <= c <= "﫿"  # CJK Compatibility Ideographs
+        for c in s
+    )
+
+
+def _pick_title(payload: dict[str, Any], aliases: list[str]) -> str | None:
+    """Choose a TVDB series title for display, preferring English — the mirror of
+    the overview's prefer-English logic. Order:
+      1. an English NAME translation (`translations.nameTranslations`), else
+      2. if the master `name` is CJK (a Japan-origin anime master record is in
+         Japanese), the first Latin-script alias, else
+      3. the master `name` as-is.
+    `aliases` is the already-flattened alias list from the extended payload."""
+    for t in ((payload.get("translations") or {}).get("nameTranslations") or []):
+        if isinstance(t, dict) and t.get("language") in ("eng", "en") and t.get("name"):
+            return t["name"]
+    master = payload.get("name")
+    if master and _has_cjk(master):
+        return next((a for a in aliases if a and not _has_cjk(a)), None) or master
+    return master
 
 
 def _pick_eng(d: dict[str, Any], translations_key: str, primary_key: str, fallback_key: str) -> str | None:

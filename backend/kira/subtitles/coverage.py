@@ -68,6 +68,11 @@ def missing_languages(parsed: dict[str, Any] | None, wanted: Iterable[str]) -> l
       - ``[]`` when fully covered;
       - the missing wanted codes otherwise.
     """
+    # Music (audio) has no subtitle concept — never report it as missing subs.
+    # Single gate: the CC badge, the coverage tile, and the backfill all consult
+    # this, so music drops out of subtitle handling everywhere at once.
+    if (parsed or {}).get("media_type") == "music":
+        return None
     wanted_list = [w for w in (str(x).strip() for x in (wanted or ())) if w]
     if not wanted_list:
         return None

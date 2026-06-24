@@ -380,6 +380,10 @@ function PairRowCellImpl({
           </MarqueeText>
           <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-tertiary">
             <span className="font-mono font-medium text-secondary">{fullTag}</span>
+            {/* Music: surface the track's OWN artist when it's a collab (differs
+                from the album artist) — e.g. "Stuck With U · Ariana Grande & …". */}
+            {isAlbum && e.artist && e.artist !== item.artist
+              ? <><span className="dot-sep" /><span className="font-medium text-secondary">{e.artist}</span></> : null}
             {e.airDate && !isAlbum ? <><span className="dot-sep" /><span>{e.airDate}</span></> : null}
             {e.runtime && !isAlbum ? <><span className="dot-sep" /><span>{e.runtime} min</span></> : null}
           </div>

@@ -253,7 +253,7 @@ async def put_settings(
 
 @router.post("/providers/{provider}/test", response_model=ProviderTestResponse)
 async def test_provider(
-    provider: Literal["tmdb", "tvdb", "anidb", "fanarttv", "opensubtitles", "subdl", "subsource"],
+    provider: Literal["tmdb", "tvdb", "anidb", "fanarttv", "opensubtitles", "subdl", "subsource", "musicbrainz", "acoustid"],
     session: AsyncSession = Depends(get_session),
 ) -> ProviderTestResponse:
     """Actually call the provider with the configured credentials and report ok/error.
@@ -263,6 +263,20 @@ async def test_provider(
     pinging its API with the saved key. (`provider` is a free string rather than
     the matcher `ProviderKey` enum precisely so artwork-only sources fit here.)
     """
+    # MusicBrainz — the music matcher's metadata source. KEYLESS, so "Test" is a
+    # reachability ping (a tiny search via the matcher's own client); no creds.
+    if provider == "musicbrainz":
+        from kira.music import musicbrainz as mbz
+        t0 = time.monotonic()
+        async with httpx.AsyncClient() as client:
+            hits = await mbz.search_releases(client, "Daft Punk", "Discovery", limit=1)
+        if hits:
+            return ProviderTestResponse(
+                ok=True, detail="MusicBrainz reachable (keyless — no API key needed)",
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
+        return ProviderTestResponse(ok=False, detail="MusicBrainz unreachable — check your network connection")
+
     # OpenSubtitles — subtitle provider. Search validates the API key (a dead
     # key 403s → typed AuthRejected); when download creds are saved, login is
     # exercised too, since downloads are the part that actually needs them.
@@ -368,6 +382,45 @@ async def test_provider(
         return ProviderTestResponse(
             ok=ok, detail=detail,
             latency_ms=int((time.monotonic() - t0) * 1000) if ok else None,
+        )
+
+    # AcoustID — audio-fingerprint matching. Kira ships an app key (a
+    # `providers.acoustid.api_key` setting overrides), so the test validates THAT
+    # key + the API reachability, then reports whether fpcalc (the local fingerprint
+    # binary — the other half the feature needs) is installed.
+    if provider == "acoustid":
+        from kira.music import acoustid as _ac
+        from kira import fpcalc_setup as _fp
+        row = await session.get(Setting, "providers.acoustid.api_key")
+        kv = row.value if row else None
+        if isinstance(kv, dict):                 # tolerate a {"value": …} wrapper
+            kv = kv.get("value")
+        key = (kv if isinstance(kv, str) else "").strip() or _ac.PROJECT_KEY
+        fp_ok = _fp.resolve_fpcalc() is not None
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    "https://api.acoustid.org/v2/lookup",
+                    data={"client": key, "duration": "120", "fingerprint": "INVALID", "meta": "recordings"},
+                    timeout=15.0,
+                )
+                d = r.json()
+        except Exception as e:                    # noqa: BLE001
+            return ProviderTestResponse(ok=False, detail=f"AcoustID unreachable — {e}")
+        # An invalid API key → AcoustID error code 4. Any other outcome (status ok,
+        # or the expected "invalid fingerprint" error) means the key was ACCEPTED.
+        code = (d.get("error") or {}).get("code") if isinstance(d, dict) else None
+        if code == 4:
+            return ProviderTestResponse(ok=False, detail="AcoustID API key rejected")
+        if not fp_ok:
+            return ProviderTestResponse(
+                ok=False,
+                detail="API reachable, key OK — but fpcalc isn't installed yet. Click “Install for me” below to enable fingerprint matching.",
+            )
+        return ProviderTestResponse(
+            ok=True, detail="AcoustID ready · key OK · fpcalc installed",
+            latency_ms=int((time.monotonic() - t0) * 1000),
         )
 
     async with httpx.AsyncClient() as client:

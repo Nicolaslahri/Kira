@@ -14,11 +14,11 @@
 // the left side renders a blank "Find a file" CTA. Orphan files (no
 // matched episode) get appended at the bottom with a blank right side.
 
-import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import type { LibraryItem, LibEpisode, LibFile } from '../lib/types';
 import {
-  IcCheck, IcX, IcSearch, IcRefresh, IcAlertTri, IcDownload,
+  IcCheck, IcX, IcSearch, IcRefresh, IcAlertTri, IcDownload, IcTrash,
 } from '../lib/icons';
 import { api } from '../lib/api';
 import { Button } from './base/buttons/button';
@@ -31,6 +31,7 @@ import { DupesResolverModal, DeleteConfirmModal, BulkDeleteConfirmModal } from '
 import { MovieBody } from './CoverPopup/MovieBody';
 import { Hero } from './CoverPopup/Hero';
 import { SeriesBody } from './CoverPopup/SeriesBody';
+import { MusicBody } from './CoverPopup/MusicBody';
 import { useSonarrQueuePopup } from './CoverPopup/useSonarrQueuePopup';
 
 interface CoverPopupProps {
@@ -764,7 +765,7 @@ export function CoverPopup({
   // `files` are the ones that WILL be deleted; `keepCount`/`epCount` describe
   // what's being kept for the summary line. null = no modal open.
   const [bulkConfirm, setBulkConfirm] = useState<
-    { files: LibFile[]; keepCount: number; epCount: number } | null
+    { files: LibFile[]; keepCount: number; epCount: number; headline?: string; detail?: ReactNode } | null
   >(null);
 
   const handleDeleteFile = useCallback(async (file: LibFile) => {
@@ -1122,6 +1123,23 @@ export function CoverPopup({
     return out;
   }, [item, providerEpisodes, deletedIds, missingIds]);
 
+  // Music cross-album duplicates — tracks flagged `dupOf` (a single that's ALSO on
+  // a real album you own, shown with an "Also on <album>" chip). Their FILES are
+  // the redundant single copies the footer's "Resolve duplicates" button removes
+  // (the album versions live in their own cards and stay untouched).
+  const crossAlbumDupes = useMemo<LibFile[]>(() => {
+    if (item.kind !== 'album') return [];
+    const seen = new Set<string>();
+    const out: LibFile[] = [];
+    rows.forEach(r => {
+      if (r.episode?.dupOf && r.file && !deletedIds.has(r.file.id) && !seen.has(r.file.id)) {
+        seen.add(r.file.id);
+        out.push(r.file);
+      }
+    });
+    return out;
+  }, [rows, item.kind, deletedIds]);
+
   // ── Bulk actions
   const handleApproveAll = useCallback(() => {
     const next: LibraryItem = {
@@ -1367,6 +1385,21 @@ export function CoverPopup({
 
           {item.kind === 'movie'
             ? <div className="cx-movie-scroll"><MovieBody item={item} /></div>
+            : item.kind === 'album'
+            ? <MusicBody
+                item={item}
+                rows={rows}
+                updateFile={updateFile}
+                onManualSearch={onManualSearch}
+                onOpenDupeModal={(episode, files) => setDupeModal({ episode, files })}
+                // Music tracks come straight from the files (no provider episode
+                // fetch), so this is normally false; kept for parity with the shell.
+                episodesLoading={
+                  !!providerKey && !!providerId &&
+                  (providerEpisodes === null || providerEpisodes.length === 0) &&
+                  rows.length === 0
+                }
+              />
             : <SeriesBody
                 item={item}
                 rows={rows}
@@ -1410,6 +1443,9 @@ export function CoverPopup({
             files={bulkConfirm.files}
             keepCount={bulkConfirm.keepCount}
             epCount={bulkConfirm.epCount}
+            noun={item.kind === 'album' ? 'track' : 'episode'}
+            headline={bulkConfirm.headline}
+            detail={bulkConfirm.detail}
             onCancel={() => setBulkConfirm(null)}
             onConfirm={() => void handleDeleteFiles(bulkConfirm.files)}
           />
@@ -1502,6 +1538,57 @@ export function CoverPopup({
                 </ButtonGroupItem>
               );
             })()}
+
+            {/* ── Reparse just this item ───────────────────────────────
+                Re-parse + re-match + re-read MediaInfo tech tags for ONLY this
+                album/show/movie's files (a scoped reparse) — seconds, vs a
+                whole-library pass. The fast way to pick up parser fixes / fill in
+                tech specs (bitrate, bit-depth) on one item. */}
+            {!clusterIsDead ? (
+              <ButtonGroupItem
+                id="reparse"
+                iconLeading={IcRefresh}
+                title="Re-parse + re-match + re-read tech tags for just this item"
+                onClick={() => {
+                  const ids = item.files.map(f => Number(f.id)).filter(Number.isFinite);
+                  window.dispatchEvent(new CustomEvent('kira:reparse', { detail: { file_ids: ids } }));
+                  pushToast?.({ title: 'Re-parsing this item', sub: item.title, kind: 'success' });
+                  handleClose();
+                }}
+              >
+                Reparse
+              </ButtonGroupItem>
+            ) : null}
+
+            {/* ── Resolve cross-album duplicates (music) ───────────────
+                A "Singles" folder often re-includes songs you already own
+                on an album (the tracks flagged "Also on <album>"). One
+                click removes the redundant single copies from disk; the
+                album versions live in their own cards and stay untouched. */}
+            {!clusterIsDead && item.kind === 'album' && crossAlbumDupes.length > 0 ? (
+              <ButtonGroupItem
+                id="resolve-dupes"
+                iconLeading={IcTrash}
+                onClick={() => {
+                  const n = crossAlbumDupes.length;
+                  setBulkConfirm({
+                    files: crossAlbumDupes,
+                    keepCount: 0,
+                    epCount: 0,
+                    headline: `Delete ${n} duplicate single${n === 1 ? '' : 's'}?`,
+                    detail: (
+                      <>
+                        {n === 1 ? 'This track is' : `These ${n} tracks are`} also on your albums —
+                        removing the single cop{n === 1 ? 'y' : 'ies'} from disk keeps the album
+                        version{n === 1 ? '' : 's'}. This can’t be undone.
+                      </>
+                    ),
+                  });
+                }}
+              >
+                Resolve duplicates ({crossAlbumDupes.length})
+              </ButtonGroupItem>
+            ) : null}
 
             {/* ── Get missing subtitles ───────────────────────────────
                 Shows only when the backend flagged ≥1 file in this cluster

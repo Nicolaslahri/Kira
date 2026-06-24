@@ -7,6 +7,7 @@ import { BadgeWithDot } from '../base/badges/badges';
 import { cn } from '../../lib/utils';
 import { pluralize, prettyLanguage, prettyCountry } from '../../lib/format';
 import { mediaTypeLong } from './format';
+import { HeroCoverMosaic, distinctCovers } from './HeroCoverMosaic';
 
 // Confidence tier → BadgeWithDot color.
 const CONF_DOT = { high: 'success', mid: 'warning', low: 'error' } as const;
@@ -43,6 +44,23 @@ export function Hero({ item, stats, tint, shape, heroSlotRef, settled, posterUrl
   const hasDetails = !!(item.studio || item.label || item.network || item.director || item.language || item.country || item.genres?.length);
   const hasProviders = !!(item.providers?.tmdb || item.providers?.tvdb || item.providers?.anidb || item.providers?.musicbrainz);
 
+  // Music album stats for the details grid (the matched-from data — durations
+  // come from the files' container metadata, discs from the track set).
+  const isMusic = item.kind === 'album';
+  // Distinct per-track covers → a contact-sheet mosaic for a Singles folder (many
+  // distinct sleeves). A normal album collapses to ONE distinct cover → we render
+  // the single-big-cover branch below instead (never a 1×1 mosaic).
+  const musicCovers = isMusic ? distinctCovers(item) : [];
+  const showMosaic = musicCovers.length >= 2;
+  const singleCover = posterUrl ?? (isMusic ? (musicCovers[0] ?? null) : null);
+  const albumTotalSec = isMusic ? item.episodes.reduce((n, e) => n + (e.durationSec ?? 0), 0) : 0;
+  const discCount = isMusic ? new Set(item.episodes.map(e => e.season)).size : 0;
+  const fmtTotalTime = (sec: number): string | null => {
+    if (!sec) return null;
+    const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+    return h ? `${h} hr ${m} min` : `${m} min`;
+  };
+
   return (
     <div className={`cx-hero variant-side shape-${shape}`}>
       <div
@@ -58,9 +76,13 @@ export function Hero({ item, stats, tint, shape, heroSlotRef, settled, posterUrl
             where the foreground cover was gone and the blurred background bleed
             showed through — the "flash ~1s after opening". */}
         {(
-          posterUrl ? (
+          // MUSIC-ONLY: ≥2 distinct track covers → contact-sheet mosaic. A
+          // single-cover album / TV / movie keeps the existing one-cover path.
+          showMosaic ? (
+            <HeroCoverMosaic covers={musicCovers} tint={tint} title={item.title} />
+          ) : singleCover ? (
             <img
-              src={posterUrl}
+              src={singleCover}
               // PB-2: meaningful alt for screen readers. The hero title h2
               // also describes the content but a single image alt makes
               // image-navigation modes (some screen readers, browser
@@ -154,6 +176,14 @@ export function Hero({ item, stats, tint, shape, heroSlotRef, settled, posterUrl
             {renderDetail('Language', item.language ? prettyLanguage(item.language) : null)}
             {renderDetail('Country', item.country ? prettyCountry(item.country) : null)}
             {item.genres?.length ? renderDetail('Genres', item.genres.join(' · '), true) : null}
+          </div>
+        ) : isMusic ? (
+          <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 border-t border-secondary pt-3">
+            {renderDetail('Artist', item.artist)}
+            {renderDetail('Tracks', pluralize(item.episodes.length, 'track'))}
+            {renderDetail('Total time', fmtTotalTime(albumTotalSec))}
+            {discCount > 1 ? renderDetail('Discs', String(discCount)) : null}
+            {renderDetail('Source', 'MusicBrainz')}
           </div>
         ) : null}
 

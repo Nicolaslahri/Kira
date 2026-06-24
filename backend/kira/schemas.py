@@ -73,6 +73,10 @@ class MatchOut(BaseModel):
     is_selected: bool = False
     is_manual: bool = False
     series_group_id: str | None = None
+    # #14 movie-collection identity — drives the Review page's collection band +
+    # "missing in collection" completion (read by the frontend's collection merge).
+    collection_id: str | None = None
+    collection_name: str | None = None
     # Rich popup metadata — genres, cast, director, network, studio,
     # language, country, runtime, last_air_date, title_romaji, title_native,
     # alt_titles. Single JSON blob so the wire format doesn't fragment as

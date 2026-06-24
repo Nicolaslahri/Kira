@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { apiToMediaFile, buildLibraryItems } from './adapters';
+import { apiToMediaFile, buildLibraryItems, mergeDuplicateClusters } from './adapters';
 import type { ApiMediaFile, ApiMatch } from './api';
 import type { MediaFile } from './types';
 
@@ -269,5 +269,42 @@ describe('buildLibraryItems — pack clustering (One Pace)', () => {
     const items = buildLibraryItems([packEp(1, 1, 1), packEp(2, 1, 2), packEp(3, 2, 1)]);
     expect(items).toHaveLength(2);                                  // S1 (2 eps) + S2 (1 ep)
     expect(items.map(i => i.episodes.length).sort()).toEqual([1, 2]);
+  });
+});
+
+describe('mergeDuplicateClusters — collapse cross-provider duplicate copies', () => {
+  // One file's worth of identity — only the fields the merge reads.
+  const f = (provider: string, gid: string | null, season: number, episode: number): MediaFile =>
+    ({ match: { provider, seriesGroupId: gid, season, episode } } as unknown as MediaFile);
+  const cluster = (provider: string, gid: string, eps: number[]): MediaFile[] =>
+    eps.map(e => f(provider, gid, 1, e));
+
+  it('merges an AniDB copy + a Sonarr {tvdb-…} copy of the same episodes into ONE cluster', () => {
+    const anidb = cluster('anidb', 'g', [1, 2, 3, 4, 5, 6, 7, 8]);
+    const tvdb = cluster('tvdb', 'g', [1, 2, 3, 4, 5, 6, 7, 8]);
+    const out = mergeDuplicateClusters([anidb, tvdb]);
+    expect(out).toHaveLength(1);          // one cover, not two
+    expect(out[0]).toHaveLength(16);      // both copies' files → 2 per episode → dedupe procedure
+  });
+
+  it('does NOT merge same-provider clusters — AoT seasons / One Piece movies stay separate', () => {
+    const aot = [cluster('anidb', 'g', [1, 2]), cluster('anidb', 'g', [1, 2]), cluster('anidb', 'g', [1, 2])];
+    const movies = [[f('tmdb', 'c', 1, 1)], [f('tmdb', 'c', 1, 1)]];  // both fabricate S1E1
+    expect(mergeDuplicateClusters([...aot, ...movies])).toHaveLength(5);
+  });
+
+  it('does NOT merge different franchises or non-overlapping seasons', () => {
+    const a = cluster('anidb', 'g1', [1]);
+    const b = cluster('tvdb', 'g2', [1]);                  // different franchise
+    const c = [f('tvdb', 'g1', 2, 1)];                     // same franchise as a, season 2 → no overlap
+    expect(mergeDuplicateClusters([a, b, c])).toHaveLength(3);
+  });
+
+  it('merges three copies (anidb + tvdb + tmdb) of one episode into one cluster', () => {
+    const out = mergeDuplicateClusters([
+      [f('anidb', 'g', 1, 1)], [f('tvdb', 'g', 1, 1)], [f('tmdb', 'g', 1, 1)],
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toHaveLength(3);
   });
 });

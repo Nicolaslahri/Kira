@@ -71,7 +71,7 @@ export function apiToMediaFile(api: ApiMediaFile): MediaFile {
   // last_air_date AND in_production is false, show "2022 – 2024"; if still
   // running, "2022 –"; movies just keep the bare year.
   let yearRange: string | undefined;
-  if (mediaType !== 'movie' && displayYear) {
+  if (mediaType !== 'movie' && mediaType !== 'music' && displayYear) {  // an album isn't an ongoing series → bare year
     const lastAir = strOrU('last_air_date');
     const lastYear = lastAir ? parseInt(lastAir.slice(0, 4), 10) : undefined;
     const inProd = meta['in_production'] !== false;  // default to ongoing
@@ -115,6 +115,7 @@ export function apiToMediaFile(api: ApiMediaFile): MediaFile {
         providerId: topMatch?.provider_id,
         seriesGroupId: topMatch?.series_group_id ?? undefined,
         collectionName: strOrU('collection_name') ?? null,  // #14
+        collectionId: strOrU('collection_id') ?? null,       // #14 collection band key
         tmdbId: topMatch && topMatch.provider === 'tmdb' ? Number(topMatch.provider_id) || null : null,
         poster: poster(displayTitle, displayYear),
         posterUrl: posterSrc(topMatch?.poster_url),
@@ -155,11 +156,19 @@ export function apiToMediaFile(api: ApiMediaFile): MediaFile {
         titleRomaji: strOrU('title_romaji'),
         titleNative: strOrU('title_native'),
         altTitles: strArr('alt_titles'),
-        // Music-specific
-        artist: parsed.artist ?? undefined,
-        album: parsed.album ?? undefined,
+        // Music-specific. Prefer the MusicBrainz-corrected metadata (the matcher
+        // wrote artist/album/title into the blob) over the filename parse, which
+        // is unreliable for music — these folder layouts put the year in the
+        // artist slot ("music|2014|justin bieber journals").
+        artist: (isMusic ? strOrU('artist') : undefined) ?? parsed.artist ?? undefined,
+        album: (isMusic ? strOrU('album') : undefined) ?? parsed.album ?? undefined,
         track: parsed.track ?? undefined,
-        trackTitle: parsed.track_title ?? undefined,
+        trackTitle: (isMusic ? strOrU('title') : undefined) ?? parsed.track_title ?? undefined,
+        // This track's length + the album genre + the release MBID (for the
+        // popup's rows, details, and MusicBrainz link).
+        duration: isMusic ? fmtDuration(typeof parsed.duration === 'number' ? parsed.duration : null) : undefined,
+        genre: isMusic ? (strOrU('genre') ?? (typeof parsed.genre === 'string' ? parsed.genre : undefined)) : undefined,
+        mbid: isMusic ? mbReleaseId(topMatch?.series_group_id) : undefined,
         art: isMusic ? poster(parsed.album ?? parsed.artist ?? displayTitle, displayYear) : undefined,
       }
     : null;
@@ -211,7 +220,12 @@ export function apiToMediaFile(api: ApiMediaFile): MediaFile {
     bitDepth: parsed.bit_depth ?? undefined,
     hdr: parsed.hdr ?? undefined,
     channels: parsed.channels ?? undefined,
+    audioBitrate: typeof parsed.audio_bitrate === 'number' ? parsed.audio_bitrate : undefined,
+    sampleRate: typeof parsed.sample_rate === 'number' ? parsed.sample_rate : undefined,
+    audioBitDepth: typeof parsed.audio_bit_depth === 'number' ? parsed.audio_bit_depth : undefined,
+    lossless: typeof parsed.lossless === 'boolean' ? parsed.lossless : undefined,
     audio: Array.isArray(parsed.audio) ? parsed.audio : undefined,
+    durationSec: typeof parsed.duration === 'number' ? parsed.duration : undefined,
     audio_langs: Array.isArray(parsed.audio_langs) ? parsed.audio_langs : undefined,
     sub_langs: Array.isArray(parsed.sub_langs) ? parsed.sub_langs : undefined,
     // Backend-computed coverage gap (top-level, not in parsed_data). Keep only
@@ -244,6 +258,22 @@ function humanSize(bytes: number | null | undefined): string | undefined {
   return `${(bytes / KB).toFixed(0)} KB`;
 }
 
+/** Seconds → "m:ss" (music track length). */
+function fmtDuration(sec: number | null | undefined): string | undefined {
+  if (!sec || sec <= 0) return undefined;
+  const m = Math.floor(sec / 60), s = Math.round(sec % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+/** Extract the MusicBrainz release MBID from a music seriesGroupId
+ *  (`musicbrainz:<mbid>`), skipping the synthetic `loose:` group (no real MB
+ *  release → no link). */
+function mbReleaseId(gid: string | null | undefined): string | undefined {
+  if (!gid || !gid.startsWith('musicbrainz:')) return undefined;
+  const id = gid.slice('musicbrainz:'.length);
+  return id.startsWith('loose:') ? undefined : id;
+}
+
 /** Friendly title cased from the series_key tail when no match exists yet. */
 function titleFromKey(key: string | null | undefined, fallback: string): string {
   if (!key) return fallback;
@@ -253,6 +283,10 @@ function titleFromKey(key: string | null | undefined, fallback: string): string 
 }
 
 /** Build a LibraryItem from one or more MediaFiles. */
+/** Japanese/Chinese/Korean characters — used to prefer a readable (romaji/eng)
+ *  title over a CJK master name when a merged card has both to choose from. */
+const hasCjk = (s: string): boolean => /[぀-ヿ㐀-鿿가-힯]/.test(s);
+
 function buildItem(group: MediaFile[]): LibraryItem {
   const head = group[0];
   const isMovie = head.mediaType === 'movie';
@@ -260,9 +294,20 @@ function buildItem(group: MediaFile[]): LibraryItem {
   const kind: LibraryItem['kind'] = isMovie ? 'movie' : isMusic ? 'album' : 'series';
 
   // Use top-confidence file's match as the representative title for the card.
-  const repFile = [...group].sort((a, b) => (b.confidence || 0) - (a.confidence || 0))[0];
+  // Tiebreak on a readable title: when a merged AniDB+TVDB anime card has two
+  // equally-confident matches, prefer the non-CJK one so it reads "Modaete yo,
+  // Adam-kun", not the Japanese master "悶えてよ、アダムくん".
+  const repFile = [...group].sort((a, b) => {
+    const byConf = (b.confidence || 0) - (a.confidence || 0);
+    if (byConf !== 0) return byConf;
+    return (hasCjk(a.match?.title || '') ? 1 : 0) - (hasCjk(b.match?.title || '') ? 1 : 0);
+  })[0];
   const repMatch = repFile.match;
-  const title = repMatch?.title || titleFromKey(head.seriesKey, head.filename);
+  // Music cards are titled by the ALBUM / folder ("Singles") — the cover IS the
+  // group; its songs live inside the popup. TV/movie keep their match title.
+  const title = (isMusic && repMatch?.album)
+    ? repMatch.album
+    : (repMatch?.title || titleFromKey(head.seriesKey, head.filename));
   const year = repMatch?.year ?? null;
 
   // Synthesize episodes from each file's parsed season/episode.
@@ -271,12 +316,36 @@ function buildItem(group: MediaFile[]): LibraryItem {
   // absolute) and a Moozzi2 file (Nana-16 with absolute=16) of the same
   // episode created two separate entries, and the popup's single-file-
   // per-key lookup ended up orphaning one of them.
+  // Music dedup is by SONG, not track number. Loose singles often share a missing
+  // / placeholder track number from the backend (all "1"), but they are DIFFERENT
+  // songs — they must NOT collapse into one "duplicate" track (the 34-singles bug).
+  // When the track numbers collide, derive a distinct position per song (same
+  // title → same track = a genuine duplicate); real albums (distinct track
+  // numbers) are left untouched.
+  let musicEpByFile: Map<string, number> | null = null;
+  if (isMusic) {
+    const epCounts = new Map<number, number>();
+    group.forEach(f => { const e = f.match?.episode ?? 0; epCounts.set(e, (epCounts.get(e) ?? 0) + 1); });
+    if ([...epCounts.values()].some(c => c > 1)) {
+      const byFile = (musicEpByFile = new Map<string, number>());
+      let pos = 0;
+      const byTitle = new Map<string, number>();
+      group.forEach(f => {
+        const songKey = (f.match?.trackTitle || f.match?.title || '').trim().toLowerCase();
+        let epNo: number;
+        if (songKey && byTitle.has(songKey)) epNo = byTitle.get(songKey)!;     // same song → same track (a real dup)
+        else { epNo = ++pos; if (songKey) byTitle.set(songKey, epNo); }
+        byFile.set(f.id, epNo);   // local non-null ref — closure loses the narrowing
+      });
+    }
+  }
+
   const epMap = new Map<string, LibEpisode>();
   group.forEach(f => {
     if (kind === 'movie') return;
     const abs = f.match?.absoluteEpisode ?? null;
-    const season = f.match?.season ?? 1;
-    const episode = f.match?.episode ?? abs ?? null;
+    const season = isMusic ? 1 : (f.match?.season ?? 1);
+    const episode = (isMusic && musicEpByFile) ? (musicEpByFile.get(f.id) ?? null) : (f.match?.episode ?? abs ?? null);
     if (episode == null) return;
     const key = `${season}-${episode}`;
     const existing = epMap.get(key);
@@ -285,8 +354,12 @@ function buildItem(group: MediaFile[]): LibraryItem {
         season,
         episode,
         absolute: abs ?? undefined,
-        title: f.match?.episodeTitle || undefined,
-        track: isMusic ? (f.match?.track ?? episode ?? undefined) : undefined,
+        title: f.match?.episodeTitle || (isMusic ? (f.match?.trackTitle || f.match?.title) : undefined) || undefined,
+        track: isMusic ? episode : undefined,
+        duration: isMusic ? (fmtDuration(f.durationSec) ?? undefined) : undefined,
+        durationSec: isMusic ? f.durationSec : undefined,
+        artist: isMusic ? (f.match?.artist ?? undefined) : undefined,
+        coverUrl: isMusic ? (f.match?.posterUrl ?? null) : undefined,
       });
     } else {
       // Merge missing fields from a duplicate file into the existing entry.
@@ -311,6 +384,11 @@ function buildItem(group: MediaFile[]): LibraryItem {
     let matchedToEpisode: number | null = null;
     if (kind === 'movie') {
       matchedToEpisode = f.match ? 0 : null;
+    } else if (isMusic && musicEpByFile) {
+      // Music with colliding track numbers — map each file to its per-song track.
+      const epNo = musicEpByFile.get(f.id);
+      const targetIdx = epNo != null ? episodes.findIndex(e => e.season === 1 && e.episode === epNo) : -1;
+      matchedToEpisode = targetIdx >= 0 ? targetIdx : null;
     } else if (f.match) {
       const abs = f.match.absoluteEpisode ?? null;
       const ep = f.match.episode ?? null;
@@ -333,6 +411,10 @@ function buildItem(group: MediaFile[]): LibraryItem {
       bitDepth: f.bitDepth,
       hdr: f.hdr,
       channels: f.channels,
+      audioBitrate: f.audioBitrate,
+      sampleRate: f.sampleRate,
+      audioBitDepth: f.audioBitDepth,
+      lossless: f.lossless,
       audio: f.audio,
       audio_langs: f.audio_langs,
       sub_langs: f.sub_langs,
@@ -409,6 +491,17 @@ function buildItem(group: MediaFile[]): LibraryItem {
     ? `_${repMatch.provider}_${repMatch.providerId}${_seasonSuffix}`
     : '';
   const _idStem = head.seriesKey ? `lib_${head.seriesKey}` : `lib_${head.id}`;
+
+  // Music: the card's album/folder artist is the MOST COMMON track artist, not the
+  // rep file's — a "Singles" folder's rep may be a collab ("X & Justin Bieber"),
+  // which would mislabel the whole card. Counter over the group → the dominant.
+  let musicArtist: string | undefined;
+  if (isMusic) {
+    const counts = new Map<string, number>();
+    group.forEach(g => { const a = g.match?.artist?.trim(); if (a) counts.set(a, (counts.get(a) ?? 0) + 1); });
+    musicArtist = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? repFile.match?.artist ?? undefined;
+  }
+
   return {
     id: `${_idStem}${_matchSuffix}`,
     kind, mediaType: head.mediaType,
@@ -436,6 +529,7 @@ function buildItem(group: MediaFile[]): LibraryItem {
       ?? null,
     seriesGroupId: repMatch?.seriesGroupId ?? null,
     collectionName: repMatch?.collectionName ?? null,  // #14 movie collections
+    collectionId: repMatch?.collectionId ?? null,      // #14 collection band key
     // Per-cluster key (distinct from the franchise group id) — lets the
     // Review page re-find this exact item after a re-match shifts its id.
     seriesKey: head.seriesKey ?? null,
@@ -447,6 +541,7 @@ function buildItem(group: MediaFile[]): LibraryItem {
       tmdb:  repMatch?.provider === 'tmdb'  ? repMatch.providerId : undefined,
       tvdb:  repMatch?.provider === 'tvdb'  ? repMatch.providerId : undefined,
       anidb: repMatch?.provider === 'anidb' ? repMatch.providerId : undefined,
+      musicbrainz: isMusic ? repMatch?.mbid : undefined,   // release MBID → MusicBrainz ↗ link
     },
     episodes,
     files,
@@ -455,7 +550,7 @@ function buildItem(group: MediaFile[]): LibraryItem {
     overallStatus: allRejected ? 'rejected' : undefined,
     runtime: repMatch?.runtime,
     // Music fields
-    artist: isMusic ? repFile.match?.artist : undefined,
+    artist: musicArtist,
   };
 }
 
@@ -490,6 +585,12 @@ export function buildLibraryItems(files: MediaFile[]): LibraryItem[] {
       // collapses to ONE card with its episodes — Romance Dawn = one card, not 4.
       const seasonPart = f.match.season != null ? `|s${f.match.season}` : '';
       key = `pack|${f.match.seriesGroupId}${seasonPart}`;
+    } else if (f.mediaType === 'music' && f.match?.seriesGroupId) {
+      // Music: the provider_id is the per-TRACK recording MBID, so the generic
+      // `match|provider|providerId` key below would give every track its own card.
+      // Cluster by the ALBUM-level group id so a whole album OR a Singles folder
+      // collapses to ONE card; its songs live INSIDE the popup (music rows).
+      key = `album|${f.match.seriesGroupId}`;
     } else if (f.match?.provider && f.match.providerId) {
       // Per-season clustering: include the season number so Euphoria
       // S01 / S02 / S03 (all sharing TVDB id 360261) render as 3 cards
@@ -522,6 +623,104 @@ export function buildLibraryItems(files: MediaFile[]): LibraryItem[] {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key)!.push(f);
   });
-  return Array.from(groups.values()).map(buildItem);
+  const items = mergeDuplicateClusters(Array.from(groups.values())).map(buildItem);
+  markCrossAlbumDuplicates(items);
+  return items;
+}
+
+/** Music cross-album dedupe (flag-only). A "Singles" folder often re-includes
+ *  songs you already have on a real album (e.g. "Yummy" in Singles AND on
+ *  Changes). Index every song on a REAL album, then flag any LOOSE single whose
+ *  song matches one — so the row shows an "Also on <album>" badge instead of
+ *  silently presenting the duplicate as a distinct single. Keyed on song title +
+ *  album artist (so a different artist's same-titled song is NOT a false dup);
+ *  exact title only, so remixes ("Yummy (Country remix)") correctly DON'T match. */
+function markCrossAlbumDuplicates(items: LibraryItem[]): void {
+  const keyOf = (title: string | undefined | null, artist: string | undefined | null) =>
+    `${(title || '').trim().toLowerCase()}|${(artist || '').trim().toLowerCase()}`;
+  const onAlbum = new Map<string, string>();   // song key → album title
+  for (const it of items) {
+    if (it.kind !== 'album' || it.seriesGroupId?.includes(':loose:')) continue;   // REAL albums only
+    for (const e of it.episodes) {
+      if (e.title) onAlbum.set(keyOf(e.title, it.artist), it.title);
+    }
+  }
+  if (!onAlbum.size) return;
+  for (const it of items) {
+    if (it.kind !== 'album' || !it.seriesGroupId?.includes(':loose:')) continue;   // LOOSE singles only
+    for (const e of it.episodes) {
+      const alb = e.title ? onAlbum.get(keyOf(e.title, it.artist)) : undefined;
+      if (alb) e.dupOf = alb;
+    }
+  }
+}
+
+/**
+ * Merge cross-provider duplicate COPIES into ONE cluster before card-building.
+ * Two clusters in the same franchise (`seriesGroupId`) that cover the same
+ * (season, episode) via DIFFERENT providers are two copies of one show — e.g.
+ * Kira's earlier AniDB-organized copy plus a Sonarr `{tvdb-…}` re-download of the
+ * same eight episodes. Collapsing them into one group means the card carries BOTH
+ * files per episode, so Kira's existing per-episode dedupe procedure (pick the
+ * best, delete the rest) takes over — instead of leaving two separate cards.
+ *
+ * The cross-provider requirement keeps it honest: same-provider overlap is
+ * legitimately distinct content the provider numbered separately — Attack on
+ * Titan's seasons, Bleach's cours, One Piece's movies (all sharing a fabricated
+ * S1E1) — and is NEVER merged. Merging only happens when episode numbers already
+ * ALIGN (that IS the overlap), so the merged card's per-episode pairing is clean.
+ */
+export function mergeDuplicateClusters(groups: MediaFile[][]): MediaFile[][] {
+  // Per-cluster facts: franchise id, matched provider, covered (season,episode)s.
+  const facts = groups.map(g => {
+    const m = g.find(f => f.match)?.match;
+    const eps = new Set<string>();
+    for (const f of g) {
+      const e = f.match?.episode ?? f.match?.absoluteEpisode ?? null;
+      if (e != null) eps.add(`s${f.match?.season ?? 1}e${e}`);
+    }
+    return { gid: m?.seriesGroupId ?? null, provider: m?.provider ?? null, eps };
+  });
+
+  // Union-find: link clusters that share a franchise, DIFFER in provider, and
+  // overlap on an episode → one connected component = one merged group.
+  const parent = groups.map((_, i) => i);
+  const find = (i: number): number => {
+    let r = i;
+    while (parent[r] !== r) r = parent[r]!;
+    while (parent[i] !== r) { const n = parent[i]!; parent[i] = r; i = n; }
+    return r;
+  };
+  const union = (a: number, b: number) => { parent[find(a)] = find(b); };
+
+  const byGid = new Map<string, number[]>();
+  facts.forEach((f, i) => {
+    if (!f.gid) return;
+    const arr = byGid.get(f.gid);
+    if (arr) arr.push(i); else byGid.set(f.gid, [i]);
+  });
+  for (const idxs of byGid.values()) {
+    for (let a = 0; a < idxs.length; a++) {
+      for (let b = a + 1; b < idxs.length; b++) {
+        const ia = idxs[a]!, ib = idxs[b]!;
+        const A = facts[ia]!, B = facts[ib]!;
+        if (!A.provider || !B.provider || A.provider === B.provider) continue;  // same provider → not a copy
+        let overlap = false;
+        for (const k of A.eps) { if (B.eps.has(k)) { overlap = true; break; } }
+        if (overlap) union(ia, ib);
+      }
+    }
+  }
+
+  // Collect each component's files into one group, preserving first-seen order.
+  const byRoot = new Map<number, MediaFile[]>();
+  const order: number[] = [];
+  groups.forEach((g, i) => {
+    const r = find(i);
+    let arr = byRoot.get(r);
+    if (!arr) { arr = []; byRoot.set(r, arr); order.push(r); }
+    arr.push(...g);
+  });
+  return order.map(r => byRoot.get(r)!);
 }
 

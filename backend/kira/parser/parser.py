@@ -47,6 +47,12 @@ class ParsedFile:
     hdr: str | None = None
     bit_depth: str | None = None  # "10bit" | "8bit" | None — drives the dedupe ranker
     channels: str | None = None   # "5.1" | "7.1" | "2.0" — usually from MediaInfo (filenames rarely carry it)
+    # Music tech specs (MediaInfo audio track) — surfaced in the music popup rows.
+    # NOTE: `audio_bit_depth`, NOT `bit_depth` above (that's the VIDEO 10/8-bit dedupe key).
+    audio_bitrate: int | None = None      # kbps (lossy: nominal; lossless: average)
+    sample_rate: int | None = None        # Hz (44100, 96000)
+    audio_bit_depth: int | None = None    # bits (16, 24)
+    lossless: bool | None = None          # MediaInfo Compression_Mode == "Lossless"
     release_group: str | None = None
     # R2-H12: cour/part/arc sub-season hint detected from parent path
     # (e.g. `/Bleach/Season 17/Cour 1/`) OR from a filename "Part N" token
@@ -393,6 +399,82 @@ _NON_ARTIST_FOLDERS = {
     "media", "library", "albums", "artists", "rip", "rips",
 }
 
+# Bare "Artist - Title" single with NO track number (a loose download / blog rip /
+# YouTube rip). Spaces required on both sides of the dash so a hyphenated single
+# word ("Get-Lucky") isn't split. Tried LAST so it never hijacks a real numbered
+# "NN - Title" / "Artist - NN - Title".
+_MUSIC_BARE_SINGLE = re.compile(r"^(?P<artist>.+?)\s+[-–—]\s+(?P<title>.+)$")
+# A multi-disc subfolder ("CD 1", "Disc 02", "Vol. 1") — the real album/artist are
+# one level up, so we step over it.
+_DISC_FOLDER_RE = re.compile(r"^(?:cd|disc|disk|vol|volume)\s*[-_.]?\s*\d{1,2}$", re.IGNORECASE)
+# A leading date prefix on a folder. The separator is OPTIONAL when the year is
+# bracketed (the common scene style "(YYYY) Artist - Album" / "[1994] Nas - …"); a
+# BARE year requires a dash so band names like "1975 Something" aren't misread.
+_FOLDER_YEAR_PREFIX = re.compile(r"^([\(\[]\d{4}[\)\]])\s*[-–—]?\s*(.+)$|^(\d{4})\s*[-–—]\s*(.+)$")
+# Technical [scene] brackets ([FLAC], [WEB], [V0], [320kbps], [WEB-DL]) — stripped
+# from a folder name, but a [YYYY] year bracket is KEPT for the year extractor.
+_SCENE_BRACKET_RE = re.compile(r"\s*\[(?!\d{4}\])[^\]]*\]\s*")
+
+
+def _akey(s: str | None) -> str:
+    """Alphanumeric-only lowercase key for fuzzy artist comparison — 'Jay - Z' and
+    'Jay-Z' both collapse to 'jayz', so a hyphenated artist in the filename is
+    recognised as the folder's artist rather than split into artist/album."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def _strip_album_year(album: str) -> tuple[str, int | None]:
+    """Pull a (YYYY)/[YYYY] year out of an album name and trim that suffix so the
+    rendered path doesn't double up ("Abbey Road (1969)" → "Abbey Road", 1969)."""
+    year: int | None = None
+    m = re.search(r"[\(\[](\d{4})[\)\]]", album)
+    if m and 1900 <= int(m.group(1)) <= 2100:
+        year = int(m.group(1))
+    cleaned = re.sub(r"\s*[\(\[]\d{4}[\)\]]\s*$", "", album).strip() or album
+    return cleaned, year
+
+
+def _music_folder_meta(parent_path: str) -> tuple[str | None, str | None, int | None]:
+    """Artist / album / year from the directory — the structural BASELINE that
+    disambiguates the filename. Steps over a multi-disc subfolder, strips scene
+    brackets, and handles a leading date prefix, so the folder reads as clean
+    canonical metadata rather than a poisoned scene/disc string."""
+    if not parent_path:
+        return None, None, None
+    parent_dir = Path(parent_path)
+    # Step over a "CD 1" / "Disc 2" disc subfolder → album/artist are one level up.
+    if _DISC_FOLDER_RE.match(parent_dir.name):
+        parent_dir = parent_dir.parent
+    # Strip technical [scene] brackets (keeps a [YYYY] year + any (Deluxe) parens).
+    name = _SCENE_BRACKET_RE.sub(" ", parent_dir.name)
+    name = re.sub(r"\s{2,}", " ", name).strip()
+    year: int | None = None
+    if m := _FOLDER_YEAR_PREFIX.match(name):
+        ystr = m.group(1) or m.group(3)
+        rest = m.group(2) or m.group(4)
+        y = int(re.sub(r"\D", "", ystr))
+        if 1900 <= y <= 2100:
+            year, name = y, rest.strip()
+    artist: str | None = None
+    album: str | None = None
+    if " - " in name:
+        a, b = name.split(" - ", 1)
+        artist = a.strip().replace("_", " ") or None
+        album = b.strip().replace("_", " ") or None
+    else:
+        album = name.replace("_", " ").strip() or None
+        gp = parent_dir.parent.name if str(parent_dir.parent) != str(parent_dir) else ""
+        if gp and gp.lower() not in _NON_ARTIST_FOLDERS:
+            artist = gp.replace("_", " ").strip() or None
+    # A generic container folder ("Downloads" / "Music") is not a real album.
+    if album and album.lower() in _NON_ARTIST_FOLDERS:
+        album = None
+    if album:
+        album, suffix_year = _strip_album_year(album)
+        if year is None:
+            year = suffix_year
+    return artist, album, year
+
 
 def _parse_music(filename: str, parent_path: str) -> ParsedFile:
     stem = Path(filename).stem
@@ -400,21 +482,33 @@ def _parse_music(filename: str, parent_path: str) -> ParsedFile:
     norm = re.sub(r"[_]+", " ", stem)
     norm = re.sub(r"\s{2,}", " ", norm).strip()
 
+    # Structural BASELINE from the directory FIRST. Establishing clean folder
+    # artist/album/year up front lets the filename parse DISAMBIGUATE against it
+    # (a hyphenated artist "Jay - Z" in the filename is recognised, not split into
+    # artist/album) and keeps disc subfolders / scene tags / date prefixes from
+    # poisoning the result.
+    dir_artist, dir_album, dir_year = _music_folder_meta(parent_path)
+
     artist: str | None = None
     album: str | None = None
     track: int | None = None
     track_title: str | None = None
 
     if m := _MUSIC_TRACK_ANCHOR.match(norm):
-        # Found "<prefix> - NN - <title>". Split prefix from the RIGHT so
-        # hyphenated artist names stay together.
+        # "<prefix> - NN - <title>". Split the prefix from the RIGHT so hyphenated
+        # artist names survive — but ONLY when the prefix isn't itself just the
+        # folder's artist ("Jay - Z"), which we keep whole instead of fracturing
+        # into artist "Jay" / album "Z".
         prefix = m.group("pre").strip()
         track = int(m.group("n"))
         track_title = m.group("title").strip()
         if " - " in prefix:
-            a, b = prefix.rsplit(" - ", 1)
-            artist = a.strip().title()
-            album = b.strip().title()
+            if dir_artist and _akey(prefix) == _akey(dir_artist):
+                artist = dir_artist
+            else:
+                a, b = prefix.rsplit(" - ", 1)
+                artist = a.strip().title()
+                album = b.strip().title()
         else:
             artist = prefix.title()
     elif m := _MUSIC_TRACK_TITLE.match(norm):
@@ -422,44 +516,25 @@ def _parse_music(filename: str, parent_path: str) -> ParsedFile:
         track_title = m.group("title").strip()
     elif m := _MUSIC_TRACK_ONLY.match(norm):
         track = int(m.group("n"))
+    elif m := _MUSIC_BARE_SINGLE.match(norm):
+        # Bare "Artist - Title" single (no track number — a loose download). Trust
+        # it for artist + title only; any real album still comes from the folder.
+        artist = m.group("artist").strip().title()
+        track_title = m.group("title").strip()
 
-    # Fall back to parent folder structure for artist/album when filename
-    # didn't supply them. The canonical layout is `Artist / Album / NN.mp3`,
-    # so we walk up one level too.
-    if (artist is None or album is None) and parent_path:
-        parent_dir = Path(parent_path)
-        parent_name = parent_dir.name
-        if " - " in parent_name:
-            # "Artist - Album" all-in-one folder.
-            a, b = parent_name.split(" - ", 1)
-            if artist is None:
-                artist = a.strip().replace("_", " ")
-            if album is None:
-                album = b.strip().replace("_", " ")
-        else:
-            # Album folder. Grandparent is usually the artist.
-            if album is None and parent_name:
-                album = parent_name.replace("_", " ").strip()
-            if artist is None:
-                gp_name = parent_dir.parent.name if str(parent_dir.parent) != str(parent_dir) else ""
-                if gp_name and gp_name.lower() not in _NON_ARTIST_FOLDERS:
-                    artist = gp_name.replace("_", " ").strip()
+    # Merge: the folder baseline fills whatever the filename didn't supply.
+    if artist is None:
+        artist = dir_artist
+    if album is None:
+        album = dir_album
+    year_extracted: int | None = dir_year
 
-    # Fix #12: extract year from the album folder name when present.
-    # Album folders commonly include the release year as `Abbey Road (1969)`
-    # or `Rumours [1977]`. Without this, the music template renders an
-    # empty `()` in the album path (`Beatles/Abbey Road ()/01 - ...`).
-    # We strip the year suffix from the album name too so the rendered
-    # path doesn't double up.
-    year_extracted: int | None = None
-    if album:
-        m_year = re.search(r"[\(\[](\d{4})[\)\]]", album)
-        if m_year:
-            y = int(m_year.group(1))
-            if 1900 <= y <= 2100:
-                year_extracted = y
-                # Trim the (YYYY) suffix from album so {y} owns it.
-                album = re.sub(r"\s*[\(\[]\d{4}[\)\]]\s*$", "", album).strip() or album
+    # Year suffix on a FILENAME-derived album ("Abbey Road (1969)") — a folder-derived
+    # album already had its year stripped inside _music_folder_meta.
+    if album and year_extracted is None:
+        album, year_extracted = _strip_album_year(album)
+    elif album:
+        album, _suffix_year = _strip_album_year(album)
 
     confidence = 0.0
     if artist and album and track_title:
