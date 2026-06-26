@@ -12,11 +12,10 @@ services:
       # SQLite DB + persisted state. Keep this to survive container recreation.
       - ./config:/config
       # YOUR media library — mounted read-write so Kira can rename/move in place.
-      # This is the NAS-local path behind the SMB share \\192.168.0.63\Data.
-      # On DietPi that's the `path =` under [Data] in /etc/samba/smb.conf —
-      # usually /mnt/Data. Override KIRA_MEDIA_HOST in Portainer's env if it
-      # maps somewhere else (e.g. /mnt/dietpi_userdata/Data).
-      - ${KIRA_MEDIA_HOST:-/mnt/Data}:/media
+      # This is the NAS-local path behind the SMB share \\192.168.0.63\Data —
+      # confirmed from `path =` under [Data] in DietPi's /etc/samba/smb.conf.
+      # Override KIRA_MEDIA_HOST in Portainer's env to point elsewhere.
+      - ${KIRA_MEDIA_HOST:-/mnt/dietpi_userdata/data}:/media
     environment:
       - KIRA_DATABASE_URL=sqlite+aiosqlite:////config/kira.db
       - KIRA_MEDIA_ROOT=/media
