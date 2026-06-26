@@ -19,6 +19,7 @@ import asyncio
 import gzip
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -66,8 +67,16 @@ _USER_AGENT = KIRA_USER_AGENT
 # touching code. Format is JSON per event — see `_http_api` for shape.
 _anidb_log = logging.getLogger("kira.anidb")
 
-# Per-process cache directory. .cache/ is git-ignored.
-_CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache"
+# Cache directory. Defaults to a repo-local .cache/ (git-ignored) for dev, but
+# honors KIRA_CACHE_DIR so a container can point it at the PERSISTED /config
+# volume. This matters: the AniDB title dump + the `anidb-relations.json`
+# franchise sequel-chains live here, and the relations cache is what folds all
+# seasons of a show into ONE library card. If the cache sits on the container's
+# ephemeral layer, every image rebuild wipes it → Kira must re-walk every
+# franchise via live AniDB calls → a library-wide re-match trips AniDB's
+# rate-limit ban → the walk falls back to per-season ids → season grouping
+# silently breaks until it heals. Persisting it under /config prevents that.
+_CACHE_DIR = Path(os.environ.get("KIRA_CACHE_DIR") or (Path(__file__).resolve().parents[2] / ".cache"))
 _TITLES_PATH = _CACHE_DIR / "anidb-titles.xml.gz"
 _TITLES_URL = "https://anidb.net/api/anime-titles.xml.gz"
 _TITLE_MAX_AGE_SEC = 24 * 3600  # AniDB regenerates daily; refresh same cadence.

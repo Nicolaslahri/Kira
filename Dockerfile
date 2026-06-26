@@ -49,6 +49,7 @@ ENV KIRA_FRONTEND_DIST=/app/frontend/dist \
     KIRA_DATABASE_URL=sqlite+aiosqlite:////config/kira.db \
     KIRA_MEDIA_ROOT=/media \
     KIRA_BROWSE_ROOT=/media \
+    KIRA_CACHE_DIR=/config/.cache \
     PYTHONUNBUFFERED=1
 
 # /config persists the SQLite DB + settings; /media is the library (mounted rw
