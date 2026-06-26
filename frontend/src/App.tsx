@@ -380,6 +380,9 @@ export default function App() {
   // in-flight scan (the mount effect below, after a page refresh) drive the
   // exact same progress UI — no duplicated/drifting poll logic.
   const trackScan = useCallback(async (scanId: number) => {
+    // Claim the banner for this loop; any earlier loop sees the token change and
+    // bails on its next tick, so two loops can never write progress at once.
+    const myToken = ++activePollRef.current;
     try {
       // PB-4: baseline for ETA math. Watchdog baseline too (bumped each cycle).
       scanStartedAtRef.current = Date.now();
@@ -392,8 +395,11 @@ export default function App() {
       // the scan worker. Gating on matched_count kills that flood.
       let lastMatched = -1;
       let lastCount = -1;
+      let stopped = false;
       while (!done) {
         await new Promise(r => setTimeout(r, 800));
+        // Superseded by a newer scan/reparse loop — stop writing banner state.
+        if (activePollRef.current !== myToken) return;
         let s: Awaited<ReturnType<typeof api.getScan>>;
         try {
           s = await api.getScan(scanId);
@@ -448,6 +454,21 @@ export default function App() {
           const partial = s.status === 'completed_partial' ? ' (partial — see notifications)' : '';
           msg = `${s.file_count} files · ${s.matched_count} matched${partial}`;
           done = true;
+        } else if (s.status === 'cancelled') {
+          // Stop button (or a forced stale-lock release). The worker keeps what
+          // it found — show that, then let the banner clear. MUST end the loop:
+          // 'cancelled' matches no in-progress branch, so without this the loop
+          // would spin forever re-asserting 'scanning' and flicker against the
+          // next scan's loop (and `scanRunning` would never clear → stuck Stop).
+          phase = 'done';
+          pct = Math.min(100, pct);
+          msg = `Stopped · ${s.file_count} files, ${s.matched_count} matched`;
+          done = true;
+          stopped = true;
+        } else if (s.status !== 'scanning' && s.status !== 'matching' && s.status !== 'pending') {
+          // Any other unrecognized terminal status — never keep polling blindly.
+          done = true;
+          stopped = true;
         }
         setState(st => ({ ...st, scanProgress: pct, scanFound: s.file_count, scanMessage: msg, scanPhase: phase }));
         lastProgressAtRef.current = Date.now();
@@ -456,7 +477,7 @@ export default function App() {
       await refreshFiles();
       const final = await api.getScan(scanId);
       pushToast({
-        title: 'Scan complete',
+        title: stopped ? 'Scan stopped' : 'Scan complete',
         sub: `${final.file_count} files · ${final.matched_count} matched`,
         kind: 'success',
       });
@@ -469,12 +490,17 @@ export default function App() {
         kind: 'error',
       });
     } finally {
-      // Narrate the detached tech-tag pass as the popup's 3rd line, holding the
-      // popup open until it finishes (feature off → returns at once). Wrapped so
-      // it can never block the banner from clearing.
-      try { await narrateTechTail(t => setState(s => ({ ...s, scanTech: t })), techTagsOnRef.current, dismissJob); } catch { /* ignore */ }
-      // Brief delay so the user sees the final state before the banner disappears.
-      setTimeout(() => setState(s => ({ ...s, scanRunning: false, scanTech: null })), 1600);
+      // Only tear down the banner if we're still the active loop. A superseded
+      // loop (a newer scan took over) must NOT narrate or clear — its delayed
+      // setState would hide the live scan's progress 1.6s from now.
+      if (activePollRef.current === myToken) {
+        // Narrate the detached tech-tag pass as the popup's 3rd line, holding the
+        // popup open until it finishes (feature off → returns at once). Wrapped so
+        // it can never block the banner from clearing.
+        try { await narrateTechTail(t => setState(s => ({ ...s, scanTech: t })), techTagsOnRef.current, dismissJob); } catch { /* ignore */ }
+        // Brief delay so the user sees the final state before the banner disappears.
+        setTimeout(() => { if (activePollRef.current === myToken) setState(s => ({ ...s, scanRunning: false, scanTech: null })); }, 1600);
+      }
     }
   }, [pushToast, refreshFiles]);
 
@@ -671,13 +697,17 @@ export default function App() {
         : scope?.file_ids ? 'Re-parsing selected…'
         : 'Re-parsing library…',
     }));
+    const myToken = ++activePollRef.current;
     try {
       scanStartedAtRef.current = Date.now();
       lastProgressAtRef.current = Date.now();
       const scan = await api.reparseLibrary(scope);
       let done = false;
+      let stopped = false;
       while (!done) {
         await new Promise(r => setTimeout(r, 800));
+        // Superseded by a newer scan/reparse loop — stop writing banner state.
+        if (activePollRef.current !== myToken) return;
         let s: typeof scan;
         try { s = await api.getScan(scan.id); } catch { continue; }
         try {
@@ -711,6 +741,16 @@ export default function App() {
           pct = 100;
           msg = `Done · ${s.file_count} files, ${s.matched_count} matched`;
           done = true;
+        } else if (s.status === 'cancelled') {
+          // Stopped mid-reparse — end the loop (mirrors trackScan; without this
+          // it spins forever on 'cancelled' and flickers against the next scan).
+          phase = 'done';
+          msg = `Stopped · ${s.file_count} files, ${s.matched_count} matched`;
+          done = true;
+          stopped = true;
+        } else if (s.status !== 'scanning' && s.status !== 'matching' && s.status !== 'pending') {
+          done = true;
+          stopped = true;
         }
         setState(st => ({ ...st, scanProgress: pct, scanFound: s.file_count, scanMessage: msg, scanPhase: phase }));
         lastProgressAtRef.current = Date.now();
@@ -718,7 +758,7 @@ export default function App() {
       await refreshFiles();
       const final = await api.getScan(scan.id);
       pushToast({
-        title: 'Re-parse complete',
+        title: stopped ? 'Re-parse stopped' : 'Re-parse complete',
         sub: `${final.file_count} files · ${final.matched_count} matched`,
         kind: 'success',
       });
@@ -731,10 +771,13 @@ export default function App() {
         kind: 'error',
       });
     } finally {
-      // Re-parse also spawns the tech-tag pass over the whole library — narrate
-      // it as the popup's 3rd line too, so the read isn't an invisible pill.
-      try { await narrateTechTail(t => setState(s => ({ ...s, scanTech: t })), techTagsOnRef.current, dismissJob); } catch { /* ignore */ }
-      setTimeout(() => setState(s => ({ ...s, scanRunning: false, scanTech: null })), 1600);
+      // Superseded loops must not tear down the banner — see trackScan.
+      if (activePollRef.current === myToken) {
+        // Re-parse also spawns the tech-tag pass over the whole library — narrate
+        // it as the popup's 3rd line too, so the read isn't an invisible pill.
+        try { await narrateTechTail(t => setState(s => ({ ...s, scanTech: t })), techTagsOnRef.current, dismissJob); } catch { /* ignore */ }
+        setTimeout(() => { if (activePollRef.current === myToken) setState(s => ({ ...s, scanRunning: false, scanTech: null })); }, 1600);
+      }
     }
   }, [state.scanRunning, pushToast, refreshFiles]);
 
@@ -940,6 +983,13 @@ export default function App() {
   // check (no in-flight scan to defer to). On subsequent runs, scan
   // starts by bumping it to Date.now() so the watchdog has a baseline.
   const lastProgressAtRef = useRef<number>(0);
+  // Identity of the scan/reparse the progress banner currently belongs to. Each
+  // poll loop stamps this when it starts and bails the moment it no longer
+  // matches — so a stale loop (e.g. one left spinning on a cancelled scan, or a
+  // re-attach that raced a fresh Scan-now) can't keep writing banner state and
+  // flicker against the live loop. Bumped via a monotonic token, not the scan
+  // id, so even adopting the SAME scan id from two paths resolves to one winner.
+  const activePollRef = useRef(0);
   const renameFilesDirectly = useCallback(async (fileIds: string[], opts?: { profile?: string; op?: string }): Promise<void> => {
     const backendIds = fileIds.map(Number).filter(Number.isFinite);
     if (backendIds.length === 0) return;

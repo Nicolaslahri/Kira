@@ -14,6 +14,16 @@ from kira.providers.factory import IMPLEMENTED_PROVIDERS, KEYLESS_PROVIDERS
 
 router = APIRouter(prefix="/providers", tags=["providers"])
 
+# Music providers whose feature IS live but is served by the standalone
+# kira.music pipeline (match_album), NOT by build_provider — so they're absent
+# from factory.IMPLEMENTED_PROVIDERS (that set means "build_provider supports
+# it"). Listed here so the discovery endpoint reports them as implemented and
+# their Connections cards read "Connected" instead of "Coming soon".
+#  - musicbrainz: keyless (User-Agent only).
+#  - acoustid: ships a bundled app key (acoustid.PROJECT_KEY), so it's always
+#    usable out of the box; a personal providers.acoustid.api_key is optional.
+_FEATURE_IMPLEMENTED: set[str] = {"musicbrainz", "acoustid"}
+
 
 class ProviderInfo(BaseModel):
     key: str                  # 'tmdb' | 'tvdb' | 'anidb' | 'musicbrainz' | 'acoustid'
@@ -70,8 +80,15 @@ async def list_providers() -> list[ProviderInfo]:
         registry = await registry_from_settings(client)
         for entry in _CATALOGUE:
             key = entry["key"]
-            implemented = key in IMPLEMENTED_PROVIDERS
-            configured = implemented and registry.has(key)  # type: ignore[arg-type]
+            implemented = key in IMPLEMENTED_PROVIDERS or key in _FEATURE_IMPLEMENTED
+            if key == "acoustid":
+                # Bundled app key → configured out of the box (personal key optional).
+                configured = implemented
+            elif key in KEYLESS_PROVIDERS:
+                # No user credential needed → usable as soon as it's implemented.
+                configured = implemented
+            else:
+                configured = implemented and registry.has(key)  # type: ignore[arg-type]
             info = ProviderInfo(
                 key=key,
                 name=entry["name"],
