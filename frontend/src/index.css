@@ -4442,7 +4442,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   padding: 36px;
 }
 .cx-overlay.opening {
-  background: var(--scrim-60);
+  background: var(--scrim-75);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
 }
@@ -6189,7 +6189,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   background:
     radial-gradient(110% 75% at 0% 0%, color-mix(in srgb, var(--hue-a, var(--panel)) 26%, transparent), transparent 58%),
     radial-gradient(95% 75% at 100% 100%, color-mix(in srgb, var(--hue-b, var(--panel)) 16%, transparent), transparent 58%),
-    var(--panel-75) !important;
+    var(--panel-90) !important;
   border-color: var(--border-2) !important;
 }
 
