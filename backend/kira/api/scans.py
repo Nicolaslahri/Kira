@@ -3225,6 +3225,20 @@ async def _reparse_worker_locked(scan_id: int, media_type: str | None = None, fi
     async with _SCAN_LOCK:
         try:
             await _reparse_worker(scan_id, media_type, file_ids)
+        except asyncio.CancelledError:
+            # User clicked Stop. Mark the scan 'cancelled' and KEEP whatever was
+            # re-parsed / re-matched so far (re-parse never deletes rows). Re-raise
+            # so the task ends cancelled; the finally still releases the lock.
+            try:
+                async with SessionLocal() as _cx_sess:
+                    _cx = await _cx_sess.get(Scan, scan_id)
+                    if _cx is not None and _cx.status in ("scanning", "matching"):
+                        _cx.status = "cancelled"
+                        _cx.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                        await _cx_sess.commit()
+            except Exception as _ce:
+                logger.warning(f"_reparse_worker_locked: marking cancelled failed: {_ce!r}")
+            raise
         finally:
             try:
                 await _release_db_scan_lock()
@@ -3241,7 +3255,6 @@ class ReparseScope(BaseModel):
 
 @router.post("/reparse", response_model=ScanOut, status_code=201)
 async def reparse_library(
-    background: BackgroundTasks,
     scope: ReparseScope | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> Scan:
@@ -3284,7 +3297,18 @@ async def reparse_library(
         session.add(scan)
         await session.commit()
         await session.refresh(scan)
-        background.add_task(_reparse_worker_locked, scan.id, media_type, file_ids)
+        # Track the worker in _SCAN_TASKS (exactly like _start_scan) so the Stop
+        # button can cancel it. FastAPI BackgroundTasks are NOT cancellable and
+        # were never registered here — so cancel_scan fell through to its stale-
+        # lock path, which 500'd on the SQLite write lock the live worker still
+        # held AND never told the worker to stop (it kept re-stamping 'matching',
+        # so the scan could neither stop nor let a new one start). spawn_tracked +
+        # registration makes Stop hit the real task.cancel() path instead.
+        task = spawn_tracked(
+            _reparse_worker_locked(scan.id, media_type, file_ids), label="reparse_worker",
+        )
+        _SCAN_TASKS[scan.id] = task
+        task.add_done_callback(lambda t, sid=scan.id: _SCAN_TASKS.pop(sid, None))
         return scan
     except Exception:
         try:
