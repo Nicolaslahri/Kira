@@ -33,7 +33,7 @@ _BASE = "https://api.acoustid.org/v2"
 # the box (an AcoustID app key identifies the app for rate-limiting; it is NOT a
 # secret credential, same as the bundled fanart.tv project key). A
 # `providers.acoustid.api_key` setting overrides it.
-PROJECT_KEY = "Icu2xFDuTY"
+PROJECT_KEY = "260j83KoWt"
 # AcoustID's free tier allows ~3 lookups/sec; pace ourselves so a folder of
 # untagged files doesn't trip the limiter (a single module-level gate).
 _MIN_INTERVAL = 0.34
