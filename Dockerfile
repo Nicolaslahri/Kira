@@ -25,11 +25,13 @@ RUN npm run build
 FROM python:3.12-slim AS runtime
 
 # ffmpeg → embedded-subtitle extraction (kira/subtitles/embedded.py).
-# libmediainfo → real resolution/codec/HDR/audio reads (pymediainfo). Both are
-# optional at runtime (the app degrades to filename-only if absent) but cheap to
-# include so the MediaInfo + embedded-subs features work out of the box.
+# libmediainfo → real resolution/codec/HDR/audio reads (pymediainfo).
+# libchromaprint-tools → fpcalc for AcoustID audio fingerprinting (untagged music).
+# All optional at runtime (the app degrades gracefully if absent) but cheap to
+# include so MediaInfo, embedded-subs, and AcoustID work out of the box on every
+# arch (amd64 + arm64) and survive image rebuilds — no in-container download.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg libmediainfo0v5 \
+    && apt-get install -y --no-install-recommends ffmpeg libmediainfo0v5 libchromaprint-tools \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
