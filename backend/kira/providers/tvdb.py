@@ -21,6 +21,12 @@ from kira.providers.base import (
     TVResult,
 )
 
+# Kira's registered TheTVDB v4 APPLICATION key — ships so TV/anime metadata
+# works out of the box (a TVDB project key identifies the app for its
+# negotiated-contract quota; it is NOT a per-user secret, same as the bundled
+# AcoustID and fanart.tv keys). A `providers.tvdb.api_key` setting overrides it.
+DEFAULT_API_KEY = "d8908ce5-36cc-4afa-9f64-6b49740b025f"
+
 
 class TVDBProvider(MetadataProvider):
     key: ClassVar[ProviderKey] = "tvdb"

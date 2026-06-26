@@ -1735,7 +1735,10 @@ async def registry_from_settings(client: httpx.AsyncClient) -> ProviderRegistry:
             mode=ProviderMode.DIRECT, api_key=tmdb_key,
             tmdb_language=_tmdb_language_code(db.get("providers.tmdb.language")),
         )
-    tvdb_key = db.get("providers.tvdb.api_key") or settings.tvdb_api_key
+    # DB (UI) > env > bundled default key, so TVDB works out of the box while
+    # still letting a user override with their own key. See tvdb.DEFAULT_API_KEY.
+    from kira.providers.tvdb import DEFAULT_API_KEY as _TVDB_DEFAULT_KEY
+    tvdb_key = db.get("providers.tvdb.api_key") or settings.tvdb_api_key or _TVDB_DEFAULT_KEY
     if tvdb_key:
         configs["tvdb"] = ProviderConfig(
             mode=ProviderMode.DIRECT, api_key=tvdb_key,
