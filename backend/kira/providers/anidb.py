@@ -743,6 +743,16 @@ class AniDBProvider(MetadataProvider):
         if aid in cache:
             return cache[aid]
 
+        # AniDB banned → don't walk. Every _http_api hop below already no-ops to
+        # None under the ban, so the walk can only ever collapse to the seed AID
+        # anyway. Bail to cache-only: any franchise we've previously resolved is
+        # returned from the cache check above and STILL groups correctly while
+        # banned; a never-before-seen franchise just can't be resolved until the
+        # ban lifts (impossible without the API). This skips the pointless,
+        # 5s-gated no-op loop so a re-match under a ban stays fast and quiet.
+        if AniDBProvider.is_banned():
+            return []
+
         visited: set[int] = set()
         queue: list[str] = [aid]
         # ── KI-8: skip-and-continue on a missing related AID ───────────
