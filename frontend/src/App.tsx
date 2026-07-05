@@ -716,12 +716,18 @@ export default function App() {
   }, []);
 
   const runScan = useCallback(async (reason?: string) => {
+    // Only a STRING reason overrides the banner text. The sidebar/dashboard
+    // Scan buttons wire `onClick={onScan}`, which hands React's MouseEvent in
+    // as the first arg — and a non-string `reason` used to land in
+    // `scanMessage`, so React tried to render an event object ("Objects are
+    // not valid as a React child") and the whole page went blank until reload.
+    const scanReason = typeof reason === 'string' ? reason : undefined;
     // Synchronous guard FIRST — set before any await so a double-click or a
     // second caller in the same tick can never both reach createScan.
     if (scanStartInFlightRef.current) return;
     scanStartInFlightRef.current = true;
     try {
-      await runScanInner(reason);
+      await runScanInner(scanReason);
     } finally {
       scanStartInFlightRef.current = false;
     }
