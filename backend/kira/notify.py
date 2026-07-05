@@ -28,6 +28,20 @@ _log = logging.getLogger("kira.notify")
 _TIMEOUT = 8.0
 
 
+def _truncate_markdown(content: str, limit: int = 1900) -> str:
+    """Truncate to `limit` without cutting inside a `**bold**` run (which would
+    leave dangling asterisks rendering as literal `*` in Discord)."""
+    if len(content) <= limit:
+        return content
+    cut = content[:limit]
+    # If the number of `**` markers is odd, we cut mid-bold — trim back to the
+    # last complete marker and add an ellipsis.
+    if cut.count("**") % 2 == 1:
+        last = cut.rfind("**")
+        cut = cut[:last]
+    return cut.rstrip() + " …"
+
+
 async def _post_discord(webhook_url: str, kind: str, title: str, body: str | None) -> None:
     # Discord webhooks take a `content` field (markdown). Prefix with an emoji
     # by severity so it's scannable in a busy channel.
@@ -36,19 +50,24 @@ async def _post_discord(webhook_url: str, kind: str, title: str, body: str | Non
     if body:
         content += f"\n{body}"
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        await client.post(webhook_url, json={"content": content[:1900]})
+        r = await client.post(webhook_url, json={"content": _truncate_markdown(content)})
+    # Raise on 4xx/5xx so fan_out records the FAILURE instead of counting a
+    # dropped message as sent: a regenerated/deleted webhook 404s, and a
+    # message burst that trips Discord's 30/min webhook cap 429s.
+    r.raise_for_status()
 
 
 async def _post_generic(webhook_url: str, kind: str, title: str, body: str | None) -> None:
     # A plain JSON envelope any generic receiver (Apprise, n8n, a custom
     # script) can consume.
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        await client.post(webhook_url, json={
+        r = await client.post(webhook_url, json={
             "source": "kira",
             "kind": kind,
             "title": title,
             "body": body or "",
         })
+    r.raise_for_status()
 
 
 async def fan_out(kind: str, title: str, body: str | None = None) -> list[str]:
@@ -74,6 +93,9 @@ async def fan_out(kind: str, title: str, body: str | None = None) -> list[str]:
             sent.append("discord")
         except ValueError as e:  # unsafe URL — distinct from a transport failure
             _log.warning("notify: discord webhook rejected: %s", e)
+        except httpx.HTTPStatusError as e:
+            _log.warning("notify: discord push failed HTTP %s (webhook deleted or rate-limited?)",
+                         e.response.status_code)
         except Exception as e:  # noqa: BLE001
             _log.warning("notify: discord push failed: %r", e)
     if generic:
@@ -83,6 +105,8 @@ async def fan_out(kind: str, title: str, body: str | None = None) -> list[str]:
             sent.append("webhook")
         except ValueError as e:
             _log.warning("notify: generic webhook rejected: %s", e)
+        except httpx.HTTPStatusError as e:
+            _log.warning("notify: generic push failed HTTP %s", e.response.status_code)
         except Exception as e:  # noqa: BLE001
             _log.warning("notify: generic push failed: %r", e)
     return sent

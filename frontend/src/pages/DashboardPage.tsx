@@ -73,7 +73,7 @@ function Card({ title, icon, action, divider, className, bodyClassName, children
   const hasHeader = title != null || action != null;
   return (
     <section className={cn(
-      'relative flex flex-col overflow-hidden rounded-xl bg-secondary shadow-xs ring-1 ring-inset ring-secondary',
+      'dash-lift relative flex flex-col overflow-hidden rounded-xl bg-secondary shadow-xs ring-1 ring-inset ring-secondary',
       className,
     )}>
       {hasHeader ? (
@@ -224,7 +224,15 @@ function SubtitleCoverageCard({ setActive }: { setActive: (p: 'dashboard' | 'rev
   const [note, setNote] = useState<string | null>(null);
 
   const load = () => { void api.subtitleCoverage().then(setCov).catch(() => {}); };
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    // Refresh when subtitle work lands elsewhere ("Get all" backfill finishes,
+    // a per-file fetch completes) — the tile used to stay stale until a full
+    // page remount even though the numbers had changed on disk.
+    const onChange = () => load();
+    window.addEventListener('kira:files-changed', onChange);
+    return () => window.removeEventListener('kira:files-changed', onChange);
+  }, []);
 
   if (!cov || cov.inspected === 0) return null;
 
@@ -318,7 +326,12 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
   // setState after unmount.
   useEffect(() => {
     let cancelled = false;
+    let inFlight = false;   // reentrancy guard: a slow backend (>10s across the
+    // sequential requests) let interval ticks pile up overlapping loads, and an
+    // OLDER response could overwrite a newer one.
     const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try { const h = await api.listHistory({ period: 'all' }); if (!cancelled) setHistory(h); } catch { /* */ }
       try { const c = await api.historyCounts(); if (!cancelled) setTotalRenames(c.all); } catch { /* */ }
       try { const n = await api.listNotifications(); if (!cancelled) setNotifications(n); } catch { /* */ }
@@ -340,6 +353,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
         if (!cancelled) setProviderStatus(s => ({ ...s, tmdb: 'fail', tvdb: 'fail' }));
       }
       if (!cancelled) setActivityHydrated(true);
+      inFlight = false;
     };
     void load();
     const t = setInterval(load, 10_000);
@@ -533,6 +547,21 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
                       {label}
                     </button>
                   ))}
+                  {/* Lighter than Re-parse: keeps parse data, just re-runs matching. */}
+                  <div className="my-1 h-px bg-white/[0.08]" />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReparseOpen(false);
+                      void api.rematchAll().then(() => {
+                        window.dispatchEvent(new CustomEvent('kira:files-changed'));
+                      }).catch(() => { /* connectivity UI covers failures */ });
+                    }}
+                    className="block w-full rounded-lg px-3 py-2 text-left text-[13px] font-medium text-secondary transition-colors hover:bg-tertiary hover:text-primary"
+                    title="Re-run matching only (keeps existing parse data) — faster than a full re-parse"
+                  >
+                    Re-match only (faster)
+                  </button>
                 </div>
               ) : null}
             </div>

@@ -424,11 +424,19 @@ async def send_missing_episodes(
         if not isinstance(series_id, int):
             raise SonarrError("Sonarr series response lacked an 'id' field.")
 
-        # Map Kira's (season, episode_number) tuples to Sonarr's
-        # internal episode IDs. Sonarr just-added series may have a
-        # short delay before /episode returns the list — but in
-        # practice it's synchronous once /series POST returns 201.
+        # Map Kira's (season, episode_number) tuples to Sonarr's internal
+        # episode IDs. A JUST-ADDED series can briefly return an empty
+        # /episode list while Sonarr finishes its metadata refresh — retry a
+        # couple times before giving up, so a fresh add doesn't spuriously
+        # report "series may need a metadata refresh" when a 2s wait fixes it.
         episodes = await _list_episodes(c, series_id)
+        if series_was_added and not episodes:
+            import asyncio as _asyncio
+            for _delay in (1.5, 2.5):
+                await _asyncio.sleep(_delay)
+                episodes = await _list_episodes(c, series_id)
+                if episodes:
+                    break
         wanted = set(int(n) for n in episode_numbers)
         # Build a (season, number) → id index. Sonarr's anime series
         # use the same field shape (seasonNumber + episodeNumber); the
@@ -628,30 +636,46 @@ async def get_queue(cfg: SonarrConfig) -> list[SonarrQueueItem]:
     library-wide cover-card pills (every series). Caching is done at
     the endpoint layer.
     """
+    _PAGE_SIZE = 200
+    _MAX_PAGES = 25   # 5,000 records — a hard stop so a broken API can't loop
+    records: list = []
     async with _client(cfg) as c:
-        try:
-            r = await c.get("api/v3/queue", params={
-                "pageSize": 200,
-                "includeUnknownSeriesItems": "false",
-                "includeSeries": "true",
-                "includeEpisode": "true",
-            })
-        except httpx.RequestError as e:
-            raise SonarrError(f"Cannot reach Sonarr at {cfg.base_url}: {e}") from e
-        if r.status_code != 200:
-            raise SonarrError(
-                f"Sonarr /queue returned HTTP {r.status_code}",
-                status=r.status_code,
-                body=r.text[:200],
-            )
-        try:
-            data = r.json()
-        except ValueError as e:
-            raise SonarrError(f"Sonarr /queue returned non-JSON: {e}") from e
-        if not isinstance(data, dict):
-            raise SonarrError("Sonarr /queue returned non-dict envelope.")
-        records = data.get("records")
-        if not isinstance(records, list):
+        page = 1
+        while page <= _MAX_PAGES:
+            try:
+                r = await c.get("api/v3/queue", params={
+                    "page": page,
+                    "pageSize": _PAGE_SIZE,
+                    "includeUnknownSeriesItems": "false",
+                    "includeSeries": "true",
+                    "includeEpisode": "true",
+                })
+            except httpx.RequestError as e:
+                raise SonarrError(f"Cannot reach Sonarr at {cfg.base_url}: {e}") from e
+            if r.status_code != 200:
+                raise SonarrError(
+                    f"Sonarr /queue returned HTTP {r.status_code}",
+                    status=r.status_code,
+                    body=r.text[:200],
+                )
+            try:
+                data = r.json()
+            except ValueError as e:
+                raise SonarrError(f"Sonarr /queue returned non-JSON: {e}") from e
+            if not isinstance(data, dict):
+                raise SonarrError("Sonarr /queue returned non-dict envelope.")
+            page_records = data.get("records")
+            if not isinstance(page_records, list) or not page_records:
+                break
+            records.extend(page_records)
+            # Stop once we've collected everything the server says it has (or
+            # this page came back short — the last page).
+            total = data.get("totalRecords")
+            if len(page_records) < _PAGE_SIZE or (isinstance(total, int) and len(records) >= total):
+                break
+            page += 1
+
+        if not records:
             return []
 
         items: list[SonarrQueueItem] = []
@@ -1074,14 +1098,20 @@ async def retry_manual_import(
             if not isinstance(episodes, list) or not episodes:
                 skipped.append("no episodes mapped")
                 continue
+            episode_ids = [
+                e["id"] for e in episodes
+                if isinstance(e, dict) and isinstance(e.get("id"), int)
+            ]
+            # Sonarr 400s the WHOLE command if any file entry has an empty
+            # episodeIds — so drop this candidate instead of poisoning the batch.
+            if not episode_ids:
+                skipped.append("no valid episode ids")
+                continue
             file_payload: dict[str, Any] = {
                 "path": cand.get("path"),
                 "folderName": cand.get("folderName"),
                 "seriesId": series["id"],
-                "episodeIds": [
-                    e["id"] for e in episodes
-                    if isinstance(e, dict) and isinstance(e.get("id"), int)
-                ],
+                "episodeIds": episode_ids,
                 "quality": cand.get("quality"),
                 "languages": cand.get("languages") or [],
                 "releaseGroup": cand.get("releaseGroup") or "",
@@ -1137,15 +1167,22 @@ async def retry_manual_import(
         # move + writes the history row within 1-1.5s on local
         # filesystem moves; cross-device can take longer but we don't
         # block forever (the user can navigate away).
-        await asyncio.sleep(2.0)
         all_ep_ids: list[int] = []
         for f in importable:
             ep_ids = f.get("episodeIds")
             if isinstance(ep_ids, list):
                 all_ep_ids.extend(int(x) for x in ep_ids if isinstance(x, int))
-        destinations, history_warning = await _fetch_recent_import_history(
-            cfg, episode_ids=all_ep_ids,
-        )
+        # Poll up to ~6s (3 tries) rather than one fixed 2s nap: a cross-device
+        # import slower than 2s used to return no destinations and surface a
+        # spurious "verify in Sonarr" warning. Stop as soon as we see rows.
+        destinations, history_warning = [], None
+        for _attempt in range(3):
+            await asyncio.sleep(2.0)
+            destinations, history_warning = await _fetch_recent_import_history(
+                cfg, episode_ids=all_ep_ids,
+            )
+            if destinations:
+                break
 
         return ManualImportRetryResult(
             ok=True,

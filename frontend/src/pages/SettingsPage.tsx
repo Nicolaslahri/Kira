@@ -13,7 +13,7 @@ import { Input } from '../components/base/input/input';
 import { IcShieldCheck, IcChevDown, IcLink, IcSearch, IcHistory, IcUndo, IcFolder, IcSpin, IcCaption } from '../lib/icons';
 import { Select } from '../components/ui';
 import { api, type ApiProvider } from '../lib/api';
-import { strSetting, isValidHttpUrl, humanizeSettingKey, maskValue } from './settings/helpers';
+import { strSetting, isValidHttpUrl, humanizeSettingKey, maskValue, secretSet } from './settings/helpers';
 import { AdvancedSection } from './settings/AdvancedSection';
 import { PathsSection } from './settings/PathsSection';
 import { SubtitlesCard } from './settings/SubtitlesCard';
@@ -117,7 +117,12 @@ function deriveProviderStatus(info: ApiProvider | undefined, key: string): Block
   if (key === 'musicbrainz') return 'connected';
   if (!info) return 'not-configured';
   if (!info.implemented) return 'coming-soon';
-  if (key === 'anidb') return 'warning'; // rate-limit caveat always visible
+  if (key === 'anidb') {
+    // Reflect REAL state instead of a permanent 'warning' pin (which made the
+    // connected-count badge unreachable and showed a false amber pill).
+    if (info.banned_until || info.rate_limited) return 'warning';
+    return info.configured ? 'connected' : 'not-configured';
+  }
   if (!info.configured) return 'not-configured';
   return 'connected';
 }
@@ -147,10 +152,18 @@ interface Props {
 // Resolves `true` on a verified connection so ProviderCard can fire its
 // success pulse. The toast behaviour (success / error) is unchanged; the
 // boolean is purely additive and ignored by any caller that doesn't need it.
-function makeTester(slug: string, pushToast: Props['pushToast'], displayName: string) {
+function makeTester(
+  slug: string,
+  pushToast: Props['pushToast'],
+  displayName: string,
+  // Reads the JUST-TYPED draft credentials at click time, so Test validates
+  // what's in the box — not the stale key still saved on the server (the
+  // settings page buffers edits until Save).
+  candidate?: () => { api_key?: string; username?: string; password?: string },
+) {
   return async (): Promise<boolean> => {
     try {
-      const res = await api.testProvider(slug);
+      const res = await api.testProvider(slug, candidate?.());
       if (res.ok) {
         pushToast({ title: `${displayName} verified`, sub: `${res.latency_ms ?? '—'} ms`, kind: 'success' });
         return true;
@@ -189,6 +202,8 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
   // to know what's unsaved (and revert to on Cancel).
   const [rawSettings, setRawSettings] = useState<Record<string, unknown>>({});
   const [baseline, setBaseline] = useState<Record<string, unknown>>({});
+  // Pending 'delete EVERYTHING non-video' choice awaiting in-app confirm (§5 m).
+  const [pendingCleanupAll, setPendingCleanupAll] = useState(false);
   const [loaded, setLoaded] = useState(false);
   // F-05 / F-06: live provider catalog from /providers, keyed by slug.
   // Drives Connected / Not configured / Coming soon labels per block.
@@ -220,7 +235,12 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
         if (typeof s['matching.high_threshold'] === 'number') setHighT(s['matching.high_threshold'] as number);
         if (typeof s['matching.mid_threshold'] === 'number') setMidT(s['matching.mid_threshold'] as number);
       })
-      .catch(() => { setRawSettings(SIX_DEFAULTS); setBaseline(SIX_DEFAULTS); })
+      .catch(() => {
+        setRawSettings(SIX_DEFAULTS); setBaseline(SIX_DEFAULTS);
+        // NOT silent: the page otherwise rendered pristine defaults the user
+        // could unknowingly re-save over their real config.
+        pushToast({ title: 'Couldn’t load settings', sub: 'Showing defaults — don’t save until the connection recovers.', kind: 'error' });
+      })
       .finally(() => setLoaded(true));
     // Pull live provider catalog in parallel so block statuses are correct.
     api.getProviders()
@@ -272,6 +292,31 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
   // longer silently overwrite a saved API key / token.
   const saveKey = (key: string) => (value: string | number | boolean) => {
     setRawSettings(s => ({ ...s, [key]: value }));
+  };
+
+  // Explicit secret clear (§5 M / §7): PUTs the {clear:true} sentinel, which
+  // DELETES the stored row server-side — the provider then falls back to the
+  // bundled/env key where one ships with Kira. This is the only path back to a
+  // bundled key after saving a bad personal one (blank saves are refused as
+  // likely accidents). Instant (not draft): the affordance only appears on a
+  // SAVED key, so there is no draft state to stage.
+  const clearSecretKey = (key: string) => () => {
+    void (async () => {
+      try {
+        await api.putSettings({ [key]: { clear: true } });
+        setRawSettings(s => { const n = { ...s }; delete n[key]; return n; });
+        setBaseline(b => { const n = { ...b }; delete n[key]; return n; });
+        try {
+          const list = await api.getProviders();
+          const map: Record<string, ApiProvider> = {};
+          for (const p of list) map[p.key] = p;
+          setProviders(map);
+        } catch { /* status refresh is cosmetic */ }
+        pushToast({ title: 'Saved key cleared', sub: 'Reverted to the bundled key where one ships with Kira.', kind: 'success' });
+      } catch (e) {
+        pushToast({ title: 'Couldn’t clear the key', sub: (e as Error).message, kind: 'error' });
+      }
+    })();
   };
 
   // Custom naming templates persist as a single JSON object under
@@ -422,7 +467,10 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
   // ring, but Save previously only checked `dirty`, so a bad URL (missing
   // scheme, etc.) persisted and failed later at scan/refresh with a vaguer error.
   const invalidUrls = useMemo(() => {
-    const URL_KEYS = ['integrations.sonarr.url', 'integrations.plex.url', 'integrations.jellyfin.url', 'notifications.webhook_url'];
+    // Radarr + Discord were missing: a malformed Radarr URL showed the red
+    // invalid ring but Save happily persisted it (failing later at relink
+    // time with a vaguer error) — the exact failure this guard exists for.
+    const URL_KEYS = ['integrations.sonarr.url', 'integrations.radarr.url', 'integrations.plex.url', 'integrations.jellyfin.url', 'notifications.webhook_url', 'notifications.discord_webhook'];
     return URL_KEYS.filter(k => !isValidHttpUrl(strSetting(rawSettings, k)));
   }, [rawSettings]);
   const dirty = dirtyKeys.length > 0;
@@ -560,8 +608,40 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
     [dirtyKeys, keyLabels],
   );
 
+  // Hydrate gate (§5 m): before the settings GET lands, the page used to render
+  // pristine DEFAULTS that flashed then snapped to real values — and any edit
+  // in that window diffed against the wrong baseline (Save could persist a
+  // defaults-shaped patch). Hold a skeleton until `loaded`.
+  const cleanupAllConfirm = pendingCleanupAll ? (
+    <div className="fixed inset-0 z-[10000] grid place-items-center bg-black/60 p-4" role="alertdialog" aria-modal="true" aria-label="Confirm permanent deletion">
+      <div className="w-full max-w-md rounded-xl border border-secondary bg-[var(--panel-90)] p-5 shadow-[var(--shadow-3)] backdrop-blur-2xl">
+        <div className="text-[15px] font-semibold text-primary">Delete EVERYTHING non-video?</div>
+        <div className="mt-2 text-[13px] leading-relaxed text-secondary">
+          With <strong>Move to trash</strong> off, this permanently deletes every non-video file
+          (subtitles included) from any folder a Move empties of video. It cannot be undone.
+          Tip: turn on Move to trash first to make it recoverable.
+        </div>
+        <div className="mt-4 flex justify-end gap-2">
+          <Button color="secondary" size="sm" onClick={() => setPendingCleanupAll(false)}>Cancel</Button>
+          <Button color="primary-destructive" size="sm" onClick={() => { setPendingCleanupAll(false); saveKey('rename.cleanup_nonvideo')('all'); }}>Delete everything</Button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
+  if (!loaded) {
+    return (
+      <div className="grid min-h-[40vh] place-items-center p-5" aria-busy="true" aria-label="Loading settings">
+        <div className="flex flex-col items-center gap-3 text-tertiary">
+          <div className="size-6 animate-spin rounded-full border-2 border-current border-t-transparent" />
+          <span className="text-[12.5px]">Loading settings…</span>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="page relative">
+      {cleanupAllConfirm}
       {/* Plain page header — matches History/Dashboard (no boxed card). */}
       <div className="page-header">
         <div>
@@ -602,11 +682,18 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
             const tmdbOk = deriveProviderStatus(providers['tmdb'], 'tmdb') === 'connected';
             const tvdbOk = deriveProviderStatus(providers['tvdb'], 'tvdb') === 'connected';
             const anidbOk = providers['anidb']?.configured === true;
+            // Music is only "covered" when the user has ENABLED it (Advanced →
+            // music.enabled, default off) AND MusicBrainz is reachable — not on
+            // MusicBrainz alone (it's keyless, so it always reads connected,
+            // which made the tile claim music was covered while scans skipped it).
+            const _me = rawSettings['music.enabled'];
+            const musicEnabled = _me === true || (typeof _me === 'string' && ['1', 'true', 'yes', 'on'].includes(_me.trim().toLowerCase()));
+            const mbOk = deriveProviderStatus(providers['musicbrainz'], 'musicbrainz') === 'connected';
             const idTypes = [
               { key: 'movie', label: 'Movies', icon: <IcFilm />, color: '#4ec5b3', covered: tmdbOk, via: tmdbOk ? 'TMDB' : null },
               { key: 'tv', label: 'TV', icon: <IcTv />, color: '#b3e5fc', covered: tvdbOk || tmdbOk, via: tvdbOk ? 'TheTVDB' : tmdbOk ? 'TMDB' : null },
               { key: 'anime', label: 'Anime', icon: <IcAnime />, color: 'var(--media-anime)', covered: anidbOk || tvdbOk || tmdbOk, via: anidbOk ? 'AniDB' : tvdbOk ? 'TheTVDB' : tmdbOk ? 'TMDB' : null },
-              ...(MUSIC_PROVIDERS_ENABLED ? [{ key: 'music', label: 'Music', icon: <IcMusic />, color: 'var(--media-music)', covered: deriveProviderStatus(providers['musicbrainz'], 'musicbrainz') === 'connected', via: deriveProviderStatus(providers['musicbrainz'], 'musicbrainz') === 'connected' ? 'MusicBrainz' : null }] : []),
+              ...(MUSIC_PROVIDERS_ENABLED ? [{ key: 'music', label: 'Music', icon: <IcMusic />, color: 'var(--media-music)', covered: musicEnabled && mbOk, via: musicEnabled ? (mbOk ? 'MusicBrainz' : null) : 'Off — enable in Advanced' }] : []),
             ];
             const coveredCount = idTypes.filter(t => t.covered).length;
             const allCovered = coveredCount === idTypes.length;
@@ -681,7 +768,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                         <div className="text-[12.5px] font-semibold" style={t.covered ? { color: t.color } : undefined}>
                           <span className={t.covered ? '' : 'text-tertiary'}>{t.label}</span>
                         </div>
-                        <div className="mt-0.5 text-[11px] text-tertiary">{t.covered ? `via ${t.via}` : 'no source yet'}</div>
+                        <div className="mt-0.5 text-[11px] text-tertiary">{t.covered ? `via ${t.via}` : (t.via ?? 'no source yet')}</div>
                       </div>
                       {t.covered
                         ? <span className="text-[var(--conf-high)] [&_svg]:size-[15px]"><IcCheck /></span>
@@ -727,38 +814,42 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                   // key back for security), swap the placeholder to a
                   // "key already saved" indicator so the user knows not
                   // to retype.
-                  { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.tmdb.api_key'),
+                  { kind: 'password', label: 'API key', value: strSetting(rawSettings, 'providers.tmdb.api_key'),
                     lockedDisplay: maskValue(rawSettings, 'providers.tmdb.api_key'),
                     placeholder: providers['tmdb']?.configured && !strSetting(rawSettings, 'providers.tmdb.api_key')
                       ? '••••••••••••••••  (key saved — enter a new one to replace)'
                       : 'paste 32-char key from themoviedb.org',
                     mono: true,
                     desc: 'Get a free key at themoviedb.org → Settings → API.',
-                    onSave: saveKey('providers.tmdb.api_key') },
+                    onSave: saveKey('providers.tmdb.api_key'), onClear: clearSecretKey('providers.tmdb.api_key') },
                   { kind: 'select', label: 'Language', value: strSetting(rawSettings, 'providers.tmdb.language') || 'English (US)',
                     options: ['English (US)', 'English (UK)', 'Français', 'Deutsch', '日本語'],
                     onSave: saveKey('providers.tmdb.language') },
                 ]}
-                onTest={makeTester('tmdb', pushToast, 'TMDB')}
+                onTest={makeTester('tmdb', pushToast, 'TMDB', () => ({ api_key: strSetting(rawSettings, 'providers.tmdb.api_key') }))}
               />
 
               <ProviderCard
                 providerKey="TVDB" status={deriveProviderStatus(providers['tvdb'], 'tvdb')}
                 fields={[
-                  { kind: 'text', label: 'API key (v4)', value: strSetting(rawSettings, 'providers.tvdb.api_key'),
+                  { kind: 'password', label: 'API key (v4)', value: strSetting(rawSettings, 'providers.tvdb.api_key'),
                     lockedDisplay: maskValue(rawSettings, 'providers.tvdb.api_key'),
-                    placeholder: providers['tvdb']?.configured && !strSetting(rawSettings, 'providers.tvdb.api_key')
+                    // "key saved" only when a USER key actually exists in
+                    // settings — providers.tvdb.configured is ALWAYS true
+                    // (Kira ships a bundled key), so it falsely implied a
+                    // saved personal key on every fresh install.
+                    placeholder: secretSet(rawSettings, 'providers.tvdb.api_key') && !strSetting(rawSettings, 'providers.tvdb.api_key')
                       ? '••••••••••••••••  (key saved — enter a new one to replace)'
-                      : 'paste your TVDB v4 API key',
+                      : 'works out of the box — paste a personal v4 key to override',
                     mono: true,
-                    desc: 'Required for TV and as a secondary anime source. Sign up at thetvdb.com/api-information.',
-                    onSave: saveKey('providers.tvdb.api_key') },
+                    desc: 'Kira ships a key — TV and anime matching work with no setup. Optionally paste your own v4 key from thetvdb.com/api-information to use your personal quota.',
+                    onSave: saveKey('providers.tvdb.api_key'), onClear: clearSecretKey('providers.tvdb.api_key') },
                   { kind: 'select', label: 'Search language', value: strSetting(rawSettings, 'providers.tvdb.language') || 'English',
                     options: ['English', 'Français', 'Deutsch', 'Español', 'Italiano', '日本語'],
                     desc: 'Language for TVDB search result names. Leave on English unless your library titles are in another language.',
                     onSave: saveKey('providers.tvdb.language') },
                 ]}
-                onTest={makeTester('tvdb', pushToast, 'TVDB')}
+                onTest={makeTester('tvdb', pushToast, 'TVDB', () => ({ api_key: strSetting(rawSettings, 'providers.tvdb.api_key') }))}
               />
 
               <ProviderCard
@@ -770,13 +861,6 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                   { kind: 'text', label: 'Client version', value: strSetting(rawSettings, 'providers.anidb.clientver') || '1', mono: true,
                     desc: 'The numeric version AniDB approved for your client. Pictures stay blank until this matches a real registration.',
                     onSave: saveKey('providers.anidb.clientver') },
-                  { kind: 'text', label: 'Username (optional)', value: strSetting(rawSettings, 'providers.anidb.username'),
-                    placeholder: 'only needed for mylist features (future)',
-                    onSave: saveKey('providers.anidb.username') },
-                  { kind: 'password', label: 'Password (optional)', value: strSetting(rawSettings, 'providers.anidb.password'),
-                    lockedDisplay: maskValue(rawSettings, 'providers.anidb.password'),
-                    placeholder: '••••••••',
-                    onSave: saveKey('providers.anidb.password') },
                 ]}
                 warning="AniDB strictly rate-limits to ~1 request per 4 seconds. Title-only search (the matcher) works out-of-the-box; cover art requires a registered AniDB client name + version."
                 onTest={makeTester('anidb', pushToast, 'AniDB')}
@@ -787,17 +871,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
               {MUSIC_PROVIDERS_ENABLED && (<>
               <ProviderCard
                 providerKey="MusicBrainz" status={deriveProviderStatus(providers['musicbrainz'], 'musicbrainz')}
-                fields={[
-                  { kind: 'text', label: 'User-Agent string',
-                    value: strSetting(rawSettings, 'providers.musicbrainz.user_agent') || 'Kira/0.5.0 (self-hosted)',
-                    mono: true,
-                    desc: 'MusicBrainz requires a unique User-Agent identifying your application and contact info.',
-                    onSave: saveKey('providers.musicbrainz.user_agent') },
-                  { kind: 'text', label: 'Contact (URL or email)',
-                    value: strSetting(rawSettings, 'providers.musicbrainz.contact'),
-                    placeholder: 'your-email@example.com', mono: true,
-                    onSave: saveKey('providers.musicbrainz.contact') },
-                ]}
+                warning="Keyless — no configuration needed. Kira identifies itself to MusicBrainz with its own compliant User-Agent and honors the 1-request/second rate limit automatically."
                 onTest={makeTester('musicbrainz', pushToast, 'MusicBrainz')}
               />
 
@@ -805,13 +879,13 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
               <ProviderCard
                 providerKey="AcoustID" status={deriveProviderStatus(providers['acoustid'], 'acoustid')}
                 fields={[
-                  { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.acoustid.api_key'),
+                  { kind: 'password', label: 'API key', value: strSetting(rawSettings, 'providers.acoustid.api_key'),
                     lockedDisplay: maskValue(rawSettings, 'providers.acoustid.api_key'),
                     placeholder: keyIsSet('providers.acoustid.api_key')
                       ? '••••••••••••••••  (personal key saved — enter a new one to replace)'
                       : 'optional — paste a personal acoustid.org key to override Kira’s', mono: true,
                     desc: 'Optional — Kira ships an AcoustID app key, so fingerprinting works out of the box. Enter your own (free at acoustid.org) only to use a personal key.',
-                    onSave: saveKey('providers.acoustid.api_key') },
+                    onSave: saveKey('providers.acoustid.api_key'), onClear: clearSecretKey('providers.acoustid.api_key') },
                   { kind: 'toggle', label: 'Auto-fingerprint untagged files',
                     value: rawSettings['providers.acoustid.auto_fingerprint'] === true ? 'true' : 'false',
                     desc: 'Match music files with no usable tags / filename by their AUDIO, as a last resort. Requires fpcalc (below).',
@@ -836,76 +910,76 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                 providerKey="fanart.tv"
                 status={fanartKeySet ? 'connected' : 'not-configured'}
                 fields={[
-                  { kind: 'text', label: 'Personal key (optional)', value: strSetting(rawSettings, 'providers.fanarttv.client_key'),
+                  { kind: 'password', label: 'Personal key (optional)', value: strSetting(rawSettings, 'providers.fanarttv.client_key'),
                     lockedDisplay: maskValue(rawSettings, 'providers.fanarttv.client_key'),
                     placeholder: 'paste your personal key from fanart.tv → API',
                     mono: true,
                     desc: 'Your OWN fanart.tv key, sent in addition to the one Kira ships — it bypasses the 7-day image-update limit so fresh artwork appears sooner. Optional. Free at fanart.tv → log in → API.',
-                    onSave: saveKey('providers.fanarttv.client_key') },
-                  { kind: 'text', label: 'Project key (advanced)', value: strSetting(rawSettings, 'providers.fanarttv.api_key'),
+                    onSave: saveKey('providers.fanarttv.client_key'), onClear: clearSecretKey('providers.fanarttv.client_key') },
+                  { kind: 'password', label: 'Project key (advanced)', value: strSetting(rawSettings, 'providers.fanarttv.api_key'),
                     lockedDisplay: maskValue(rawSettings, 'providers.fanarttv.api_key'),
                     placeholder: 'using the shared key Kira ships — override only with your own',
                     mono: true,
                     desc: 'Kira ships a shared fanart.tv project key, so artwork (clear logos, clear art, banners, disc & character art for the “Download artwork” option in Naming) works out of the box. Leave blank unless you have your own project key to use instead. Anime resolves its artwork via the TheTVDB cross-reference.',
-                    onSave: saveKey('providers.fanarttv.api_key') },
+                    onSave: saveKey('providers.fanarttv.api_key'), onClear: clearSecretKey('providers.fanarttv.api_key') },
                 ]}
-                onTest={makeTester('fanarttv', pushToast, 'fanart.tv')}
+                onTest={makeTester('fanarttv', pushToast, 'fanart.tv', () => ({ api_key: strSetting(rawSettings, 'providers.fanarttv.api_key') }))}
               />
 
               <ProviderCard
                 providerKey="OpenSubtitles"
                 status={osKeySet ? 'connected' : 'not-configured'}
                 fields={[
-                  { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.opensubtitles.api_key'),
+                  { kind: 'password', label: 'API key', value: strSetting(rawSettings, 'providers.opensubtitles.api_key'),
                     lockedDisplay: maskValue(rawSettings, 'providers.opensubtitles.api_key'),
                     placeholder: osKeySet
                       ? '••••••••••••••••  (key saved — enter a new one to replace)'
                       : 'paste the 32-char key from opensubtitles.com → API consumers',
                     mono: true,
                     desc: 'Enables subtitle SEARCH. Free key: opensubtitles.com → log in → API consumers.',
-                    onSave: saveKey('providers.opensubtitles.api_key') },
+                    onSave: saveKey('providers.opensubtitles.api_key'), onClear: clearSecretKey('providers.opensubtitles.api_key') },
                   { kind: 'text', label: 'Username', value: strSetting(rawSettings, 'providers.opensubtitles.username'),
                     placeholder: 'your opensubtitles.com account',
                     desc: 'Downloads count against your account quota — without a login, search works but nothing can be saved.',
-                    onSave: saveKey('providers.opensubtitles.username') },
+                    onSave: saveKey('providers.opensubtitles.username'), onClear: clearSecretKey('providers.opensubtitles.username') },
                   { kind: 'password', label: 'Password', value: strSetting(rawSettings, 'providers.opensubtitles.password'),
                     lockedDisplay: maskValue(rawSettings, 'providers.opensubtitles.password'),
                     placeholder: '••••••••',
-                    onSave: saveKey('providers.opensubtitles.password') },
+                    onSave: saveKey('providers.opensubtitles.password'), onClear: clearSecretKey('providers.opensubtitles.password') },
                 ]}
-                onTest={makeTester('opensubtitles', pushToast, 'OpenSubtitles')}
+                onTest={makeTester('opensubtitles', pushToast, 'OpenSubtitles', () => ({ api_key: strSetting(rawSettings, 'providers.opensubtitles.api_key'), username: strSetting(rawSettings, 'providers.opensubtitles.username'), password: strSetting(rawSettings, 'providers.opensubtitles.password') }))}
               />
 
               <ProviderCard
                 providerKey="SubDL"
                 status={subdlKeySet ? 'connected' : 'not-configured'}
                 fields={[
-                  { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.subdl.api_key'),
+                  { kind: 'password', label: 'API key', value: strSetting(rawSettings, 'providers.subdl.api_key'),
                     lockedDisplay: maskValue(rawSettings, 'providers.subdl.api_key'),
                     placeholder: subdlKeySet
                       ? '••••••••••••••••  (key saved — enter a new one to replace)'
                       : 'paste your SubDL API key',
                     mono: true,
                     desc: 'Subtitle source. Free key at subdl.com → panel → API. Enable it in Settings → Subtitles.',
-                    onSave: saveKey('providers.subdl.api_key') },
+                    onSave: saveKey('providers.subdl.api_key'), onClear: clearSecretKey('providers.subdl.api_key') },
                 ]}
-                onTest={makeTester('subdl', pushToast, 'SubDL')}
+                onTest={makeTester('subdl', pushToast, 'SubDL', () => ({ api_key: strSetting(rawSettings, 'providers.subdl.api_key') }))}
               />
 
               <ProviderCard
                 providerKey="SubSource"
                 status={subsourceKeySet ? 'connected' : 'not-configured'}
                 fields={[
-                  { kind: 'text', label: 'API key', value: strSetting(rawSettings, 'providers.subsource.api_key'),
+                  { kind: 'password', label: 'API key', value: strSetting(rawSettings, 'providers.subsource.api_key'),
                     lockedDisplay: maskValue(rawSettings, 'providers.subsource.api_key'),
                     placeholder: subsourceKeySet
                       ? '••••••••••••••••  (key saved — enter a new one to replace)'
                       : 'paste your SubSource API key',
                     mono: true,
                     desc: "Subtitle source (Subscene's successor). Free key from your subsource.net profile. Enable it in Settings → Subtitles.",
-                    onSave: saveKey('providers.subsource.api_key') },
+                    onSave: saveKey('providers.subsource.api_key'), onClear: clearSecretKey('providers.subsource.api_key') },
                 ]}
-                onTest={makeTester('subsource', pushToast, 'SubSource')}
+                onTest={makeTester('subsource', pushToast, 'SubSource', () => ({ api_key: strSetting(rawSettings, 'providers.subsource.api_key') }))}
               />
               </div>
               </div>
@@ -957,7 +1031,6 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
 
           {section === 'naming' && (
             <SettingsLayout
-              wide
               header={(
                 <SectionHeader
                   accent
@@ -1229,9 +1302,10 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                       </div>
                       </fieldset>
                       <div className={`mt-3 border-t pt-3 text-[11px] leading-relaxed text-ink-soft ${SETTINGS_DIVIDER}`}>
-                        Logos, clear art, banners, disc &amp; character art need a free{' '}
-                        <span className="font-mono text-ink">fanart.tv</span> API key — set it in{' '}
-                        <button type="button" onClick={() => setSection('connections')} className="font-medium text-info underline underline-offset-2 transition-colors hover:text-ink">Connections</button>.
+                        Logos, clear art, banners, disc &amp; character art come from{' '}
+                        <span className="font-mono text-ink">fanart.tv</span> — Kira ships a key, so they work out of the box. Add a personal key in{' '}
+                        <button type="button" onClick={() => setSection('connections')} className="font-medium text-info underline underline-offset-2 transition-colors hover:text-ink">Connections</button>{' '}
+                        to skip the 7-day image-update delay.
                       </div>
                     </NestedBox>
                   )}
@@ -1246,7 +1320,6 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
 
           {section === 'subtitles' && (
             <SettingsLayout
-              wide
               header={(
                 <SectionHeader
                   accent
@@ -1281,7 +1354,8 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
             })();
             // Recycle/trash instead of permanent delete — defaults OFF
             // (preserves prior hard-delete behavior; opt in for recoverability).
-            const trashOn = rawSettings['rename.cleanup_trash'] === true;
+            // Default ON (matches the backend): only an explicit false turns trash off.
+            const trashOn = rawSettings['rename.cleanup_trash'] !== false;
             const trashDir = strSetting(rawSettings, 'rename.trash_dir');
             const libRoot = (strSetting(rawSettings, 'paths.library_root') || '/media').replace(/[\\/]+$/, '');
             // User-extendable sweep lists + the aggressive "delete non-video" mode.
@@ -1449,13 +1523,10 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                               // even lands in the draft. (Controlled control reverts on cancel
                               // since we skip the saveKey.)
                               if (v === 'all' && !trashOn) {
-                                const ok = window.confirm(
-                                  'Delete EVERYTHING non-video?\n\n'
-                                  + 'With "Move to trash" OFF, this PERMANENTLY deletes every non-video file '
-                                  + '(subtitles included) from any folder a Move empties of video. It cannot be undone.\n\n'
-                                  + 'Tip: turn on "Move to trash" below first to make it recoverable.\n\nProceed anyway?'
-                                );
-                                if (!ok) return;
+                                // In-app confirm (§5 m): the native window.confirm
+                                // broke in embedded contexts and looked alien.
+                                setPendingCleanupAll(true);
+                                return;
                               }
                               saveKey('rename.cleanup_nonvideo')(v);
                             }}
@@ -1720,7 +1791,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                     <div className={`mt-4 ${!autoApprove ? 'pointer-events-none opacity-50' : ''}`}>
                       <SliderField
                         label="Threshold"
-                        min={80}
+                        min={0}
                         max={100}
                         value={autoThreshold}
                         disabled={!autoApprove}
@@ -1842,7 +1913,7 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
             <div className="flex items-center gap-3">
               <span className="flex-1 text-[13px] text-ink-muted">
                 {invalidUrls.length > 0 ? (
-                  <span className="font-medium text-[var(--danger)]">Fix the invalid URL before saving</span>
+                  <span className="font-medium text-[var(--danger)]">Fix the invalid URL before saving: {invalidUrls.map(humanizeSettingKey).join(', ')}</span>
                 ) : (
                   <><span className="font-semibold text-ink">{dirtyKeys.length}</span> unsaved {dirtyKeys.length === 1 ? 'change' : 'changes'}</>
                 )}
@@ -2128,7 +2199,7 @@ export function TrashBinCard({ rawSettings, saveKey, pushToast }: {
       title="Trash bin"
       desc={items.length > 0
         ? <>{items.length} item{items.length === 1 ? '' : 's'} · {fmtBytes(totalBytes)} — swept artifacts wait here until you restore or remove them.</>
-        : 'Items the cleanup sweep recycles land here, ready to restore.'}
+        : 'Items the cleanup sweep recycles land here, ready to restore. Actions here apply instantly — no Save needed.'}
       action={items.length > 0 ? (
         <Button
           color={armEmpty ? 'primary-destructive' : 'secondary-destructive'}

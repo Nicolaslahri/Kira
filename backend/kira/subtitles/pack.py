@@ -429,9 +429,14 @@ def _read_7z(raw: bytes) -> dict[str, bytes] | None:
             if not names:
                 return {}
             z.extract(path=td, targets=names)
-        base = Path(td)
+        base = Path(td).resolve()
         for n in names:
-            fp = base / n
+            fp = (base / n).resolve()
+            # Path-traversal guard: a crafted member like ../../x must not be
+            # read from outside the throwaway temp dir (py7zr honours the
+            # archive's own paths).
+            if not fp.is_relative_to(base):
+                continue
             try:
                 if fp.is_file() and 0 < fp.stat().st_size <= MAX_SUB_BYTES:
                     out[n] = fp.read_bytes()

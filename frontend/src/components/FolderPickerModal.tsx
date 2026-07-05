@@ -24,6 +24,7 @@ export function FolderPickerModal({
   const [parent, setParent] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
 
   const load = async (path: string) => {
     setLoading(true);
@@ -43,6 +44,23 @@ export function FolderPickerModal({
 
   useEffect(() => { void load(initialPath); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
 
+  // Validate the current path exists before confirming. `cwd` can be a raw,
+  // never-loaded value (typed without pressing Go, or an initialPath that
+  // 404'd), so confirm it against the server rather than accepting it blindly.
+  const confirm = async () => {
+    setConfirming(true);
+    setError(null);
+    try {
+      const res = await api.listFolders(cwd);
+      onPick(res.path);   // canonical path the server resolved
+      onClose();
+    } catch (e) {
+      setError((e as Error).message || 'That folder can’t be used — pick another.');
+    } finally {
+      setConfirming(false);
+    }
+  };
+
   const CTL_BTN = 'inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-line bg-glass px-3 py-2 text-[13px] font-medium text-ink-muted transition-colors hover:bg-glass-2 hover:text-ink disabled:opacity-40 [&_svg]:size-[14px]';
 
   return (
@@ -59,10 +77,10 @@ export function FolderPickerModal({
             <button
               className="inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-[13px] font-semibold text-white transition-transform active:translate-y-px disabled:opacity-40 [&_svg]:size-[14px]"
               style={{ background: 'linear-gradient(135deg, var(--brand-a), var(--brand-b))', boxShadow: '0 8px 22px -10px var(--brand-50)' }}
-              disabled={!cwd}
-              onClick={() => { onPick(cwd); onClose(); }}
+              disabled={!cwd || confirming}
+              onClick={() => void confirm()}
             >
-              <IcCheck /> Use this folder
+              {confirming ? <><IcSpin /> Checking…</> : <><IcCheck /> Use this folder</>}
             </button>
           </div>
         </>

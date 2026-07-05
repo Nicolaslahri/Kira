@@ -26,6 +26,7 @@ Endpoints:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import logging
@@ -175,6 +176,13 @@ class SetupBody(BaseModel):
     password: str
 
 
+# Serializes account creation: two simultaneous /auth/setup calls both passed
+# the `get_db_account() is None` check (no unique/transactional guard), so the
+# LAST writer silently won. First-writer-wins is the contract — the lock +
+# re-check inside makes it atomic in-process.
+_SETUP_LOCK = asyncio.Lock()
+
+
 @router.post("/setup")
 async def auth_setup(body: SetupBody, session: AsyncSession = Depends(get_session)) -> dict:
     if _env_auth_on():
@@ -182,23 +190,24 @@ async def auth_setup(body: SetupBody, session: AsyncSession = Depends(get_sessio
             status_code=409,
             detail="Credentials are managed via environment variables on this server.",
         )
-    if await get_db_account() is not None:
-        raise HTTPException(status_code=409, detail="An account already exists.")
     username = body.username.strip()
     if not username:
         raise HTTPException(status_code=422, detail="Username can't be empty.")
     if len(body.password) < 6:
         raise HTTPException(status_code=422, detail="Password must be at least 6 characters.")
 
-    pw_hash = hash_password(body.password)
-    for key, value in (("auth.user", username), ("auth.password_hash", pw_hash)):
-        existing = await session.get(Setting, key)
-        if existing is None:
-            session.add(Setting(key=key, value=value))
-        else:
-            existing.value = value
-    await session.commit()
-    set_account_cache((username, pw_hash))
+    async with _SETUP_LOCK:
+        if await get_db_account() is not None:
+            raise HTTPException(status_code=409, detail="An account already exists.")
+        pw_hash = hash_password(body.password)
+        for key, value in (("auth.user", username), ("auth.password_hash", pw_hash)):
+            existing = await session.get(Setting, key)
+            if existing is None:
+                session.add(Setting(key=key, value=value))
+            else:
+                existing.value = value
+        await session.commit()
+        set_account_cache((username, pw_hash))
     logger.info("auth: account created for %r — sign-in now required", username)
     return {"ok": True}
 

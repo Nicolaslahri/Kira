@@ -1,5 +1,7 @@
 """Inbound automation webhooks (Pass 6 #8) — Sonarr / Radarr post-import.
 
+# (kind|event|path) -> monotonic ts of the last accepted webhook (30s window).
+_RECENT_EVENTS: dict[str, float] = {}
 A *arr server can POST here after it imports a release so Kira immediately
 scans + matches (and, for an auto_rename watched folder, organizes) the new
 file — no manual Scan click, no wait for the poll loop.
@@ -123,7 +125,12 @@ def _check_token(provided: str | None, configured: str | None) -> None:
     if not configured:
         raise HTTPException(status_code=404, detail="Webhooks are not enabled.")
     # Constant-time compare — a plain `!=` leaks the token via response timing.
-    if not provided or not secrets.compare_digest(provided, configured):
+    # Compared as BYTES: compare_digest raises TypeError on non-ASCII str, so a
+    # non-ASCII header (or a user who saved a non-ASCII token) got an unhandled
+    # 500 instead of a clean 403.
+    if not provided or not secrets.compare_digest(
+        provided.encode("utf-8"), configured.encode("utf-8")
+    ):
         raise HTTPException(status_code=403, detail="Invalid or missing webhook token.")
 
 
@@ -146,6 +153,27 @@ async def _handle(kind: str, request: Request, token: str | None, session: Async
     # Sonarr/Radarr fire a "Test" event from their UI's Test button.
     if event.lower() == "test":
         return {"ok": True, "test": True, "source": kind}
+
+    # Only FILE-CHANGING events warrant a scan. Grab (queued, nothing on disk
+    # yet), Health, ApplicationUpdate etc. used to each trigger a full scan.
+    _ev = event.lower()
+    if _ev and not any(k in _ev for k in ("download", "import", "rename", "delete", "upgrade")):
+        return {"ok": True, "queued": False,
+                "detail": f"Event {event!r} doesn't change files — no scan needed.",
+                "source": kind}
+
+    # Replay/duplicate suppression: *arr retries + double-fires (and a replayed
+    # request) shouldn't stack scans. Same (kind, event, target) within 30s is
+    # acked without starting another scan — the first one covers it.
+    import time as _time
+    _key = f"{kind}|{_ev}|{extract_target_path(payload) or ''}"
+    _now = _time.monotonic()
+    _stale = [k for k, t in _RECENT_EVENTS.items() if _now - t > 30.0]
+    for k in _stale:
+        _RECENT_EVENTS.pop(k, None)
+    if _key in _RECENT_EVENTS:
+        return {"ok": True, "queued": False, "detail": "Duplicate event (deduped).", "source": kind}
+    _RECENT_EVENTS[_key] = _now
 
     roots = await _configured_roots(session)
     if not roots:

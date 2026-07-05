@@ -40,6 +40,7 @@ _SIDECAR_EXTS = ("srt", "ass", "ssa", "vtt", "sub")
 def languages_needing_fetch(
     video_path: str, languages: list[str],
     embedded: Iterable[str] | None = None,
+    forced: bool = False,
 ) -> list[str]:
     """Languages still worth fetching — i.e. NOT already satisfied. Drops a
     language that already has ANY sidecar on disk (from a prior run or another
@@ -61,30 +62,47 @@ def languages_needing_fetch(
     for lang in languages:
         if embedded_norm and normalize_lang(lang) in embedded_norm:
             continue
+        # Alias-aware disk probe: an existing `.eng.srt` (or `.english.srt`)
+        # satisfies a wanted `en` — the literal-code-only check used to fetch
+        # a duplicate sub beside every alias-spelled sidecar.
         if not any(
-            Path(video_path).with_name(subtitle_sidecar_name(video_path, lang, ext=e)).exists()
+            Path(video_path).with_name(subtitle_sidecar_name(video_path, spelling, ext=e, forced=forced)).exists()
+            for spelling in _lang_spellings(lang)
             for e in _SIDECAR_EXTS
         ):
             out.append(lang)
     return out
 
 
-def has_sidecar(video_path: str, lang: str) -> bool:
-    return find_sidecar(video_path, lang) is not None
+def _lang_spellings(lang: str) -> list[str]:
+    """The wanted code plus every alias that normalizes to the same language
+    (en → en/eng/english), for disk-probe purposes. The wanted code always
+    comes first so naming for NEW sidecars is unchanged."""
+    from kira.subtitles.embedded import _LANG_TO_2
+    want = normalize_lang(lang) or lang
+    out = [lang]
+    for alias, two in _LANG_TO_2.items():
+        if two == want and alias not in out:
+            out.append(alias)
+    return out
 
 
-def find_sidecar(video_path: str, lang: str) -> str | None:
+def has_sidecar(video_path: str, lang: str, *, forced: bool = False) -> bool:
+    return find_sidecar(video_path, lang, forced=forced) is not None
+
+
+def find_sidecar(video_path: str, lang: str, *, forced: bool = False) -> str | None:
     """Path of an existing `<stem>.<lang>.<ext>` sidecar beside the video, or
     None. Used to short-circuit a re-fetch of a language already on disk."""
     for e in _SIDECAR_EXTS:
-        p = Path(video_path).with_name(subtitle_sidecar_name(video_path, lang, ext=e))
+        p = Path(video_path).with_name(subtitle_sidecar_name(video_path, lang, ext=e, forced=forced))
         if os.path.exists(long_path(p)):
             return str(p)
     return None
 
 
 def save_sidecar(video_path: str, lang: str, data: bytes, ext: str = "srt",
-                 *, overwrite: bool = False) -> str | None:
+                 *, overwrite: bool = False, forced: bool = False) -> str | None:
     """Write `<stem>.<lang>.<ext>` beside the video, atomically. Returns the
     path on success, None if the write fails. By default refuses to clobber an
     existing sidecar; `overwrite=True` (used by upgrade-over-time) replaces it.
@@ -92,7 +110,7 @@ def save_sidecar(video_path: str, lang: str, data: bytes, ext: str = "srt",
     size-checked + validated by the caller (not an HTML error page)."""
     if not data:
         return None
-    dest = Path(video_path).with_name(subtitle_sidecar_name(video_path, lang, ext=ext))
+    dest = Path(video_path).with_name(subtitle_sidecar_name(video_path, lang, ext=ext, forced=forced))
     if dest.is_symlink():
         return None
     if os.path.exists(long_path(dest)) and not overwrite:

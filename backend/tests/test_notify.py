@@ -90,3 +90,58 @@ async def test_settings_read_failure_is_isolated(monkeypatch) -> None:
     monkeypatch.setattr(notify, "SessionLocal", boom)
     # Must not raise — returns [] when it can't even read settings.
     assert await notify.fan_out("info", "x") == []
+
+
+# ── HTTP-failure handling (audit: 429/4xx were swallowed as "sent") ───────────
+class _FakeResp:
+    def __init__(self, status: int):
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import httpx
+            raise httpx.HTTPStatusError(
+                f"HTTP {self.status_code}", request=None, response=self)  # type: ignore[arg-type]
+
+
+class _FakeClient:
+    def __init__(self, status: int):
+        self._status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, json=None):
+        return _FakeResp(self._status)
+
+
+async def test_discord_429_not_counted_as_sent(monkeypatch) -> None:
+    _patch_settings(monkeypatch, {"notifications.discord_webhook": "https://discord/webhook"})
+    monkeypatch.setattr(notify.httpx, "AsyncClient", lambda *a, **k: _FakeClient(429))
+    # A rate-limited (429) push must NOT be reported as delivered.
+    sent = await notify.fan_out("info", "burst")
+    assert sent == []
+
+
+async def test_discord_404_not_counted_as_sent(monkeypatch) -> None:
+    _patch_settings(monkeypatch, {"notifications.discord_webhook": "https://discord/webhook"})
+    monkeypatch.setattr(notify.httpx, "AsyncClient", lambda *a, **k: _FakeClient(404))
+    sent = await notify.fan_out("info", "deleted webhook")
+    assert sent == []
+
+
+async def test_discord_200_counted_as_sent(monkeypatch) -> None:
+    _patch_settings(monkeypatch, {"notifications.discord_webhook": "https://discord/webhook"})
+    monkeypatch.setattr(notify.httpx, "AsyncClient", lambda *a, **k: _FakeClient(204))
+    sent = await notify.fan_out("info", "ok")
+    assert sent == ["discord"]
+
+
+def test_truncate_markdown_never_cuts_mid_bold() -> None:
+    # A title long enough to cut inside the **bold** run must not leave a
+    # dangling `**`.
+    long = notify._truncate_markdown("✅ **" + "x" * 3000 + "**", limit=100)
+    assert long.count("**") % 2 == 0

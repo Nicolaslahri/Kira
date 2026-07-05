@@ -6,7 +6,7 @@ import logging
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from pydantic import Field
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -863,52 +863,22 @@ async def load_opensubtitles_settings(session: AsyncSession):
     return api_key, user, pw, (languages or ["en"])
 
 
-@router.post("/files/{file_id}/fetch-subtitles")
-async def fetch_subtitles(
-    file_id: int,
-    session: AsyncSession = Depends(get_session),
-) -> dict:
-    """#11 — download subtitles for one file from OpenSubtitles and save them as
-    `<stem>.<lang>.srt` sidecars (which the rename co-move then carries). Hash-
-    first, falling back to the selected match's TMDB/IMDb id + season/episode.
-    Requires an OpenSubtitles API key; downloads also need username/password
-    (the API charges downloads against the user's quota)."""
-    from sqlalchemy.orm import selectinload
-    from kira.providers.opensubtitles import fetch_and_save_subtitles
-
-    media_file = await session.scalar(
-        select(MediaFile).options(selectinload(MediaFile.matches)).where(MediaFile.id == file_id)
-    )
-    if media_file is None:
-        raise HTTPException(404, "File not found")
-    if not media_file.file_path:
-        raise HTTPException(422, "File has no on-disk path")
-
-    api_key, user, pw, languages = await load_opensubtitles_settings(session)
-    if not api_key:
-        raise HTTPException(400, "OpenSubtitles API key not configured (Settings → Connections)")
-
-    selected = next((m for m in media_file.matches if m.is_selected), None)
-    tmdb_id = None
-    if selected and selected.provider == "tmdb" and selected.provider_id:
-        try:
-            tmdb_id = int(selected.provider_id)
-        except (TypeError, ValueError):
-            tmdb_id = None
-    season = selected.season_number if selected else None
-    episode = selected.episode_number if selected else None
-
-    async with httpx.AsyncClient() as client:
-        saved = await fetch_and_save_subtitles(
-            media_file.file_path, api_key=api_key, client=client, languages=languages,
-            username=user, password=pw, tmdb_id=tmdb_id, season=season, episode=episode,
-        )
-    return {"saved": saved, "count": len(saved), "languages": languages}
+# (legacy POST /files/{file_id}/fetch-subtitles removed — it bypassed the
+#  user's language prefs, provider toggles, blacklist and history ledger.
+#  The supported path is POST /subtitles/backfill with file_ids.)
 
 
-class BulkSelectManualPayload(ManualMatch):
-    """Same ManualMatch fields PLUS the list of file IDs to apply to."""
-    file_ids: list[int] = Field(..., max_length=10_000)
+class BulkSelectManualPayload(BaseModel):
+    """Bulk manual match: pin one provider selection onto many files at once
+    (the Review page's "Match N files to…" flow)."""
+    provider: str
+    provider_id: str
+    media_type: str | None = None
+    title: str | None = None
+    year: int | None = None
+    poster_url: str | None = None
+    overview: str | None = None
+    file_ids: list[int]
 
 
 @router.post("/files/bulk-select-manual", response_model=dict[str, int])

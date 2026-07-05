@@ -68,11 +68,17 @@ def compute_series_key(parsed: ParsedFile, file_path: str | None = None) -> str 
             return None
         season = str(parsed.season) if parsed.season is not None else ""
 
-        # EE-5 disambiguator: year > parent folder > empty.
+        # EE-5 disambiguator: parent FOLDER > year > empty. Folder-first
+        # (audit §21 m): year-first split a show whenever only SOME files
+        # carried the year in their filename (`tv|show|1|2020` vs
+        # `tv|show|1|<folder>`), which is common in mixed releases. Every
+        # file in a series folder shares the folder, so folder-first keeps
+        # them together; two same-title shows are still disambiguated
+        # because they live in different folders. Year remains the fallback
+        # for flat layouts with no series folder.
         disambig = ""
-        if parsed.year is not None:
-            disambig = str(parsed.year)
-        elif file_path:
+        _folder_disambig = ""
+        if file_path:
             try:
                 p = Path(file_path)
                 parent = p.parent
@@ -83,9 +89,10 @@ def compute_series_key(parsed: ParsedFile, file_path: str | None = None) -> str 
                     and pname_lower[1:].isdigit()
                 ):
                     parent = parent.parent
-                disambig = normalize(parent.name) or ""
+                _folder_disambig = normalize(parent.name) or ""
             except Exception:
-                disambig = ""
+                _folder_disambig = ""
+        disambig = _folder_disambig or (str(parsed.year) if parsed.year is not None else "")
 
         return f"{parsed.media_type}|{title_n}|{season}|{disambig}"
     if parsed.media_type == "music":

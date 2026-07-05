@@ -95,13 +95,15 @@ def test_subsource_movie_id_year_disambiguates_same_title():
 def test_subsource_parse_subtitles_filters_and_maps_fullname_langs():
     payload = {"data": [
         {"subtitleId": 1, "language": "english", "releaseInfo": ["X.S01E05"]},
-        {"subtitleId": 2, "language": "brazilian_portuguese", "releaseInfo": []},  # → pt
+        {"subtitleId": 2, "language": "brazilian_portuguese", "releaseInfo": []},  # → pt-br (regional kept)
         {"subtitleId": 3, "language": "french", "releaseInfo": []},                # not wanted
         {"subtitleId": 4, "language": "english"},                                   # ep-unmatched
     ]}
-    got = subsource_parse(payload, {"en", "pt"}, episode=5)
+    # brazilian_portuguese keeps its REGIONAL code now (audit §20 M2): a pt-BR
+    # user gets it, and it is never mislabeled as plain pt.
+    got = subsource_parse(payload, {"en", "pt-br"}, episode=5)
     langs = [c["lang"] for c in got]
-    assert "fr" not in langs and "pt" in langs
+    assert "fr" not in langs and "pt-br" in langs
     # episode-matched english (S01E05) ranks before the unmatched english
     en = [c for c in got if c["lang"] == "en"]
     assert en[0]["subtitle_id"] == 1

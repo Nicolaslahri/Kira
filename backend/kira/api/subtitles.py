@@ -254,7 +254,9 @@ async def list_candidates(
     if not prefs.any_source_enabled:
         raise HTTPException(400, "No subtitle source enabled (Settings → Subtitles).")
     mf = await _file_with_matches(session, file_id)
-    langs = [language.lower()] if language else prefs.languages
+    # Per-TYPE languages (audit §20 m): the browse menu used the global list,
+    # so an anime with per-type ja+en prefs offered only the global languages.
+    langs = [language.lower()] if language else prefs.languages_for(mf.media_type)
     ctx = await build_context(session, mf, prefs, langs)
     cands = await gather_candidates(net.shared_client(), ctx, prefs.sources_for(ctx.media_type))
     return [CandidateOut(ref=str(c.download_ref), **c.public()) for c in cands]
@@ -313,6 +315,10 @@ async def _record_pick(session: AsyncSession, mf: MediaFile, res) -> dict:
     from kira.subtitles import store
     from kira.subtitles.backfill import _record_langs
     title = next((m.title for m in mf.matches if m.is_selected and m.title), None)
+    # Tag as a MANUAL pick so the upgrade sweep never overrides a deliberate
+    # user choice (audit §20 m).
+    if isinstance(res.reasons, list) and "manual pick" not in res.reasons:
+        res.reasons = ["manual pick", *res.reasons]
     await store.record_results(session, mf.id, title, [res])
     await _record_langs(session, mf.id, [res.language])
     return {"ok": True, "language": res.language, "provider": res.provider,

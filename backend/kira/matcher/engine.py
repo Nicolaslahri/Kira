@@ -1,10 +1,9 @@
-"""Matcher engine — given a ParsedFile, query the appropriate provider(s),
-score each result, and return ranked candidates.
+"""Matching engine — routes parsed files to providers and ranks candidates.
 
-Confidence is a weighted blend (see plan §3c):
-  - title similarity (trigram)  0.55
-  - year match                  0.25
-  - result rank                 0.20
+Scoring is the tiered CASCADE (kira/matcher/cascade): tier-1 structural
+identity wins outright; otherwise the best tier-2 similarity, boosted (never
+diluted) by tier-3 corroboration. See cascade/runner.py for the exact rule.
+(The old 0.55/0.25/0.20 weighted formula previously described here is gone.)
 """
 
 from __future__ import annotations
@@ -101,6 +100,12 @@ PROVIDER_PREFERENCE: dict[str, list[ProviderKey]] = {
     # AniDB first (canonical anime source, keyless), TVDB fallback (re-ranked).
     "anime": ["anidb", "tvdb", "tmdb"],
     "music": [],                  # MusicBrainz lives in a separate engine (audio path)
+    # `unknown` = the parser found a title but no year / episode marker to
+    # commit to a type (e.g. "2001 A Space Odyssey" with no year in the name).
+    # Without an entry the order was empty, so the file was NEVER searched and
+    # silently stayed no_match. Try both movie and TV providers so it can still
+    # resolve; the matcher's scoring picks the best hit across them.
+    "unknown": ["tmdb", "tvdb"],
 }
 
 # Provider keys we accept when validating a user-supplied order. Anything not
@@ -193,6 +198,20 @@ class ScoredMatch:
 _global_registry_ref: "contextvars.ContextVar[ProviderRegistry | None]" = (
     contextvars.ContextVar("kira_active_registry", default=None)
 )
+
+
+def _year_closeness(parsed_year: int | None, candidate_year: int | None) -> int:
+    """Sort component for equal-confidence tie-breaking: 0 = exact year match,
+    more negative = further away. When the FILE carries no year there's no
+    signal — every candidate gets the same neutral value (tie-break falls
+    through to provider/provider_id). A candidate with an unknown year loses
+    to any candidate with a known one (when the file names a year, a dated
+    candidate is more trustworthy than an undated one)."""
+    if parsed_year is None:
+        return 0
+    if candidate_year is None:
+        return -1000
+    return -abs(int(parsed_year) - int(candidate_year))
 
 
 def _series_folder_from_parsed(parsed: ParsedFile) -> str | None:
@@ -379,13 +398,20 @@ class MatchEngine:
                 return scored[:limit]
 
         # Walked all providers without a clear winner — return the global best
-        # ranked across everyone we asked. Deterministic tiebreak on (provider,
-        # provider_id): equal-confidence candidates (two 1.0s at the tier-1
-        # ceiling is common) must resolve the SAME way every scan, not by
-        # non-deterministic provider search-result order (e.g. AniDB title-dump
-        # iteration). is_ambiguous in the cascade trace still flags these for a
-        # future "needs resolution" surface.
-        all_scored.sort(key=lambda s: (s.confidence, str(s.provider), str(s.provider_id)), reverse=True)
+        # ranked across everyone we asked. Tiebreak order for equal confidence:
+        # (1) year closeness to the parsed year — same-title remakes ("The
+        # Thing" 1982 vs 2011) both hit tier-1 1.0, and the old lexicographic
+        # provider-id tiebreak picked whichever id string sorted higher (the
+        # 2011 remake, id "60935" > "1091"); (2) provider/provider_id so the
+        # remaining ties still resolve the SAME way every scan, not by
+        # non-deterministic provider search-result order. is_ambiguous in the
+        # cascade trace still flags exact ties for a future "needs resolution"
+        # surface.
+        all_scored.sort(
+            key=lambda s: (s.confidence, _year_closeness(parsed.year, s.year),
+                           str(s.provider), str(s.provider_id)),
+            reverse=True,
+        )
 
         # No-match floor: refuse to return junk. Caller treats empty as
         # `no_match` and renders the manual-search affordance.
@@ -447,6 +473,7 @@ class MatchEngine:
         # ProviderPermanentError and bubbles up immediately — fall through
         # to the next provider in PROVIDER_PREFERENCE.
         results: list[MovieResult | TVResult] = []
+        used_query: str | None = None
         for query, with_year in _query_ladder(parsed):
             year = parsed.year if with_year else None
             label = f"{key}.{'search_tv' if is_episode else 'search_movie'}({query!r})"
@@ -469,9 +496,29 @@ class MatchEngine:
                 logger.info(f"matcher: {label} gave up: {e!r}")
                 continue
             if results:
+                used_query = query
                 break
         if not results:
             return []
+
+        # Year-recombined rung: the results came from querying "<title> <year>"
+        # ("Blade Runner 2049" — the parser peeled 2049 off as a release year).
+        # Score against THAT text too: with parsed.title still "Blade Runner",
+        # the 1982 film exact-matched (1.0) and beat the 2049 film's substring
+        # score, defeating the rung's whole purpose. Only the recombination
+        # rung gets this — the simplification rungs (arc-dropped, first-words)
+        # query a REDUCED title, where the full parsed title remains the
+        # correct scoring needle.
+        scoring_parsed = parsed
+        if (
+            used_query is not None
+            and parsed.year
+            and parsed.title
+            and used_query.strip() == f"{parsed.title} {parsed.year}".strip()
+        ):
+            import copy as _copy
+            scoring_parsed = _copy.copy(parsed)
+            scoring_parsed.title = used_query.strip()
 
         # Build ScoredMatch objects with placeholder confidence; the
         # cascade fills in the real number below. We keep the rank info
@@ -506,7 +553,7 @@ class MatchEngine:
         )
         _global_registry_ref.set(self.registry)
         ctx = CascadeContext(
-            parsed=parsed,
+            parsed=scoring_parsed,
             candidates=scored,
             series_folder_name=_series_folder_from_parsed(parsed),
             cluster_signal=getattr(parsed, "_cluster_signal", None),
@@ -538,10 +585,15 @@ class MatchEngine:
             sm.raw = dict(sm.raw or {})
             sm.raw["cascade_trace"] = trace.to_dict()
 
-        # Sort by cascade-derived confidence, with a deterministic tiebreak on
-        # (provider, provider_id) so equal-confidence ties don't flip between
+        # Sort by cascade-derived confidence. Tiebreak: year closeness first
+        # (equal-confidence remakes resolve to the year the filename carries),
+        # then (provider, provider_id) so remaining ties don't flip between
         # scans on non-deterministic candidate order.
-        scored.sort(key=lambda s: (s.confidence, str(s.provider), str(s.provider_id)), reverse=True)
+        scored.sort(
+            key=lambda s: (s.confidence, _year_closeness(parsed.year, s.year),
+                           str(s.provider), str(s.provider_id)),
+            reverse=True,
+        )
 
         # AniDB absolute → AID routing stays as a separate routing pass
         # (bipartite refinement at cluster-write time handles the per-
@@ -557,83 +609,9 @@ class MatchEngine:
 
         return scored
 
-    async def _rerank_anime_tvdb(
-        self,
-        provider: MetadataProvider,
-        parsed: ParsedFile,
-        scored: list[ScoredMatch],
-    ) -> list[ScoredMatch]:
-        """Boost anime-flavoured TVDB results, penalize live-action remakes.
+# (_rerank_anime_tvdb (method) removed — zero callers; superseded by the cascade's
+#  Fribb-season metrics + the pack-override pre-pass. FIXES.md §21.)
 
-        Fetches /series/{id}/extended for the top 5 candidates and applies:
-          - +0.15 if originalCountry == 'jpn' OR originalLanguage == 'jpn'
-          - +0.10 confidence-only bump when an alias matches the parsed
-            title better than the canonical display title — we never
-            REPLACE the canonical title with the matched alias (that
-            would pollute the Library with mixed romaji / English /
-            Japanese names based on how each file happened to be named).
-          - -0.20 if genres include obviously-not-anime markers
-        """
-        if not hasattr(provider, "get_series_extended"):
-            return scored
-
-        # Only inspect the top candidates — extra TVDB calls are expensive.
-        head = scored[:5]
-        tail = scored[5:]
-
-        async def enrich(sm: ScoredMatch) -> ScoredMatch:
-            try:
-                ext = await provider.get_series_extended(sm.provider_id)  # type: ignore[attr-defined]
-            except Exception:
-                return sm
-            if not ext:
-                return sm
-            new_conf = sm.confidence
-
-            origin = (ext.get("original_country") or "").lower()
-            lang = (ext.get("original_language") or "").lower()
-            if origin == "jpn" or lang == "jpn" or origin == "jp" or lang == "ja":
-                new_conf = min(1.0, new_conf + 0.15)
-
-            # Score aliases against the parsed title — used only as a
-            # confidence signal. The canonical title from the provider
-            # stays as-is so the Library displays consistent names
-            # regardless of how the user spelled the filename.
-            best_alias_sim = 0.0
-            for alias in (ext.get("aliases") or []):
-                if not isinstance(alias, str):
-                    continue
-                sim = trigram_similarity(parsed.title, alias)
-                if sim > best_alias_sim:
-                    best_alias_sim = sim
-            primary_sim = trigram_similarity(parsed.title, sm.title)
-            if best_alias_sim > primary_sim + 0.05:
-                new_conf = min(1.0, new_conf + 0.10)
-
-            # Penalize obvious live-action / non-anime genres.
-            genres = {(g or "").lower() for g in (ext.get("genres") or [])}
-            if genres & {"live action", "live-action", "reality", "talk show", "news"}:
-                new_conf = max(0.0, new_conf - 0.20)
-
-            return ScoredMatch(
-                provider=sm.provider, provider_id=sm.provider_id,
-                match_type=sm.match_type, confidence=new_conf,
-                title=sm.title, year=sm.year,
-                poster_url=sm.poster_url, overview=sm.overview,
-            )
-
-        # Run the 5 enrich calls in parallel.
-        enriched = await asyncio.gather(*(enrich(sm) for sm in head))
-        return list(enriched) + tail
-
-
-# Roman numerals 2-12 — covers basically every anime franchise; we only
-# look up roman when season >= 2, so "I" isn't in the map.
-_ROMAN = {2: "II", 3: "III", 4: "IV", 5: "V", 6: "VI", 7: "VII", 8: "VIII",
-          9: "IX", 10: "X", 11: "XI", 12: "XII"}
-
-# Ordinal words AniDB uses on its main titles: `2nd Season`, `3rd Season`, etc.
-_ORDINAL = {1: "1st", 2: "2nd", 3: "3rd"}
 def _ordinal(n: int) -> str:
     return _ORDINAL.get(n, f"{n}th")
 
@@ -641,61 +619,8 @@ def _ordinal(n: int) -> str:
 import re as _re_mod  # local alias so test-only imports don't shadow the engine's `re`
 
 
-def _rerank_anime_by_season(season: int, scored: list[ScoredMatch]) -> list[ScoredMatch]:
-    """Boost candidates whose title (or any alias) carries the season ordinal.
-
-    AniDB stores every season of a franchise as a separate AID. The English
-    display title for AID 17629 (Rent-a-Girlfriend S3) reads
-    `"Kanojo, Okarishimasu 3rd Season"`. The S1 AID (15299) reads bare
-    `"Kanojo, Okarishimasu"`. With a season=3 hint we boost the former and
-    knock down the latter so the cluster lands on the right AID.
-    """
-    ord_word = _ordinal(season)
-    roman = _ROMAN.get(season)
-    season_terms = [
-        rf"\b{ord_word}\s+season\b",
-        rf"\bseason\s+0?{season}\b",
-        rf"\bpart\s+0?{season}\b",
-        rf"\bs{season}\b",
-    ]
-    if roman:
-        # Roman pads to a hard word boundary so "II" doesn't match "Twins II".
-        season_terms.append(rf"(?:\s|^|:){roman}(?:\s|$|:)")
-    season_re = _re_mod.compile("|".join(season_terms), _re_mod.IGNORECASE)
-
-    # Skip the rerank entirely when NO candidate carries an ordinal hint —
-    # this is the long-running-single-AID case (One Piece has one AID
-    # titled "One Piece" covering 1100+ episodes; users shelf it into
-    # "Season 23" folders for Plex layout, not because AniDB knows about
-    # such a season). Penalizing the lone "One Piece" candidate here would
-    # demote a perfectly correct match. The rerank only applies to
-    # franchises where AniDB actually splits seasons into separate AIDs.
-    has_ordinal_candidate = any(
-        any(season_re.search(t or "") for t in [sm.title] + list(sm.aliases or []))
-        for sm in scored
-    )
-    if not has_ordinal_candidate:
-        return scored
-
-    rescored: list[ScoredMatch] = []
-    for sm in scored:
-        haystack = [sm.title] + list(sm.aliases or [])
-        hit = any(season_re.search(t or "") for t in haystack)
-        if hit:
-            new_conf = min(1.0, sm.confidence + 0.20)
-        else:
-            # Plain title without any season indicator is most likely S1
-            # — penalize when the parser knows we wanted a later season.
-            new_conf = max(0.0, sm.confidence - 0.15)
-        rescored.append(ScoredMatch(
-            provider=sm.provider, provider_id=sm.provider_id,
-            match_type=sm.match_type, confidence=new_conf,
-            title=sm.title, year=sm.year,
-            poster_url=sm.poster_url, overview=sm.overview,
-            aliases=sm.aliases,
-        ))
-    return rescored
-
+# (_rerank_anime_by_season removed — zero callers; superseded by the cascade's
+#  Fribb-season metrics + the pack-override pre-pass. FIXES.md §21.)
 
 async def _filter_anime_to_known_aids(
     scored: list[ScoredMatch],
@@ -722,7 +647,7 @@ async def _filter_anime_to_known_aids(
     The Round-1 fallback (just pass everything through) silently wiped
     TVDB-only anime libraries: results passed the filter but then failed
     the 0.80 anime confidence floor because none had been boosted by
-    `_rerank_anime_tvdb` yet (rerank runs AFTER this filter). The fix
+    the (since-removed) rerank pass yet. The fix
     is to perform a minimal language check INSIDE this function when
     Fribb is empty: fetch get_series_extended for high-trigram candidates
     only (>= 0.60 to bound the cost) and keep those flagged as JP-origin
@@ -786,228 +711,8 @@ async def _filter_anime_to_known_aids(
     return out
 
 
-async def _rerank_anime_by_fribb_season(parsed_season: int, scored: list[ScoredMatch]) -> list[ScoredMatch]:
-    """Use Fribb cross-ref as authoritative truth on which AID matches a
-    given (TVDB series, season) pair.
-
-    Concrete example: a file named "Bleach.S17E27" returns from AniDB
-    search:
-      - AID 2369  "Bleach"                         (trigram 1.0)
-      - AID 15449 "Bleach: Thousand-Year Blood War" (trigram ~0.55)
-
-    Trigram alone picks AID 2369. But Fribb says:
-      - AID 2369  → tvdb_id=74796, season=None    (not season-specific)
-      - AID 15449 → tvdb_id=74796, season=17      (definitive S17)
-
-    parsed.season=17 means the user has TVDB Season 17 of Bleach. Fribb's
-    `(74796, 17)` reverse lookup is unambiguous: AID 15449. Override the
-    matcher's choice.
-
-    Override conditions:
-      - Exactly ONE candidate has Fribb season == parsed_season AND that
-        AID shares a tvdb_id with at least one OTHER candidate in the list
-        (i.e. it's part of a franchise that AniDB returned). Force to top
-        with confidence 1.0.
-      - Multiple matches → soft boost.
-      - Zero matches OR matching AID isn't a franchise sibling → leave
-        scored as-is.
-
-    The franchise-sibling guard is critical: without it, "BLEACH Thousand-
-    Year Blood War" with parsed.season=1 would pick AID 366 (Queen
-    Millennia, an unrelated 1981 anime that happens to have Fribb
-    season=1) over AID 15449 (Bleach: TYBW, which actually IS the show
-    but has Fribb season=17 not 1). Restricting to franchise siblings
-    means "pick among Bleach AIDs", not "pick from any AID anywhere
-    that happens to share a season number with this folder".
-
-    Pure in-memory — Fribb dict already loaded on startup. No HTTP.
-    """
-    from kira.providers.anime_mappings import AnimeMappings
-
-    # Single pass — collect each candidate's Fribb tvdb_id + season.
-    # mapped_seasons[i] = None means Fribb has no opinion on this AID
-    # (typically the umbrella entry for a long-running show like the
-    # original Bleach AID 2369); = N means Fribb pins it to TVDB S{N}.
-    mapped_seasons: list[int | None] = []
-    mapped_tvdb_ids: list[int | None] = []
-    for sm in scored:
-        try:
-            aid_i = int(sm.provider_id)
-            mapped_seasons.append(await AnimeMappings.tvdb_season(aid_i))
-            mapped_tvdb_ids.append(await AnimeMappings.tvdb_id(aid_i))
-        except Exception:
-            mapped_seasons.append(None)
-            mapped_tvdb_ids.append(None)
-
-    matching = [sm for sm, m in zip(scored, mapped_seasons) if m == parsed_season]
-
-    if not matching:
-        # No candidate matches the requested season. Defensive penalty:
-        # if SOME candidates have explicit Fribb mappings that CONTRADICT
-        # the requested season, demote them. Candidates with no Fribb
-        # opinion (mapped=None) stay neutral. This catches the case where
-        # parsed.season comes from a partial mapping or where the user's
-        # season number doesn't appear in Fribb at all — better to surface
-        # uncertainty than silently pick a known-wrong AID.
-        any_explicit = any(m is not None for m in mapped_seasons)
-        if not any_explicit:
-            return scored
-        rescored: list[ScoredMatch] = []
-        for sm, m in zip(scored, mapped_seasons):
-            penalty = 0.0
-            if m is not None and m != parsed_season:
-                penalty = 0.20
-            new_conf = max(0.0, sm.confidence - penalty) if penalty else sm.confidence
-            rescored.append(ScoredMatch(
-                provider=sm.provider, provider_id=sm.provider_id,
-                match_type=sm.match_type, confidence=new_conf,
-                title=sm.title, year=sm.year,
-                poster_url=sm.poster_url, overview=sm.overview,
-                aliases=sm.aliases,
-            ))
-        rescored.sort(key=lambda s: s.confidence, reverse=True)
-        return rescored
-
-    if len(matching) == 1:
-        winner = matching[0]
-        # H8: Franchise-sibling guard relaxed. Previously: only promote
-        # the matched AID if at least one OTHER candidate in the scored
-        # list shares its tvdb_id. That was too strict — if AniDB search
-        # didn't surface the franchise opener (S1 AID) in the top 10
-        # results, the sibling check failed and the correct S17 AID
-        # never got promoted. Real example: "Bleach S17E27" search
-        # returns the umbrella AID 2369 + 5 other Bleach-ish AIDs but
-        # NOT AID 15449 (the actual S17 Thousand-Year Blood War). Old
-        # code refused to inject 15449 because it wasn't "in the list".
-        #
-        # New rule: trust the Fribb mapping unconditionally when:
-        #   - the winner has a tvdb_id (Fribb knows it)
-        #   - AND no other candidate carries a CONTRADICTORY tvdb_id
-        #     (so we're not picking a totally unrelated show)
-        # The "Queen Millennia happens to be season 1" failure mode is
-        # caught by the existing trigram floor — Queen Millennia won't
-        # score high enough on a "Bleach" search to even become a
-        # candidate.
-        #
-        # **TITLE-SIMILARITY GATE** (One Pace fix). The contradictor
-        # check above presumes the *correct* show is in the candidate
-        # list. When the AniDB search filters out the real target
-        # because the parsed title scores below the 0.15 trigram floor
-        # (M7 short-title penalty does this on purpose for "One Pace"
-        # vs "One Piece"), the real show never enters `scored` — so it
-        # can't contradict the winner. Result: ANOTHER show with the
-        # same Fribb season number (e.g. "ONE: Kagayaku Kisetsu e",
-        # which happens to be TVDB S1 of a totally unrelated 2001 OVA)
-        # gets the 1.0 promotion by default.
-        #
-        # The fix: require the AID's OWN pre-promotion confidence to be
-        # at least PROMOTION_MIN_CONF. Below that, the title genuinely
-        # doesn't look like the filename — the Fribb (tvdb_id, season)
-        # match is coincidence, not identity. Bail out and let the
-        # MIN_CONFIDENCE_ANIME floor drop the cluster to no_match,
-        # which is the correct outcome for a fan-edit nobody's database
-        # actually catalogues.
-        PROMOTION_MIN_CONF = 0.55
-        if winner.confidence < PROMOTION_MIN_CONF:
-            return scored
-        try:
-            winner_idx = scored.index(winner)
-            winner_tvdb = mapped_tvdb_ids[winner_idx]
-        except (ValueError, IndexError):
-            winner_tvdb = None
-        # Block promotion only if a HIGHER-confidence candidate maps to
-        # a DIFFERENT tvdb_id — that would mean the search clearly
-        # wanted a different show, not just a different season of ours.
-        contradicted = winner_tvdb is not None and any(
-            tvid is not None and tvid != winner_tvdb
-            and idx < winner_idx  # higher-confidence rival
-            for idx, tvid in enumerate(mapped_tvdb_ids)
-        )
-        if contradicted:
-            return scored
-        if winner_tvdb is None:
-            # Fribb has no opinion on the winner — fall back to old
-            # sibling check so we don't blindly promote a no-info row.
-            has_sibling = any(
-                i != winner_idx and tvid is not None
-                for i, tvid in enumerate(mapped_tvdb_ids)
-            )
-            if not has_sibling:
-                return scored
-        # Unambiguous Fribb hit AND franchise-confirmed — force to top.
-        rescored: list[ScoredMatch] = []
-        for sm in scored:
-            if sm is winner:
-                rescored.append(ScoredMatch(
-                    provider=sm.provider, provider_id=sm.provider_id,
-                    match_type=sm.match_type, confidence=1.0,
-                    title=sm.title, year=sm.year,
-                    poster_url=sm.poster_url, overview=sm.overview,
-                    aliases=sm.aliases,
-                ))
-            else:
-                # Cap others at 0.95 so the winner sorts first deterministically.
-                rescored.append(ScoredMatch(
-                    provider=sm.provider, provider_id=sm.provider_id,
-                    match_type=sm.match_type, confidence=min(sm.confidence, 0.95),
-                    title=sm.title, year=sm.year,
-                    poster_url=sm.poster_url, overview=sm.overview,
-                    aliases=sm.aliases,
-                ))
-        rescored.sort(key=lambda s: s.confidence, reverse=True)
-        return rescored
-
-    # Multiple matches — this happens when Fribb maps several AIDs to the
-    # same TVDB season (e.g. Bleach TYBW arc-cours all map to TVDB S17).
-    # CRITICAL: only promote when matching AIDs share a tvdb_id (= they're
-    # cours of the same series). Without this guard, common season=1 hint
-    # would promote a random low-AID show ("One: Kagayaku Kisetsu e" for
-    # "One Pace s01") over the correct trigram winner ("One Piece").
-    matching_indexes = [i for i, m in enumerate(mapped_seasons) if m == parsed_season]
-    matching_tvdb = {mapped_tvdb_ids[i] for i in matching_indexes if mapped_tvdb_ids[i] is not None}
-    if len(matching_tvdb) != 1:
-        # Matching candidates come from multiple unrelated shows — Fribb
-        # has no useful signal here. Bail out and trust trigram scoring.
-        return scored
-
-    # Collect matching AIDs (same tvdb_id confirmed above).
-    matching_aids: list[int] = []
-    for sm in matching:
-        try:
-            matching_aids.append(int(sm.provider_id))
-        except (ValueError, TypeError):
-            pass
-    winner_aid = min(matching_aids) if matching_aids else None
-
-    rescored: list[ScoredMatch] = []
-    for sm, m in zip(scored, mapped_seasons):
-        try:
-            aid_i = int(sm.provider_id)
-        except (ValueError, TypeError):
-            aid_i = None
-        if aid_i == winner_aid:
-            new_conf = 1.0
-        elif m == parsed_season:
-            # Another franchise sibling that's also a valid TVDB-season
-            # candidate — kept just below the winner.
-            new_conf = 0.95
-        elif m is not None and m != parsed_season:
-            # Explicit contradiction — drop hard so it can't win.
-            new_conf = max(0.0, sm.confidence - 0.30)
-        else:
-            # No Fribb opinion (m is None). Cap at 0.90 so the explicitly-
-            # confirmed winner wins regardless of base trigram.
-            new_conf = min(sm.confidence, 0.90)
-        rescored.append(ScoredMatch(
-            provider=sm.provider, provider_id=sm.provider_id,
-            match_type=sm.match_type, confidence=new_conf,
-            title=sm.title, year=sm.year,
-            poster_url=sm.poster_url, overview=sm.overview,
-            aliases=sm.aliases,
-        ))
-    rescored.sort(key=lambda s: s.confidence, reverse=True)
-    return rescored
-
+# (_rerank_anime_by_fribb_season removed — zero callers; superseded by the cascade's
+#  Fribb-season metrics + the pack-override pre-pass. FIXES.md §21.)
 
 async def _route_anime_absolute_to_aid(
     provider: MetadataProvider,

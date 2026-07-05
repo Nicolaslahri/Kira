@@ -109,8 +109,10 @@ function useSonarrQueueLibrary(): QueueMaps {
           return;
         }
         // Transient — slow ramp-up, eventually give up.
-        const delay = errCount <= 1 ? 12000 : errCount <= 3 ? 30000 : 60000;
-        if (errCount > 6) return;
+        // Slow ramp-up but NEVER a permanent stop — a 6-minute Sonarr outage
+        // used to kill queue pills for the rest of the session. Settle at a
+        // lazy 5-minute retry instead.
+        const delay = errCount <= 1 ? 12000 : errCount <= 3 ? 30000 : errCount <= 6 ? 60000 : 300000;
         timer = setTimeout(tick, delay);
       }
     };
@@ -301,7 +303,7 @@ interface CoverCardProps {
    *  "(YYYY)" disambiguator only when two cours would read identically).
    *  When omitted, the card strips the year itself. */
   displayTitle?: string;
-  onSelect: (id: string) => void;
+  onSelect: (id: string, shiftKey?: boolean) => void;
   onOpen: (item: LibraryItem, coverEl: HTMLElement) => void;
   onApprove: (item: LibraryItem) => void;
   onReject: (item: LibraryItem) => void;
@@ -387,7 +389,10 @@ export function CoverCard({
     <div
       className={cn(
         'group/cc relative flex cursor-pointer flex-col gap-2.5 rounded-xl outline-none transition',
-        focused && 'outline outline-1 outline-white/20 outline-offset-2',
+        // Keyboard-focus ring: must be UNMISSABLE — this is the cursor for the
+        // j/k review flow (the old 1px 20%-white outline was invisible, so the
+        // user had no idea which card a/r/x/Enter would act on).
+        focused && 'outline outline-2 outline-[var(--accent)] outline-offset-3 shadow-[0_0_0_5px_rgba(99,102,241,0.28)]',
         stats.cardState === 'rejected' && 'opacity-50 grayscale-[0.35] hover:opacity-75',
       )}
       onClick={handleCardClick}
@@ -450,7 +455,7 @@ export function CoverCard({
             <button
               data-cc-control
               type="button"
-              onClick={(e) => { e.stopPropagation(); onSelect(item.id); }}
+              onClick={(e) => { e.stopPropagation(); onSelect(item.id, e.shiftKey); }}
               title={selected ? 'Deselect' : 'Select'}
               aria-label={`${selected ? 'Deselect' : 'Select'} ${item.title || 'card'}`}
               aria-pressed={selected}
@@ -746,6 +751,9 @@ interface LibraryGridProps {
   totalLibrarySize?: number;
   /** Called when the user clicks "Clear filters" in the empty state. */
   onClearFilters?: () => void;
+  /** True when the ACTIVE filters are the landing defaults (Pending + no
+   *  narrowing) — zero items then means "queue cleared", not "over-filtered". */
+  defaultView?: boolean;
   /** Hydration gate. False while the initial /files fetch is in flight;
    *  true once it resolves (success OR failure). When false, we suppress
    *  the "Library is empty" hero — that hero is meaningful only after
@@ -768,10 +776,32 @@ interface LibraryGridProps {
 
 export function LibraryGrid({
   items, selected, setSelected, focusedId, setFocusedId,
-  totalLibrarySize, onClearFilters, hydrated,
+  totalLibrarySize, onClearFilters, defaultView, hydrated,
   scanRunning, scanProgress, scanMessage, scanFound,
   onOpenCover, onApprove, onReject, onManualSearch, onGetMovie,
 }: LibraryGridProps) {
+  // Shift-click range selection (§10): plain click toggles one card; a
+  // shift-click extends the selection from the LAST toggled card to this one,
+  // in display order. Ghost cards (nothing to act on) are skipped.
+  const lastSelectedRef = useRef<string | null>(null);
+  const toggleSelect = (id: string, shiftKey?: boolean) => {
+    const order = items.filter(it => !it.ghost).map(it => it.id);
+    const next = new Set(selected);
+    if (shiftKey && lastSelectedRef.current && lastSelectedRef.current !== id) {
+      const a = order.indexOf(lastSelectedRef.current);
+      const b = order.indexOf(id);
+      if (a !== -1 && b !== -1) {
+        for (let k = Math.min(a, b); k <= Math.max(a, b); k++) next.add(order[k]);
+        lastSelectedRef.current = id;
+        setSelected(next);
+        return;
+      }
+    }
+    if (next.has(id)) next.delete(id); else next.add(id);
+    lastSelectedRef.current = id;
+    setSelected(next);
+  };
+
   // Live Sonarr queue — polled while this grid is mounted. Each card
   // gets its slice via the byTvdb / byAnidb lookups below.
   const sonarrQueueMaps = useSonarrQueueLibrary();
@@ -872,6 +902,28 @@ export function LibraryGrid({
     // wants "Clear filters".
     const isFiltered = (totalLibrarySize ?? 0) > 0;
     if (isFiltered) {
+      // Inbox-zero (§10 M): the DEFAULT view (Pending, no other narrowing)
+      // reaching zero means the queue is CLEARED — celebrate + point at next
+      // steps instead of the confusing "Nothing matches these filters".
+      if (defaultView) {
+        return (
+          <div className="grid place-items-center py-10">
+            <EmptyState
+              icon={<IcCheck />}
+              title="All caught up!"
+              sub={`Every file in your library is reviewed. ${totalLibrarySize} file${totalLibrarySize === 1 ? '' : 's'} tracked.`}
+              action={
+                <div className="flex items-center gap-2">
+                  <Button color="secondary" size="sm" onClick={() => { window.location.hash = '#/history'; }}>View History</Button>
+                  {onClearFilters ? (
+                    <Button color="secondary" size="sm" onClick={onClearFilters}>Browse everything</Button>
+                  ) : null}
+                </div>
+              }
+            />
+          </div>
+        );
+      }
       return (
         <div className="grid place-items-center py-10">
           <EmptyState
@@ -918,7 +970,7 @@ export function LibraryGrid({
               <span className="step-num">3</span>
               <div>
                 <strong>Run your first scan</strong>
-                <span className="step-meta">— button is in the top bar, top-right of the page.</span>
+                <span className="step-meta">— the Scan button lives at the bottom of the sidebar.</span>
               </div>
             </li>
           </ol>
@@ -953,7 +1005,7 @@ export function LibraryGrid({
 
             {renderSectionBody(
               arr, sec.key,
-              { selected, setSelected, focusedId, setFocusedId, anySelected,
+              { selected, setSelected, toggleSelect, focusedId, setFocusedId, anySelected,
                 onOpenCover, onApprove, onReject, onManualSearch, onGetMovie,
                 sonarrQueueMaps, radarrQueue, shelfGroupIds },
             )}
@@ -980,7 +1032,7 @@ export function LibraryGrid({
           </header>
           {renderSectionBody(
             needsMatching, 'anime',
-            { selected, setSelected, focusedId, setFocusedId, anySelected,
+            { selected, setSelected, toggleSelect, focusedId, setFocusedId, anySelected,
               onOpenCover, onApprove, onReject, onManualSearch, onGetMovie, sonarrQueueMaps,
               radarrQueue, shelfGroupIds },
           )}
@@ -997,6 +1049,7 @@ export function LibraryGrid({
 interface SectionCtx {
   selected: Set<string>;
   setSelected: (s: Set<string>) => void;
+  toggleSelect: (id: string, shiftKey?: boolean) => void;
   focusedId: string;
   setFocusedId: (id: string) => void;
   anySelected: boolean;
@@ -1048,11 +1101,11 @@ function lookupQueue(item: LibraryItem, maps: QueueMaps): QueueEntry[] {
     if (hits && hits.length) {
       // Card represents ONE season for TVDB/TMDB providers; filter to
       // matching season so a series-wide queue doesn't paint the same
-      // pill on every season card.
+      // pill on every season card. When the card has a season, show ONLY
+      // its season's hits (plus any with an unknown season) — do NOT fall
+      // back to the whole series, which lit up S1/S2 for an S3 download.
       if (typeof item.season === 'number') {
-        const seasonHits = hits.filter(h => h.season === item.season);
-        if (seasonHits.length) entries = seasonHits;
-        else entries = hits;
+        entries = hits.filter(h => h.season === item.season || h.season == null);
       } else {
         entries = hits;
       }
@@ -1167,11 +1220,7 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
             selected={ctx.selected.has(item.id)}
             anySelected={ctx.anySelected}
             focused={ctx.focusedId === item.id}
-            onSelect={(id) => {
-              const next = new Set(ctx.selected);
-              if (next.has(id)) next.delete(id); else next.add(id);
-              ctx.setSelected(next);
-            }}
+            onSelect={ctx.toggleSelect}
             onOpen={(it, el) => { ctx.setFocusedId(it.id); ctx.onOpenCover(it, el); }}
             onApprove={ctx.onApprove}
             onReject={ctx.onReject}
@@ -1318,11 +1367,7 @@ function renderSectionBody(items: LibraryItem[], sectionKey: MediaType, ctx: Sec
               selected={ctx.selected.has(item.id)}
               anySelected={ctx.anySelected}
               focused={ctx.focusedId === item.id}
-              onSelect={(id) => {
-                const next = new Set(ctx.selected);
-                if (next.has(id)) next.delete(id); else next.add(id);
-                ctx.setSelected(next);
-              }}
+              onSelect={ctx.toggleSelect}
               onOpen={(it, el) => { ctx.setFocusedId(it.id); ctx.onOpenCover(it, el); }}
               onApprove={ctx.onApprove}
               onReject={ctx.onReject}

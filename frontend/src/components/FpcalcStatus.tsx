@@ -19,9 +19,17 @@ export function FpcalcStatusRow({ compact = false }: { compact?: boolean }) {
 
   const refresh = () => { void api.fpcalcStatus().then(setStatus).catch(() => {}); };
   useEffect(() => {
-    refresh();
+    let attempts = 0;
+    let timer: number | undefined;
+    // Retry the initial fetch — a blip must not hide the row forever.
+    const tryLoad = () => {
+      void api.fpcalcStatus().then(setStatus).catch(() => {
+        if (++attempts < 4) timer = window.setTimeout(tryLoad, 1500);
+      });
+    };
+    tryLoad();
     window.addEventListener('kira:fpcalc-changed', refresh);
-    return () => window.removeEventListener('kira:fpcalc-changed', refresh);
+    return () => { window.removeEventListener('kira:fpcalc-changed', refresh); if (timer) clearTimeout(timer); };
   }, []);
 
   if (!status) return null;

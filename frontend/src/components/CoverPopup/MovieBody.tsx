@@ -3,11 +3,15 @@ import { IcAlertTri, IcCheck, IcX } from '../../lib/icons';
 import { confTier } from '../LibraryGrid';
 import { inferQuality, inferSource } from './quality';
 import { MarqueeText } from './MarqueeText';
+import { CandidateList } from './CandidateList';
 
 // Movie popup body — single-file layout adapted to the unified-row visual
 // language: one rich pairing card (FILM badge + filename + tech chips +
 // one confidence pill + status) followed by cast and the rename preview.
-export function MovieBody({ item }: { item: LibraryItem }) {
+export function MovieBody({ item, onPickCandidate }: {
+  item: LibraryItem;
+  onPickCandidate?: (fileId: string, candidate: { matchId?: number; title?: string; year?: number | null }) => void | Promise<void>;
+}) {
   const file = item.files[0];
   if (!file) return null;
   const conf = file.confidence;
@@ -71,6 +75,10 @@ export function MovieBody({ item }: { item: LibraryItem }) {
           </div>
         </div>
       </section>
+
+      {/* Alternative match candidates — one-click "Use" to correct a wrong
+          auto-pick in place, instead of opening full Manual Search. */}
+      <CandidateList file={file} onPick={onPickCandidate} />
 
       {item.cast?.length ? (
         <section className="cx-movie-section">

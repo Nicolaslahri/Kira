@@ -87,10 +87,14 @@ export function NotificationsBell({ placement = 'down-right' }: { placement?: 'd
     try {
       const next = await api.listNotifications();
       setItems(next);
-      if (fetchError) {
-        setFetchError(null);
-        errorSurfacedRef.current = false;
-      }
+      // Functional update, NOT `if (fetchError)`: the 15s interval captures
+      // the FIRST render's closure, whose `fetchError` binding is forever
+      // null — so after one transient failure, successful polls never
+      // cleared it and the "Notifications offline" alert stuck permanently.
+      setFetchError(prev => {
+        if (prev !== null) errorSurfacedRef.current = false;
+        return null;
+      });
     } catch (e) {
       // An ApiError means the backend ANSWERED (with a non-2xx) — it's
       // reachable, just erroring on this endpoint. Only a raw network failure
@@ -144,7 +148,10 @@ export function NotificationsBell({ placement = 'down-right' }: { placement?: 'd
     try {
       await api.markAllNotificationsRead();
       void refresh();
-    } catch { /* swallow */ }
+    } catch {
+      // Surface the failure — a silently-dead button looked broken.
+      setFetchError('Couldn’t mark notifications read — try again.');
+    }
   };
 
   return (
@@ -248,9 +255,20 @@ export function NotificationsBell({ placement = 'down-right' }: { placement?: 'd
                           : 'shadow-[inset_0_-1px_0_var(--line-strong)] last:shadow-none hover:bg-tertiary',
                       )}
                       onClick={async () => {
+                        // Click-through (§10 m): a notification points somewhere —
+                        // renames → History, scan/match results → Review. Navigate
+                        // (hash routing) in addition to marking the group read, so
+                        // "completed_partial (see notifications)" stops being a
+                        // dead end.
+                        const t = `${g.rep.title} ${g.rep.body ?? ''}`.toLowerCase();
+                        if (/rename|undo|renamed/.test(t)) window.location.hash = '#/history';
+                        else if (/scan|match|review|file/.test(t)) window.location.hash = '#/review';
+                        setOpen(false);
                         const unreadMembers = g.members.filter(m => !m.read);
                         if (!unreadMembers.length) return;
-                        try { await Promise.all(unreadMembers.map(m => api.markNotificationRead(m.id))); void refresh(); } catch { /* */ }
+                        // ONE request for the whole collapsed group, not N
+                        // parallel POSTs.
+                        try { await api.markNotificationsRead(unreadMembers.map(m => m.id)); void refresh(); } catch { /* */ }
                       }}
                     >
                       <FeaturedIcon size="sm" color={kindColor(g.rep.kind)} icon={kindIcon(g.rep.kind)} className={cn(!isUnread && 'opacity-60')} />

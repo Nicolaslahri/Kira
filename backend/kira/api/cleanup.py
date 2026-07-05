@@ -23,7 +23,9 @@ async def _resolve_trash_root(session: AsyncSession, roots: list[str]) -> Path |
     (`rename.cleanup_trash` + `rename.trash_dir`, default `<root>/.kira-trash`).
     None → hard delete."""
     from kira.api.rename import _resolve_bool_setting, _resolve_str_setting
-    if not await _resolve_bool_setting(session, "rename.cleanup_trash", False):
+    # Default ON (audit §19 M): cleanup deletions were unrecorded and
+    # unrestorable out of the box — hard-delete is now the OPT-IN.
+    if not await _resolve_bool_setting(session, "rename.cleanup_trash", True):
         return None
     override = await _resolve_str_setting(session, "rename.trash_dir", "")
     if override:

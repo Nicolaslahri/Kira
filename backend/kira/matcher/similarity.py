@@ -114,6 +114,11 @@ def normalize(s: str) -> str:
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower()
     s = s.replace("&", " and ")
+    # Underscore is a word char to `\w`, so `_SPACE_PUNCT_RE` won't touch it —
+    # but in filenames it's a separator ("Attack_on_Titan"). Fold it to a space
+    # explicitly, or underscore-named series folders never trigram-match their
+    # spaced provider titles (folder-identity metric silently missed them).
+    s = s.replace("_", " ")
     s = _DELETE_PUNCT_RE.sub("", s)
     s = _SPACE_PUNCT_RE.sub(" ", s)
     s = _WS_RE.sub(" ", s).strip()

@@ -74,12 +74,15 @@ export function ConfidenceBadge({ value }: { value: number | null | undefined })
     <span className="badge badge-neutral"><span className="dot" />No match</span>
   );
   // Score → plain-English verdict. New users immediately know whether to
-  // trust the match; the % becomes secondary detail.
+  // trust the match; the % becomes secondary detail. Label AND colour now both
+  // derive from the SAME user-tunable band (`confLevel`) — previously the
+  // colour used the bands while the wording used fixed 90/75/50 cutoffs, so a
+  // score between the two taxonomies could show an amber dot labelled "Likely
+  // match". One source of truth keeps them consistent.
   const level = confLevel(value);
-  const label = value >= 90 ? 'Strong match'
-    : value >= 75 ? 'Likely match'
-    : value >= 50 ? 'Needs review'
-    : 'Probably wrong';
+  const label = level === 'high' ? 'Strong match'
+    : level === 'mid' ? 'Likely match'
+    : 'Needs review';
   return (
     <span className={`badge badge-${level}`} title={`Match confidence: ${value}%`}>
       <span className="dot" />
@@ -256,7 +259,20 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
             const isActive = active === it.key;
             const isSettings = it.key === 'settings';
             return (
-              <li key={it.key}>
+              <li key={it.key} className="relative">
+                {/* Sliding active pill — one shared layoutId, so the glow GLIDES
+                    between nav items instead of teleporting. */}
+                {isActive ? (
+                  <motion.span
+                    layoutId="nav-active-pill"
+                    className="pointer-events-none absolute inset-x-0 top-0 h-10 rounded-lg"
+                    style={{
+                      background: 'linear-gradient(110deg, var(--accent-12), var(--accent-8))',
+                      boxShadow: 'inset 0 0 0 1px var(--accent-16)',
+                    }}
+                    transition={{ type: 'spring', stiffness: 480, damping: 40 }}
+                  />
+                ) : null}
                 <NavItemBase
                   icon={it.icon}
                   current={isActive}
@@ -377,8 +393,10 @@ export function Topbar({ active, onMenuClick }: {
   // Slim context bar: the search / scan / notifications / shortcuts that used
   // to live here now live in the sidebar; only the mobile-nav trigger and the
   // page breadcrumb remain.
+  // 48px (was 62): the bar only carries a breadcrumb + the mobile menu —
+  // 62px of chrome for one line of text stole real estate on every page.
   return (
-    <header className="topbar-glass sticky top-0 z-30 flex h-[62px] items-center gap-3 border-b border-[var(--border-2)] px-4 lg:gap-4 lg:px-7">
+    <header className="topbar-glass sticky top-0 z-30 flex h-12 items-center gap-3 border-b border-[var(--border-2)] px-4 lg:gap-4 lg:px-7">
       <ButtonUtility
         size="md"
         color="tertiary"
@@ -647,44 +665,7 @@ export function Select<T>({
   );
 }
 
-export function FilterPill({ on, onClick, label, num }: {
-  on: boolean;
-  onClick: () => void;
-  label: ReactNode;
-  num?: number;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      aria-pressed={on}
-      className={cn(
-        'inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12.5px] font-semibold outline-brand transition duration-100 ease-linear focus-visible:outline-2 focus-visible:outline-offset-2',
-        on
-          ? 'bg-tertiary text-primary shadow-xs ring-1 ring-inset ring-secondary'
-          : 'text-tertiary hover:bg-primary_hover hover:text-secondary',
-      )}
-    >
-      {label}
-      {num != null ? (
-        <span className={cn(
-          'rounded-full px-1.5 py-0.5 text-[10px] font-semibold tabular-nums',
-          on ? 'bg-white/10 text-secondary' : 'bg-white/[0.06] text-tertiary',
-        )}>{num}</span>
-      ) : null}
-    </button>
-  );
-}
-
-// Wraps a set of FilterPills into a tidy segmented group (subtle inset bar).
-// Each group reads as one cohesive control so the three filter dimensions
-// (status / confidence / media) stay visually separated from each other.
-export function FilterGroup({ children }: { children: ReactNode }) {
-  return (
-    <div className="inline-flex flex-wrap items-center gap-0.5 rounded-lg bg-secondary p-1 ring-1 ring-inset ring-secondary">
-      {children}
-    </div>
-  );
-}
+// (FilterPill / FilterGroup removed — dead exports superseded by FilterChip.)
 
 /**
  * Inline shimmering placeholder. Use anywhere a value is loading and

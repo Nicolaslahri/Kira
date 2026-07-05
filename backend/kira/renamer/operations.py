@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import threading
 from enum import Enum
 from pathlib import Path
 
@@ -523,6 +524,34 @@ class RenameSkipped(Exception):
     no-op (leave both files untouched), not an error."""
 
 
+# ── Cross-batch destination claims ──────────────────────────────────────
+# The per-batch duplicate-target guard in perform_rename can't see across
+# batches: a user /rename and the watcher's auto-rename (same process,
+# separate batches) can both render the SAME destination, both pass the
+# non-atomic `dst.exists()` check, and on POSIX the second os.rename()
+# silently REPLACES the first file — bytes gone, no trash, both history
+# rows report success. This registry claims a destination for the full
+# duration of its operation; a concurrent claimant conflicts loudly
+# instead of destroying the winner's file. threading.Lock (not asyncio)
+# because execute_op / undo_op run on worker threads via asyncio.to_thread.
+_INFLIGHT_TARGETS: set[str] = set()
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _claim_target(dst: Path) -> bool:
+    key = os.path.normcase(str(dst))
+    with _INFLIGHT_LOCK:
+        if key in _INFLIGHT_TARGETS:
+            return False
+        _INFLIGHT_TARGETS.add(key)
+        return True
+
+
+def _release_target(dst: Path) -> None:
+    with _INFLIGHT_LOCK:
+        _INFLIGHT_TARGETS.discard(os.path.normcase(str(dst)))
+
+
 def _apply_permissions(path: Path, perms: dict, *, is_dir: bool) -> None:
     """Best-effort post-rename chmod/chown for Docker / NAS deployments —
     applies the octal `dir_mode`/`file_mode` + `uid`/`gid` from the resolved
@@ -543,7 +572,25 @@ def _apply_permissions(path: Path, perms: dict, *, is_dir: bool) -> None:
             pass
 
 
-def execute_op(
+def execute_op(op: FileOp, src: Path, dst: Path, **kwargs) -> int:
+    """Public entry: claim `dst` in the process-global in-flight registry for
+    the duration of the operation (see _INFLIGHT_TARGETS above), then run the
+    real operation. A destination already claimed by a concurrent batch is a
+    conflict — honored via on_conflict ('skip' → RenameSkipped no-op, default
+    → FileExistsError) exactly like an on-disk collision."""
+    if not _claim_target(dst):
+        if kwargs.get("on_conflict") == "skip":
+            raise RenameSkipped(
+                f"another in-flight operation is writing {dst}")
+        raise FileExistsError(
+            f"Destination is being written by another in-flight rename: {dst}")
+    try:
+        return _execute_op_unclaimed(op, src, dst, **kwargs)
+    finally:
+        _release_target(dst)
+
+
+def _execute_op_unclaimed(
     op: FileOp,
     src: Path,
     dst: Path,
@@ -583,15 +630,41 @@ def execute_op(
     dirs deepest-first with `rmdir`. `rmdir` only removes empty
     directories so we can't accidentally nuke siblings.
     """
-    if not src.exists():
+    if not os.path.exists(long_path(src)):
         raise FileNotFoundError(f"Source does not exist: {src}")
 
     created_dirs = _mkdir_tracked(dst.parent)
     artifacts_cleaned = 0
+    # When overwriting, the existing destination is stashed aside here (not
+    # deleted) so a failed op can restore it — see the pre-delete branch below.
+    _overwrite_backup: Path | None = None
 
     try:
-        if dst.exists():
+        # long_path-aware: a bare Path.exists() false-negatives on Windows
+        # >=260-char paths, letting COPY's os.replace silently overwrite an
+        # unseen destination (audit §19 M4).
+        if os.path.exists(long_path(dst)) or dst.is_symlink():
             if not overwrite:
+                # CASE-ONLY rename detection MUST run before the per-op
+                # idempotence checks below: on a case-insensitive volume
+                # (NTFS/APFS/most CIFS) src and dst are the SAME directory
+                # entry, so the hardlink/copy short-circuits would report
+                # success while the on-disk casing never changed — the DB then
+                # records the new casing the disk doesn't have (audit §19 m).
+                try:
+                    _cf_src = os.path.normcase(str(src.resolve()))
+                    _cf_dst = os.path.normcase(str(dst.resolve()))
+                except OSError:
+                    _cf_src = _cf_dst = None
+                if (_cf_src is not None and _cf_src == _cf_dst
+                        and str(src) != str(dst)):
+                    try:
+                        _cf_tmp = dst.with_name(dst.name + ".kira-casefix-tmp")
+                        os.rename(long_path(src), long_path(_cf_tmp))
+                        os.rename(long_path(_cf_tmp), long_path(dst))
+                    except OSError:
+                        pass   # best-effort; leave as-is rather than risk loss
+                    return artifacts_cleaned
                 # If hardlink and they point at the same inode, treat as success.
                 if op == FileOp.HARDLINK and _same_inode(src, dst):
                     return artifacts_cleaned
@@ -662,6 +735,18 @@ def execute_op(
                             return artifacts_cleaned
                     except OSError:
                         pass
+                # COPY + dst is already a complete copy of src: idempotent
+                # success. `shutil.copy2` preserves size AND mtime, so a re-run
+                # of an already-finished copy matches both — treat it as a no-op
+                # like the other ops above instead of raising FileExistsError and
+                # failing an otherwise-done rename.
+                if op == FileOp.COPY:
+                    try:
+                        ss, ds = src.stat(), dst.stat()
+                        if ss.st_size == ds.st_size and int(ss.st_mtime) == int(ds.st_mtime):
+                            return artifacts_cleaned
+                    except OSError:
+                        pass
                 # Genuine conflict — a DIFFERENT file occupies dst (all
                 # idempotent no-op cases already returned above). Honor the
                 # user's on_conflict policy. "overwrite" never reaches here
@@ -673,9 +758,23 @@ def execute_op(
             # COPY does its own atomic temp-file + os.replace below, so it must
             # NOT pre-delete the (good) destination here — otherwise a mid-write
             # copy failure would leave neither the original nor a complete copy.
-            # The other ops (rename/symlink/hardlink) need the slot freed first.
+            # The other ops (rename/symlink/hardlink) need the slot freed first —
+            # but STASH the existing file aside instead of deleting it, so a
+            # failed cross-device MOVE or a failed link can restore it. Deleting
+            # up-front lost BOTH files when the op then failed (the bug COPY was
+            # already guarded against). The backup is dropped on success and
+            # restored in the except handler on failure.
             if op != FileOp.COPY:
-                dst.unlink()
+                _bak = dst.with_name(dst.name + ".kira-overwrite-bak")
+                try:
+                    if _bak.exists():
+                        _bak.unlink()
+                    os.replace(long_path(dst), long_path(_bak))
+                    _overwrite_backup = _bak
+                except OSError:
+                    # Couldn't stash aside — fall back to the old pre-delete so
+                    # the op can still proceed (best-effort, matches prior behaviour).
+                    dst.unlink()
 
         if op == FileOp.MOVE:
             src_parent_before = src.parent
@@ -738,7 +837,23 @@ def execute_op(
                 _apply_permissions(dst, permissions, is_dir=False)
             for _perm_dir in created_dirs:
                 _apply_permissions(_perm_dir, permissions, is_dir=True)
+        # Op succeeded — the new file is in place, so drop the stashed original.
+        if _overwrite_backup is not None:
+            try:
+                _overwrite_backup.unlink()
+            except OSError:
+                pass
     except Exception:
+        # Restore the stashed original if we overwrote and the op then failed,
+        # so "overwrite" never destroys the existing file on a failed MOVE/link.
+        if _overwrite_backup is not None:
+            try:
+                if not dst.exists():
+                    os.replace(long_path(_overwrite_backup), long_path(dst))
+                else:
+                    _overwrite_backup.unlink()
+            except OSError:
+                pass
         # Operation failed AFTER we created destination dirs — roll them
         # back so the target volume doesn't accumulate orphan skeletons.
         # Best-effort: rmdir refuses non-empty dirs so this can't clobber
@@ -814,7 +929,15 @@ def _move_to_trash(entry: Path, trash_root: Path) -> bool:
                 "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }, separators=(",", ":"))
             with open(trash_root / TRASH_MANIFEST, "a", encoding="utf-8") as fh:
+                # Write the whole line in one call and fsync it, so a crash
+                # right after the trash move doesn't leave the item without
+                # provenance (which makes restore 409 "predates the manifest").
                 fh.write(line + "\n")
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
         except OSError:
             pass
         return True
@@ -1164,9 +1287,23 @@ def undo_op(op: FileOp, src: Path, dst: Path) -> None:
     - MOVE   → move dst back to src
     - COPY   → delete dst
     - SYMLINK/HARDLINK → unlink dst (source untouched)
+
+    The undo destination (`src`, the original location) is claimed in the same
+    in-flight registry as forward renames, so an undo can't race a concurrent
+    rename batch that happens to target the same path.
     """
+    if not _claim_target(src):
+        raise FileExistsError(
+            f"Cannot undo — {src} is being written by another in-flight operation.")
+    try:
+        _undo_op_unclaimed(op, src, dst)
+    finally:
+        _release_target(src)
+
+
+def _undo_op_unclaimed(op: FileOp, src: Path, dst: Path) -> None:
     if op == FileOp.MOVE:
-        if not dst.exists():
+        if not os.path.exists(long_path(dst)):
             raise FileNotFoundError(f"Cannot undo move — {dst} no longer exists")
         # Refuse if the original location is now OCCUPIED by a DIFFERENT file. The
         # cross-device copy path below opens `src` (old_path) with "wb" (truncate),
@@ -1174,7 +1311,7 @@ def undo_op(op: FileOp, src: Path, dst: Path) -> None:
         # would SILENTLY destroy whatever the user placed at the old name after the
         # rename. Same-inode ⇒ it's literally the same file (hard link / already
         # restored) → safe to proceed.
-        if src.exists() and not _same_inode(src, dst):
+        if os.path.exists(long_path(src)) and not _same_inode(src, dst):
             raise FileExistsError(
                 f"Cannot undo move — original location {src} is now occupied by a "
                 f"different file; move or remove it first."
@@ -1186,8 +1323,8 @@ def undo_op(op: FileOp, src: Path, dst: Path) -> None:
         # copy+delete across the SMB boundary) could destroy it on a short read.
         _atomic_move(dst, src)
     elif op in (FileOp.COPY, FileOp.SYMLINK, FileOp.HARDLINK):
-        if dst.exists() or dst.is_symlink():
-            dst.unlink()
+        if os.path.lexists(long_path(dst)):
+            os.unlink(long_path(dst))
     else:
         raise ValueError(f"Unknown FileOp: {op}")
 

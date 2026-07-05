@@ -15,7 +15,6 @@
     "WEBRip",
     "WEB-Rip",
     "WEBDL",
-    "WEB",
     "HD-DVD",
     "HDDVD",
     "HDRip",
@@ -37,7 +36,6 @@
     "TELECINE",
     "WORKPRINT",
     "SCREENER",
-    "CAM",
     "TC",
     "PPV"
   ],
@@ -48,7 +46,9 @@
     "NF",
     "TS",
     "BD",
-    "STAN"
+    "STAN",
+    "WEB",
+    "CAM"
   ],
   "codecs": [
     "x265",
@@ -183,7 +183,6 @@
     "Restored",
     "Remastered",
     "IMAX",
-    "Anniversary",
     "Criterion",
     "LIMITED"
   ],

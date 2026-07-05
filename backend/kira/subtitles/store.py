@@ -34,7 +34,18 @@ async def load_blacklist(session: AsyncSession, media_file_id: int | None) -> se
             SubtitleAsset.blacklisted.is_(True),
         )
     )
-    return {(r.provider, str(r.ref)) for r in rows if r.ref is not None}
+    out: set = set()
+    for r in rows:
+        if r.ref is not None:
+            out.add((r.provider, str(r.ref)))
+        else:
+            # Embedded tracks / cache reuses have NO provider ref — key them by
+            # (provider, "lang:<language>") so the aggregator can honor the
+            # blacklist for them too. Without this the "won't be picked again"
+            # toast was FALSE for embedded/cache picks: the next backfill just
+            # re-extracted the identical track.
+            out.add((r.provider, f"lang:{r.language}"))
+    return out
 
 
 async def record_results(

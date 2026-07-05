@@ -177,7 +177,16 @@ def _run_alembic_sync(async_url: str) -> None:
     from alembic.config import Config
 
     sync_url = async_url.replace("+aiosqlite", "")
-    backend_dir = Path(__file__).resolve().parent.parent
+    # In the container the package lives in site-packages while alembic.ini +
+    # migrations/ live at KIRA_ALEMBIC_DIR (/app/backend) — resolving relative
+    # to __file__ there pointed INTO site-packages and raised every boot,
+    # silently disabling migrations. Env wins; source-tree layout is the
+    # dev/test fallback.
+    import os as _os
+    _env_dir = _os.environ.get("KIRA_ALEMBIC_DIR")
+    backend_dir = Path(_env_dir) if _env_dir else Path(__file__).resolve().parent.parent
+    if not (backend_dir / "alembic.ini").is_file():
+        raise FileNotFoundError(f"alembic.ini not found under {backend_dir}")
     cfg = Config(str(backend_dir / "alembic.ini"))
     cfg.set_main_option("script_location", str(backend_dir / "migrations"))
     cfg.set_main_option("sqlalchemy.url", sync_url)
@@ -202,7 +211,7 @@ def _run_alembic_sync(async_url: str) -> None:
     command.upgrade(cfg, "head")
 
 
-async def init_db() -> None:
+async def init_db(defer_data_ops: bool = False) -> None:
     """Create tables + apply idempotent in-place migrations on startup.
 
     CRITICAL ORDERING (do not collapse back into one transaction): SCHEMA
@@ -243,13 +252,34 @@ async def init_db() -> None:
     # ── 3) Data backfills + one-shot data migrations — EACH isolated and
     #        NON-FATAL. A failure here logs and is skipped; the schema above
     #        is already committed, so the app still starts cleanly.
+    #
+    #        With `defer_data_ops=True` (the production lifespan) only the
+    #        CHEAP correctness op runs inline (the scan-lock row, needed
+    #        before any scan); the heavy full-table backfills run via
+    #        `run_deferred_data_ops()` in a background task — so the NAS
+    #        serves its first request immediately instead of blocking boot
+    #        on full-table SELECT sweeps of a big library.
+    for name, fn in [("ensure_scan_lock_row", _ensure_scan_lock_row)]:
+        try:
+            async with engine.begin() as conn:
+                await fn(conn)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"init_db: {name} failed (non-fatal): {e!r}")
+    if not defer_data_ops:
+        await run_deferred_data_ops()
+
+
+async def run_deferred_data_ops() -> None:
+    """The heavy, best-effort data backfills init_db used to run inline at
+    boot. Every op is idempotent + isolated, so this is safe to run at any
+    time; production schedules it as a background task right after serving
+    starts (see main.lifespan)."""
     _data_ops = [
         ("backfill_series_keys", _backfill_series_keys),
         ("backfill_variant_keys", _backfill_variant_keys),
         ("backfill_series_group_ids", _backfill_series_group_ids),
         ("refold_tvdb_anime_groups", _refold_tvdb_anime_groups),
         ("migrate_legacy_naming_templates", _migrate_legacy_naming_templates),
-        ("ensure_scan_lock_row", _ensure_scan_lock_row),
         ("create_perf_indexes", _create_perf_indexes),
     ]
     for name, fn in _data_ops:
@@ -257,7 +287,7 @@ async def init_db() -> None:
             async with engine.begin() as conn:
                 await fn(conn)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"init_db: {name} failed (non-fatal): {e!r}")
+            logger.warning(f"data_ops: {name} failed (non-fatal): {e!r}")
 
 
 async def _ensure_scan_lock_row(conn) -> None:
@@ -294,13 +324,32 @@ async def _create_perf_indexes(conn) -> None:
         # indexed for fast lookup, plus is_selected covers the "give me
         # the picked match" hot query.
         "CREATE INDEX IF NOT EXISTS ix_match_mfid_selected ON matches(media_file_id, is_selected)",
+        # rename_history.media_file_id: bulk file delete runs an UPDATE per
+        # deleted file against this column (files.py) — a 500-file purge over
+        # a 50k-row history was 25M row scans without it. Same column drives
+        # the undo→MediaFile sync.
+        "CREATE INDEX IF NOT EXISTS ix_rh_media_file_id ON rename_history(media_file_id)",
+        # rename_history.created_at: every History page load sorts on it,
+        # and the retention prune filters on it.
+        "CREATE INDEX IF NOT EXISTS ix_rh_created_at ON rename_history(created_at)",
+        # media_files.created_at / updated_at: /files default ordering now,
+        # delta-polling cursor later.
+        "CREATE INDEX IF NOT EXISTS ix_mf_created_at ON media_files(created_at)",
+        "CREATE INDEX IF NOT EXISTS ix_mf_updated_at ON media_files(updated_at)",
+        # media_files.scan_id: FK with no index (SQLite doesn't auto-index
+        # FKs); scan-failure cleanup DELETEs by it.
+        "CREATE INDEX IF NOT EXISTS ix_mf_scan_id ON media_files(scan_id)",
+        # matches(provider, provider_id): boot backfills / refolds / heal
+        # passes all look matches up by provider identity.
+        "CREATE INDEX IF NOT EXISTS ix_match_provider_pid ON matches(provider, provider_id)",
     ]
     for stmt in statements:
         await conn.execute(text(stmt))
-    # ANALYZE rebuilds SQLite's sqlite_stat1 table so the query planner
-    # learns about the new indexes. Without it, the planner may keep
-    # using sequential scans until the database is closed and reopened.
-    await conn.execute(text("ANALYZE"))
+    # PRAGMA optimize (SQLite's recommended maintenance call): analyzes only
+    # the tables whose stats are stale — including the indexes just created —
+    # so the query planner learns about them WITHOUT a full-database ANALYZE
+    # stalling boot on a large library every start.
+    await conn.execute(text("PRAGMA optimize"))
 
 
 async def _ensure_column(conn, table: str, column: str, ddl_type: str) -> bool:

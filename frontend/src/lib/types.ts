@@ -322,6 +322,10 @@ export interface LibFile {
    *  (Sonarr "send missing", future Radarr / NFO writers). Null when
    *  the file has no real provider match (synthesised no_match cards). */
   matchId?: number | null;
+  /** All provider match candidates for this file (from MediaFile.candidates),
+   *  so the CoverPopup can offer a one-click "Use" switch to a different match
+   *  without opening full Manual Search. */
+  candidates?: CandidateData[];
 }
 
 /** One episode/track entry on a series or album item. */

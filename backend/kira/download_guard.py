@@ -44,13 +44,23 @@ async def fetch_capped(
     302s to a file host (SubSource, some CDNs). The INITIAL host is still SSRF-
     validated; following the provider's own redirect chain is an accepted
     tradeoff for those (same fail-open posture as the rest of the outbound guard)."""
+    import time as _time
     from kira.url_guard import is_safe_outbound_url
 
     # Loop only matters when `revalidate_redirects` is set — otherwise this runs
     # exactly once (identical to the old straight-through behaviour).
     current = url
     hops = 0
+    # Total wall-clock budget across ALL redirect hops — without it a
+    # 30s per-hop timeout could stack to ~150s over 5 hops. Cap the
+    # whole fetch at 2x the per-hop timeout and shrink each hop's
+    # timeout to whatever budget remains.
+    _deadline = _time.monotonic() + max(float(timeout), 1.0) * 2.0
     while True:
+        _remaining = _deadline - _time.monotonic()
+        if _remaining <= 0:
+            return None
+        _hop_timeout = min(float(timeout), _remaining)
         if guard:
             ok, _ = is_safe_outbound_url(current)
             if not ok:
@@ -67,7 +77,7 @@ async def fetch_capped(
             # hop (httpx's own follow_redirects would jump straight to the
             # redirect target without the guard ever seeing it).
             _follow = follow_redirects and not revalidate_redirects
-            async with client.stream("GET", current, timeout=timeout,
+            async with client.stream("GET", current, timeout=_hop_timeout,
                                      headers=headers or {}, follow_redirects=_follow) as resp:
                 if revalidate_redirects and resp.is_redirect:
                     loc = resp.headers.get("location")

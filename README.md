@@ -47,6 +47,10 @@ until you approve it.
 
 ## Quick start (Docker)
 
+> **Low-RAM NAS?** Don't build the image on the box — every push to `main`
+> publishes a prebuilt multi-arch image via GitHub Actions. Point your stack at
+> `ghcr.io/nicolaslahri/kira:latest` instead of `build: .`.
+
 A ready-to-edit [`docker-compose.yml`](docker-compose.yml) is included. Change one
 line — point the media volume at your library:
 
@@ -82,6 +86,29 @@ environment variables for first-boot bootstrapping:
 | `KIRA_DATABASE_URL` | SQLite URL (defaults to `/config/kira.db`). |
 | `KIRA_TMDB_API_KEY` / `KIRA_TVDB_API_KEY` | Metadata provider keys (also settable in the UI). |
 | `KIRA_AUTH_USER` / `KIRA_AUTH_PASS` | Optional HTTP Basic auth — set **both** to require login. |
+| `KIRA_CACHE_DIR` | Where the image/poster caches persist (`/config/.cache` in Docker). |
+| `KIRA_LOG_LEVEL` | Backend log level (`INFO` default; `DEBUG` for troubleshooting). |
+| `KIRA_SLOW_QUERY_MS` | Log any DB query slower than this many milliseconds. |
+| `KIRA_FORCE_IPV4` | Force IPv4 DNS resolution (works around broken IPv6 to TMDB etc.). |
+| `KIRA_SCENE_RULES` | Path to a custom `scene-rules.json` overriding the bundled release tokens. |
+| `KIRA_FRONTEND_DIST` | Path of the built SPA the backend serves (set by the image). |
+| `KIRA_CORS_ORIGINS` | Extra allowed origins for API calls (dev servers). |
+| `KIRA_HOST` | Bind address override for bare-metal runs. |
+| `KIRA_MEDIA_HOST` | Compose-only: host path mounted at `/media` (see docker-compose.yml). |
+| `KIRA_IMG_ALLOWED_HOSTS` | Extra image-CDN hosts the `/img` proxy may fetch from (comma-separated). |
+
+
+### Security notes
+
+- **TLS**: Kira speaks plain HTTP. If you expose it beyond your LAN, put it
+  behind a reverse proxy that terminates TLS (Caddy, nginx, Traefik) and enable
+  Basic auth (`KIRA_AUTH_USER`/`KIRA_AUTH_PASS` or the in-app sign-up).
+- **Failed logins** are rate-limited per IP (exponential lockout) and logged.
+- **`/config/kira.db` contains your provider API keys in plaintext** — treat the
+  config volume as sensitive: keep it off shared folders, and consider
+  `chmod 600 kira.db` on the host.
+- The image proxy (`/img`) only fetches from known art CDNs; extend with
+  `KIRA_IMG_ALLOWED_HOSTS` if you use a custom artwork source.
 
 ---
 

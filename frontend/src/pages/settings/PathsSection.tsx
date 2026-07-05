@@ -108,7 +108,10 @@ export function PathsSection({
       .then(p => { if (!cancelled) setPersistence(p.mode); })
       .catch(() => { /* informational only — stay silent on failure */ });
     return () => { cancelled = true; };
-  }, [libraryRoot]);
+    // Mount-only: the endpoint reflects the SAVED root (takes no path arg), so
+    // re-firing per keystroke of the draft was pure spam showing stale data.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // watch_folders stored as JSON array; fall back to single root.
   const watchFolders: string[] = (() => {
@@ -329,8 +332,20 @@ export function PathsSection({
                 <button
                   type="button"
                   title="Remove"
-                  onClick={() => void setWatch(watchFolders.filter((_, j) => j !== i))}
-                  className="grid size-7 shrink-0 place-items-center rounded-md text-tertiary opacity-0 transition-all hover:bg-error-secondary hover:text-error-primary group-hover:opacity-100 [&_svg]:size-[13px]"
+                  aria-label={`Remove watch folder ${p}`}
+                  onClick={() => {
+                    // Prune the folder AND its per-folder auto-scan config —
+                    // otherwise re-adding the same path silently resurrects the
+                    // old auto_rename mode/threshold.
+                    void setWatch(watchFolders.filter((_, j) => j !== i));
+                    if (watchCfg.folders[p]) {
+                      const { [p]: _dropped, ...rest } = watchCfg.folders;
+                      void saveWatchCfg({ ...watchCfg, folders: rest });
+                    }
+                  }}
+                  // Visible by default on touch/coarse pointers (no hover to
+                  // reveal it there); fade-on-hover only for mouse users.
+                  className="grid size-7 shrink-0 place-items-center rounded-md text-tertiary transition-all hover:bg-error-secondary hover:text-error-primary [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 [&_svg]:size-[13px]"
                 >
                   <Trash01 />
                 </button>

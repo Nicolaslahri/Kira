@@ -109,6 +109,50 @@ async def warm_anime_posters(*, narrate: bool = True) -> dict:
     return summary
 
 
+async def warm_music_covers() -> dict:
+    """Prefetch Cover Art Archive covers for selected music matches into the
+    image-proxy disk cache (audit §9 M): CAA/IA cold fetches run 2-8s per
+    cover, so without a warmup the first library paint always paid it live.
+    No 1req/s policy applies to CAA — run a few concurrent. Best-effort."""
+    import asyncio as _asyncio
+    from sqlalchemy import select
+    from kira.database import SessionLocal
+    from kira.models import Match, MediaFile
+    summary = {"urls": 0, "warmed": 0}
+    try:
+        async with SessionLocal() as session:
+            rows = (await session.execute(
+                select(Match.poster_url)
+                .join(MediaFile, MediaFile.id == Match.media_file_id)
+                .where(
+                    MediaFile.media_type == "music",
+                    Match.is_selected.is_(True),
+                    Match.poster_url.is_not(None),
+                )
+                .distinct()
+            )).all()
+        urls = [r[0] for r in rows if r[0] and "coverartarchive.org" in r[0]]
+        summary["urls"] = len(urls)
+        if not urls:
+            return summary
+        from kira.api.images import prefetch_into_cache
+        sem = _asyncio.Semaphore(6)
+
+        async def _one(u: str) -> None:
+            async with sem:
+                try:
+                    if await prefetch_into_cache(u):
+                        summary["warmed"] += 1
+                except Exception:
+                    pass
+
+        await _asyncio.gather(*(_one(u) for u in urls), return_exceptions=True)
+        logger.info("music cover warmup: %d/%d cached", summary["warmed"], summary["urls"])
+    except Exception as e:  # noqa: BLE001 — warmup must never break a scan
+        logger.warning("warm_music_covers aborted (non-fatal): %r", e)
+    return summary
+
+
 def spawn_poster_warmup() -> bool:
     """Fire-and-forget the warm-up (after scans / on startup). No-op without a
     running loop. Returns True if spawned."""
@@ -118,4 +162,5 @@ def spawn_poster_warmup() -> bool:
         return False
     from kira.tasks import spawn_tracked
     spawn_tracked(warm_anime_posters(), label=POSTER_WARMUP_JOB)
+    spawn_tracked(warm_music_covers(), label="music_cover_warmup")
     return True

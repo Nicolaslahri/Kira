@@ -1,16 +1,16 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { AnimatePresence, motion, MotionConfig } from 'motion/react';
 import type { AppState, ModalState, Page, ToastData, MediaFile, SearchResult, TechProgress } from './lib/types';
-import { api, getBackendOnline, onBackendConnectivity, type ApiActivityJob } from './lib/api';
+import { api, ApiError, getBackendOnline, onBackendConnectivity, type ApiActivityJob } from './lib/api';
 import { apiToMediaFile } from './lib/adapters';
 import { cacheGet, cacheSet } from './lib/cache';
 import { setConfBands, getConfBands } from './lib/confBands';
 import { ScanProgress } from './components/ScanProgress';
 import { Sidebar, Topbar } from './components/ui';
-import { notify, NotificationToaster } from './components/base/notifications/notification';
+import { notify, NotificationToaster, type NotifyAction } from './components/base/notifications/notification';
 import { useActivity, ActivityPill } from './components/ActivityIndicator';
 import { SubtitleBrowseModal } from './components/SubtitleBrowseModal';
-import { ManualSearchModal, RenamePreviewModal, KeyboardShortcutsModal, FileDetailsModal } from './components/modals';
+import { ManualSearchModal, RenamePreviewModal, KeyboardShortcutsModal } from './components/modals';
 import { Onboarding, isOnboarded, setOnboarded } from './components/Onboarding';
 import { LoginGate } from './components/LoginGate';
 import { hasStoredAuth } from './lib/api';
@@ -43,12 +43,21 @@ async function narrateTechTail(
   setScanTech: (t: TechProgress | null) => void,
   featureOn: boolean,
   onDone?: (job: ApiActivityJob) => void,
+  isCurrent?: () => boolean,
 ): Promise<void> {
   if (!featureOn) { setScanTech(null); return; }
   setScanTech({ active: false, done: 0, total: null, state: 'running', queued: true });
   const appearBy = Date.now() + 5000;   // grace for the spawn-at-tail latency
+  // Hold the banner for at most ~5 minutes. The tail matches the enrich job by
+  // NAME only, so an unrelated whole-library MediaInfo backfill could hold the
+  // scan popup hostage for its entire (potentially hour-long) run; past the
+  // cap we release the banner and let the ActivityPill narrate the rest.
+  const holdUntil = Date.now() + 5 * 60_000;
   let seen = false;
   for (let i = 0; i < 5000; i++) {       // safety cap; a real pass ends well before
+    // A newer scan/reparse loop took the banner — stop writing over its state.
+    if (isCurrent && !isCurrent()) return;
+    if (Date.now() > holdUntil) { setScanTech(null); return; }
     let job: ApiActivityJob | undefined;
     try { job = (await api.getActivity()).jobs.find(j => j.name === 'mediainfo_enrich'); }
     catch { /* transient backend blip — keep polling */ }
@@ -121,6 +130,11 @@ export default function App() {
   const [authState, setAuthState] = useState<'unknown' | 'login' | 'setup' | 'open'>(
     () => (hasStoredAuth() ? 'open' : 'unknown'),
   );
+  // Whether /auth/status has come back yet. Onboarding (a SERVER fact) must
+  // wait for it: seeding `onboarded` from the localStorage hint means a tab
+  // with a STALE `false` (e.g. cleared storage on an already-onboarded server)
+  // would flash the wizard for a beat until the server corrected it.
+  const [authResolved, setAuthResolved] = useState(false);
   useEffect(() => {
     let cancelled = false;
     void api.getAuthStatus()
@@ -129,15 +143,31 @@ export default function App() {
         if (s.setup) setAuthState('setup');
         else if (s.required && !hasStoredAuth()) setAuthState('login');
         else setAuthState('open');
+        // Durable hint for the fail-closed catch above.
+        try { localStorage.setItem('kira:auth-required', s.required ? '1' : '0'); } catch { /* */ }
         // Onboarding is a SERVER fact (set on completion; legacy instances
         // with a populated library count as onboarded). The localStorage
         // flag remains only as a fast first-paint hint.
         setOnboardedState(s.onboarded);
         setOnboarded(s.onboarded);
+        setAuthResolved(true);
       })
-      // Offline → open: the connectivity UI handles "backend unreachable",
-      // and there's nothing sensitive to protect when nothing can load.
-      .catch(() => { if (!cancelled) setAuthState('open'); });
+      // Failure policy (§18 M): fall OPEN only when this browser has never
+      // authenticated — there the connectivity UI covers "backend down" and
+      // nothing sensitive hydrates. But when stored credentials exist, this
+      // server has auth ON — a transient 500/timeout must NOT render the app
+      // shell + cached library as if logged in; keep the stored-auth gate
+      // ('open' with credentials attached) and let the 401 handler flip to
+      // the login screen if the creds turn out stale. When auth was required
+      // last session (localStorage flag) and no creds are stored, fail to
+      // the LOGIN screen, not the open app.
+      .catch(() => {
+        if (cancelled) return;
+        let requiredHint = false;
+        try { requiredHint = localStorage.getItem('kira:auth-required') === '1'; } catch { /* */ }
+        setAuthState(hasStoredAuth() ? 'open' : requiredHint ? 'login' : 'open');
+        setAuthResolved(true);
+      });
     const onAuthRequired = () => setAuthState('login');
     window.addEventListener('kira:auth-required', onAuthRequired);
     return () => { cancelled = true; window.removeEventListener('kira:auth-required', onAuthRequired); };
@@ -184,9 +214,29 @@ export default function App() {
     if (q.trim() && active !== 'review') setActive('review');
   }, [active, setActive]);
 
+  // Live refs so the mount-once hashchange listener sees CURRENT values.
+  const activeForHashRef = useRef(active);
+  const settingsSectionForHashRef = useRef(settingsSection);
+  useEffect(() => { activeForHashRef.current = active; }, [active]);
+  useEffect(() => { settingsSectionForHashRef.current = settingsSection; }, [settingsSection]);
+
   useEffect(() => {
     const onHashChange = () => {
       const { page, section } = parseHash();
+      // Browser back/forward must respect the SAME unsaved-settings guard as
+      // sidebar nav (§5 M) — it used to bypass it and destroy the draft. If
+      // the user declines, restore the settings hash (this re-fires
+      // hashchange, which no-ops: page === 'settings').
+      if (
+        activeForHashRef.current === 'settings' && page !== 'settings'
+        && settingsDirtyRef.current
+      ) {
+        if (!window.confirm('You have unsaved settings changes. Leave and discard them?')) {
+          window.location.hash = `#/settings/${settingsSectionForHashRef.current}`;
+          return;
+        }
+        settingsDirtyRef.current = false;
+      }
       setActiveState(page);
       setSettingsSectionState(section);
     };
@@ -226,6 +276,10 @@ export default function App() {
   // Cache write: every successful response gets persisted so the next
   // refresh can hydrate the previous data instantly (stale-while-revalidate).
   useEffect(() => {
+    // Gate on auth resolution (§18 m): firing before /auth/status returns
+    // guaranteed a 401 burst on every unauthenticated visit. One cheap wait,
+    // then the fetch runs exactly once post-resolution.
+    if (!authResolved) return;
     api.listAllFiles()
       .then(rows => {
         const mapped = rows.map(apiToMediaFile);
@@ -241,7 +295,7 @@ export default function App() {
       .finally(() => {
         setState(s => ({ ...s, hydrated: true }));
       });
-  }, []);
+  }, [authResolved]);
 
   // Keep the stale-while-revalidate cache in lockstep with live state. Without
   // this, only the initial fetch wrote the cache, so after a mutation (manual
@@ -250,7 +304,14 @@ export default function App() {
   // fetch landed seconds later. Debounced so rapid scan-time updates coalesce.
   useEffect(() => {
     if (!state.hydrated) return;  // don't clobber the cache with the empty pre-fetch []
-    const h = setTimeout(() => cacheSet('files', state.files), 800);
+    // Large libraries: stringifying the WHOLE list burns hundreds of ms of
+    // main thread per debounce fire (every 800ms during scans) only for
+    // localStorage's ~5MB quota to reject it anyway. Cache a first-paint
+    // slice instead — the live fetch replaces it seconds later regardless.
+    const h = setTimeout(() => {
+      const payload = state.files.length > 1500 ? state.files.slice(0, 500) : state.files;
+      cacheSet('files', payload);
+    }, 800);
     return () => clearTimeout(h);
   }, [state.files, state.hydrated]);
 
@@ -275,7 +336,7 @@ export default function App() {
   // Toasts are now Untitled UI notifications on Sonner. pushToast keeps its
   // old signature so every call site is unchanged; the content-length duration
   // scaling (errors linger 50% longer) lives in notify().
-  const pushToast = useCallback((t: Omit<ToastData, 'id'>) => { notify(t); }, []);
+  const pushToast = useCallback((t: Omit<ToastData, 'id'> & { action?: NotifyAction }) => { notify(t); }, []);
 
   // Background-activity poll (boot auto-heal, subtitle fetches, ffmpeg
   // install…) + the one-time "recovered after restart" toast. Always mounted
@@ -291,6 +352,28 @@ export default function App() {
   const activityVisible = state.scanRunning || !!activeJob;
   const activityRef = useRef<HTMLDivElement | null>(null);
   const [activityH, setActivityH] = useState(0);
+  // Watchdog baseline: bumped to Date.now() on real scan progress; the scan
+  // health derivation below reads it to detect a stalled scan. Declared here
+  // (before scanStatus) so it's initialized when scanStatus reads it.
+  // Initialized to 0 so the very first Scan click always passes the staleness
+  // check (no in-flight scan to defer to).
+  const lastProgressAtRef = useRef<number>(0);
+  // Scan-health heartbeat: while a scan runs, tick every 3s so the "stalled"
+  // derivation re-evaluates even when the poll has gone quiet (a wedged scan
+  // stops producing state updates, so nothing else would re-render).
+  const [scanHealthTick, setScanHealthTick] = useState(0);
+  useEffect(() => {
+    if (!state.scanRunning) return;
+    const t = setInterval(() => setScanHealthTick(n => n + 1), 3000);
+    return () => clearInterval(t);
+  }, [state.scanRunning]);
+  // Frozen-state for the scan popup: offline when the backend is unreachable,
+  // stalled when no real progress landed in 2 min (matches the poll watchdog).
+  const scanStatus: 'live' | 'stalled' | 'offline' = !state.scanRunning ? 'live'
+    : backendOk === false ? 'offline'
+    : (Date.now() - lastProgressAtRef.current > 120_000) ? 'stalled'
+    : 'live';
+  void scanHealthTick;  // re-render dependency only
   useEffect(() => {
     const el = activityRef.current;
     if (!el) return;
@@ -317,7 +400,6 @@ export default function App() {
   // when it narrates the tech-tag tail, without churning its dependency list.
   const techTagsOnRef = useRef(techTagsOn);
   useEffect(() => { techTagsOnRef.current = techTagsOn; }, [techTagsOn]);
-
   useEffect(() => {
     const loadDefaults = async () => {
       try {
@@ -394,8 +476,11 @@ export default function App() {
       // makes no progress — floods the backend's event loop and competes with
       // the scan worker. Gating on matched_count kills that flood.
       let lastMatched = -1;
+      let lastFilesRefetchAt = 0;
       let lastCount = -1;
+      let lastPath: string | null = null;
       let stopped = false;
+      let pollFailures = 0;
       while (!done) {
         await new Promise(r => setTimeout(r, 800));
         // Superseded by a newer scan/reparse loop — stop writing banner state.
@@ -403,16 +488,39 @@ export default function App() {
         let s: Awaited<ReturnType<typeof api.getScan>>;
         try {
           s = await api.getScan(scanId);
-        } catch {
-          continue; // transient — keep polling
+          pollFailures = 0;
+        } catch (err) {
+          // 404 = the scan row itself is gone (DB reset / container rebuilt
+          // mid-scan) — no amount of polling brings it back. And transient
+          // errors are tolerated but NOT forever: this loop used to swallow
+          // every failure and leave the banner animating "running" against a
+          // permanently dead backend.
+          if (err instanceof ApiError && err.status === 404) {
+            throw new Error('Scan record no longer exists — it may have been cleared by a backend reset.');
+          }
+          if (++pollFailures >= 75) { // ~60s of continuous failures
+            throw new Error('Lost contact with the backend while tracking the scan.');
+          }
+          continue;
         }
         if (s.status.startsWith('failed')) {
           throw new Error(s.status);
         }
         // Refresh the file list only when something new resolved (or finished).
         const progressed = s.matched_count !== lastMatched || s.file_count !== lastCount;
+        // The stall watchdog counts current_path movement as life too — the
+        // backend deliberately updates it before slow rate-limited clusters,
+        // so a legit no-new-matches stretch doesn't read as "wedged".
+        const pathMoved = s.current_path !== lastPath;
+        lastPath = s.current_path;
         const finishing = s.status === 'completed' || s.status === 'completed_partial';
-        if (progressed || finishing) {
+        // Throttle (§10 m): with the parallel match lane, "progressed" is true
+        // on almost every poll tick — refetching the ENTIRE library each time
+        // hammered the backend and the adapter. At most one refetch per 5s
+        // mid-scan; the terminal refetch always runs.
+        const refetchDue = finishing || (Date.now() - lastFilesRefetchAt) > 5000;
+        if ((progressed && refetchDue) || finishing) {
+          lastFilesRefetchAt = Date.now();
           lastMatched = s.matched_count;
           lastCount = s.file_count;
           try {
@@ -447,12 +555,21 @@ export default function App() {
             if (etaMin >= 1) etaSuffix = ` · ~${etaMin} min left`;
             else if (etaMs > 5000) etaSuffix = ` · <1 min left`;
           }
-          msg = `Matching ${s.matched_count} / ${denom}${etaSuffix}`;
+          // Current-file ticker: the backend maintains current_path exactly
+          // for this — show WHICH title is resolving so slow rate-limited
+          // clusters read as progress, not a hang.
+          const curName = s.current_path ? (s.current_path.split(/[\/]/).pop() ?? '') : '';
+          msg = `Matching ${s.matched_count} / ${denom}${etaSuffix}${curName ? ` · ${curName}` : ''}`;
         } else if (s.status === 'completed' || s.status === 'completed_partial') {
           phase = 'done';
           pct = 100;
-          const partial = s.status === 'completed_partial' ? ' (partial — see notifications)' : '';
-          msg = `${s.file_count} files · ${s.matched_count} matched${partial}`;
+          // Actionable terminal numbers (§3 M): say what needs the user next,
+          // not just raw counts.
+          const needsReview = Math.max(0, s.file_count - s.matched_count);
+          const reviewHint = needsReview > 0 ? ` · ${needsReview} need review` : '';
+          const partial = s.status === 'completed_partial'
+            ? ' · some folders unreachable — see the bell' : '';
+          msg = `${s.file_count} files · ${s.matched_count} matched${reviewHint}${partial}`;
           done = true;
         } else if (s.status === 'cancelled') {
           // Stop button (or a forced stale-lock release). The worker keeps what
@@ -466,22 +583,40 @@ export default function App() {
           done = true;
           stopped = true;
         } else if (s.status !== 'scanning' && s.status !== 'matching' && s.status !== 'pending') {
-          // Any other unrecognized terminal status — never keep polling blindly.
+          // Any other unrecognized terminal status — never keep polling blindly,
+          // and never leave the banner frozen on "Looking for media files…".
+          phase = 'done';
+          msg = `Scan ended (${s.status}) · ${s.file_count} files, ${s.matched_count} matched`;
           done = true;
           stopped = true;
         }
         setState(st => ({ ...st, scanProgress: pct, scanFound: s.file_count, scanMessage: msg, scanPhase: phase }));
-        lastProgressAtRef.current = Date.now();
+        // Watchdog baseline: bump ONLY on real movement (counts / current file /
+        // terminal). It used to bump on every successful poll, which meant the
+        // 90s stale check could never detect a wedged backend scan — a row
+        // stuck at 'matching' with a dead worker froze the banner forever.
+        if (progressed || pathMoved || done) lastProgressAtRef.current = Date.now();
       }
 
+      // A superseded loop (a newer scan took over mid-iteration) must not
+      // narrate the OLD scan's completion — that produced double "Scan
+      // complete" toasts and a stale full-list refresh over the live scan.
+      if (activePollRef.current !== myToken) return;
       await refreshFiles();
-      const final = await api.getScan(scanId);
+      // Final counts are cosmetic — a transient blip here must not convert a
+      // completed scan into a "Scan failed" toast.
+      let finalCounts = '';
+      try {
+        const final = await api.getScan(scanId);
+        finalCounts = `${final.file_count} files · ${final.matched_count} matched`;
+      } catch { finalCounts = 'finished'; }
       pushToast({
         title: stopped ? 'Scan stopped' : 'Scan complete',
-        sub: `${final.file_count} files · ${final.matched_count} matched`,
+        sub: finalCounts,
         kind: 'success',
       });
     } catch (err) {
+      if (activePollRef.current !== myToken) return;
       pushToast({
         title: 'Scan failed',
         sub: (err as Error).message.includes('Failed to fetch')
@@ -497,7 +632,7 @@ export default function App() {
         // Narrate the detached tech-tag pass as the popup's 3rd line, holding the
         // popup open until it finishes (feature off → returns at once). Wrapped so
         // it can never block the banner from clearing.
-        try { await narrateTechTail(t => setState(s => ({ ...s, scanTech: t })), techTagsOnRef.current, dismissJob); } catch { /* ignore */ }
+        try { await narrateTechTail(t => setState(s => ({ ...s, scanTech: t })), techTagsOnRef.current, dismissJob, () => activePollRef.current === myToken); } catch { /* ignore */ }
         // Brief delay so the user sees the final state before the banner disappears.
         setTimeout(() => { if (activePollRef.current === myToken) setState(s => ({ ...s, scanRunning: false, scanTech: null })); }, 1600);
       }
@@ -512,30 +647,92 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      try {
-        const scans = await api.listScans();
-        const running = scans.find(
-          s => (s.status === 'scanning' || s.status === 'matching') && !s.completed_at
-        );
-        if (running && !cancelled) {
-          setState(s => ({
-            ...s,
-            scanRunning: true,
-            scanProgress: 0,
-            scanFound: running.file_count ?? 0,
-            scanPhase: running.status === 'matching' ? 'matching' : 'scanning',
-            scanMessage: 'Resuming scan in progress…',
-          }));
-          await trackScan(running.id);
+      // The re-attach used to be one-shot: a brief backend unavailability at
+      // page load (NAS cold start — this deployment's normal case) meant an
+      // in-flight scan was never adopted and the banner just vanished. Retry
+      // a few times before giving up; the visibility re-sync below is the
+      // longer-term safety net.
+      for (let attempt = 0; attempt < 3 && !cancelled; attempt++) {
+        try {
+          const scans = await api.listScans();
+          const running = scans.find(
+            s => (s.status === 'scanning' || s.status === 'matching') && !s.completed_at
+          );
+          if (running && !cancelled) {
+            setState(s => ({
+              ...s,
+              scanRunning: true,
+              scanProgress: 0,
+              scanFound: running.file_count ?? 0,
+              scanPhase: running.status === 'matching' ? 'matching' : 'scanning',
+              scanMessage: running.source === 'reparse' ? 'Resuming re-parse in progress…' : 'Resuming scan in progress…',
+            }));
+            await trackScan(running.id);
+          }
+          return;
+        } catch {
+          await new Promise(r => setTimeout(r, 5000));
         }
-      } catch { /* no running scan / backend down — nothing to resume */ }
+      }
     })();
     return () => { cancelled = true; };
     // Runs once on mount; trackScan is stable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const runScan = useCallback(async () => {
+  // Visibility re-sync: returning to a throttled/backgrounded tab, re-check
+  // reality instead of trusting frozen React state. Two failure modes healed:
+  // (a) banner says running but the backend has nothing running (poll loop
+  // died / Stop landed while throttled) → clear it; (b) backend HAS a running
+  // scan the banner doesn't know (watcher/auto scan, other tab) → adopt it.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.hidden) return;
+      void (async () => {
+        try {
+          const scans = await api.listScans();
+          const running = scans.find(
+            s => (s.status === 'scanning' || s.status === 'matching') && !s.completed_at
+          );
+          if (!running && scanRunningRef.current) {
+            setState(s => (s.scanRunning ? { ...s, scanRunning: false, scanTech: null } : s));
+          } else if (running && !scanRunningRef.current) {
+            setState(s => ({
+              ...s,
+              scanRunning: true,
+              scanProgress: 0,
+              scanFound: running.file_count ?? 0,
+              scanPhase: running.status === 'matching' ? 'matching' : 'scanning',
+              scanMessage: running.source === 'reparse' ? 'Resuming re-parse in progress…' : 'Resuming scan in progress…',
+            }));
+            await trackScan(running.id);
+          }
+        } catch { /* backend unreachable — the connectivity banner covers it */ }
+      })();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const runScan = useCallback(async (reason?: string) => {
+    // Synchronous guard FIRST — set before any await so a double-click or a
+    // second caller in the same tick can never both reach createScan.
+    if (scanStartInFlightRef.current) return;
+    scanStartInFlightRef.current = true;
+    try {
+      await runScanInner(reason);
+    } finally {
+      scanStartInFlightRef.current = false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.scanRunning, pushToast, refreshFiles, trackScan]);
+
+  // `reason` (optional) overrides the banner's opening line — used by the
+  // automatic post-import retry chain so those self-started scans announce
+  // themselves ("Checking for newly imported files…") instead of looking like
+  // a scan the user never triggered.
+  const runScanInner = useCallback(async (reason?: string) => {
     if (state.scanRunning) {
       // User-reported bug: Dashboard "Scan now" button silently doing
       // nothing. Likely cause: a previous scan crashed and left
@@ -615,9 +812,10 @@ export default function App() {
       // Preview the tech-tag line as "queued…" from the start when the feature
       // is on, so the 3rd line is present throughout (the tail fills in counts).
       scanTech: techOn ? { active: false, done: 0, total: null, state: 'running', queued: true } : null,
-      scanMessage: allRoots.length > 1
-        ? `Looking through ${allRoots.length} folders…`
-        : `Looking through ${effectiveRoot}…`,
+      scanMessage: reason
+        ?? (allRoots.length > 1
+          ? `Looking through ${allRoots.length} folders…`
+          : `Looking through ${effectiveRoot}…`),
     }));
 
     // Backend kicks off the work as a background task and returns the scan id.
@@ -667,11 +865,43 @@ export default function App() {
         return;
       }
       const r = await api.cancelScan(running.id);
+      if (!r.forced) {
+        // Reflect the stop in the BANNER immediately — the worker keeps
+        // running until its next await, and with no visible change "Stop"
+        // looked broken. trackScan's 'cancelled' terminal state closes it out.
+        setState(s => (s.scanRunning
+          ? { ...s, scanMessage: 'Stopping — finishing the current step…' }
+          : s));
+      }
       pushToast({
         title: r.forced ? 'Cleared a stuck scan' : 'Stopping scan…',
         sub: r.forced ? 'No active worker was behind it — freed the lock.' : 'Finishing the current step, then stopping.',
         kind: 'success',
       });
+      if (r.forced) {
+        // No live worker existed — nothing will drive the banner to 'done'.
+        setState(s => ({ ...s, scanRunning: false, scanTech: null }));
+        return;
+      }
+      // Stop used to be fire-and-forget: it relied entirely on the main poll
+      // loop observing 'cancelled'. If that loop was dead (browser throttled a
+      // backgrounded tab), the backend cancelled fine but the banner showed
+      // "running" forever. Confirm with a short bounded re-poll and clear the
+      // banner ourselves if the loop hasn't already done it.
+      for (let i = 0; i < 20; i++) {
+        await new Promise(res => setTimeout(res, 1000));
+        try {
+          const s = await api.getScan(running.id);
+          if (s.status !== 'scanning' && s.status !== 'matching') {
+            setState(st => (st.scanRunning
+              ? { ...st, scanRunning: false, scanTech: null }
+              : st));
+            return;
+          }
+        } catch { /* transient — keep confirming */ }
+      }
+      // Cancellation still pending after ~20s (a slow provider call is
+      // finishing). Leave the banner to the poll loop / visibility re-sync.
     } catch (e) {
       pushToast({ title: 'Couldn’t stop the scan', sub: (e as Error).message, kind: 'error' });
     }
@@ -683,6 +913,19 @@ export default function App() {
   // non-manual ones (manual pins + history preserved). Reuses the scan
   // banner — the backend returns a Scan row we poll exactly like a scan.
   const runReparse = useCallback(async (scope?: { media_type?: string; file_ids?: number[] }) => {
+    // Same synchronous re-entry guard as runScan (shared ref: a scan start and
+    // a re-parse start racing each other is the same double-run bug).
+    if (scanStartInFlightRef.current) return;
+    scanStartInFlightRef.current = true;
+    try {
+      await runReparseInner(scope);
+    } finally {
+      scanStartInFlightRef.current = false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.scanRunning, pushToast, refreshFiles]);
+
+  const runReparseInner = useCallback(async (scope?: { media_type?: string; file_ids?: number[] }) => {
     if (state.scanRunning) {
       pushToast({
         title: 'Busy',
@@ -704,19 +947,50 @@ export default function App() {
       const scan = await api.reparseLibrary(scope);
       let done = false;
       let stopped = false;
+      let pollFailures = 0;
+      let lastMatched = -1;
+      let lastFilesRefetchAt = 0;
+      let lastCount = -1;
       while (!done) {
         await new Promise(r => setTimeout(r, 800));
         // Superseded by a newer scan/reparse loop — stop writing banner state.
         if (activePollRef.current !== myToken) return;
         let s: typeof scan;
-        try { s = await api.getScan(scan.id); } catch { continue; }
         try {
-          const gen = filesGenRef.current;
-          const rows = await api.listAllFiles();
-          // Drop this background replace if a user mutation bumped the gen
-          // mid-fetch — don't revert a manual match made during reparse.
-          setState(st => (gen === filesGenRef.current ? { ...st, files: rows.map(apiToMediaFile) } : st));
-        } catch { /* swallow */ }
+          s = await api.getScan(scan.id);
+          pollFailures = 0;
+        } catch (err) {
+          // Same failure semantics as trackScan: 404 = row gone, terminal;
+          // anything else tolerated for ~60s, never forever.
+          if (err instanceof ApiError && err.status === 404) {
+            throw new Error('Re-parse record no longer exists — it may have been cleared by a backend reset.');
+          }
+          if (++pollFailures >= 75) {
+            throw new Error('Lost contact with the backend while tracking the re-parse.');
+          }
+          continue;
+        }
+        // Refetch the (heavy) full list only when counts actually moved —
+        // this used to re-serialize the entire library every 800ms tick.
+        const progressed = s.matched_count !== lastMatched || s.file_count !== lastCount;
+        const finishing = s.status === 'completed' || s.status === 'completed_partial';
+        // Throttle (§10 m): with the parallel match lane, "progressed" is true
+        // on almost every poll tick — refetching the ENTIRE library each time
+        // hammered the backend and the adapter. At most one refetch per 5s
+        // mid-scan; the terminal refetch always runs.
+        const refetchDue = finishing || (Date.now() - lastFilesRefetchAt) > 5000;
+        if ((progressed && refetchDue) || finishing) {
+          lastFilesRefetchAt = Date.now();
+          lastMatched = s.matched_count;
+          lastCount = s.file_count;
+          try {
+            const gen = filesGenRef.current;
+            const rows = await api.listAllFiles();
+            // Drop this background replace if a user mutation bumped the gen
+            // mid-fetch — don't revert a manual match made during reparse.
+            setState(st => (gen === filesGenRef.current ? { ...st, files: rows.map(apiToMediaFile) } : st));
+          } catch { /* swallow */ }
+        }
         if (s.status.startsWith('failed')) throw new Error(s.status);
 
         let pct = 0;
@@ -753,16 +1027,24 @@ export default function App() {
           stopped = true;
         }
         setState(st => ({ ...st, scanProgress: pct, scanFound: s.file_count, scanMessage: msg, scanPhase: phase }));
-        lastProgressAtRef.current = Date.now();
+        if (progressed || done) lastProgressAtRef.current = Date.now();
       }
+      // Superseded loops must not narrate the old run's completion (double
+      // toasts) — same guard as trackScan.
+      if (activePollRef.current !== myToken) return;
       await refreshFiles();
-      const final = await api.getScan(scan.id);
+      let finalCounts = '';
+      try {
+        const final = await api.getScan(scan.id);
+        finalCounts = `${final.file_count} files · ${final.matched_count} matched`;
+      } catch { finalCounts = 'finished'; }
       pushToast({
         title: stopped ? 'Re-parse stopped' : 'Re-parse complete',
-        sub: `${final.file_count} files · ${final.matched_count} matched`,
+        sub: finalCounts,
         kind: 'success',
       });
     } catch (err) {
+      if (activePollRef.current !== myToken) return;
       pushToast({
         title: 'Re-parse failed',
         sub: (err as Error).message.includes('Failed to fetch')
@@ -775,7 +1057,7 @@ export default function App() {
       if (activePollRef.current === myToken) {
         // Re-parse also spawns the tech-tag pass over the whole library — narrate
         // it as the popup's 3rd line too, so the read isn't an invisible pill.
-        try { await narrateTechTail(t => setState(s => ({ ...s, scanTech: t })), techTagsOnRef.current, dismissJob); } catch { /* ignore */ }
+        try { await narrateTechTail(t => setState(s => ({ ...s, scanTech: t })), techTagsOnRef.current, dismissJob, () => activePollRef.current === myToken); } catch { /* ignore */ }
         setTimeout(() => { if (activePollRef.current === myToken) setState(s => ({ ...s, scanRunning: false, scanTech: null })); }, 1600);
       }
     }
@@ -835,7 +1117,9 @@ export default function App() {
       if (scanRunningRef.current) return false;
       const before = filesCountRef.current;
       try {
-        await runScanRef.current();
+        // Labelled so the banner explains WHY a scan started on its own (a
+        // download just imported), instead of reading as spontaneous activity.
+        await runScanRef.current('Checking for newly imported files…');
       } catch (e) {
         console.warn('Auto-rescan failed', e);
         return false;
@@ -979,10 +1263,6 @@ export default function App() {
   // scanRunning is true but the ref hasn't been touched in >90s, the
   // loop is dead (browser tab throttling, hot-reload, etc.) and the
   // next click force-clears scanRunning instead of silently no-op'ing.
-  // Initialized to 0 so the very first click ALWAYS passes the staleness
-  // check (no in-flight scan to defer to). On subsequent runs, scan
-  // starts by bumping it to Date.now() so the watchdog has a baseline.
-  const lastProgressAtRef = useRef<number>(0);
   // Identity of the scan/reparse the progress banner currently belongs to. Each
   // poll loop stamps this when it starts and bails the moment it no longer
   // matches — so a stale loop (e.g. one left spinning on a cancelled scan, or a
@@ -990,6 +1270,13 @@ export default function App() {
   // flicker against the live loop. Bumped via a monotonic token, not the scan
   // id, so even adopting the SAME scan id from two paths resolves to one winner.
   const activePollRef = useRef(0);
+  // Synchronous re-entry guard for scan/re-parse START. `state.scanRunning`
+  // only flips after runScan's awaited settings fetch resolves (a full RTT to
+  // a NAS backend), so a double-click — or the onboarding auto-scan racing a
+  // user click — used to fire TWO createScan POSTs back-to-back: the 409-adopt
+  // usually saved the first, but a fast first scan let the second start a
+  // whole new run ("scan seems to run 2 times"). A ref flips before any await.
+  const scanStartInFlightRef = useRef(false);
   const renameFilesDirectly = useCallback(async (fileIds: string[], opts?: { profile?: string; op?: string }): Promise<void> => {
     const backendIds = fileIds.map(Number).filter(Number.isFinite);
     if (backendIds.length === 0) return;
@@ -1033,15 +1320,14 @@ export default function App() {
           const subNote = withSubs > 0
             ? ` · sidecars moved on ${withSubs} of ${res.succeeded}`
             : '';
-          pushToast({
-            title: `${res.succeeded} file${res.succeeded === 1 ? '' : 's'} renamed`,
-            sub: `${effOp} · ${effProfile}${subNote} — see Renamed filter or History.`,
-            kind: 'success',
-          });
           // Pre-warm History's cache so navigating to that tab paints
           // the fresh rows instantly instead of the "blank → 500ms gap
           // → everything pops in" pattern. Best-effort; failure here
           // just means History has to fetch on its own (which is fine).
+          // We ALSO use the freshly-fetched rows to power an inline "Undo"
+          // on the success toast (history is newest-first, so the top
+          // `res.succeeded` rows are exactly what we just renamed).
+          let undoIds: number[] = [];
           try {
             const [rows, counts] = await Promise.all([
               api.listHistory(),
@@ -1049,10 +1335,32 @@ export default function App() {
             ]);
             cacheSet('history.items', rows);
             cacheSet('history.counts', counts);
+            undoIds = rows.slice(0, res.succeeded).map(r => r.id);
           } catch {
             // History prefetch failed; the History tab will still
-            // refetch when the user navigates to it.
+            // refetch when the user navigates to it. (No Undo action then.)
           }
+          pushToast({
+            title: `${res.succeeded} file${res.succeeded === 1 ? '' : 's'} renamed`,
+            sub: `${effOp} · ${effProfile}${subNote} — see Renamed filter or History.`,
+            kind: 'success',
+            action: undoIds.length ? {
+              label: undoIds.length === 1 ? 'Undo' : 'Undo all',
+              onClick: () => { void (async () => {
+                try {
+                  const r = await api.undoHistoryBulk(undoIds);
+                  await refreshFiles();
+                  window.dispatchEvent(new CustomEvent('kira:files-changed'));
+                  pushToast({
+                    title: `${r.succeeded} rename${r.succeeded === 1 ? '' : 's'} undone`,
+                    kind: 'success',
+                  });
+                } catch (e) {
+                  pushToast({ title: 'Undo failed', sub: (e as Error).message, kind: 'error' });
+                }
+              })(); },
+            } : undefined,
+          });
           window.dispatchEvent(new CustomEvent('kira:rename-success'));
           return;
         }
@@ -1121,26 +1429,9 @@ export default function App() {
     }
   }, [pushToast]);
 
-  // Manual subtitle fetch: queue a backfill for one file through the full
-  // aggregator (embedded → OpenSubtitles → YIFY). The activity pill IS the
-  // feedback — it appears immediately (the kick below), narrates each phase,
-  // and ends green/red with the outcome. No redundant "watch the pill" toast.
-  const handleFetchSubtitles = useCallback(async (file: MediaFile) => {
-    const backendId = Number(file.id);
-    if (!Number.isFinite(backendId)) {
-      pushToast({ title: 'Cannot fetch', sub: 'This file has no backend record yet.', kind: 'error' });
-      return;
-    }
-    try {
-      const res = await api.backfillSubtitles({ file_ids: [backendId] });
-      window.dispatchEvent(new Event('kira:activity-refresh'));
-      if (!res.started) {
-        pushToast({ title: 'Nothing to fetch', sub: res.detail ?? 'Already covered.', kind: 'success' });
-      }
-    } catch (e) {
-      pushToast({ title: 'Subtitle fetch failed', sub: (e as Error).message, kind: 'error' });
-    }
-  }, [pushToast]);
+// (handleFetchSubtitles removed with FileDetailsModal — per-file subtitle
+// fetch lives in CoverPopup's missing-subs action now.)
+
 
   useEffect(() => {
     const isFormField = (el: Element | null) =>
@@ -1155,8 +1446,18 @@ export default function App() {
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'a') {
         e.preventDefault();
         const ids = state.files.filter(f => f.confidence >= getConfBands().high && f.status === 'pending').map(f => f.id);
-        void setFileStatusBulk(ids, 'approved');
-        pushToast({ title: `${ids.length} high-confidence matches approved`, kind: 'success' });
+        if (!ids.length) {
+          pushToast({ title: 'No high-confidence matches to approve', kind: 'info' });
+          return;
+        }
+        // Approve AND rename — every other approve path (card, bulk bar, popup)
+        // renames on approve. This shortcut used to bare-approve, stranding the
+        // files in "approved but not renamed" limbo that no other flow produces.
+        void (async () => {
+          await setFileStatusBulk(ids, 'approved');
+          if (renameFilesDirectly) await renameFilesDirectly(ids);
+        })();
+        pushToast({ title: `${ids.length} high-confidence match${ids.length === 1 ? '' : 'es'} approved & renamed`, kind: 'success' });
         return;
       }
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
@@ -1193,48 +1494,11 @@ export default function App() {
         if (modal) { closeModal(); return; }
       }
 
-      if (active !== 'review') return;
-      const list = state.files.filter(f => f.status === 'pending');
-      const idx = list.findIndex(f => f.id === focusedId);
-
-      if (e.key === 'j') {
-        e.preventDefault();
-        const n = list[Math.min(list.length - 1, idx + 1)] || list[0];
-        if (n) setFocusedId(n.id);
-      } else if (e.key === 'k') {
-        e.preventDefault();
-        const n = list[Math.max(0, idx - 1)] || list[0];
-        if (n) setFocusedId(n.id);
-      } else if (e.key === 'a' && !e.metaKey && !e.ctrlKey) {
-        const f = state.files.find(x => x.id === focusedId);
-        if (f && f.match?.provider && f.match?.providerId
-            && (f.status === 'pending' || f.status === 'matching')) {
-          // Approve + rename in one shot — same contract as the card
-          // green check + bulk-bar button. Without the rename call the
-          // keyboard shortcut would only flip status, stranding the file
-          // in 'approved' limbo (this was a real bug — caught by the
-          // pipeline trace audit). setFileStatus first so the local
-          // state reflects the approval; rename fires immediately after
-          // (backend rename endpoint doesn't actually require approval).
-          void (async () => {
-            await setFileStatus(focusedId, 'approved');
-            await renameFilesDirectly([focusedId]);
-          })();
-        }
-      } else if (e.key === 'r' && !e.metaKey && !e.ctrlKey) {
-        const f = state.files.find(x => x.id === focusedId);
-        if (f && f.status === 'pending') {
-          void setFileStatus(focusedId, 'rejected');
-          pushToast({ title: 'Rejected', sub: f.filename, kind: 'error' });
-        }
-      } else if (e.key === 'm') {
-        const f = state.files.find(x => x.id === focusedId);
-        if (f) openModal('manualSearch', f);
-      } else if (e.key === 'Enter') {
-        e.preventDefault();
-        const f = state.files.find(x => x.id === focusedId);
-        if (f) openModal('fileDetails', f);
-      }
+      // Review-item navigation (j/k/a/r/m/x/Enter) is owned by ReviewPage now
+      // — it operates on the SAME LibraryItems the grid renders (matching the
+      // `focused` highlight on item ids). The old handler here keyed off raw
+      // file ids, which never matched the grid's `lib_…` item ids, so every
+      // shortcut silently no-op'd. Global shortcuts (g-mode, ⌘⇧A, Esc) stay.
     };
 
     window.addEventListener('keydown', handler);
@@ -1284,8 +1548,18 @@ export default function App() {
     // the manual pick to ALL of them in one bulk call. Movies (and any
     // file with no series_key) fall through to the single-file path
     // since there's no cluster to bulk-apply to.
+    // Prefer the EXPLICIT scope the opener attached (the card's actual file
+    // set, or the single file for a per-file action). The parsed-seriesKey
+    // expansion below is only the fallback for callers that don't pass one:
+    // it mismatched the displayed card both ways — a merged cluster spans
+    // multiple parsed keys (Re-identify re-pinned only a subset, so the cover
+    // "didn't change"), and a per-file pick bulk-clobbered every sibling
+    // sharing the key.
+    const explicitIds = (file as { _clusterFileIds?: string[] })._clusterFileIds;
     const seriesKey = (file as { seriesKey?: string | null }).seriesKey ?? null;
-    const cluster = seriesKey
+    const cluster = explicitIds && explicitIds.length
+      ? state.files.filter(f => explicitIds.includes(f.id))
+      : seriesKey
       ? state.files.filter(f => (f as { seriesKey?: string | null }).seriesKey === seriesKey)
       : [file];
     const clusterIds = cluster
@@ -1402,7 +1676,7 @@ export default function App() {
   return (
     <MotionConfig reducedMotion="user">
       <div className="backdrop" />
-      {!onboarded && (
+      {authResolved && !onboarded && (
         <Onboarding onComplete={() => {
           setOnboardedState(true);
           // Land on the dashboard with the one-shot entrance choreography,
@@ -1469,6 +1743,7 @@ export default function App() {
                   searchQuery={searchQuery}
                   onBulkManualMatch={handleBulkManualMatch}
                   renameFilesDirectly={renameFilesDirectly}
+                  onPickCandidate={(id, candidate) => { void pickCandidate(id, candidate); }}
                   pushToast={pushToast}
                 />
               )}
@@ -1497,41 +1772,14 @@ export default function App() {
       {modal?.kind === 'shortcuts' && (
         <KeyboardShortcutsModal onClose={closeModal} />
       )}
-      {modal?.kind === 'fileDetails' && (
-        <FileDetailsModal
-          file={state.files.find(f => f.id === modal.payload.id) || modal.payload}
-          onClose={closeModal}
-          onApprove={(id, st = 'approved') => {
-            if (st !== 'approved') { void setFileStatus(id, st as 'approved' | 'pending'); return; }
-            const f = state.files.find(x => x.id === id);
-            // Approve + rename in one shot — same contract as the card check,
-            // bulk bar, and keyboard 'a'. A bare status flip here strands the
-            // file in 'approved' limbo: gone from Pending, never renamed, never
-            // in History. The rename toast replaces the old "Approved" one.
-            void (async () => {
-              await setFileStatus(id, 'approved');
-              if (f?.match?.provider && f?.match?.providerId) {
-                await renameFilesDirectly([id]);
-              } else {
-                pushToast({ title: 'Approved', sub: f?.match?.title || f?.filename, kind: 'success' });
-              }
-            })();
-          }}
-          onReject={(id) => {
-            void setFileStatus(id, 'rejected');
-            const f = state.files.find(x => x.id === id);
-            pushToast({ title: 'Rejected', sub: f?.filename, kind: 'error' });
-          }}
-          onManualSearch={(file) => openModal('manualSearch', file)}
-          onPickCandidate={(id, candidate) => { void pickCandidate(id, candidate); }}
-          onFetchSubtitles={handleFetchSubtitles}
-        />
-      )}
 
       {/* Persistent activity indicator (scan progress / background job) — fixed
           in the bottom-right corner; the Sonner toast stack lifts above it. */}
       {(state.scanRunning || activeJob) ? (
-        <div ref={activityRef} className="fixed bottom-6 right-6 z-[9998]">
+        <div ref={activityRef} className="fixed bottom-6 right-6 z-[9998] flex flex-col items-end gap-2">
+          {/* Scan/re-parse popup AND background-job pill now STACK instead of
+              the old either/or slot (a running scan used to HIDE every other
+              job — subtitle backfill, poster warmup — until it finished). */}
           {state.scanRunning ? (
             <ScanProgress
               phase={state.scanPhase}
@@ -1539,8 +1787,13 @@ export default function App() {
               found={state.scanFound}
               message={state.scanMessage}
               tech={state.scanTech}
+              status={scanStatus}
             />
-          ) : activeJob ? (
+          ) : null}
+          {/* Show the background pill alongside a scan, EXCEPT the mediainfo
+              job the scan popup already narrates as its 3rd line (avoid the
+              same job appearing twice). */}
+          {activeJob && !(state.scanRunning && activeJob.name === 'mediainfo_enrich') ? (
             <ActivityPill job={activeJob} onDismiss={dismissJob} />
           ) : null}
         </div>

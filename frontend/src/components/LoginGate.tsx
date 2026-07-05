@@ -29,6 +29,18 @@ function shuffle<T>(arr: T[]): T[] {
 const RAIL_COUNT = 5;
 const RAIL_LEN = 14;
 
+// Bundled poster art served from public/backdrop — 20 PUBLIC-DOMAIN vintage
+// film posters (silent-era / 1920s, from Wikimedia Commons; copyright expired,
+// free to redistribute). On a FRESH boot the server backdrop is empty by
+// construction — no library art yet, and no TMDB key to fetch "popular" — so
+// the rails used to render nothing (the `pool.length < 6` bail). These
+// fill/pad the pool so the login screen always has moving art, offline
+// included. See public/backdrop/CREDITS.md for provenance.
+const BUILTIN_POSTERS: string[] = Array.from(
+  { length: 20 },
+  (_, i) => `/backdrop/builtin-${String(i + 1).padStart(2, '0')}.jpg`,
+);
+
 /** Five tilted poster rails behind the auth card, sliding in alternating
  *  directions on a 3D plane. Posters are the library's own art topped up
  *  with TMDB popular titles (server-shuffled per request) and partitioned
@@ -40,16 +52,28 @@ function PosterRails() {
 
   useEffect(() => {
     let cancelled = false;
-    void api.getAuthBackdrop().then(b => {
-      if (cancelled) return;
-      // One global shuffled, de-duplicated pool → consecutive slices, so a
-      // cover only repeats once every poster has already appeared once.
-      const pool = shuffle([...new Set([...b.movies, ...b.anime, ...b.tv])]);
-      if (pool.length < 6) return; // not enough art for the effect
+    // The bundled posters are TEMPORARY placeholders, shown only until the
+    // user has scanned a library. `art` is the user's OWN cover art (backdrop
+    // endpoint → Match.poster_url); once they have enough of it, we show THEIR
+    // covers and drop the builtins entirely. Below the threshold their art
+    // still leads and builtins just fill the empty rail slots (and are the
+    // whole pool on a fresh, offline first boot).
+    const build = (art: string[]) => {
+      const real = shuffle([...new Set(art)]);
+      const pool = real.length >= 6 ? real : [...real, ...shuffle(BUILTIN_POSTERS)];
+      if (pool.length === 0) return; // truly nothing (shouldn't happen — builtins exist)
       const next = (() => { let i = 0; return () => pool[(i++) % pool.length]; })();
       setRows(Array.from({ length: RAIL_COUNT }, () =>
         Array.from({ length: Math.min(RAIL_LEN, pool.length) }, next)));
-    }).catch(() => { /* cosmetic only */ });
+    };
+    void api.getAuthBackdrop().then(b => {
+      if (cancelled) return;
+      build([...b.movies, ...b.anime, ...b.tv]);
+    }).catch(() => {
+      // Backend unreachable — still show the bundled rails so the login page
+      // isn't a plain gradient offline.
+      if (!cancelled) build([]);
+    });
     return () => { cancelled = true; };
   }, []);
 
@@ -109,7 +133,9 @@ export function LoginGate({ mode }: { mode: 'login' | 'setup' }) {
   const isSetup = mode === 'setup';
   const ready = isSetup
     ? user.trim().length > 0 && pass.length >= 6 && confirm === pass
-    : user.trim().length > 0;
+    // Login also requires a non-empty password — submitting without one just
+    // fired a doomed request instead of inline validation.
+    : user.trim().length > 0 && pass.length > 0;
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -130,7 +156,11 @@ export function LoginGate({ mode }: { mode: 'login' | 'setup' }) {
       setError('Wrong username or password.');
       setPass('');
     } catch (err) {
-      setError((err as Error).message);
+      // Friendly mapping for the raw fetch failure ("Failed to fetch").
+      const msg = (err as Error).message || '';
+      setError(/failed to fetch|networkerror|load failed/i.test(msg)
+        ? 'Can’t reach the Kira server — is it running?'
+        : msg);
     }
     setBusy(false);
   };

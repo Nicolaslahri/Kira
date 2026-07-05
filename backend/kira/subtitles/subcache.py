@@ -176,6 +176,12 @@ async def cache_subtitle(srt_path: str, *, video_path: str, language: str) -> st
     root = await _cache_root()
     if root is None:
         return None
+    # The cache stores everything under a `.srt` key and reuse replays the
+    # bytes as an .srt sidecar with a flat score-100 — an `.ass`/`.vtt` payload
+    # cached here would masquerade as srt forever (and be exempt from
+    # upgrades). Only genuine .srt files enter the reuse cache.
+    if not str(srt_path).lower().endswith(".srt"):
+        return None
     key = await asyncio.to_thread(cache_key, video_path, language)
     lang = (language or "").strip().lower() or "und"
 

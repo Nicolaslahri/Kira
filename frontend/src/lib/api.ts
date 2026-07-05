@@ -113,6 +113,8 @@ export interface ApiScan {
   root_path: string;
   // 'scanning' | 'matching' | 'completed' | 'completed_partial' | 'failed: ...'
   status: string;
+  // 'manual' | 'reparse' | 'watch' — origin of the job (kind-aware labels).
+  source?: string;
   file_count: number;
   matched_count: number;
   // PB-4: set ONCE Phase 1 (file walk) completes — frontend uses it
@@ -144,6 +146,14 @@ export function hasStoredAuth(): boolean {
 /** Sign out: drop the held credentials and let the login gate take over. */
 export function clearStoredAuth(): void {
   setStoredAuth(null);
+  // Logout also drops the cached library/history snapshots — they'd otherwise
+  // instantly hydrate (and be readable via devtools) for the next person who
+  // opens this tab.
+  try {
+    for (const k of Object.keys(localStorage)) {
+      if (k.startsWith('kira:cache:') || k.startsWith('kira:collections')) localStorage.removeItem(k);
+    }
+  } catch { /* storage unavailable */ }
   try { window.dispatchEvent(new Event('kira:auth-required')); } catch { /* SSR */ }
 }
 
@@ -152,7 +162,7 @@ export function clearStoredAuth(): void {
 export async function setupAccount(user: string, pass: string): Promise<void> {
   const res = await fetch(`${API_BASE}/auth/setup`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'Kira' },
     body: JSON.stringify({ username: user, password: pass }),
   });
   if (!res.ok) {
@@ -206,10 +216,29 @@ export function onBackendConnectivity(fn: ConnListener): () => void {
   return () => { _connListeners.delete(fn); };
 }
 
+// Consecutive network failures before we declare the backend offline. A single
+// dropped packet on lossy Wi-Fi used to flip the whole app to "disconnected"
+// (and back), so the banner flickered. Recovery is instant (one good response),
+// only the OFFLINE transition is debounced.
+let _failStreak = 0;
+const _OFFLINE_AFTER = 2;
+
 function markBackend(online: boolean): void {
-  if (_backendOnline === online) return;
-  _backendOnline = online;
-  for (const fn of _connListeners) fn(online);
+  if (online) {
+    _failStreak = 0;
+    if (_backendOnline !== true) {
+      _backendOnline = true;
+      for (const fn of _connListeners) fn(true);
+    }
+    return;
+  }
+  // A failure: require a short streak before flipping to offline.
+  _failStreak += 1;
+  if (_failStreak < _OFFLINE_AFTER) return;
+  if (_backendOnline !== false) {
+    _backendOnline = false;
+    for (const fn of _connListeners) fn(false);
+  }
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -220,6 +249,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       ...init,
       headers: {
         'Content-Type': 'application/json',
+        // CSRF token-of-intent: the backend rejects state-changing requests
+        // without this custom header (forms can't set custom headers, so a
+        // cross-site POST can never be a no-preflight "simple request").
+        'X-Requested-With': 'Kira',
         ...(auth ? { Authorization: `Basic ${auth}` } : {}),
         ...init?.headers,
       },
@@ -266,7 +299,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch { /* not JSON, keep status line */ }
     throw new ApiError(message, res.status);
   }
-  return res.json() as Promise<T>;
+  // Guard the parse: an empty/non-JSON 2xx body used to throw a raw
+  // SyntaxError ("Unexpected end of JSON input") — an inconsistent error
+  // shape reaching toasts. Normalize to ApiError.
+  const bodyText = await res.text();
+  if (!bodyText) return undefined as T;
+  try {
+    return JSON.parse(bodyText) as T;
+  } catch {
+    throw new ApiError(`Malformed JSON response (HTTP ${res.status})`, res.status);
+  }
 }
 
 export interface ApiSearchResult {
@@ -455,20 +497,15 @@ export const api = {
         ? { root_path, root_paths }
         : { root_path }),
     }),
-  rematchFile: (fileId: number) =>
-    request<ApiMediaFile>(`/files/${fileId}/rematch`, { method: 'POST' }),
-  /** M5 — content-hash identify: hash the file's bytes (OSDb 64-bit), ask
-   *  OpenSubtitles which release it is, and pin the resulting TMDB match.
-   *  Works even when the filename is garbage. Requires an OpenSubtitles API
-   *  key. Returns the updated file with its freshly-pinned match. */
+  /** Re-match the whole library: re-runs matching against existing parse
+   *  data — much lighter than a full re-parse. */
+  rematchAll: () =>
+    request<{ queued: number }>('/rematch-all', { method: 'POST' }),
+
+  /** Content-hash identification (OpenSubtitles file-hash lookup) for a file
+   *  the title/metadata matcher couldn't place. Returns the updated file. */
   identifyByHash: (fileId: number) =>
     request<ApiMediaFile>(`/files/${fileId}/identify-by-hash`, { method: 'POST' }),
-  /** #11 — download OpenSubtitles subtitles for one file as `<stem>.<lang>.srt`
-   *  sidecars (hash-first, falls back to the selected match's TMDB id + S/E).
-   *  Needs an API key; downloads also need account login. */
-  fetchSubtitles: (fileId: number) =>
-    request<{ saved: string[]; count: number; languages: string[] }>(
-      `/files/${fileId}/fetch-subtitles`, { method: 'POST' }),
 
   /** Queue a subtitle backfill (embedded → OpenSubtitles → YIFY) for specific
    *  files, or the whole library's missing-sub set with scope:'library'.
@@ -564,16 +601,6 @@ export const api = {
    *  without a scan (and without the scan's all-or-nothing walk fragility). */
   reconcileFiles: () =>
     request<{ removed: number; ids: number[] }>('/files/reconcile', { method: 'POST' }),
-  rematchAll: (params?: { media_type?: string; limit?: number }) => {
-    const q = new URLSearchParams();
-    if (params?.media_type) q.set('media_type', params.media_type);
-    if (params?.limit) q.set('limit', String(params.limit));
-    const qs = q.toString();
-    return request<{ files_processed: number; files_with_matches: number }>(
-      `/rematch-all${qs ? `?${qs}` : ''}`,
-      { method: 'POST' },
-    );
-  },
   search: (provider: string, query: string, type: 'movie' | 'tv' | 'auto' = 'auto') => {
     const q = new URLSearchParams({ q: query, type });
     return request<ApiSearchResponse>(`/search/${provider}?${q.toString()}`);
@@ -705,10 +732,10 @@ export const api = {
       return res;
     }),
 
-  testProvider: (provider: string) =>
+  testProvider: (provider: string, candidate?: { api_key?: string; username?: string; password?: string }) =>
     request<{ ok: boolean; detail: string | null; latency_ms: number | null }>(
       `/settings/providers/${provider}/test`,
-      { method: 'POST' },
+      { method: 'POST', body: JSON.stringify(candidate ?? {}) },
     ),
 
   /** Sonarr integration: validate URL+API key AND fetch the user's
@@ -987,11 +1014,35 @@ export const api = {
   historyCounts: () => request<{ today: number; week: number; all: number }>('/history/counts'),
   undoHistory: (id: number) => request<ApiHistoryEntry>(`/history/${id}/undo`, { method: 'POST' }),
   undoHistoryBulk: (ids: number[]) =>
-    request<{ succeeded: number; failed: number }>('/history/undo-bulk', {
+    request<{ succeeded: number; failed: number; succeeded_ids?: number[]; failed_ids?: number[] }>('/history/undo-bulk', {
       method: 'POST',
       body: JSON.stringify({ ids }),
     }),
   exportHistoryUrl: () => `${API_BASE}/history/export.csv`,
+  /** Download the history CSV through the AUTHED fetch layer. A plain
+   *  `<a href>` navigation sends no Authorization header (creds live in
+   *  sessionStorage, attached only by request()), so with Basic auth enabled
+   *  the link 401'd instead of downloading. Fetch as a blob + synthetic
+   *  anchor keeps the header on the request. */
+  downloadHistoryCsv: async (): Promise<void> => {
+    const auth = getStoredAuth();
+    const res = await fetch(`${API_BASE}/history/export.csv`, {
+      headers: {
+        'X-Requested-With': 'Kira',
+        ...(auth ? { Authorization: `Basic ${auth}` } : {}),
+      },
+    });
+    if (!res.ok) throw new ApiError(`Export failed (HTTP ${res.status})`, res.status);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'kira-history.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
   /** Sweep leftover sidecar files (NFO / poster / subtitle sidecars) that an
    *  undone rename couldn't clean up — the media file went back to its original
    *  location but the artifacts Kira wrote alongside the renamed copy stayed
@@ -1034,12 +1085,18 @@ export const api = {
 
   listNotifications: (unreadOnly = false) => {
     const q = new URLSearchParams();
+    // 200 (backend default was 50): the bell's unread badge counts only what
+    // this returns, so a busy scan pushed unread items past the window and
+    // silently undercounted (the 99+ branch was dead code).
+    q.set('limit', '200');
     if (unreadOnly) q.set('unread_only', 'true');
     const qs = q.toString();
     return request<ApiNotification[]>(`/notifications${qs ? `?${qs}` : ''}`);
   },
   markNotificationRead: (id: number) =>
     request<ApiNotification>(`/notifications/${id}/read`, { method: 'POST' }),
+  markNotificationsRead: (ids: number[]) =>
+    request<{ updated: number }>('/notifications/read', { method: 'POST', body: JSON.stringify({ ids }) }),
   markAllNotificationsRead: () =>
     request<{ updated: number }>('/notifications/read-all', { method: 'POST' }),
 

@@ -126,6 +126,29 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['parent_id'], ['rename_history.id'], ondelete='SET NULL'),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_table('subtitle_assets',
+        sa.Column('id', sa.Integer(), nullable=False),
+        sa.Column('media_file_id', sa.Integer(), nullable=True),
+        sa.Column('language', sa.String(), nullable=False),
+        sa.Column('provider', sa.String(), nullable=False),
+        sa.Column('release_name', sa.String(), nullable=True),
+        sa.Column('ref', sa.String(), nullable=True),
+        sa.Column('score', sa.Integer(), nullable=False),
+        sa.Column('sync', sa.String(), nullable=False),
+        sa.Column('reasons', sa.JSON(), nullable=True),
+        sa.Column('hearing_impaired', sa.Boolean(), nullable=False),
+        sa.Column('forced', sa.Boolean(), nullable=False),
+        sa.Column('path', sa.String(), nullable=True),
+        sa.Column('title', sa.String(), nullable=True),
+        sa.Column('active', sa.Boolean(), nullable=False),
+        sa.Column('blacklisted', sa.Boolean(), nullable=False),
+        sa.Column('created_at', sa.DateTime(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
+        sa.ForeignKeyConstraint(['media_file_id'], ['media_files.id'], ),
+        sa.PrimaryKeyConstraint('id'),
+    )
+    op.create_index('ix_subtitle_assets_active', 'subtitle_assets', ['active'])
+    op.create_index('ix_subtitle_assets_blacklisted', 'subtitle_assets', ['blacklisted'])
+    op.create_index('ix_subtitle_assets_media_file_id', 'subtitle_assets', ['media_file_id'])
     # ### end Alembic commands ###
 
 
@@ -137,6 +160,10 @@ def downgrade() -> None:
         batch_op.drop_index(batch_op.f('ix_matches_series_group_id'))
         batch_op.drop_index(batch_op.f('ix_matches_collection_id'))
 
+    op.drop_index('ix_subtitle_assets_media_file_id', table_name='subtitle_assets')
+    op.drop_index('ix_subtitle_assets_blacklisted', table_name='subtitle_assets')
+    op.drop_index('ix_subtitle_assets_active', table_name='subtitle_assets')
+    op.drop_table('subtitle_assets')
     op.drop_table('matches')
     with op.batch_alter_table('media_files', schema=None) as batch_op:
         batch_op.drop_index(batch_op.f('ix_media_files_variant_key'))

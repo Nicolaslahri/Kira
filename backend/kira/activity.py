@@ -36,6 +36,16 @@ def begin(name: str, label: str, total: int | None = None) -> None:
     }
 
 
+def is_active(name: str, *, stale_after: float = 120.0) -> bool:
+    """True when a job by this name is running AND has updated recently — the
+    same freshness rule `snapshot()` uses, so a crash-orphaned `active` flag
+    doesn't read as running forever. Used to block double-spawning a job."""
+    job = _jobs.get(name)
+    if not job or not job.get("active"):
+        return False
+    return (time.time() - job.get("updated_at", 0)) < stale_after
+
+
 def progress(name: str, done: int, total: int | None = None) -> None:
     job = _jobs.get(name)
     if job is None:

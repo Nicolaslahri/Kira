@@ -151,6 +151,13 @@ async def gather_candidates(
             elif verdict == "mismatch":
                 c.score = max(0, c.score - 50)
                 c.reasons.append("names a different episode")
+            else:
+                # "unknown" (no episode token / pack-shaped): a mild penalty so
+                # a big-download season dump can't outscore the CONFIRMED right
+                # episode purely on release affinity — SubSource in particular
+                # ignores its episode param and returns the whole season.
+                c.score = max(0, c.score - 8)
+                c.reasons.append("no episode marker in the name")
     # Movie identity gate — a candidate whose provider-reported FILM identity
     # (imdb/tmdb id, or year) clearly differs from the title we matched is the
     # WRONG MOVIE (Ballerina 2023 vs 2025), however good its release looks. Only
@@ -205,8 +212,14 @@ async def fetch_subtitles(
     # EXTRACTION isn't enabled. Pulled safely from ctx.parsed (dict | object |
     # None); when MediaInfo never ran this is empty → no behavior change.
     embedded_langs = _embedded_langs(ctx.parsed)
-    remaining = set(_common.languages_needing_fetch(
-        ctx.video_path, ctx.languages, embedded=embedded_langs))
+    # ORDER-PRESERVING (dict keys, not a set): `remaining` feeds
+    # "first wanted language" fallbacks downstream (untagged embedded tracks,
+    # AnimeTosho attachments) — a set made that fallback ARBITRARY, so an
+    # English track could get saved as `.es.srt` for an en,es user.
+    _want_forced = (ctx.forced or "") == "only"
+    remaining = dict.fromkeys(_common.languages_needing_fetch(
+        ctx.video_path, ctx.languages, embedded=embedded_langs,
+        forced=_want_forced))
     if not remaining:
         return results
 
@@ -214,14 +227,20 @@ async def fetch_subtitles(
     if enabled.get("embedded", True) and _embedded.available():
         try:
             _say("checking embedded tracks")
-            for p in await _embedded.extract(ctx.video_path, list(remaining), forced=ctx.forced):
+            # Honor the blacklist for embedded picks: a language whose embedded
+            # track the user binned must not be silently re-extracted.
+            _embed_langs = [
+                l for l in remaining
+                if ("embedded", f"lang:{l}") not in (ctx.blacklist or set())
+            ]
+            for p in await _embedded.extract(ctx.video_path, _embed_langs, forced=ctx.forced):
                 lang = _lang_from_path(p)
                 if lang:
                     results.append(SubtitleFetchResult(
                         language=lang, path=p, provider="embedded",
                         release_name="embedded track", score=100, sync="guaranteed",
                         reasons=["embedded track (perfect sync)"]))
-                    remaining.discard(lang)
+                    remaining.pop(lang, None)
         except Exception as e:
             _log.warning("embedded failed for %s: %r", ctx.video_path, e)
     if not remaining:
@@ -233,9 +252,11 @@ async def fetch_subtitles(
     # burned). Mirrors the on-disk-sidecar skip above: on a hit we copy it to the
     # sidecar and drop the language from the to-download set. Best-effort.
     for lang in list(remaining):
-        if _common.has_sidecar(ctx.video_path, lang):
-            remaining.discard(lang)
+        if _common.has_sidecar(ctx.video_path, lang, forced=_want_forced):
+            remaining.pop(lang, None)
             continue
+        if ("cache", f"lang:{lang}") in (ctx.blacklist or set()):
+            continue   # user binned a cache-provided sub for this language
         try:
             cached = await _subcache.find_cached_subtitle(ctx.video_path, lang)
         except Exception as e:
@@ -250,7 +271,8 @@ async def fetch_subtitles(
         if not data or len(data) > _common.MAX_SUB_BYTES:
             continue
         path = await asyncio.to_thread(
-            _common.save_sidecar, ctx.video_path, lang, data, "srt")
+            lambda: _common.save_sidecar(ctx.video_path, lang, data, "srt",
+                                         forced=_want_forced))
         if not path:
             continue
         _say(f"reused cached {lang.upper()} subtitle — no download needed")
@@ -258,7 +280,7 @@ async def fetch_subtitles(
             language=lang, path=path, provider="cache",
             release_name="reuse-cache", score=100, sync="likely",
             reasons=["reused from cache (previously downloaded for this file)"]))
-        remaining.discard(lang)
+        remaining.pop(lang, None)
     if not remaining:
         return results
 
@@ -274,7 +296,7 @@ async def fetch_subtitles(
     # 3) Per language: try best-scored first, fall through on failure.
     for lang in list(remaining):
         for cand in by_lang.get(lang, []):
-            if _common.has_sidecar(ctx.video_path, lang):
+            if _common.has_sidecar(ctx.video_path, lang, forced=_want_forced):
                 break
             # Minimum-score floor: better no sub than a likely-mistimed one.
             if ctx.min_score and cand.score < ctx.min_score:

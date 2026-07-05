@@ -43,6 +43,10 @@ _REQ_CODE: dict[str, str] = {
 
 
 def _req_code(lang: str) -> str:
+    # SubDL's Brazilian-Portuguese token is BR_PT, not the naive PT-BR upper-
+    # casing (which silently returned zero results for pt-BR users).
+    if lang.lower() in ("pt-br", "pt_br", "ptbr"):
+        return "BR_PT"
     return _REQ_CODE.get(lang.lower(), lang.upper())
 
 

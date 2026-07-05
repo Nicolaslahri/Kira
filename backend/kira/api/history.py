@@ -333,6 +333,7 @@ def _verify_row_undoable_sync(
     old_path: str,
     provider: str | None,
     provider_id: str | None,
+    operation: str = "move",
 ) -> tuple[bool, str]:
     """The pure, BLOCKING half of the undo-viability check (stat + xattr reads).
     Callers wrap it in `asyncio.to_thread` so the event loop stays responsive.
@@ -354,6 +355,12 @@ def _verify_row_undoable_sync(
 
     new_p = _P(new_path)
     if not new_p.exists():
+        # A SYMLINK/HARDLINK undo just unlinks new_path, which works even on a
+        # BROKEN symlink (its target moved) — `exists()` is False for a broken
+        # link but `is_symlink()` is True, and undo_op handles it. Only MOVE/COPY
+        # genuinely need the target present to move/delete it.
+        if operation in ("symlink", "hardlink") and new_p.is_symlink():
+            return True, ""
         return False, "Target missing"
 
     # Identity stamp: the rename stamped the destination with the resolved
@@ -385,13 +392,22 @@ def _verify_row_undoable_sync(
     # Original location now holding a DIFFERENT file → undo would clobber it
     # (same data-loss guard as undo_op's MOVE branch). Same-inode means it's
     # literally the same file (already restored / hardlink) → fine.
-    old_p = _P(old_path)
-    try:
-        if old_p.exists() and not _same_inode(old_p, new_p):
-            return False, "Original location occupied"
-    except OSError:
-        # stat hiccup (NAS blip) — be conservative and allow; undo_op re-checks.
-        pass
+    #
+    # MOVE ONLY: undo_op physically moves new_path back onto old_path only for
+    # a MOVE. For COPY/SYMLINK/HARDLINK, undo just DELETES the destination and
+    # never touches old_path — so old_path legitimately still holds the source
+    # (that's the whole point of a copy/link). Applying this guard to those ops
+    # rejected EVERY copy-mode undo, and every hardlink/symlink undo on a
+    # zero-inode CIFS/SMB mount (where `_same_inode` can't prove sameness) —
+    # i.e. undo of the DEFAULT op on the primary Docker deployment.
+    if operation == "move":
+        old_p = _P(old_path)
+        try:
+            if old_p.exists() and not _same_inode(old_p, new_p):
+                return False, "Original location occupied"
+        except OSError:
+            # stat hiccup (NAS blip) — be conservative and allow; undo_op re-checks.
+            pass
     return True, ""
 
 
@@ -413,7 +429,7 @@ async def _verify_row_undoable(
             provider, provider_id = match.provider, match.provider_id
     return await asyncio.to_thread(
         _verify_row_undoable_sync,
-        entry.new_path, entry.old_path, provider, provider_id,
+        entry.new_path, entry.old_path, provider, provider_id, entry.operation,
     )
 
 
@@ -801,6 +817,28 @@ async def _relink_radarr_after_undo(session: AsyncSession, entries: list[RenameH
         logger.warning(f"undo: radarr relink prep failed (non-fatal): {e!r}")
 
 
+async def _refresh_media_servers_after_undo(session: AsyncSession) -> None:
+    """Nudge Plex/Jellyfin to re-scan after an undo, the same way the forward
+    rename does — otherwise the media server keeps pointing at the NEW (now
+    deleted) paths until its next scheduled scan. Backgrounded + best-effort;
+    a refresh failure must never affect the undo itself."""
+    try:
+        from kira.integrations.media_server import refresh_all
+        from kira.tasks import spawn_tracked
+
+        async def _bg() -> None:
+            try:
+                from kira.database import SessionLocal
+                async with SessionLocal() as s:
+                    await refresh_all(s)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"undo: media-server refresh failed (non-fatal): {e!r}")
+
+        spawn_tracked(_bg(), "undo-media-refresh")
+    except Exception as e:  # noqa: BLE001 — best-effort
+        logger.warning(f"undo: media-server refresh prep failed (non-fatal): {e!r}")
+
+
 @router.post("/{entry_id}/undo", response_model=HistoryOut)
 async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)) -> RenameHistory:
     entry = await session.get(RenameHistory, entry_id)
@@ -839,6 +877,17 @@ async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)
     # is still at `new_path` and we'd corrupt the row by pointing it at
     # a path that doesn't exist.
     await _sync_media_file_after_undo(session, entry)
+    # Re-key the portable-ID index (audit §19 m): it's PATH-keyed, so after
+    # moving the file back its identity was stranded under the renamed path —
+    # a re-scan on SMB (no xattr) lost the instant re-identification.
+    try:
+        from kira import xattr_store
+        _ids = xattr_store.read_ids(entry.new_path)
+        if _ids:
+            xattr_store.write_ids(entry.old_path, _ids)
+    except Exception:
+        pass
+
     entry.undone_at = _utcnow_naive()
     # Tier 1.2: cascade to sidecar children. Subtitle / sub files that
     # rode along with the video at rename time also ride back at undo
@@ -871,6 +920,7 @@ async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)
     # so an undone folder-rename doesn't orphan the files. Backgrounded + best-effort.
     await _relink_sonarr_after_undo(session, [entry])
     await _relink_radarr_after_undo(session, [entry])
+    await _refresh_media_servers_after_undo(session)
     body = f"Restored to {entry.old_path}"
     if sub_ok:
         body += f" (+ {sub_ok} sidecar{'s' if sub_ok != 1 else ''})"
@@ -889,11 +939,11 @@ async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)
     return entry
 
 
-@router.post("/undo-bulk", response_model=dict[str, int])
+@router.post("/undo-bulk", response_model=dict[str, object])
 async def undo_bulk(
     payload: dict[str, list[int]],
     session: AsyncSession = Depends(get_session),
-) -> dict[str, int]:
+) -> dict[str, object]:
     raw_ids = payload.get("ids", [])
     if not isinstance(raw_ids, list):
         raise HTTPException(400, "'ids' must be a list of history entry ids.")
@@ -925,10 +975,13 @@ async def undo_bulk(
     bulk_roots = await _managed_roots_aliased(session)
     # Recoverable deletes for every entry's asset teardown — resolved once.
     bulk_trash_root = await _resolve_trash_root(session, bulk_roots)
+    succeeded_ids: list[int] = []
+    failed_ids: list[int] = []
     for entry_id in ids:
         entry = await session.get(RenameHistory, entry_id)
         if entry is None or entry.undone_at is not None:
             failed += 1
+            failed_ids.append(entry_id)
             continue
         # Identity gate (read-only), per entry: a row whose file was edited /
         # replaced / whose original slot is now occupied is counted as failed
@@ -937,6 +990,7 @@ async def undo_bulk(
         undoable, _reason = await _verify_row_undoable(session, entry)
         if not undoable:
             failed += 1
+            failed_ids.append(entry_id)
             continue
         try:
             # Autopsy 13: same thread-offload as `undo_entry` above —
@@ -958,8 +1012,21 @@ async def undo_bulk(
             # try block ensures a transient FS failure on one entry
             # doesn't corrupt the matching DB row.
             await _sync_media_file_after_undo(session, entry)
+            # Re-key the portable-ID index (audit §19 m): it's PATH-keyed, so
+            # after moving the file back its identity was stranded under the
+            # renamed path — a re-scan on SMB (no xattr) lost the instant
+            # re-identification. Copy the ids to the restored path.
+            try:
+                from kira import xattr_store
+                _ids = xattr_store.read_ids(entry.new_path)
+                if _ids:
+                    xattr_store.write_ids(entry.old_path, _ids)
+            except Exception:
+                pass
+
             entry.undone_at = _utcnow_naive()
             succeeded += 1
+            succeeded_ids.append(entry_id)
             # Tier 1.2: sidecar cascade. Sidecar children attached to
             # this video row also undo together. Sidecar failures are
             # logged but never bubble up as a parent failure — the
@@ -977,14 +1044,34 @@ async def undo_bulk(
                 )
                 await _cleanup_undo_vacated_folders(session, entry)
                 undone_parents.append(entry)
+            # Per-item durability: commit each successful undo IMMEDIATELY.
+            # The old single commit-at-the-end meant a crash mid-batch left
+            # files physically moved back on disk while the DB still said
+            # "renamed" — and the identity verify gate then permanently
+            # blocked re-undoing those rows. expire_on_commit=False, so the
+            # ORM objects (undone_parents) stay usable after each commit.
+            await session.commit()
         except Exception:
             failed += 1
+            failed_ids.append(entry_id)
+            # Drop any uncommitted state from the failed entry so it can't
+            # leak into the next iteration's per-item commit.
+            try:
+                await session.rollback()
+            except Exception:
+                pass
     # Re-point Sonarr/Radarr at the restored folders for fully-undone titles
     # (reverse of the rename hook). Backgrounded + best-effort.
     await _relink_sonarr_after_undo(session, undone_parents)
     await _relink_radarr_after_undo(session, undone_parents)
+    if succeeded:
+        await _refresh_media_servers_after_undo(session)
     await session.commit()
-    out = {"succeeded": succeeded, "failed": failed}
+    # Per-id outcomes: the frontend used to flag EVERY attempted id as
+    # "Restored" because only counts came back — failed rows flashed the green
+    # celebration then snapped back.
+    out = {"succeeded": succeeded, "failed": failed,
+           "succeeded_ids": succeeded_ids, "failed_ids": failed_ids}
     if sidecar_succeeded or sidecar_failed:
         out["sidecars_undone"] = sidecar_succeeded
         out["sidecars_failed"] = sidecar_failed

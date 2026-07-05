@@ -41,6 +41,12 @@ CHECK_INTERVAL_SECONDS = 300
 # on a healthy LAN answer their status endpoints in well under a second.
 PROBE_TIMEOUT_SECONDS = 5.0
 
+# Consecutive failures required before firing a "connection lost" notification.
+# With a 5-min interval, 3 means ~10-15 min of sustained failure — long enough
+# that a single slow/dropped probe (a NAS-hosted Sonarr answering in >5s under
+# load) doesn't generate a lost/restored notification pair every few minutes.
+_FAIL_THRESHOLD = 3
+
 # The integrations we monitor. Keys are the snapshot keys the endpoint returns
 # and the frontend polls on.
 INTEGRATION_KEYS = ("sonarr", "radarr", "plex", "jellyfin")
@@ -65,6 +71,9 @@ class HealthMonitor:
         # key -> {"ok", "detail", "checked_at"}. Module-level state, read by the
         # endpoint, written only by the loop (single writer → no lock needed).
         self._snapshot: dict[str, dict[str, Any]] = {}
+        # key -> {"fails": int, "alerted_down": bool} — debounce state so a
+        # transient slow probe doesn't spam lost/restored notifications.
+        self._alert_state: dict[str, dict[str, Any]] = {}
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -157,36 +166,41 @@ class HealthMonitor:
             await self._record(key, ok, detail)
 
     async def _record(self, key: str, ok: bool, detail: str) -> None:
-        """Store the latest result and, on a state TRANSITION, fire one
-        Notification. The previous ok-state lives in the snapshot, so we notify
-        only when it flips — not every cycle."""
-        prev = self._snapshot.get(key)
-        prev_ok = prev.get("ok") if prev else None
+        """Store the latest result and fire a Notification only on a DEBOUNCED
+        state change. A single slow probe (>5s timeout under load) would
+        otherwise flip ok→failed and back, spamming lost/restored pairs — so we
+        require `_FAIL_THRESHOLD` consecutive failures before alerting 'down',
+        and only alert 'restored' if we actually alerted 'down' first."""
         self._snapshot[key] = {"ok": ok, "detail": detail, "checked_at": _now_iso()}
+        st = self._alert_state.setdefault(key, {"fails": 0, "alerted_down": False})
 
-        # Transition detection. prev_ok is None on the FIRST observation: we do
-        # NOT notify then (avoids a "broken" alert at boot for an integration
-        # that was already misconfigured before Kira started — the Settings dot
-        # surfaces that quietly instead). Only an actual ok↔failed flip alerts.
-        if prev_ok is None or prev_ok == ok:
-            return
         try:
-            if prev_ok and not ok:
-                await _notify(
-                    kind="warning",
-                    title=f"{_label(key)} connection lost",
-                    body=(
-                        f"Kira's background health check can no longer reach "
-                        f"{_label(key)}: {detail} "
-                        f"Check the integration in Settings → Integrations."
-                    ),
-                )
-            elif not prev_ok and ok:
-                await _notify(
-                    kind="success",
-                    title=f"{_label(key)} connection restored",
-                    body=f"{_label(key)} is reachable again.",
-                )
+            if ok:
+                # Recovered. Only announce if we'd previously announced the
+                # outage — otherwise a transient blip stays silent.
+                was_down = st["alerted_down"]
+                st["fails"] = 0
+                st["alerted_down"] = False
+                if was_down:
+                    await _notify(
+                        kind="success",
+                        title=f"{_label(key)} connection restored",
+                        body=f"{_label(key)} is reachable again.",
+                    )
+            else:
+                st["fails"] += 1
+                # Alert once, only after sustained failure (not the first blip).
+                if st["fails"] >= _FAIL_THRESHOLD and not st["alerted_down"]:
+                    st["alerted_down"] = True
+                    await _notify(
+                        kind="warning",
+                        title=f"{_label(key)} connection lost",
+                        body=(
+                            f"Kira's background health check can no longer reach "
+                            f"{_label(key)} ({st['fails']} checks in a row): {detail} "
+                            f"Check the integration in Settings → Integrations."
+                        ),
+                    )
         except Exception as e:  # noqa: BLE001 — a notify failure must not break the loop
             _log.warning("health monitor: notify failed (non-fatal): %r", e)
 

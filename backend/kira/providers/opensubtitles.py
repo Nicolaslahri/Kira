@@ -534,8 +534,30 @@ async def search(client: httpx.AsyncClient, ctx) -> list:
     return out
 
 
-# Login token cached per (api_key, user) for the life of one backfill batch.
+# Login token cached per (api_key, user) as (token, expiry_monotonic). OS JWTs
+# last ~24h; we re-login well before that. Caching "forever" meant a long-lived
+# server process kept using an EXPIRED token — the download then 401'd and was
+# misreported as "API key rejected" (aborting the whole backfill and telling
+# the user to replace a perfectly valid key).
 _token_cache: dict = {}
+_TOKEN_TTL_SEC = 6 * 3600
+
+
+def _cached_token(ck) -> str | None:
+    import time
+    entry = _token_cache.get(ck)
+    if not entry:
+        return None
+    token, expiry = entry
+    if time.monotonic() >= expiry:
+        _token_cache.pop(ck, None)
+        return None
+    return token
+
+
+def _store_token(ck, token: str) -> None:
+    import time
+    _token_cache[ck] = (token, time.monotonic() + _TOKEN_TTL_SEC)
 
 
 async def download(client: httpx.AsyncClient, cand, ctx) -> bytes | None:
@@ -546,11 +568,11 @@ async def download(client: httpx.AsyncClient, cand, ctx) -> bytes | None:
     token = None
     if ctx.os_user and ctx.os_pw:
         ck = (ctx.os_api_key, ctx.os_user)
-        token = _token_cache.get(ck)
+        token = _cached_token(ck)
         if token is None:
             token = await osc.login(ctx.os_user, ctx.os_pw)
             if token:
-                _token_cache[ck] = token
+                _store_token(ck, token)
     link = await osc.download_link(cand.download_ref, token)
     if not link:
         return None

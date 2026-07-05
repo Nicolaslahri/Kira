@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, type ReactNode, type Dispatch, type SetStateAction } from 'react';
-import { IcTv, IcRefresh, IcEyeOff, IcEye, IcCheck, IcAlertTri, IcLink, IcSettings, IcFilm } from '../../lib/icons';
+import { IcTv, IcRefresh, IcEyeOff, IcEye, IcCheck, IcAlertTri, IcLink, IcSettings, IcFilm, IcX } from '../../lib/icons';
 import { Select } from '../../components/ui';
 import { SettingsLayout, NestedBox, FieldRow, SETTINGS_NESTED, SectionHeader } from '../../components/settings-blocks';
 import { BadgeWithDot } from '../../components/base/badges/badges';
@@ -115,11 +115,12 @@ export function IntegrationsSection({
   rawSettings,
   saveKey,
   pushToast,
+  setRawSettings,
 }: {
   rawSettings: Record<string, unknown>;
-  setRawSettings: Dispatch<SetStateAction<Record<string, unknown>>>;
   saveKey: SaveKeyFn;
   pushToast: PushToast;
+  setRawSettings: Dispatch<SetStateAction<Record<string, unknown>>>;
 }) {
   const sonarrUrl = strSetting(rawSettings, 'integrations.sonarr.url');
   // `sonarrApiKey` is the EDITABLE value: '' when the saved key hasn't been
@@ -168,6 +169,36 @@ export function IntegrationsSection({
     >
       {showSecrets ? <IcEyeOff /> : <IcEye />}
     </button>
+  );
+
+  // Explicit secret clear (§5 M): PUTs the {clear:true} sentinel, which DELETES
+  // the stored row server-side — the honest way to disable a token ("blank to
+  // disable" was a lie; blank saves are refused as likely accidents).
+  const clearSecret = (key: string, label: string) => () => {
+    void (async () => {
+      try {
+        await api.putSettings({ [key]: { clear: true } });
+        setRawSettings(s => { const n = { ...s }; delete n[key]; return n; });
+        pushToast({ title: `${label} cleared`, sub: 'The saved secret was removed.', kind: 'success' });
+      } catch (e) {
+        pushToast({ title: `Couldn’t clear ${label}`, sub: (e as Error).message, kind: 'error' });
+      }
+    })();
+  };
+  const clearBtn = (key: string, label: string) =>
+    secretSet(rawSettings, key) ? (
+      <button
+        type="button"
+        onClick={clearSecret(key, label)}
+        title={`Clear the saved ${label} (disables it)`}
+        aria-label={`Clear saved ${label}`}
+        className="grid size-6 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-error-secondary hover:text-error-primary [&_svg]:size-[14px]"
+      >
+        <IcX />
+      </button>
+    ) : null;
+  const secretTrailing = (key: string, label: string) => (
+    <div className="flex items-center gap-0.5">{clearBtn(key, label)}{secretEye}</div>
   );
   // Origin for the copy-paste webhook URL hint (the user pastes this into
   // Sonarr/Radarr's Connect → Webhook). Guarded for SSR/tests.
@@ -472,7 +503,7 @@ export function IntegrationsSection({
   );
 
   // Section summary — how many outbound legs the user has wired up.
-  const wiredCount = [sonarrConfigured, !!plexUrl, !!jellyfinUrl, !!webhookToken, !!discordWebhook, !!genericWebhook].filter(Boolean).length;
+  const wiredCount = [sonarrConfigured, !!plexUrl, !!jellyfinUrl, webhookSet || !!webhookToken, !!discordWebhook, !!genericWebhook].filter(Boolean).length;
   return (
     <SettingsLayout
       header={(
@@ -562,15 +593,18 @@ export function IntegrationsSection({
               autoComplete="off"
               onChange={e => saveSecret(saveKey('integrations.sonarr.api_key'))(e.target.value)}
               trailing={
-                <button
-                  type="button"
-                  onClick={() => setShowApiKey(s => !s)}
-                  title={showApiKey ? 'Hide API key' : 'Show API key'}
-                  aria-label={showApiKey ? 'Hide API key' : 'Show API key'}
-                  className="grid size-6 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink [&_svg]:size-[14px]"
-                >
-                  {showApiKey ? <IcEyeOff /> : <IcEye />}
-                </button>
+                <div className="flex items-center gap-0.5">
+                  {clearBtn('integrations.sonarr.api_key', 'Sonarr API key')}
+                  <button
+                    type="button"
+                    onClick={() => setShowApiKey(s => !s)}
+                    title={showApiKey ? 'Hide API key' : 'Show API key'}
+                    aria-label={showApiKey ? 'Hide API key' : 'Show API key'}
+                    className="grid size-6 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink [&_svg]:size-[14px]"
+                  >
+                    {showApiKey ? <IcEyeOff /> : <IcEye />}
+                  </button>
+                </div>
               }
             />
           )}
@@ -652,11 +686,11 @@ export function IntegrationsSection({
         connected={webhookSet}
         icon={<IcLink />}
         title="Inbound webhook"
-        desc={<>Let Sonarr / Radarr tell Kira to scan the moment a release imports. Set a token, then add a <span className="font-mono text-ink">Connect → Webhook</span> in *arr pointing at the URL below. Blank token = disabled.</>}
+        desc={<>Let Sonarr / Radarr tell Kira to scan the moment a release imports. Set a token, then add a <span className="font-mono text-ink">Connect → Webhook</span> in *arr pointing at the URL below. Use the ✕ button to clear a saved token. </>}
       >
         <div className="flex flex-col gap-3">
           {fieldRow('Token',
-            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={webhookToken} lockedDisplay={maskValue(rawSettings, 'integrations.webhook.token')} placeholder={maskHint(rawSettings, 'integrations.webhook.token') ?? 'a shared secret you choose'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.webhook.token'))(e.target.value)} trailing={secretEye} />
+            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={webhookToken} lockedDisplay={maskValue(rawSettings, 'integrations.webhook.token')} placeholder={maskHint(rawSettings, 'integrations.webhook.token') ?? 'a shared secret you choose'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.webhook.token'))(e.target.value)} trailing={secretTrailing('integrations.webhook.token', 'webhook token')} />
           )}
           {webhookSet ? (
             <NestedBox className="px-3 py-2.5">
@@ -717,15 +751,18 @@ export function IntegrationsSection({
               autoComplete="off"
               onChange={e => saveSecret(saveKey('integrations.radarr.api_key'))(e.target.value)}
               trailing={
-                <button
-                  type="button"
-                  onClick={() => setShowRadarrApiKey(s => !s)}
-                  title={showRadarrApiKey ? 'Hide API key' : 'Show API key'}
-                  aria-label={showRadarrApiKey ? 'Hide API key' : 'Show API key'}
-                  className="grid size-6 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink [&_svg]:size-[14px]"
-                >
-                  {showRadarrApiKey ? <IcEyeOff /> : <IcEye />}
-                </button>
+                <div className="flex items-center gap-0.5">
+                  {clearBtn('integrations.radarr.api_key', 'Radarr API key')}
+                  <button
+                    type="button"
+                    onClick={() => setShowRadarrApiKey(s => !s)}
+                    title={showRadarrApiKey ? 'Hide API key' : 'Show API key'}
+                    aria-label={showRadarrApiKey ? 'Hide API key' : 'Show API key'}
+                    className="grid size-6 shrink-0 place-items-center rounded-md text-ink-soft transition-colors hover:bg-glass-2 hover:text-ink [&_svg]:size-[14px]"
+                  >
+                    {showRadarrApiKey ? <IcEyeOff /> : <IcEye />}
+                  </button>
+                </div>
               }
             />
           )}
@@ -798,14 +835,14 @@ export function IntegrationsSection({
             <Input wrapperClassName="flex-1" mono editGate value={plexUrl} placeholder="http://plex:32400" invalid={!isValidHttpUrl(plexUrl)} aria-invalid={!isValidHttpUrl(plexUrl)} title={!isValidHttpUrl(plexUrl) ? 'Enter a full http(s) URL, e.g. http://plex:32400' : undefined} onChange={e => saveKey('integrations.plex.url')(e.target.value)} />
           )}
           {fieldRow('Token',
-            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={plexToken} lockedDisplay={maskValue(rawSettings, 'integrations.plex.token')} placeholder={maskHint(rawSettings, 'integrations.plex.token') ?? 'X-Plex-Token'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.plex.token'))(e.target.value)} trailing={secretEye} />
+            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={plexToken} lockedDisplay={maskValue(rawSettings, 'integrations.plex.token')} placeholder={maskHint(rawSettings, 'integrations.plex.token') ?? 'X-Plex-Token'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.plex.token'))(e.target.value)} trailing={secretTrailing('integrations.plex.token', 'Plex token')} />
           )}
           <div className="mt-1 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-muted">Jellyfin<StatusDot state={jellyfinHealth} label="Jellyfin" detail={health['jellyfin']?.detail} checkedAt={health['jellyfin']?.checked_at} /></div>
           {fieldRow('URL',
             <Input wrapperClassName="flex-1" mono editGate value={jellyfinUrl} placeholder="http://jellyfin:8096" invalid={!isValidHttpUrl(jellyfinUrl)} aria-invalid={!isValidHttpUrl(jellyfinUrl)} title={!isValidHttpUrl(jellyfinUrl) ? 'Enter a full http(s) URL, e.g. http://jellyfin:8096' : undefined} onChange={e => saveKey('integrations.jellyfin.url')(e.target.value)} />
           )}
           {fieldRow('API key',
-            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={jellyfinKey} lockedDisplay={maskValue(rawSettings, 'integrations.jellyfin.api_key')} placeholder={maskHint(rawSettings, 'integrations.jellyfin.api_key') ?? 'Dashboard → API Keys'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.jellyfin.api_key'))(e.target.value)} trailing={secretEye} />
+            <Input wrapperClassName="flex-1" mono editGate type={showSecrets ? 'text' : 'password'} value={jellyfinKey} lockedDisplay={maskValue(rawSettings, 'integrations.jellyfin.api_key')} placeholder={maskHint(rawSettings, 'integrations.jellyfin.api_key') ?? 'Dashboard → API Keys'} autoComplete="off" onChange={e => saveSecret(saveKey('integrations.jellyfin.api_key'))(e.target.value)} trailing={secretTrailing('integrations.jellyfin.api_key', 'Jellyfin API key')} />
           )}
         </div>
       </IntegrationCard>

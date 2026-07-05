@@ -40,10 +40,9 @@ export const SETTINGS_DIVIDER = 'border-[var(--border-1)]';
  * `wide` is retained for call-site compatibility but no longer changes the
  * width — every section now uses the same full width.
  */
-export function SettingsLayout({ intro, children, wide: _wide = false, actions, header }: {
+export function SettingsLayout({ intro, children, actions, header }: {
   intro?: ReactNode;
   children: ReactNode;
-  wide?: boolean;
   /** Optional right-aligned header content (e.g. a status badge). */
   actions?: ReactNode;
   /** Full section-identity banner (see {@link SectionHeader}). When set it
@@ -458,6 +457,12 @@ export interface ProviderFieldProps {
   mono?: boolean;
   desc?: string;
   onSave?: (next: string | boolean) => void;
+  /** Clears the SAVED secret (deletes the stored row server-side, reverting to
+   *  the bundled/env key where one exists). Rendered as a small ✕ next to the
+   *  field only while a saved value exists (`lockedDisplay` set) — this is the
+   *  explicit affordance for "I pasted a bad key, take me back to the bundled
+   *  one", which blank-saving deliberately does NOT do. */
+  onClear?: () => void;
   /** Grey out + block the control when its prerequisite isn't met (e.g. a
    *  toggle whose API key isn't configured). `disabledReason` is shown beneath
    *  the label so the user knows WHY and how to fix it. */
@@ -465,7 +470,7 @@ export interface ProviderFieldProps {
   disabledReason?: string;
 }
 
-export function ProviderField({ kind = 'text', label, value, placeholder, lockedDisplay, options, mono, desc, onSave, disabled = false, disabledReason }: ProviderFieldProps) {
+export function ProviderField({ kind = 'text', label, value, placeholder, lockedDisplay, options, mono, desc, onSave, onClear, disabled = false, disabledReason }: ProviderFieldProps) {
   const [text, setText] = useState(value ?? '');
   const [on, setOn] = useState(value !== 'false');
   const [show, setShow] = useState(false);
@@ -546,16 +551,31 @@ export function ProviderField({ kind = 'text', label, value, placeholder, locked
         // Off for ALL credential fields (not just passwords) — these API-key
         // `text` inputs were the ones browser autofill silently overwrote.
         autoComplete="off"
-        trailing={isPassword ? (
-          <button
-            type="button"
-            onClick={() => setShow(s => !s)}
-            title={show ? 'Hide' : 'Show'}
-            aria-label={show ? 'Hide value' : 'Show value'}
-            className="grid size-6 shrink-0 place-items-center rounded-md text-tertiary transition-colors hover:bg-white/[0.07] hover:text-primary [&_svg]:size-[14px]"
-          >
-            {show ? <IcEyeOff /> : <IcEye />}
-          </button>
+        trailing={(isPassword || (onClear && lockedDisplay)) ? (
+          <div className="flex items-center gap-0.5">
+            {onClear && lockedDisplay ? (
+              <button
+                type="button"
+                onClick={onClear}
+                title="Clear the saved key — reverts to the bundled/default key where one ships with Kira"
+                aria-label={`Clear saved ${label}`}
+                className="grid size-6 shrink-0 place-items-center rounded-md text-tertiary transition-colors hover:bg-error-secondary hover:text-error-primary [&_svg]:size-[14px]"
+              >
+                <IcX />
+              </button>
+            ) : null}
+            {isPassword ? (
+              <button
+                type="button"
+                onClick={() => setShow(s => !s)}
+                title={show ? 'Hide' : 'Show'}
+                aria-label={show ? 'Hide value' : 'Show value'}
+                className="grid size-6 shrink-0 place-items-center rounded-md text-tertiary transition-colors hover:bg-white/[0.07] hover:text-primary [&_svg]:size-[14px]"
+              >
+                {show ? <IcEyeOff /> : <IcEye />}
+              </button>
+            ) : null}
+          </div>
         ) : undefined}
       />
     </div>
@@ -1312,7 +1332,7 @@ export function NamingTemplateTabs({ profile, savedCustom, onSaveCustom }: {
             <span>Template · {tabs.find(t => t.key === tab)!.label}</span>
             {!editable
               ? <span className="naming-lock">{profile} preset · pick Custom to edit</span>
-              : <BadgeWithDot color="success" pulse>editable · autosaved</BadgeWithDot>}
+              : <BadgeWithDot color="warning">editable · draft — Save to apply</BadgeWithDot>}
           </div>
           <TemplateChipEditor
             key={tab}

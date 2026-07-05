@@ -84,6 +84,22 @@ _IGNORE_FRAGMENTS = (
 _POLL_SIGNATURE_FILE_CAP = 50_000
 
 
+# ── Self-write suppression (audit §2 m) ─────────────────────────────────────
+# Kira's own post-scan writes (subtitle sidecars, auto-renames, NFO/artwork)
+# re-dirty the watched tree and used to fire ANOTHER scan seconds after the
+# one that caused them. Writers bump this deadline; events arriving before it
+# are dropped. A real import landing inside the window is caught by the next
+# poll cycle / webhook, so the window errs modest.
+_SELF_WRITE_UNTIL = 0.0
+
+
+def suppress_events(seconds: float = 90.0) -> None:
+    """Ignore filesystem events for `seconds` — call around Kira-authored
+    writes (renames, sidecar downloads, NFO/artwork output)."""
+    global _SELF_WRITE_UNTIL
+    _SELF_WRITE_UNTIL = max(_SELF_WRITE_UNTIL, time.monotonic() + seconds)
+
+
 def _is_ignored_path(path: str) -> bool:
     """True if a filesystem change at `path` should NOT trigger a scan.
 
@@ -297,6 +313,8 @@ class WatcherService:
             try:
                 async for changes in awatch(*self._dirs, stop_event=self._stop_event, recursive=True):
                     backoff = 5  # healthy again
+                    if time.monotonic() < _SELF_WRITE_UNTIL:
+                        continue   # Kira's own writes — don't re-trigger a scan
                     if any(not _is_ignored_path(path) for _change, path in changes):
                         self._dirty = True
                         self._last_event = time.monotonic()

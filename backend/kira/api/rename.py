@@ -1199,6 +1199,40 @@ async def reconcile_pending_renames() -> tuple[int, int]:
                 src, dst = Path(it.src), Path(it.dst)
                 src_exists = await asyncio.to_thread(src.exists)
                 dst_exists = await asyncio.to_thread(dst.exists)
+                # EE-4 guard (same as the phantom-rename branch): when NEITHER
+                # path exists, distinguish "the files really vanished" from
+                # "the NAS is unmounted so every exists() is False". On an
+                # unreachable filesystem, KEEP the intent — deleting it here
+                # would discard the crash-recovery record and the DB/disk
+                # divergence could never be reconciled once the mount returns.
+                if not src_exists and not dst_exists:
+                    _src_reachable = await asyncio.to_thread(_filesystem_reachable, src)
+                    _dst_reachable = await asyncio.to_thread(_filesystem_reachable, dst)
+                    if not (_src_reachable and _dst_reachable):
+                        logger.warning(
+                            "reconcile_pending_renames: filesystem for intent %s "
+                            "unreachable (src=%s) — keeping intent for next boot.",
+                            getattr(it, "id", None), it.src,
+                        )
+                        continue
+                # Copied-but-not-unlinked crash window: a cross-device MOVE
+                # copies to dst then unlinks src; a crash between the two
+                # leaves BOTH files. The copy completed (sizes match) so the
+                # move's intent is satisfiable — finish it idempotently by
+                # unlinking the source, then finalize below exactly like the
+                # dst-only case. Size mismatch = the copy did NOT finish; keep
+                # the source as canonical and drop the partial dst record
+                # (old behaviour) rather than risk pointing the DB at a
+                # truncated file.
+                if src_exists and dst_exists and str(it.operation).lower() == "move":
+                    try:
+                        _ss = (await asyncio.to_thread(src.stat)).st_size
+                        _ds = (await asyncio.to_thread(dst.stat)).st_size
+                    except OSError:
+                        _ss, _ds = -1, -2
+                    if _ss == _ds and _ss >= 0:
+                        await asyncio.to_thread(src.unlink)
+                        src_exists = False
                 if dst_exists and not src_exists:
                     mf = await session.get(MediaFile, it.media_file_id) if it.media_file_id else None
                     if mf is not None:
@@ -1282,7 +1316,7 @@ async def perform_rename(
     # <library_root>/.kira-trash; user may override the path. Off → hard delete
     # (the prior behavior).
     cleanup_trash_dir: Path | None = None
-    if await _resolve_bool_setting(session, "rename.cleanup_trash", False):
+    if await _resolve_bool_setting(session, "rename.cleanup_trash", True):  # default ON — see cleanup.py
         _trash_override = await _resolve_str_setting(session, "rename.trash_dir", "")
         if _trash_override:
             cleanup_trash_dir = Path(_trash_override)
@@ -1311,7 +1345,11 @@ async def perform_rename(
     # artwork works out of the box; a user can override it, and their optional
     # PERSONAL key (client_key) is sent in addition.
     from kira.providers import fanarttv as _fanarttv
-    fanart_key = await _resolve_str_setting(session, "providers.fanarttv.api_key", _fanarttv.PROJECT_KEY) if download_artwork else ""
+    # `.strip() or PROJECT_KEY`: a persisted EMPTY row (type-then-clear-then-
+    # Save) must fall back to the bundled project key like AcoustID does —
+    # returning the stored "" verbatim silently killed all fanart.tv artwork
+    # while the Connections card still said "Connected".
+    fanart_key = ((await _resolve_str_setting(session, "providers.fanarttv.api_key", _fanarttv.PROJECT_KEY)).strip() or _fanarttv.PROJECT_KEY) if download_artwork else ""
     fanart_client_key = await _resolve_str_setting(session, "providers.fanarttv.client_key", "") if download_artwork else ""
     # Language preference for artwork (logos/posters): reuse the subtitle
     # languages as the "my language" hint, falling back to English.
@@ -1798,6 +1836,27 @@ async def perform_rename(
                 ))
                 return
             if target.exists():
+                # Identity gate: the occupant must LOOK like our file (same
+                # size) before the DB is repointed at it — otherwise a
+                # different release already at the target path gets claimed
+                # as "renamed" and two rows can share one path.
+                try:
+                    _occ_size = target.stat().st_size
+                except OSError:
+                    _occ_size = None
+                if (
+                    f.file_size is not None and _occ_size is not None
+                    and int(f.file_size) != int(_occ_size)
+                ):
+                    results.append(RenameItemResult(
+                        file_id=fid, ok=False, old_path=str(src),
+                        error=(
+                            "A DIFFERENT file occupies the target path "
+                            f"(size {_occ_size} ≠ recorded {f.file_size}) — "
+                            "refusing to claim it as this rename."
+                        ),
+                    ))
+                    return
                 f.status = "renamed"
                 # Update the file_path so future actions point at where
                 # the file actually lives.
@@ -2012,11 +2071,10 @@ async def perform_rename(
         # old target's name. Each prior non-undone history row recorded exactly
         # what it created, so we can delete that set authoritatively now. Cheap
         # (one indexed query per file), best-effort, never fails the rename.
-        try:
-            from kira.api.history import sweep_superseded_assets
-            await sweep_superseded_assets(session, fid, str(target), managed_roots)
-        except Exception as e:
-            logger.warning(f"rename: superseded-asset sweep failed for {fid} (non-fatal): {e!r}")
+        # DEFERRED to after the per-file COMMIT below (§19 m): deleting the
+        # prior rename's assets before this rename is durable meant a commit
+        # failure destroyed assets for a rename the DB never recorded.
+        _superseded_sweep_pending = True
 
         # ── Tier 1.2: Subtitle / sidecar co-renaming ─────────────────
         # Now that the video has moved, hunt for sidecars (.srt, .ass,
@@ -2086,6 +2144,26 @@ async def perform_rename(
                     )
                     continue
                 claimed_targets[sub_key] = fid
+                # #187: write-ahead intent for the SIDECAR too — a crash between
+                # the video move and this sidecar move used to strand subtitles
+                # invisibly (reconcile only knew about the video). The intent is
+                # deleted in the same per-sidecar commit path below; on a crash,
+                # boot reconcile finalizes it from disk exactly like a video.
+                _sub_intent = None
+                try:
+                    _sub_intent = RenameIntent(
+                        media_file_id=fid, src=str(sidecar), dst=str(sub_target),
+                        operation=op.value,
+                    )
+                    session.add(_sub_intent)
+                    await session.commit()
+                except Exception as _ie:
+                    logger.warning(f"rename: sidecar intent write failed (non-fatal): {_ie!r}")
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        pass
+                    _sub_intent = None
                 try:
                     # Same cleanup_empty_source policy as the video. Last
                     # operation in the parent folder triggers the cleanup
@@ -2114,11 +2192,27 @@ async def perform_rename(
                     # up there — but counting per-call is robust to any
                     # ordering.
                     video_artifacts_cleaned += sub_artifacts_cleaned
+                    # Sidecar landed — retire its write-ahead intent (committed
+                    # with the surrounding per-file transaction).
+                    if _sub_intent is not None:
+                        try:
+                            await session.delete(_sub_intent)
+                        except Exception:
+                            pass
+
                     # Co-renamed sidecar is our output too — shield it from the
                     # in-place junk sweep (esp. 'all' mode, which deletes subs).
                     inplace_protected.add(str(sub_target))
                 except Exception as e:
                     failed_subs.append(f"{sidecar.name}: {e}")
+                    # Move failed → the file never left src; the intent would
+                    # otherwise linger and reconcile would just discard it at
+                    # boot (src exists). Retire it now to keep the table clean.
+                    if _sub_intent is not None:
+                        try:
+                            await session.delete(_sub_intent)
+                        except Exception:
+                            pass
                     continue
                 if parent_history_id is not None:
                     session.add(RenameHistory(
@@ -2206,6 +2300,16 @@ async def perform_rename(
                 except Exception:
                     pass
                 return
+        # ── #1 forward-orphan sweep (post-commit) ────────────────────
+        # The rename is DURABLE now — safe to delete the assets the PRIOR
+        # rename of this file wrote under its old target name.
+        if _superseded_sweep_pending:
+            try:
+                from kira.api.history import sweep_superseded_assets
+                await sweep_superseded_assets(session, fid, str(target), managed_roots)
+            except Exception as e:
+                logger.warning(f"rename: superseded-asset sweep failed for {fid} (non-fatal): {e!r}")
+
         # Successful episode rename → remember the series + its OLD/NEW show
         # folders for the Sonarr hook (movies don't apply; Sonarr keys series by
         # TVDB id). The roots let the hook re-point a renamed folder, not just
@@ -2309,7 +2413,14 @@ async def perform_rename(
             try:
                 from kira.renamer.operations import sweep_destination_junk
                 _prot = frozenset(inplace_protected)
-                _dest_folders = {Path(r.new_path).parent for r in results if r.ok and r.new_path}
+                # Exclude phantom/skip results whose new_path == old_path: the
+                # file never actually moved, so this batch did NOT write into
+                # that folder — sweeping it would delete junk the user kept
+                # untouched. Only folders a file genuinely landed in qualify.
+                _dest_folders = {
+                    Path(r.new_path).parent for r in results
+                    if r.ok and r.new_path and r.new_path != r.old_path
+                }
                 _swept = 0
                 for _folder in _dest_folders:
                     _swept += sweep_destination_junk(
@@ -2333,6 +2444,15 @@ async def perform_rename(
         # on disk; the activity pill narrates the subtitle phase as it fills the
         # sidecars in. The files are already moved + their history committed, so
         # the rename is DONE and fully undoable before this even starts.
+        # Watched-folders self-suppression: the moves above + the sidecar/
+        # NFO/artwork writes the hooks are about to do must not re-trigger
+        # the watcher's auto-scan.
+        try:
+            from kira import watcher as _watcher
+            _watcher.suppress_events(180.0)
+        except Exception:
+            pass
+
         async def _post_rename_hooks():
             # Run on a FRESH session: the original request session is already
             # closed by the time this task runs (so its loaded MediaFiles are
@@ -2414,36 +2534,24 @@ async def perform_rename(
                                 if _stop["reason"]:
                                     return
                                 f = by_id.get(r.file_id)
-                                sel = next((m for m in (f.matches if f else []) if m.is_selected), None) if f else None
-                                tmdb_id = (int(sel.provider_id) if sel and sel.provider == "tmdb"
-                                           and (sel.provider_id or "").isdigit() else None)
-                                anidb_id = (int(sel.provider_id) if sel and sel.provider == "anidb"
-                                            and (sel.provider_id or "").isdigit() else None)
-                                imdb_id = None
-                                if sel and isinstance(getattr(sel, "metadata_blob", None), dict):
-                                    imdb_id = sel.metadata_blob.get("imdbid") or sel.metadata_blob.get("imdb_id")
-                                # Parsed (rendered-filename) S/E beats cour-local
-                                # match numbers (see backfill for the AoT case).
-                                _pd = f.parsed_data if f and isinstance(f.parsed_data, dict) else {}
-                                _season = _pd.get("season")
-                                _episode = _pd.get("episode")
-                                if _season is None and sel is not None:
-                                    _season = sel.season_number
-                                if _episode is None and sel is not None:
-                                    _episode = sel.episode_number
-                                _query = sel.title if sel and sel.title else None
-                                _ctx = SearchContext(
-                                    video_path=r.new_path, languages=sub_langs,
-                                    media_type=f.media_type if f else None, query=_query,
-                                    tmdb_id=tmdb_id, imdb_id=imdb_id, anidb_id=anidb_id,
-                                    season=_season, episode=_episode, parsed=_pd,
-                                    os_api_key=prefs.api_key, os_user=prefs.username, os_pw=prefs.password,
-                                    subdl_api_key=prefs.subdl_api_key, subsource_api_key=prefs.subsource_api_key,
-                                    hearing_impaired=prefs.hearing_impaired or "", forced=prefs.forced or "",
-                                    # Per-type (and global) score floor — same as backfill /
-                                    # manual; without this the auto path saved ANY-scoring sub.
-                                    min_score=prefs.min_score_for(f.media_type if f else None),
-                                )
+                                if f is None:
+                                    return
+                                # SHARED context builder (audit §20 M6): the old
+                                # ad-hoc SearchContext here ignored per-type
+                                # languages, dropped absolute/episode_title/year,
+                                # skipped the BLACKLIST (a binned sub came back on
+                                # the next rename) and had no anidb coercion —
+                                # build_context is the single source of truth the
+                                # backfill/manual/browse paths already share.
+                                from kira.subtitles.backfill import build_context
+                                _langs = prefs.languages_for(f.media_type)
+                                if not _langs:
+                                    return
+                                _ctx = await build_context(hook_session, f, prefs, _langs)
+                                if r.new_path and _ctx.video_path != r.new_path:
+                                    # f.file_path should already BE new_path (the
+                                    # rename committed), but never trust it blindly.
+                                    _ctx = SearchContext(**{**_ctx.__dict__, "video_path": r.new_path})
                                 async with _sem:
                                     if _stop["reason"]:
                                         return

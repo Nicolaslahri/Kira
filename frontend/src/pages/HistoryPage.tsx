@@ -113,10 +113,14 @@ export function HistoryPage({ pushToast }: Props) {
     cachedCounts ?? { today: 0, week: 0, all: 0 }
   );
   const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [view, setView] = useState<'renames' | 'subtitles'>('renames');
+  const [view, setView] = useState<'renames' | 'subtitles' | 'trash'>('renames');
   const [period, setPeriod] = useState<Period>('all');
   const [opFilter, setOpFilter] = useState<OpFilter>('all');
   const [query, setQuery] = useState('');
+  // Selection must not outlive the view it was made in: rows selected under
+  // "All" stayed selected after switching to "Today", so the bulk bar counted
+  // (and "Undo selected" acted on) rows the user could no longer SEE.
+  useEffect(() => { setSelected(new Set()); }, [period, opFilter, query]);
   // Initial value `true` so the empty-state EmptyState doesn't flash
   // on first paint — the useEffect below kicks off refresh() which sets
   // loading=true anyway, but during the very first render before the
@@ -143,6 +147,9 @@ export function HistoryPage({ pushToast }: Props) {
   // don't re-verify the same rows every pass (mirrors CoverPopup's
   // verifiedExistRef). Cleared on refetch so a refreshed list re-checks.
   const verifiedRef = useRef<Set<number>>(new Set());
+  // Undo requests currently in flight (row ids; -1 = the bulk button) — the
+  // double-click guard for undoOne/undoBatch.
+  const undoInFlight = useRef<Set<number>>(new Set());
   // IDs the user just undid in THIS session — fires a one-shot "Restored"
   // celebration on the row. Purely visual; the undo data flow is unchanged.
   const [justRestored, setJustRestored] = useState<Set<number>>(new Set());
@@ -153,7 +160,11 @@ export function HistoryPage({ pushToast }: Props) {
     restoredTimer.current = window.setTimeout(() => setJustRestored(new Set()), 1800);
   };
 
+  const refreshGen = useRef(0);
   const refresh = async () => {
+    // Generation guard: rapid filter switches fire overlapping refreshes; if
+    // the OLDER one resolved last it painted the wrong filter's rows.
+    const gen = ++refreshGen.current;
     setLoading(true);
     try {
       const [rows, c] = await Promise.all([
@@ -165,6 +176,7 @@ export function HistoryPage({ pushToast }: Props) {
       // previous refresh. Skipped on the very first load (when the
       // snapshot starts at cachedItems' ids — everything would be
       // "old" against that baseline anyway).
+      if (gen !== refreshGen.current) return;  // superseded by a newer refresh
       const prevIds = seenIdsRef.current;
       const newFresh = new Set<number>();
       if (prevIds.size > 0) {
@@ -229,6 +241,12 @@ export function HistoryPage({ pushToast }: Props) {
   }, [period, opFilter]);
 
   const undoOne = async (id: number) => {
+    // In-flight guard: the row's Undo button is only disabled by SERVER-derived
+    // state (undone/stale), refreshed after the fact — a double-click fired two
+    // undo calls, the second 4xx'ing into a confusing "Undo failed" toast right
+    // after the success one.
+    if (undoInFlight.current.has(id)) return;
+    undoInFlight.current.add(id);
     try {
       await api.undoHistory(id);
       markRestored([id]);
@@ -240,10 +258,14 @@ export function HistoryPage({ pushToast }: Props) {
       void refresh();
     } catch (e) {
       pushToast({ title: 'Undo failed', sub: (e as Error).message, kind: 'error' });
+    } finally {
+      undoInFlight.current.delete(id);
     }
   };
   const undoBatch = async () => {
     if (selected.size === 0) return;
+    if (undoInFlight.current.has(-1)) return;  // bulk guard
+    undoInFlight.current.add(-1);
     try {
       // Skip rows we already KNOW are stale — sending them would just inflate
       // the "N failed" count with predictable failures. The remaining ids still
@@ -258,7 +280,9 @@ export function HistoryPage({ pushToast }: Props) {
         return;
       }
       const res = await api.undoHistoryBulk(ids);
-      markRestored(ids);
+      // Celebrate only the rows that ACTUALLY restored — flagging every
+      // attempted id flashed green on failed rows too.
+      markRestored(res.succeeded_ids ?? ids);
       pushToast({
         title: `${res.succeeded} renames undone`,
         sub: res.failed > 0 ? `${res.failed} failed` : 'Files restored to their original locations.',
@@ -270,6 +294,8 @@ export function HistoryPage({ pushToast }: Props) {
       void refresh();
     } catch (e) {
       pushToast({ title: 'Bulk undo failed', sub: (e as Error).message, kind: 'error' });
+    } finally {
+      undoInFlight.current.delete(-1);
     }
   };
   const toggleOne = (id: number) => {
@@ -412,14 +438,20 @@ export function HistoryPage({ pushToast }: Props) {
           {/* View toggle stays a SegmentedControl — it's a mode switch, not a filter. */}
           <SegmentedControl
             value={view}
-            onChange={v => setView(v as 'renames' | 'subtitles')}
-            options={[{ value: 'renames', label: 'Renames' }, { value: 'subtitles', label: 'Subtitles' }]}
+            onChange={v => setView(v as 'renames' | 'subtitles' | 'trash')}
+            options={[{ value: 'renames', label: 'Renames' }, { value: 'subtitles', label: 'Subtitles' }, { value: 'trash', label: 'Trash' }]}
           />
 
           {view === 'renames' ? (
             <div className="ml-auto flex items-center gap-2">
               <Button color="secondary" size="sm" iconLeading={IcSparkles} isLoading={cleaning} onClick={() => void cleanupOrphans()} title="Remove leftover sidecar files (NFO, posters, subtitles) that undone renames left on disk">Clean undo leftovers</Button>
-              <Button color="secondary" size="sm" iconLeading={IcDownload} href={api.exportHistoryUrl()} download>Export CSV</Button>
+              {/* Fetch-blob download (NOT a plain href): a link navigation
+                  carries no Authorization header, so with auth enabled the
+                  old link 401'd instead of downloading. */}
+              <Button color="secondary" size="sm" iconLeading={IcDownload} onClick={() => {
+                void api.downloadHistoryCsv().catch(e =>
+                  pushToast({ title: 'Export failed', sub: (e as Error).message, kind: 'error' }));
+              }}>Export CSV</Button>
             </div>
           ) : null}
         </div>
@@ -433,6 +465,11 @@ export function HistoryPage({ pushToast }: Props) {
               <FilterChip on={period === 'week'} onClick={() => setPeriod('week')} label="This week" num={counts.week} />
               <FilterChip on={period === 'all'} onClick={() => setPeriod('all')} label="All" num={counts.all} />
             </div>
+            {/* Honest truncation notice: the API caps at 500 rows, so on a
+                big ledger the visible list is a window, not the whole thing. */}
+            {items.length >= 500 ? (
+              <span className="text-[11px] text-quaternary">Showing latest {items.length}{counts.all > items.length ? ` of ${counts.all}` : ''}</span>
+            ) : null}
             <span aria-hidden className="hidden h-5 w-px bg-white/10 sm:block" />
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="mr-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Operation</span>
@@ -465,7 +502,7 @@ export function HistoryPage({ pushToast }: Props) {
         ) : null}
       </div>
 
-      {view === 'subtitles' ? <SubtitleHistory pushToast={pushToast} /> : (
+      {view === 'trash' ? <TrashView pushToast={pushToast} /> : view === 'subtitles' ? <SubtitleHistory pushToast={pushToast} /> : (
       <>
       {/* Bulk-undo selection bar — indigo-armed, mirrors the Review page.
           Surfaces verifyMap's "can no longer be undone" so the bar tells the
@@ -628,6 +665,67 @@ export function HistoryPage({ pushToast }: Props) {
       ) : null}
       </>
       )}
+    </div>
+  );
+}
+
+
+/** Trash tab (§10): restore/remove swept items right next to Undo, instead of
+ *  digging through Settings. Same API the Settings trash card uses. */
+function TrashView({ pushToast }: { pushToast: (t: Omit<ToastData, 'id'>) => void }) {
+  type TrashItem = { name: string; is_dir: boolean; size_bytes: number; trashed_at: string | null; mtime: number; original: string | null };
+  const [items, setItems] = useState<TrashItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const load = async () => {
+    setLoading(true);
+    try {
+      const r = await api.listTrash();
+      setItems(r.items);
+    } catch { /* connectivity UI covers it */ } finally { setLoading(false); }
+  };
+  useEffect(() => { void load(); }, []);
+  const fmtSize = (b: number) => b >= 1 << 30 ? `${(b / (1 << 30)).toFixed(1)} GB` : b >= 1 << 20 ? `${(b / (1 << 20)).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`;
+  const restore = async (it: TrashItem) => {
+    setBusy(it.name);
+    try {
+      const r = await api.restoreTrashItem(it.name);
+      pushToast({ title: 'Restored', sub: r.to, kind: 'success' });
+      await load();
+    } catch (e) {
+      pushToast({ title: 'Restore failed', sub: (e as Error).message, kind: 'error' });
+    } finally { setBusy(null); }
+  };
+  const remove = async (it: TrashItem) => {
+    setBusy(it.name);
+    try {
+      await api.deleteTrashItem(it.name);
+      pushToast({ title: 'Deleted permanently', sub: it.name, kind: 'error' });
+      await load();
+    } catch (e) {
+      pushToast({ title: 'Delete failed', sub: (e as Error).message, kind: 'error' });
+    } finally { setBusy(null); }
+  };
+  if (loading) return <div className="py-10 text-center text-[13px] text-tertiary">Loading trash…</div>;
+  if (!items.length) return (
+    <div className="grid place-items-center py-10">
+      <EmptyState icon={<IcSparkles />} title="Trash is empty" sub="Items the cleanup sweep recycles land here, ready to restore." />
+    </div>
+  );
+  return (
+    <div className="flex flex-col gap-1.5">
+      {items.map(it => (
+        <div key={it.name} className="flex items-center gap-3 rounded-xl bg-secondary px-3.5 py-2.5 ring-1 ring-inset ring-secondary">
+          <div className="min-w-0 flex-1">
+            <div className="truncate font-mono text-[12.5px] text-primary">{it.name}</div>
+            <div className="truncate text-[11px] text-tertiary">
+              {fmtSize(it.size_bytes)}{it.trashed_at ? ` · trashed ${new Date(it.trashed_at).toLocaleString()}` : ''}{it.original ? ` · from ${it.original}` : ' · original location unknown'}
+            </div>
+          </div>
+          <Button color="secondary" size="sm" iconLeading={IcUndo} isDisabled={busy === it.name || !it.original} isLoading={busy === it.name} onClick={() => void restore(it)} title={it.original ? `Restore to ${it.original}` : 'Original location unknown — restore by hand from the trash folder'}>Restore</Button>
+          <Button color="secondary-destructive" size="sm" iconLeading={IcX} isDisabled={busy === it.name} onClick={() => void remove(it)}>Delete</Button>
+        </div>
+      ))}
     </div>
   );
 }

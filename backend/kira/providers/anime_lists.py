@@ -44,7 +44,8 @@ _MAPPING_URL = (
     "https://raw.githubusercontent.com/Anime-Lists/anime-lists/master/anime-list-master.xml"
 )
 
-_CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache"
+from kira.config import cache_dir as _kira_cache_dir
+_CACHE_DIR = _kira_cache_dir()
 _XML_PATH = _CACHE_DIR / "anime-list-master.xml"
 _MAX_AGE_SEC = 24 * 3600
 

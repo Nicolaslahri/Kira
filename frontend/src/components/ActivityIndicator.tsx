@@ -70,6 +70,12 @@ export function useActivity(pushToast: PushToast): {
             if (j.name === 'subtitle_backfill' || j.name === 'subtitles') {
               window.dispatchEvent(new Event('kira:files-changed'));
             }
+            // Poster warmup persists poster_urls as it lands — refresh so
+            // covers pop in without a manual reload (the per-card lazy fetch
+            // only covers on-screen anime cards).
+            if (j.name === 'poster_warmup') {
+              window.dispatchEvent(new Event('kira:files-changed'));
+            }
             if (j.name === 'ffmpeg_install' && j.state === 'done') {
               // Settings/onboarding ffmpeg rows re-check their status.
               window.dispatchEvent(new Event('kira:ffmpeg-changed'));

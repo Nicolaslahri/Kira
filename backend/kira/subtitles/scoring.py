@@ -199,6 +199,8 @@ def score_candidate(
     # Forced preference.
     if want_forced == "only" and cand.forced:
         score += 4; reasons.append("forced")
+    elif want_forced == "only" and not cand.forced:
+        score -= 6; reasons.append("not forced (forced-only wanted)")
     elif want_forced == "exclude" and cand.forced:
         score -= 3; reasons.append("forced (not wanted)")
 

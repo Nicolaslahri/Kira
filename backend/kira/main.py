@@ -90,9 +90,45 @@ def _warn_insecure_exposure() -> None:
         )
 
 
+def _check_config_writable() -> None:
+    """Fail fast with a CLEAR message if the DB directory (typically the mounted
+    `/config` volume) isn't writable. Without this, an unwritable volume surfaces
+    as an opaque sqlite 'unable to open database file' and — with the compose
+    `restart: unless-stopped` policy — an endless crash loop with no hint that
+    the fix is a host volume permission."""
+    from pathlib import Path
+    from kira.config import settings
+    url = settings.database_url
+    # sqlite+aiosqlite:///<path> — only file-backed sqlite has a dir to check.
+    if "sqlite" not in url or ":///" not in url:
+        return
+    raw = url.split(":///", 1)[1]
+    if not raw or raw == ":memory:":
+        return
+    db_dir = Path(raw).resolve().parent
+    try:
+        db_dir.mkdir(parents=True, exist_ok=True)
+        probe = db_dir / ".kira-write-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as e:
+        logger.error(
+            "FATAL: config directory %s is not writable (%s). Fix the host "
+            "volume permissions for the mount backing it (e.g. chown the bind "
+            "path to the container user) and restart.", db_dir, e,
+        )
+        raise RuntimeError(f"config directory not writable: {db_dir}") from e
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+    _check_config_writable()
+    # Schema-critical work only; the heavy full-table backfills run in the
+    # background task below so a big library doesn't stall first paint.
+    await init_db(defer_data_ops=True)
+    import asyncio as _asyncio
+    from kira.database import run_deferred_data_ops
+    _deferred_ops_task = _asyncio.create_task(run_deferred_data_ops())
     # Security posture check: if exposed beyond localhost, warn the operator
     # about opt-in auth / unconfined browsing rather than silently running open.
     try:
@@ -331,6 +367,62 @@ app = FastAPI(
 )
 
 
+# ── Login rate-limiting (anti brute-force) ──────────────────────────────────
+# Per-IP failed-auth tracking with exponential lockout. Pure in-memory: resets
+# on restart (fine — the goal is throttling online guessing, not a ban list).
+# 5 straight failures → 30s lock, doubling per further failure, capped at 15min.
+# Any successful auth clears the counter. Applies to Basic-auth checks AND
+# POST /auth/setup (the two credential-bearing surfaces).
+import time as _rl_time
+
+_RL_FAILS: dict[str, tuple[int, float]] = {}   # ip -> (consecutive fails, locked_until)
+_RL_THRESHOLD = 5
+_RL_BASE_LOCK = 30.0
+_RL_MAX_LOCK = 900.0
+_RL_MAX_ENTRIES = 10_000                        # bound memory under address spraying
+
+
+def _rl_client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _rl_locked_for(ip: str) -> float:
+    """Seconds of lockout remaining for this IP (0 = not locked)."""
+    entry = _RL_FAILS.get(ip)
+    if not entry:
+        return 0.0
+    _, until = entry
+    remaining = until - _rl_time.monotonic()
+    return remaining if remaining > 0 else 0.0
+
+
+def _rl_record_failure(ip: str) -> None:
+    if len(_RL_FAILS) > _RL_MAX_ENTRIES:
+        now = _rl_time.monotonic()
+        for k in [k for k, (_, u) in list(_RL_FAILS.items()) if u < now]:
+            _RL_FAILS.pop(k, None)
+    fails, _ = _RL_FAILS.get(ip, (0, 0.0))
+    fails += 1
+    lock = 0.0
+    if fails >= _RL_THRESHOLD:
+        lock = min(_RL_BASE_LOCK * (2 ** (fails - _RL_THRESHOLD)), _RL_MAX_LOCK)
+    _RL_FAILS[ip] = (fails, _rl_time.monotonic() + lock)
+    logger.warning("auth failure from %s (consecutive: %d%s)", ip, fails,
+                   f", locked {int(lock)}s" if lock else "")
+
+
+def _rl_record_success(ip: str) -> None:
+    _RL_FAILS.pop(ip, None)
+
+
+def _rl_reject(retry_after: float) -> Response:
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Too many failed login attempts. Try again later."},
+        headers={"Retry-After": str(int(retry_after) + 1)},
+    )
+
+
 # HTTP Basic auth (opt-in via KIRA_AUTH_USER + KIRA_AUTH_PASS). Registered
 # BEFORE CORS so CORS stays the OUTERMOST middleware — that way even a 401 from
 # here carries CORS headers and the SPA can read it instead of an opaque CORS
@@ -345,12 +437,46 @@ async def _basic_auth_mw(request: Request, call_next):
       3. Neither configured → open. That's the pre-setup window: the SPA
          forces the sign-up screen before the app is usable, and /auth/setup
          itself is only valid inside this window."""
+    # Rate-limit POST /auth/setup even though it's otherwise reachable pre-auth:
+    # it accepts credentials, so it shares the per-IP lockout with Basic auth.
+    _is_setup_post = request.method == "POST" and request.url.path == "/api/v1/auth/setup"
+    if _is_setup_post:
+        _rem = _rl_locked_for(_rl_client_ip(request))
+        if _rem > 0:
+            return _rl_reject(_rem)
     if _auth_exempt(request.method, request.url.path):
         return await call_next(request)
+    # CSRF guard: state-changing endpoints must carry a custom header. A
+    # cross-site HTML form can POST here as a CORS "simple request" (no
+    # preflight — the allow-list never gets a say, and CORS only hides the
+    # RESPONSE, not the side effect), with the browser auto-attaching cached
+    # Basic credentials. Query-param-only POSTs like /system/database/reset
+    # were remotely wipeable from any page the owner visited. Custom headers
+    # can't be set by forms, so requiring one forces a preflight for every
+    # cross-origin caller. The SPA and the CLI both send it; webhooks are
+    # exempt above (token-gated, external senders).
+    if request.method not in ("GET", "HEAD", "OPTIONS") and not request.headers.get("X-Requested-With"):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Missing X-Requested-With header (cross-site request blocked)."},
+        )
     user, pw = settings.auth_user, settings.auth_pass
+    _ip = _rl_client_ip(request)
     if user and pw:
         if not _basic_auth_ok(request.headers.get("Authorization"), user, pw):
+            _rem = _rl_locked_for(_ip)
+            if _rem > 0:
+                return _rl_reject(_rem)
+            # Only count attempts that actually presented credentials — an
+            # unauthenticated first request (no header → browser prompt) is
+            # normal flow, not a guess.
+            if request.headers.get("Authorization"):
+                _rl_record_failure(_ip)
+                _rem = _rl_locked_for(_ip)
+                if _rem > 0:
+                    return _rl_reject(_rem)
             return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Kira"'})
+        _rl_record_success(_ip)
         return await call_next(request)
     from kira.api.auth import db_auth_ok, get_db_account
     try:
@@ -363,7 +489,16 @@ async def _basic_auth_mw(request: Request, call_next):
         return Response(status_code=503, headers={"Retry-After": "2"})
     if acct is not None:
         if not db_auth_ok(request.headers.get("Authorization"), acct[0], acct[1]):
+            _rem = _rl_locked_for(_ip)
+            if _rem > 0:
+                return _rl_reject(_rem)
+            if request.headers.get("Authorization"):
+                _rl_record_failure(_ip)
+                _rem = _rl_locked_for(_ip)
+                if _rem > 0:
+                    return _rl_reject(_rem)
             return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Kira"'})
+        _rl_record_success(_ip)
     return await call_next(request)
 
 
@@ -404,6 +539,13 @@ def _cors_config() -> tuple[list[str], bool]:
         return origins, False
     return origins, True
 
+
+# Response compression: the /files payload is large, repetitive JSON that
+# compresses ~10:1 — at 10k files it's tens of MB uncompressed, re-fetched
+# continuously during scans. Registered BEFORE CORS (Starlette middleware
+# runs in reverse registration order) so CORS stays outermost.
+from starlette.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 _cors_origins, _cors_allow_credentials = _cors_config()
 app.add_middleware(
@@ -468,12 +610,23 @@ _FRONTEND_DIST = _Path(
 _SPA_INDEX = _FRONTEND_DIST / "index.html"
 _API_PREFIXES = ("/api", "/docs", "/redoc", "/openapi")
 
+class _ImmutableStaticFiles(_StaticFiles):
+    """StaticFiles + `Cache-Control: immutable` for Vite's content-hashed
+    /assets bundles. Plain StaticFiles sends only ETag/Last-Modified, so every
+    asset re-validated against the NAS per visit despite the hash names."""
+
+    def file_response(self, *args, **kwargs):  # type: ignore[override]
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return resp
+
+
 if _SPA_INDEX.is_file():
     # Hashed, immutable build assets get real StaticFiles (proper caching /
     # range support). A specific prefix → can't shadow /api or anything else.
     _assets_dir = _FRONTEND_DIST / "assets"
     if _assets_dir.is_dir():
-        app.mount("/assets", _StaticFiles(directory=str(_assets_dir)), name="assets")
+        app.mount("/assets", _ImmutableStaticFiles(directory=str(_assets_dir)), name="assets")
 
     @app.exception_handler(_StarletteHTTPException)
     async def _spa_aware_404(request: Request, exc: _StarletteHTTPException):
@@ -487,7 +640,10 @@ if _SPA_INDEX.is_file():
             target = (_FRONTEND_DIST / rel).resolve()
             if rel and _FRONTEND_DIST.resolve() in target.parents and target.is_file():
                 return _FileResponse(target)
-            return _FileResponse(_SPA_INDEX)
+            # index.html must never be heuristically cached: a stale index
+            # referencing hashed chunks deleted by a rebuild = blank page
+            # until a hard refresh.
+            return _FileResponse(_SPA_INDEX, headers={"Cache-Control": "no-cache"})
         # Everything else: mirror FastAPI's default HTTPException response so API
         # errors keep their detail + headers byte-for-byte.
         return JSONResponse(

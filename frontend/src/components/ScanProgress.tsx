@@ -1,24 +1,27 @@
-import { IcSpin, IcCheck } from '../lib/icons';
+import { IcSpin, IcCheck, IcAlertTri } from '../lib/icons';
 import { cn } from '../lib/utils';
 import type { TechProgress } from '../lib/types';
 import { ProgressBar } from './base/progress-indicators/progress-bar';
 
 /**
- * Bottom-left popup shown while a scan runs. Up to three phases:
+ * Bottom-right popup shown while a scan runs. Phases:
  *  - scanning: files are being discovered (total unknown) → indeterminate Scan
  *    bar climbs a file count; Match bar waits.
  *  - matching: discovery done (Scan bar complete) → Match bar shows live %.
- *  - tech tags (optional): real container metadata is read off disk — appears
- *    as a third line when the feature is on, after matching. Detached on the
- *    backend, so Scan + Match already read complete while this one climbs.
+ *  - tech tags (optional): real container metadata is read off disk.
+ *  - stalled / offline: the poll saw no progress for a while, or lost the
+ *    backend — the bars freeze and an explicit banner explains why instead of
+ *    a frozen "running" that looks broken.
  * The `message` line surfaces what the backend is doing right now.
  */
-export function ScanProgress({ phase, progress, found, message, tech }: {
+export function ScanProgress({ phase, progress, found, message, tech, status = 'live' }: {
   phase: 'idle' | 'scanning' | 'matching' | 'done';
   progress: number;
   found: number;
   message: string;
   tech?: TechProgress | null;
+  /** Health of the tracking poll — drives the frozen/stalled/offline banner. */
+  status?: 'live' | 'stalled' | 'offline';
 }) {
   const done = phase === 'done';
   const scanDone = phase === 'matching' || done;
@@ -28,7 +31,10 @@ export function ScanProgress({ phase, progress, found, message, tech }: {
   const techPhase = !!tech && (tech.active || !!tech.queued);
   const fullyDone = done && !techPhase;
   const techPct = tech && tech.total ? Math.round((tech.done / tech.total) * 100) : tech?.state === 'done' ? 100 : 0;
-  const title = techPhase ? 'Reading tech tags'
+  const unhealthy = status !== 'live' && !done;
+  const title = unhealthy
+    ? (status === 'offline' ? 'Connection lost' : 'Scan may be stalled')
+    : techPhase ? 'Reading tech tags'
     : done ? 'Scan complete'
     : phase === 'matching' ? 'Matching metadata' : 'Scanning library';
 
@@ -41,13 +47,19 @@ export function ScanProgress({ phase, progress, found, message, tech }: {
       <div className="flex items-center gap-3">
         <span className={cn(
           'grid size-8 shrink-0 place-items-center rounded-lg [&_svg]:size-4',
-          fullyDone ? 'bg-[var(--conf-high-bg)] text-conf-high' : 'bg-white/[0.08] text-ink-muted',
+          fullyDone ? 'bg-[var(--conf-high-bg)] text-conf-high'
+            : unhealthy ? 'bg-[var(--conf-low-bg)] text-conf-low'
+            : 'bg-white/[0.08] text-ink-muted',
         )}>
-          {fullyDone ? <IcCheck /> : <IcSpin />}
+          {fullyDone ? <IcCheck /> : unhealthy ? <IcAlertTri /> : <IcSpin />}
         </span>
         <div className="min-w-0 flex-1">
           <div className="text-[13px] font-semibold text-ink">{title}</div>
-          <div className="mt-0.5 truncate font-mono text-[11.5px] text-ink-muted" title={message}>{message}</div>
+          <div className="mt-0.5 truncate font-mono text-[11.5px] text-ink-muted" title={message}>
+            {status === 'offline' ? 'The job keeps running on the server — reconnecting…'
+              : status === 'stalled' ? 'No progress recently — the server may be busy or the job may have stopped.'
+              : message}
+          </div>
         </div>
       </div>
 
@@ -60,7 +72,7 @@ export function ScanProgress({ phase, progress, found, message, tech }: {
             </span>
             <span className="font-mono tabular-nums text-ink-soft">{found.toLocaleString()} files</span>
           </div>
-          <ProgressBar value={scanDone ? 100 : 0} indeterminate={!scanDone} color="var(--info)" label="Scanning for media files" />
+          <ProgressBar value={scanDone ? 100 : 0} indeterminate={!scanDone && !unhealthy} color="var(--info)" label="Scanning for media files" />
         </div>
 
         {/* Match phase */}
@@ -92,12 +104,15 @@ export function ScanProgress({ phase, progress, found, message, tech }: {
         ) : null}
       </div>
 
-      {/* Glass sheen sweeping across the surface. */}
-      <span
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-y-0 w-1/3 -skew-x-12 bg-gradient-to-r from-transparent via-white/[0.1] to-transparent"
-        style={{ animation: 'kira-shine 4s ease-in-out infinite' }}
-      />
+      {/* Glass sheen sweeping across the surface — suppressed when the job is
+          frozen (stalled/offline) and for reduced-motion users. */}
+      {!unhealthy ? (
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-y-0 w-1/3 -skew-x-12 bg-gradient-to-r from-transparent via-white/[0.1] to-transparent motion-reduce:hidden"
+          style={{ animation: 'kira-shine 4s ease-in-out infinite' }}
+        />
+      ) : null}
     </div>
   );
 }

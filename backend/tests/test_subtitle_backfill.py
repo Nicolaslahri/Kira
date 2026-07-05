@@ -329,3 +329,28 @@ async def test_harvest_redownloads_pack_when_cache_cold(tmp_path, monkeypatch):
         src = (await s.scalars(select(MediaFile).options(selectinload(MediaFile.matches))
                                .where(MediaFile.id == fid))).first()
         assert await bf.harvest_from_cached_pack(s, src, "subsource", "coldref99", "en") == 0
+
+
+# ── double-spawn guard (audit: two concurrent sweeps burned quota twice) ──────
+async def test_spawn_backfill_rejects_second_concurrent(monkeypatch):
+    import asyncio as _a
+    from kira.subtitles import backfill
+    from kira import activity
+
+    activity._jobs.pop(backfill.SUBTITLE_BACKFILL_JOB, None)
+    spawned = []
+    monkeypatch.setattr("kira.tasks.spawn_tracked",
+                        lambda coro, label=None: (spawned.append(label), coro.close()))
+
+    # First spawn succeeds and marks the job active synchronously.
+    ok1 = backfill.spawn_subtitle_backfill([1, 2, 3])
+    # Second spawn in the same tick must be rejected (job already in flight).
+    ok2 = backfill.spawn_subtitle_backfill([1, 2, 3])
+    assert ok1 is True and ok2 is False
+    assert len(spawned) == 1
+
+    # Once the job ends, a new spawn is allowed again.
+    activity.end(backfill.SUBTITLE_BACKFILL_JOB)
+    ok3 = backfill.spawn_subtitle_backfill([4])
+    assert ok3 is True
+    activity._jobs.pop(backfill.SUBTITLE_BACKFILL_JOB, None)

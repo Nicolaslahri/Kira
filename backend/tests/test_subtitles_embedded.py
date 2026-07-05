@@ -204,3 +204,73 @@ async def test_extract_forced_exclude_never_emits_forced(monkeypatch, tmp_path):
 async def test_extract_noop_when_unavailable(monkeypatch):
     monkeypatch.setattr(embedded, "available", lambda: False)
     assert await embedded.extract("x.mkv", ["en"]) == []
+
+
+# ── _ffmpeg_extract builds a valid command (regression: the .part temp made
+#    ffmpeg fail to pick an output muxer, so every extraction failed silently) ──
+async def test_ffmpeg_extract_passes_format_flag(monkeypatch, tmp_path):
+    import asyncio
+    from kira.subtitles import embedded
+
+    monkeypatch.setattr(embedded, "resolve_ffmpeg", lambda: "ffmpeg", raising=False)
+    # resolve_ffmpeg is imported inside the function from kira.ffmpeg_setup:
+    import kira.ffmpeg_setup as fs
+    monkeypatch.setattr(fs, "resolve_ffmpeg", lambda: "ffmpeg")
+
+    captured = {}
+
+    class _FakeProc:
+        returncode = 0
+        async def communicate(self):
+            # Simulate ffmpeg writing the .part temp so the rename path runs.
+            import os
+            with open(captured["tmp"], "w", encoding="utf-8") as f:
+                f.write("1\n00:00:01,000 --> 00:00:02,000\nhi\n")
+            return (b"", b"")
+
+    async def _fake_exec(*cmd, **kw):
+        captured["cmd"] = list(cmd)
+        # the output (last arg) is the .part temp
+        captured["tmp"] = cmd[-1]
+        return _FakeProc()
+
+    monkeypatch.setattr(embedded.asyncio, "create_subprocess_exec", _fake_exec)
+
+    dest = str(tmp_path / "Show.S01E01.en.srt")
+    ok = await embedded._ffmpeg_extract(str(tmp_path / "v.mkv"), 0, dest)
+    assert ok is True
+    cmd = captured["cmd"]
+    # Must pass an explicit -f <format> so the .part temp doesn't break muxer
+    # selection, and the format must match the target extension.
+    assert "-f" in cmd, cmd
+    assert cmd[cmd.index("-f") + 1] == "srt", cmd
+    # Final sidecar exists (renamed from .part), temp gone.
+    import os
+    assert os.path.exists(dest)
+    assert not os.path.exists(dest + ".part")
+
+
+async def test_ffmpeg_extract_format_for_ass_and_vtt(monkeypatch, tmp_path):
+    from kira.subtitles import embedded
+    import kira.ffmpeg_setup as fs
+    monkeypatch.setattr(fs, "resolve_ffmpeg", lambda: "ffmpeg")
+
+    for ext, want_fmt in (("ass", "ass"), ("vtt", "webvtt")):
+        captured = {}
+
+        class _FakeProc:
+            returncode = 0
+            async def communicate(self):
+                with open(captured["tmp"], "w", encoding="utf-8") as f:
+                    f.write("x")
+                return (b"", b"")
+
+        async def _fake_exec(*cmd, **kw):
+            captured["cmd"] = list(cmd); captured["tmp"] = cmd[-1]
+            return _FakeProc()
+
+        monkeypatch.setattr(embedded.asyncio, "create_subprocess_exec", _fake_exec)
+        dest = str(tmp_path / f"Show.S01E01.en.{ext}")
+        ok = await embedded._ffmpeg_extract(str(tmp_path / "v.mkv"), 0, dest)
+        assert ok is True
+        assert captured["cmd"][captured["cmd"].index("-f") + 1] == want_fmt

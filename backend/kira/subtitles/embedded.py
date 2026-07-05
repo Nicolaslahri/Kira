@@ -42,16 +42,38 @@ except Exception:
 # matching; fall back to the lowercased raw value when it's not in the table so
 # an exotic language still matches itself.
 _LANG_TO_2: dict[str, str] = {}
+# Each row: 2-letter code, then every alias (ISO 639-2/B + 639-2/T 3-letter
+# codes and the English name) that should fold to it. Both 3-letter variants
+# matter — e.g. French is "fre" (bibliographic) OR "fra" (terminological);
+# MediaInfo / providers use either. A short list here silently split codes so
+# a `nor` embedded track never satisfied a wanted `no` (permanent "missing" +
+# duplicate downloads).
 for _two, *_aliases in [
     ("en", "eng", "english"), ("ja", "jpn", "jp", "japanese"),
-    ("es", "spa", "spanish"), ("fr", "fre", "fra", "french"),
+    ("es", "spa", "spanish", "castilian"), ("fr", "fre", "fra", "french"),
     ("de", "ger", "deu", "german"), ("it", "ita", "italian"),
     ("pt", "por", "portuguese"), ("ru", "rus", "russian"),
-    ("zh", "chi", "zho", "chinese"), ("ko", "kor", "korean"),
-    ("ar", "ara", "arabic"), ("nl", "dut", "nld", "dutch"),
+    ("zh", "chi", "zho", "chinese", "mandarin"), ("ko", "kor", "korean"),
+    ("ar", "ara", "arabic"), ("nl", "dut", "nld", "dutch", "flemish"),
     ("pl", "pol", "polish"), ("tr", "tur", "turkish"),
     ("sv", "swe", "swedish"), ("hu", "hun", "hungarian"),
     ("hi", "hin", "hindi"),
+    # ── expanded coverage ──
+    ("no", "nor", "norwegian"), ("nb", "nob", "bokmal"), ("nn", "nno", "nynorsk"),
+    ("fi", "fin", "finnish"), ("da", "dan", "danish"),
+    ("cs", "cze", "ces", "czech"), ("sk", "slo", "slk", "slovak"),
+    ("el", "gre", "ell", "greek"), ("he", "heb", "hebrew", "iw"),
+    ("uk", "ukr", "ukrainian"), ("vi", "vie", "vietnamese"),
+    ("th", "tha", "thai"), ("id", "ind", "indonesian", "in"),
+    ("ro", "rum", "ron", "romanian"), ("bg", "bul", "bulgarian"),
+    ("hr", "hrv", "croatian"), ("sr", "srp", "serbian"),
+    ("sl", "slv", "slovenian"), ("et", "est", "estonian"),
+    ("lv", "lav", "latvian"), ("lt", "lit", "lithuanian"),
+    ("ca", "cat", "catalan"), ("fa", "per", "fas", "persian", "farsi"),
+    ("ta", "tam", "tamil"), ("te", "tel", "telugu"),
+    ("ml", "mal", "malayalam"), ("bn", "ben", "bengali"),
+    ("ms", "may", "msa", "malay"), ("uz", "uzb", "uzbek"),
+    ("is", "ice", "isl", "icelandic"), ("ga", "gle", "irish"),
 ]:
     _LANG_TO_2[_two] = _two
     for _a in _aliases:
@@ -200,13 +222,26 @@ async def extract(video_path: str, languages: list[str], forced: str = "") -> li
     return saved
 
 
+# ffmpeg output-muxer name per sidecar extension. Passed explicitly with `-f`
+# because we write to a `.part` temp file, and ffmpeg would otherwise pick the
+# muxer from the output filename's extension — `.part` matches NO muxer, so
+# every extraction failed with "Unable to find a suitable output format".
+_EXT_TO_FFMPEG_FORMAT = {"srt": "srt", "ass": "ass", "ssa": "ass", "vtt": "webvtt"}
+
+
 async def _ffmpeg_extract(video_path: str, sub_index: int, dest: str) -> bool:
-    """Run `ffmpeg -map 0:s:<sub_index> -c copy <dest>` off the event loop.
-    Writes to a `.part` temp then renames (atomic — a crash never leaves a
-    half-written sidecar). Returns True on success."""
+    """Run `ffmpeg -map 0:s:<sub_index> -c copy -f <fmt> <dest>` off the event
+    loop. Writes to a `.part` temp then renames (atomic — a crash never leaves
+    a half-written sidecar). Returns True on success."""
     from kira.ffmpeg_setup import resolve_ffmpeg
     ffmpeg = resolve_ffmpeg()
     if not ffmpeg:
+        return False
+    import os as _os
+    ext = _os.path.splitext(dest)[1].lstrip(".").lower()
+    fmt = _EXT_TO_FFMPEG_FORMAT.get(ext)
+    if not fmt:
+        _log.warning("embedded extract: no ffmpeg format for extension %r (%s)", ext, dest)
         return False
     tmp = dest + ".part"
     cmd = [
@@ -214,6 +249,7 @@ async def _ffmpeg_extract(video_path: str, sub_index: int, dest: str) -> bool:
         "-i", video_path,
         "-map", f"0:s:{sub_index}",
         "-c", "copy",
+        "-f", fmt,          # explicit — the .part temp gives no usable extension
         tmp,
     ]
     try:

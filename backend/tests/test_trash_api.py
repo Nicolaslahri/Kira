@@ -131,16 +131,61 @@ def test_containment_rejects_traversal(tmp_path) -> None:
         assert ei.value.status_code == 400
 
 
-def test_purge_old_trash_by_age(tmp_path) -> None:
+def _rewrite_manifest_at(trash: Path, name: str, iso_at: str) -> None:
+    """Rewrite the manifest so `name`'s `at` becomes `iso_at` — simulates an
+    item trashed long ago without touching the file's (preserved) mtime."""
+    lines = []
+    for line in (trash / TRASH_MANIFEST).read_text(encoding="utf-8").splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("name") == name:
+            rec["at"] = iso_at
+        lines.append(json.dumps(rec))
+    (trash / TRASH_MANIFEST).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_purge_uses_trashed_at_not_file_mtime(tmp_path) -> None:
+    """A freshly-trashed item with an OLD file mtime (shutil.move preserves the
+    original mtime) must SURVIVE — age is measured from when it was trashed."""
     import os, time
     _trash_one(tmp_path)
     trash = tmp_path / "trash"
     item = next(p for p in trash.iterdir() if p.name != TRASH_MANIFEST)
-    old = time.time() - 40 * 86400
+    old = time.time() - 400 * 86400  # file is "2 years old" by mtime
     os.utime(item, (old, old))
+    # Manifest `at` is now (just trashed) → must NOT be purged.
+    assert purge_old_trash(trash, 30) == 0
+    assert item.exists()
+
+
+def test_purge_removes_items_trashed_long_ago(tmp_path) -> None:
+    from datetime import datetime, timedelta, timezone
+    _trash_one(tmp_path)
+    trash = tmp_path / "trash"
+    item = next(p for p in trash.iterdir() if p.name != TRASH_MANIFEST)
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat(timespec="seconds")
+    _rewrite_manifest_at(trash, item.name, long_ago)
     assert purge_old_trash(trash, 30) == 1
     assert not item.exists()
     assert item.name not in (trash / TRASH_MANIFEST).read_text()
-    # keep-forever (0) never deletes
+
+
+def test_purge_falls_back_to_mtime_without_manifest(tmp_path) -> None:
+    """Pre-manifest items (no `at` record) still purge by mtime."""
+    import os, time
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    orphan = trash / "orphan.jpg"
+    orphan.write_bytes(b"x")
+    old = time.time() - 40 * 86400
+    os.utime(orphan, (old, old))
+    assert purge_old_trash(trash, 30) == 1
+    assert not orphan.exists()
+
+
+def test_purge_keep_forever(tmp_path) -> None:
     _trash_one(tmp_path)
+    trash = tmp_path / "trash"
     assert purge_old_trash(trash, 0) == 0

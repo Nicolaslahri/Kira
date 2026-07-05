@@ -28,13 +28,18 @@ logger = logging.getLogger(__name__)
 SOURCES = [
     "UHD-BluRay", "UHDBD", "UHDRip", "BluRay", "Blu-Ray",
     "BDRemux", "BDRip", "BRRip", "BDMV", "REMUX",
-    "WEB-DL", "WEBRip", "WEB-Rip", "WEBDL", "WEB",
+    "WEB-DL", "WEBRip", "WEB-Rip", "WEBDL",
     "HD-DVD", "HDDVD", "HDRip", "HDTV", "PDTV", "SDTV",
     "DVDRip", "DVDScr", "DVDR", "DVD",
     "DVBRip", "SATRip", "TVRip", "VODRip", "DSR",
     "HDCAM", "HDTS", "TELESYNC", "TELECINE", "WORKPRINT", "SCREENER",
-    "CAM", "TC", "PPV",
+    "TC", "PPV",
 ]
+# Bare "WEB" and "CAM" moved to SOURCES_AMBIGUOUS below: they're overwhelmingly
+# common English titles ("Charlotte's Web", "Cam" 2018), and matching them
+# IGNORECASE + start-allowed mangled the title. The compound forms (WEB-DL,
+# WEBRip, HDCAM) stay above — they're unambiguous. Bare WEB/CAM now strip only
+# when ALL-CAPS and not the first token (real scene convention).
 # Streaming PLATFORM tags — the service a web release came from. These are NOT a
 # source TYPE: a file is `AMZN WEB-DL`, where WEB-DL is the delivery method and
 # AMZN is the platform. They're stripped from titles like any tech token, but a
@@ -47,7 +52,7 @@ PLATFORMS = ["AMZN", "ATVP", "DSNP", "HULU", "NFLX", "PCOK", "PMTP", "CRAV"]
 # Sources that double as ordinary English when title-cased ("Max", "Ts", "Nf",
 # "Bd", "Stan"). Matched case-SENSITIVELY (must be ALL-CAPS) AND must be
 # preceded by a separator so they can't be the first token of a filename.
-SOURCES_AMBIGUOUS = ["HMAX", "MAX", "NF", "TS", "BD", "STAN"]
+SOURCES_AMBIGUOUS = ["HMAX", "MAX", "NF", "TS", "BD", "STAN", "WEB", "CAM"]
 # The ALL-CAPS-ambiguous tokens that are actually streaming platforms (HBO Max,
 # Netflix, Stan) → like PLATFORMS, they imply WEB-DL rather than being a source.
 _STREAMING_AMBIG = {"HMAX", "NF", "STAN"}
@@ -111,7 +116,7 @@ EDITIONS = [
     "Deluxe\\.?Edition", "Limited\\.?Edition", "Definitive\\.?Edition",
     "Special\\.?Edition", "Final\\.?Cut", "Uncut", "Recut", "Redux",
     "Open\\.?Matte", "Fan\\.?Edit", "Despecialized", "Restored",
-    "Remastered", "IMAX", "Anniversary", "Criterion", "LIMITED",
+    "Remastered", "IMAX", "Criterion", "LIMITED",
 ]
 
 # Spelled-out "HDR10Plus" (PSA et al.) must be its own entry: boundary
@@ -492,7 +497,17 @@ def strip(name: str) -> tuple[str, FormatTokens]:
     m = _TRAILING_GROUP_RE.search(name)
     if m and tokens.release_group is None:
         candidate = m.group(1)
-        if not _is_known_token(candidate) and not _TRAILING_EP_TOKEN_RE.match(candidate):
+        # A scene group only ever trails a RELEASE-shaped name (Title.2010.
+        # 1080p.x264-GROUP). A bare hyphenated title ("Kick-Ass.mkv") has no
+        # year / tech tokens, so eating its tail produced title "Kick" +
+        # group "Ass". Require at least one release marker in the remainder
+        # before treating the tail as a group.
+        _rest = name[: m.start()]
+        _looks_release = bool(
+            re.search(r"\b(19|20)\d{2}\b", _rest)
+            or re.search(r"\b(2160p|1080p|720p|480p|x26[45]|h\.?26[45]|hevc|bluray|blu-ray|web-?dl|webrip|bdrip|dvdrip|hdtv|remux|aac|flac|dts|ac3)\b", _rest, re.IGNORECASE)
+        )
+        if _looks_release and not _is_known_token(candidate) and not _TRAILING_EP_TOKEN_RE.match(candidate):
             tokens.release_group = candidate
             name = _TRAILING_GROUP_RE.sub("", name, count=1)
 

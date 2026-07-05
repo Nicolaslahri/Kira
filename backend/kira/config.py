@@ -1,5 +1,26 @@
+import os
+from pathlib import Path
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def cache_dir() -> Path:
+    """The persistent cache root — honors KIRA_CACHE_DIR (the Docker image sets
+    it to /config/.cache on the persisted volume).
+
+    Every module that caches downloads MUST derive its path from this. The old
+    per-module defaults (`Path(__file__).parents[2]/".cache"` → inside the
+    installed package in site-packages; `Path.cwd()/".cache"` → the ephemeral
+    /app layer) were wiped on every container rebuild — re-download storms for
+    the AniDB title dump / Fribb lists / scene rules / packs, and a multi-GiB
+    poster cache accumulating on the image's overlay layer."""
+    env = os.environ.get("KIRA_CACHE_DIR")
+    if env:
+        return Path(env)
+    # Dev fallback: backend/.cache — the same directory the per-module
+    # `Path(__file__).parents[2]/".cache"` defaults resolved to before.
+    return Path(__file__).resolve().parents[1] / ".cache"
 
 
 class Settings(BaseSettings):
@@ -9,6 +30,9 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # In the container the Dockerfile sets KIRA_DATABASE_URL to the persisted
+    # /config volume. This bare default is the DEV fallback — a CWD-relative
+    # path is a data-loss footgun in prod, but the image always overrides it.
     database_url: str = "sqlite+aiosqlite:///./kira.db"
     media_root: str = "/media"
 

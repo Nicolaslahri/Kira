@@ -44,6 +44,10 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 # Our 2-letter code → SubSource's full-name language token.
 _TO_NAME: dict[str, str] = {
+    # pt-BR has its own SubSource catalogue name — mapping it to plain
+    # "portuguese" returned only pt-PT subs (zero useful results for
+    # Brazilian users).
+    "pt-br": "brazillian-portuguese",
     "en": "english", "es": "spanish", "fr": "french", "de": "german",
     "it": "italian", "pt": "portuguese", "ru": "russian", "ja": "japanese",
     "ko": "korean", "zh": "chinese", "ar": "arabic", "nl": "dutch",
@@ -54,7 +58,12 @@ _TO_NAME: dict[str, str] = {
 # regional variants the catalogue actually uses.
 _FROM_NAME: dict[str, str] = {
     "english": "en", "spanish": "es", "french": "fr", "german": "de",
-    "italian": "it", "portuguese": "pt", "brazilian_portuguese": "pt",
+    "italian": "it", "portuguese": "pt",
+    # Brazilian variants keep their REGIONAL code — relabeling them plain "pt"
+    # made the wanted-language filter drop them for pt-BR users (and mislabeled
+    # the sidecar for pt-PT users).
+    "brazilian_portuguese": "pt-br", "brazillian-portuguese": "pt-br",
+    "brazillian_portuguese": "pt-br", "portuguese_brazilian": "pt-br",
     "russian": "ru", "japanese": "ja", "korean": "ko", "chinese": "zh",
     "chinese_bg_code": "zh", "big_5_code": "zh", "arabic": "ar", "dutch": "nl",
     "polish": "pl", "turkish": "tr", "swedish": "sv", "hungarian": "hu",

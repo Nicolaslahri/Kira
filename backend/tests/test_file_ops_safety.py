@@ -206,3 +206,71 @@ def test_same_inode_false_for_distinct_files(tmp_path):
     a = tmp_path / "a.mkv"; a.write_bytes(b"x")
     b = tmp_path / "b.mkv"; b.write_bytes(b"y")
     assert ops._same_inode(a, b) is False
+
+
+# ── Cross-batch destination claim (audit fix) ────────────────────────────────
+# Bug: two concurrent rename batches (user /rename + watcher auto-rename) each
+# hold their own per-batch duplicate-target guard, both pass the non-atomic
+# dst.exists() check for the same rendered target, and the second os.rename()
+# silently replaces the first file on POSIX — data loss with both history rows
+# reporting success. execute_op now claims the destination in a process-global
+# registry for the duration of the operation.
+def test_concurrent_target_claim_conflicts_instead_of_replacing(tmp_path):
+    from kira.renamer.operations import RenameSkipped, _claim_target, _release_target
+
+    src = tmp_path / "b.mkv"
+    src.write_bytes(b"BBB")
+    dst = tmp_path / "out" / "Show.S01E01.mkv"
+
+    # Simulate batch A holding the claim mid-operation.
+    assert _claim_target(dst)
+    try:
+        with pytest.raises(FileExistsError):
+            execute_op(FileOp.MOVE, src, dst)
+        with pytest.raises(RenameSkipped):
+            execute_op(FileOp.MOVE, src, dst, on_conflict="skip")
+        assert src.read_bytes() == b"BBB"  # loser's file untouched
+    finally:
+        _release_target(dst)
+
+    # Claim released → operation proceeds normally.
+    execute_op(FileOp.MOVE, src, dst)
+    assert dst.read_bytes() == b"BBB"
+
+
+def test_target_claim_released_after_success_and_failure(tmp_path):
+    from kira.renamer.operations import _claim_target, _release_target
+
+    src = tmp_path / "a.mkv"
+    src.write_bytes(b"AAA")
+    dst = tmp_path / "done.mkv"
+    execute_op(FileOp.MOVE, src, dst)
+    # Registry must not leak the claim after a completed op.
+    assert _claim_target(dst)
+    _release_target(dst)
+
+    # Failure path releases too (missing source raises FileNotFoundError).
+    with pytest.raises(FileNotFoundError):
+        execute_op(FileOp.MOVE, tmp_path / "missing.mkv", tmp_path / "x.mkv")
+    assert _claim_target(tmp_path / "x.mkv")
+    _release_target(tmp_path / "x.mkv")
+
+
+def test_undo_claims_original_location(tmp_path):
+    from kira.renamer.operations import _claim_target, _release_target
+
+    src = tmp_path / "orig.mkv"
+    src.write_bytes(b"V")
+    dst = tmp_path / "renamed.mkv"
+    execute_op(FileOp.MOVE, src, dst)
+
+    # A concurrent batch is writing to the original location → undo must refuse.
+    assert _claim_target(src)
+    try:
+        with pytest.raises(FileExistsError):
+            undo_op(FileOp.MOVE, src, dst)
+    finally:
+        _release_target(src)
+
+    undo_op(FileOp.MOVE, src, dst)
+    assert src.read_bytes() == b"V"

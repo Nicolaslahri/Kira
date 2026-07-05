@@ -418,3 +418,64 @@ def test_empty_bracket_residue_removed() -> None:
     pf = parse_filename("Some Show [ ] S01E05.mkv")
     assert "[" not in pf.title and "]" not in pf.title
     assert "some show" in pf.title.lower()
+
+
+# ── audit: titles-with-numbers & ambiguous release words (verified-run fixes) ──
+def test_year_in_title_not_episode():
+    from kira.parser import parse
+    # WALL-E: trailing E + year must NOT become anime episode 2008.
+    p = parse("WALL-E.2008.1080p.BluRay.x264.mkv")
+    assert p.media_type == "movie" and p.year == 2008 and p.episode is None
+    # Catch-22 / Fahrenheit-451: dash-number followed by a year = title, not ep.
+    for fn, yr in [("Catch-22.2019.mkv", 2019), ("Fahrenheit-451.1966.mkv", 1966)]:
+        p = parse(fn)
+        assert p.media_type == "movie" and p.year == yr and p.episode is None, fn
+
+
+def test_real_anime_dash_still_parses():
+    from kira.parser import parse
+    assert parse("One Piece - 1156.mkv").absolute_episode == 1156
+    p = parse("[Lazier] Bleach Thousand-Year Blood War-38 [WEB 1080p AAC].mkv")
+    assert p.absolute_episode == 38
+
+
+def test_ambiguous_source_words_kept_in_title():
+    from kira.parser import parse
+    assert parse("Cam.2018.1080p.mkv").title == "Cam"
+    assert "Web" in parse("Charlottes.Web.2006.720p.mkv").title
+    assert parse("The.Anniversary.1968.mkv").title == "The Anniversary"
+    # But real ALL-CAPS tags still strip:
+    assert parse("Show.S01E01.WEB.x264.mkv").title == "Show"
+    assert parse("Movie.2020.WEB-DL.1080p.mkv").title == "Movie"
+
+
+def test_bracket_resolution_not_absolute():
+    from kira.parser import parse
+    p = parse("Show.S01E05.[1080].mkv")
+    assert p.media_type == "tv" and p.absolute_episode is None
+
+
+def test_underscore_folds_in_similarity():
+    from kira.matcher.similarity import trigram_similarity
+    assert trigram_similarity("Attack_on_Titan", "Attack on Titan") == 1.0
+
+
+def test_bare_number_title_not_compressed_sxe():
+    """'300' must stay a title, not compress to S03E00 (episode 0 is spurious
+    in the strict/compressed form). An explicit S01E00 special is unaffected."""
+    from kira.parser import parse
+    p = parse("300.mkv")
+    assert p.season is None and p.episode is None and p.title == "300"
+    # explicit pilot/special (non-strict path) still parses episode 0:
+    p2 = parse("Show.S01E00.Pilot.mkv")
+    assert p2.season == 1 and p2.episode == 0
+
+
+def test_complete_season_span_stays_tv_multiep():
+    """'S01E01-E26' is a real multi-ep TV span, not absolute anime episode 26.
+    An absorbed absolute (end > 100, e.g. S06E15-128) still reclassifies."""
+    from kira.parser import parse
+    p = parse("Show.S01E01-E26.COMPLETE.mkv")
+    assert p.media_type == "tv" and p.episode == 1 and p.episode_end == 26 and p.absolute_episode is None
+    p2 = parse("[SubsPlease] My Hero Academia - S06E15 - 128.mkv")
+    assert p2.absolute_episode == 128

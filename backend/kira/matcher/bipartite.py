@@ -19,6 +19,18 @@ stays unpaired (orphan in the popup, "no episode" pill).
 
 User-locked: fires only when len(cluster) >= 3. N=1 has no signal,
 N=2 is a coin flip; the existing per-file lookup handles those.
+
+NOTE: passes are FIRST-COME-FIRST-SERVED per metric in file order — not
+the iterative mutual-uniqueness extraction older docs described.
+
+RESOLUTION (audit §21 m): this is fine, by construction. Passes run
+STRONGEST-metric-first (exact S/E key → absolute → title → air date), so
+any earlier claim was made by a metric at least as strong as whatever a
+later file could offer — a later "strictly better" claim across passes
+cannot exist. Within one pass all matches are equal strength, so FCFS
+only ever tiebreaks between equals (duplicate releases of the same
+episode), where mutual-uniqueness would refuse to assign EITHER — a
+worse outcome for the user than deterministically picking one.
 """
 from __future__ import annotations
 

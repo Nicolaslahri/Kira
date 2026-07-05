@@ -260,9 +260,41 @@ async def sonarr_test(
     BEFORE saving, so the user gets immediate feedback without having
     to commit a possibly-wrong config first.
     """
-    # Build a config — prefer payload overrides, fall back to stored.
-    if payload.url and payload.api_key:
-        cfg = SonarrConfig(base_url=payload.url.strip(), api_key=payload.api_key.strip())
+    # Build a config — per-FIELD merge (audit §12 M): the old all-or-nothing
+    # check (`url AND api_key`) meant editing only ONE field silently tested
+    # the fully-SAVED config — a false "Connected" for a never-contacted URL.
+    # Each missing field now falls back to its saved counterpart, and an
+    # inline URL keeps the saved url_base suffix (reverse-proxy setups used
+    # to false-FAIL because the inline test dropped it).
+    _url = (payload.url or "").strip()
+    _key = (payload.api_key or "").strip()
+    if _url or _key:
+        _saved = None
+        try:
+            _saved = await _load_sonarr_config(session)
+        except Exception:
+            # No usable saved config (not configured / bare test session) —
+            # inline values must stand on their own.
+            pass
+        if _url:
+            base_url = _url.rstrip("/")
+            try:
+                _ub = await _resolve_setting(session, "integrations.sonarr.url_base")
+            except Exception:
+                _ub = None
+            if isinstance(_ub, str) and _ub.strip():
+                _sfx = _ub.strip()
+                if not _sfx.startswith("/"):
+                    _sfx = "/" + _sfx
+                base_url = base_url + _sfx.rstrip("/")
+        else:
+            base_url = _saved.base_url if _saved else ""
+        api_key = _key or (_saved.api_key if _saved else "")
+        if not base_url or not api_key:
+            return SonarrTestResponse(
+                ok=False,
+                detail="URL and API key are both required — one was empty with no saved value to fall back to.")
+        cfg = SonarrConfig(base_url=base_url, api_key=api_key)
     else:
         try:
             cfg = await _load_sonarr_config(session)
@@ -324,8 +356,34 @@ async def radarr_test(
     posts the current form values BEFORE saving, so the user gets immediate
     feedback without committing a possibly-wrong config first.
     """
-    if payload.url and payload.api_key:
-        cfg = radarr_mod.RadarrConfig(base_url=payload.url.strip(), api_key=payload.api_key.strip())
+    # Per-FIELD merge — same fix as the Sonarr test above (§12 M).
+    _url = (payload.url or "").strip()
+    _key = (payload.api_key or "").strip()
+    if _url or _key:
+        _saved = None
+        try:
+            _saved = await _load_radarr_config(session)
+        except Exception:
+            pass
+        if _url:
+            base_url = _url.rstrip("/")
+            try:
+                _ub = await _resolve_setting(session, "integrations.radarr.url_base")
+            except Exception:
+                _ub = None
+            if isinstance(_ub, str) and _ub.strip():
+                _sfx = _ub.strip()
+                if not _sfx.startswith("/"):
+                    _sfx = "/" + _sfx
+                base_url = base_url + _sfx.rstrip("/")
+        else:
+            base_url = _saved.base_url if _saved else ""
+        api_key = _key or (_saved.api_key if _saved else "")
+        if not base_url or not api_key:
+            return RadarrTestResponse(
+                ok=False,
+                detail="URL and API key are both required — one was empty with no saved value to fall back to.")
+        cfg = radarr_mod.RadarrConfig(base_url=base_url, api_key=api_key)
     else:
         try:
             cfg = await _load_radarr_config(session)
@@ -439,18 +497,20 @@ async def radarr_queue(session: AsyncSession = Depends(get_session)) -> RadarrQu
     try:
         cfg = await _load_radarr_config(session)
     except HTTPException:
-        return RadarrQueueResponse(items=[], cached_at=time.monotonic())
+        return RadarrQueueResponse(items=[], cached_at=time.time())
     try:
         items = await _get_cached_radarr_queue(cfg)
     except radarr_mod.RadarrError:
-        return RadarrQueueResponse(items=[], cached_at=time.monotonic())
+        return RadarrQueueResponse(items=[], cached_at=time.time())
     return RadarrQueueResponse(
         items=[RadarrQueueItemOut(
             tmdb_id=i.tmdb_id, title=i.title, status=i.status,
             progress_pct=i.progress_pct, eta_seconds=i.eta_seconds,
             release_title=i.release_title, error_message=i.error_message,
         ) for i in items],
-        cached_at=time.monotonic(),
+        # Wall-clock epoch — matches the Sonarr queue response contract
+        # (monotonic() is a meaningless epoch for API consumers).
+        cached_at=time.time(),
     )
 
 
@@ -627,6 +687,31 @@ async def sonarr_send_missing(
     # into a hard timeout. The activity pill narrates the outcome
     # (queued / nothing-to-do / couldn't-reach), and because that state lives in
     # the activity system it survives closing + reopening the popup.
+    # Multi-cour offset (audit §12 M): for an AniDB match inside a multi-cour
+    # TVDB season, `payload.episode_numbers` are the cour's LOCAL numbers
+    # (1..N) — but Sonarr addresses the WHOLE TVDB season, so cour 2's
+    # "missing 1-12" is really the season's E17-28. The cour routing table
+    # (summed sibling episode counts — the same source the matcher uses)
+    # yields this cour's offset within the season. Single-cour seasons return
+    # no table and the numbers pass through unchanged.
+    episode_numbers = list(payload.episode_numbers)
+    if match.provider == "anidb" and tvdb_season_override is not None:
+        try:
+            from kira.matcher.cour_routing import build_cour_routing_table
+            _table = await build_cour_routing_table(
+                "anidb", str(match.provider_id), effective_season)
+            if _table:
+                _aid = int(match.provider_id)
+                for _cs, _ce, _caid, _off in _table:
+                    if _caid == _aid and _off:
+                        episode_numbers = [n + _off for n in episode_numbers]
+                        logger.info(
+                            "send-missing: cour offset +%d applied for AID %d "
+                            "(season %s)", _off, _aid, effective_season)
+                        break
+        except Exception as e:
+            logger.warning(f"send-missing: cour offset resolution failed (raw numbers used): {e!r}")
+
     from kira import activity
     from kira.tasks import spawn_tracked
     series_label = match.series_name or match.title or "the series"
@@ -634,7 +719,7 @@ async def sonarr_send_missing(
     spawn_tracked(
         _send_missing_bg(
             cfg, tvdb_id=tvdb_id, season=effective_season,
-            episode_numbers=payload.episode_numbers, series_label=series_label),
+            episode_numbers=episode_numbers, series_label=series_label),
         label="sonarr_search",
     )
     return SendMissingResponse(
@@ -1127,9 +1212,9 @@ async def sonarr_heal_unmatched(
 
     # 4. Query Kira's heal candidates. Excludes user-pinned (is_manual)
     #    matches — never override a user decision.
-    from sqlalchemy import or_
+    from sqlalchemy import or_, select
     from sqlalchemy.orm import selectinload
-    from kira.models import Match
+    from kira.models import Match, MediaFile
 
     stmt = (
         select(MediaFile)

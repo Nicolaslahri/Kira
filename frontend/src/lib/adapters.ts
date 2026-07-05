@@ -280,7 +280,9 @@ function mbReleaseId(gid: string | null | undefined): string | undefined {
 function titleFromKey(key: string | null | undefined, fallback: string): string {
   if (!key) return fallback;
   const parts = key.split('|');
-  const raw = parts[1] || fallback;
+  // Music keys are `music|<year>|<artist ...>` — parts[1] is the YEAR, so an
+  // unmatched album card used to be titled e.g. "2014". Use the artist segment.
+  const raw = (parts[0] === 'music' ? parts.slice(2).join(' ') || parts[1] : parts[1]) || fallback;
   return raw.replace(/\b\w/g, c => c.toUpperCase());
 }
 
@@ -435,6 +437,7 @@ function buildItem(group: MediaFile[]): LibraryItem {
       // (no nested match blob duplicated 26× per cluster) while
       // unblocking these actions.
       matchId: f.match?.matchId ?? null,
+      candidates: f.candidates,
     };
   });
 

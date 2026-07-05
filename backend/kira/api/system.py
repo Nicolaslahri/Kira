@@ -303,6 +303,31 @@ class NotificationOut(BaseModel):
 
 notif_router = APIRouter(prefix="/notifications", tags=["notifications"])
 
+# Keep at most this many notification rows. Nothing pruned these before, so a
+# long-running instance (especially with a flapping integration health check)
+# grew the table unbounded. Cap by COUNT (keep the newest) rather than age, so
+# a quiet instance never loses recent history and a chatty one stays bounded.
+_NOTIFICATION_KEEP = 500
+
+
+async def prune_old_notifications(session: AsyncSession) -> int:
+    """Delete all but the newest `_NOTIFICATION_KEEP` notifications. Called on
+    the same recurring event as the history prune (post-scan). Returns removed
+    count. Best-effort — never raises into the caller."""
+    from sqlalchemy import select
+    try:
+        ids = list(await session.scalars(
+            select(Notification.id).order_by(Notification.created_at.desc())
+            .offset(_NOTIFICATION_KEEP)
+        ))
+        if not ids:
+            return 0
+        await session.execute(delete(Notification).where(Notification.id.in_(ids)))
+        await session.commit()
+        return len(ids)
+    except Exception:
+        return 0
+
 
 @notif_router.get("", response_model=list[NotificationOut])
 async def list_notifications(
@@ -325,6 +350,24 @@ async def mark_read(notif_id: int, session: AsyncSession = Depends(get_session))
     notif.read = True
     await session.commit()
     return notif
+
+
+class _MarkReadBody(BaseModel):
+    ids: list[int]
+
+
+@notif_router.post("/read", response_model=dict[str, int])
+async def mark_read_bulk(body: _MarkReadBody, session: AsyncSession = Depends(get_session)) -> dict[str, int]:
+    """Mark a SET of notifications read in one request — the bell's group click
+    (a collapsed run of N notifications) used to fire N parallel POSTs."""
+    if not body.ids:
+        return {"updated": 0}
+    from sqlalchemy import update
+    result = await session.execute(
+        update(Notification).where(Notification.id.in_(body.ids)).values(read=True)
+    )
+    await session.commit()
+    return {"updated": result.rowcount or 0}
 
 
 @notif_router.post("/read-all", response_model=dict[str, int])

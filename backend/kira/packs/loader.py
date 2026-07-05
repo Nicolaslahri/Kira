@@ -31,7 +31,8 @@ logger = logging.getLogger("kira.packs.loader")
 
 BINDINGS_KEY = "packs.bindings"
 
-_CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache" / "packs"
+from kira.config import cache_dir as _kira_cache_dir
+_CACHE_DIR = _kira_cache_dir() / "packs"
 _MAX_AGE_SEC = 24 * 3600
 
 # In-memory parsed-pack cache keyed by binding.key, plus a load lock.

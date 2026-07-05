@@ -1,10 +1,9 @@
 import { useState, useMemo, useRef, useEffect } from 'react';
-import type { MediaFile, SearchResult, CandidateData, ProviderKey, MatchData, MediaType } from '../lib/types';
-import { PROVIDERS, NAMING_PROFILES, TYPE_COLOR, formatPath, poster } from '../lib/data';
+import type { MediaFile, SearchResult, ProviderKey, MediaType } from '../lib/types';
+import { PROVIDERS, NAMING_PROFILES, poster } from '../lib/data';
 import { api, ApiError, type ApiSearchResult, type ApiProvider } from '../lib/api';
-import { IcSearch, IcCheck, IcX, IcArrowRight, IcShieldCheck, IcUndo, IcExternal, IcWaveform, IcSpin, IcAlertTri, IcDownload } from '../lib/icons';
-import { Modal, Poster, ConfidenceBadge, StatusPill, Segmented } from './ui';
-import { confLevel } from '../lib/confBands';
+import { IcSearch, IcCheck, IcArrowRight, IcShieldCheck, IcSpin, IcAlertTri } from '../lib/icons';
+import { Modal, Poster, Segmented } from './ui';
 
 export function highlightPath(path: string) {
   const parts = path.split('/');
@@ -91,14 +90,17 @@ export function ManualSearchModal({ file, onClose, onSelect, onIdentifyByContent
   const selectingRef = useRef(false);  // one-shot guard so button + double-click can't fire the match twice
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Pull provider catalogue once and pick the default tab from it.
+  // Pull provider catalogue once and pick the default tab from it — UNLESS the
+  // user already clicked a tab while the catalogue was loading (their choice
+  // must win; the async default used to clobber it).
+  const userPickedProviderRef = useRef(false);
   useEffect(() => {
     let cancelled = false;
     api.getProviders()
       .then(list => {
         if (cancelled) return;
         setProviders(list);
-        setProvider(pickDefault(file, list));
+        if (!userPickedProviderRef.current) setProvider(pickDefault(file, list));
       })
       .catch(() => { /* leave default 'TVDB' as-is */ });
     return () => { cancelled = true; };
@@ -147,28 +149,33 @@ export function ManualSearchModal({ file, onClose, onSelect, onIdentifyByContent
           // Reset any prior banner — this is a fresh search.
           setAnidbApiError(null);
           setAnidbErrorKind(null);
-          // Track whether we've already noticed AniDB rejecting our client.
-          // Once it does, every call returns the same error; stop firing.
-          let apiDead = false;
-          for (const r of res.results) {
-            if (cancelled || apiDead) break;
-            if (r.poster_url || !r.provider_id) continue;
-            api.anidbPicture(r.provider_id)
-              .then(({ picture_url, error: apiErr, error_kind }) => {
+          // Fetch pictures SEQUENTIALLY (await each) rather than firing all N
+          // at once. The backend already serializes AniDB at 1 req/4s, so this
+          // is no slower — but it lets the "client rejected" guard actually
+          // STOP the burst: the old fire-and-forget loop dispatched every call
+          // before any response arrived, so `apiDead` never short-circuited and
+          // a banned client hammered AniDB with the whole result set.
+          void (async () => {
+            for (const r of res.results) {
+              if (cancelled) break;
+              if (r.poster_url || !r.provider_id) continue;
+              try {
+                const { picture_url, error: apiErr, error_kind } = await api.anidbPicture(r.provider_id);
                 if (cancelled) return;
                 if (apiErr) {
-                  apiDead = true;
                   setAnidbApiError(apiErr);
                   setAnidbErrorKind(error_kind);
-                  return;
+                  break;   // client rejected / banned → stop firing
                 }
-                if (!picture_url) return;
+                if (!picture_url) continue;
                 setResults(curr => curr.map(x =>
                   x.provider_id === r.provider_id ? { ...x, poster_url: picture_url } : x
                 ));
-              })
-              .catch(() => { /* swallow — keep gradient initials */ });
-          }
+              } catch {
+                /* swallow — keep gradient initials */
+              }
+            }
+          })();
         }
       } catch (e) {
         const err = e as Error;
@@ -179,9 +186,12 @@ export function ManualSearchModal({ file, onClose, onSelect, onIdentifyByContent
         } else {
           setError(err.message);
         }
-        setResults([]);
+        if (!cancelled) setResults([]);
       } finally {
-        setLoading(false);
+        // Guard on `cancelled`: a superseded (older) search resolving after a
+        // provider/query change must NOT clear the spinner while the newer
+        // request is still in flight.
+        if (!cancelled) setLoading(false);
       }
     }, 300);
     return () => { cancelled = true; clearTimeout(handle); };
@@ -287,7 +297,7 @@ export function ManualSearchModal({ file, onClose, onSelect, onIdentifyByContent
               key={p}
               type="button"
               className={`provider-tab ${provider === p ? 'on' : ''} ${unavailable ? 'disabled' : ''}`}
-              onClick={() => { if (!unavailable) setProvider(p); }}
+              onClick={() => { if (!unavailable) { userPickedProviderRef.current = true; setProvider(p); } }}
               disabled={unavailable}
               aria-disabled={unavailable || undefined}
               title={unavailable ? (info && !info.implemented ? 'Coming soon' : 'Not configured') : undefined}
@@ -500,9 +510,19 @@ export function RenamePreviewModal({ files, onClose, onApply, defaultProfile = '
   // A file is renameable only when it has a REAL provider match — the
   // adapter synthesises a placeholder `match` object from parsed data
   // for display, so we filter on provider+providerId not just `match`.
-  const eligible = files.filter(f => f.match?.provider && f.match?.providerId);
+  // MEMOIZED on `files`: an unmemoized `.filter()` produced a NEW array
+  // identity every render, which invalidated the `preview` memo, which
+  // re-fired the dry-run effect below, which setTargets → re-render → an
+  // infinite loop of `POST /rename {dry_run:true}` while the modal was open.
+  const eligible = useMemo(
+    () => files.filter(f => f.match?.provider && f.match?.providerId),
+    [files],
+  );
   const skipped = files.length - eligible.length;
-  const preview = useMemo(() => eligible.slice(0, 4), [eligible]);
+  // Show the FULL plan (scrollable), not the first 4 — approving a 200-file
+  // batch while seeing 2% of it defeated "review every change". Capped at 500
+  // rows to keep the dry-run request + DOM bounded; the cap is surfaced below.
+  const preview = useMemo(() => eligible.slice(0, 500), [eligible]);
 
   const firstType = eligible[0]?.mediaType;
   const templateKey = firstType === 'tv' ? 'tv' : firstType === 'anime' ? 'anime' : firstType === 'music' ? 'music' : 'movie';
@@ -582,32 +602,40 @@ export function RenamePreviewModal({ files, onClose, onApply, defaultProfile = '
         </div>
       ) : null}
 
-      {preview.map(f => (
-        <div key={f.id} className="preview-pair" style={{ marginBottom: 12 }}>
-          <div className="preview-side">
-            <div className="preview-side-label">From</div>
-            <div className="preview-path">
-              <span className="seg-dir">{f.folder}/</span>
-              {f.filename}
+      {/* Full plan, scrollable — every from→to pair the apply will execute.
+          content-visibility keeps huge batches cheap (off-screen rows skip
+          layout/paint). */}
+      <div style={{ maxHeight: '42vh', overflowY: 'auto', paddingRight: 4 }}>
+        {preview.map(f => (
+          <div key={f.id} className="preview-pair" style={{ marginBottom: 12, contentVisibility: 'auto', containIntrinsicSize: 'auto 72px' }}>
+            <div className="preview-side">
+              <div className="preview-side-label">From</div>
+              <div className="preview-path">
+                <span className="seg-dir">{f.folder}/</span>
+                {f.filename}
+              </div>
+            </div>
+            <div className="preview-arrow"><IcArrowRight /></div>
+            <div className="preview-side new">
+              <div className="preview-side-label">To</div>
+              <div className="preview-path">
+                {targets[String(f.id)]
+                  ? highlightPath(targets[String(f.id)].replace(/\\/g, '/'))
+                  : previewLoading
+                    ? <span style={{ color: 'var(--ink-3)' }}>Computing…</span>
+                    // Honest gap (§10 m): the old fallback rendered the LEGACY
+                    // client template, which can disagree with what the backend
+                    // renderer actually writes — a wrong path shown as truth.
+                    : <span style={{ color: 'var(--ink-3)' }}>Preview unavailable — the rename itself uses the saved profile.</span>}
+              </div>
             </div>
           </div>
-          <div className="preview-arrow"><IcArrowRight /></div>
-          <div className="preview-side new">
-            <div className="preview-side-label">To</div>
-            <div className="preview-path">
-              {targets[String(f.id)]
-                ? highlightPath(targets[String(f.id)].replace(/\\/g, '/'))
-                : previewLoading
-                  ? <span style={{ color: 'var(--ink-3)' }}>Computing…</span>
-                  : highlightPath(formatPath(f, profile))}
-            </div>
-          </div>
-        </div>
-      ))}
+        ))}
+      </div>
 
       {eligible.length > preview.length ? (
         <div style={{ textAlign: 'center', color: 'var(--ink-3)', fontSize: 12, padding: '4px 0 14px' }}>
-          + {eligible.length - preview.length} more file{eligible.length - preview.length === 1 ? '' : 's'}…
+          + {eligible.length - preview.length} more file{eligible.length - preview.length === 1 ? '' : 's'} beyond the 500-row preview (they WILL be renamed on Apply)
         </div>
       ) : null}
 
@@ -647,8 +675,8 @@ export function RenamePreviewModal({ files, onClose, onApply, defaultProfile = '
 export function KeyboardShortcutsModal({ onClose }: { onClose: () => void }) {
   const groups = [
     { label: 'Navigation', items: [
-      { keys: ['j'], desc: 'Next file' },
-      { keys: ['k'], desc: 'Previous file' },
+      { keys: ['j'], desc: 'Next card' },
+      { keys: ['k'], desc: 'Previous card' },
       { keys: ['/'], desc: 'Focus search' },
       { keys: ['g', 'd'], desc: 'Go to Dashboard' },
       { keys: ['g', 'r'], desc: 'Go to Review' },
@@ -656,11 +684,12 @@ export function KeyboardShortcutsModal({ onClose }: { onClose: () => void }) {
       { keys: ['g', 's'], desc: 'Go to Settings' },
     ]},
     { label: 'Actions', items: [
-      { keys: ['a'], desc: 'Approve current' },
+      { keys: ['a'], desc: 'Approve + rename current' },
       { keys: ['r'], desc: 'Reject current' },
       { keys: ['m'], desc: 'Manual search' },
-      { keys: ['Enter'], desc: 'Open details' },
-      { keys: ['⌘', '⇧', 'A'], desc: 'Approve all high-confidence' },
+      { keys: ['x'], desc: 'Toggle selection' },
+      { keys: ['Enter'], desc: 'Open cover / candidates' },
+      { keys: ['⌘', '⇧', 'A'], desc: 'Select all high-confidence' },
       { keys: ['⌘', 'Enter'], desc: 'Open rename preview' },
       { keys: ['?'], desc: 'This panel' },
     ]},
@@ -686,275 +715,17 @@ export function KeyboardShortcutsModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-function Meta({ label, value }: { label: string; value: React.ReactNode }) {
-  return (
-    <>
-      <span className="text-muted" style={{ textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 600, fontSize: 10.5 }}>{label}</span>
-      <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{value}</span>
-    </>
-  );
-}
-
-function ProviderLink({ children, href }: { children: React.ReactNode; href: string }) {
-  return (
-    <a href={href} target="_blank" rel="noreferrer"
-      style={{ color: 'var(--accent)', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12, fontFamily: 'var(--font-mono)' }}>
-      {children} <IcExternal />
-    </a>
-  );
-}
-
-// Format the FileDetails sub line for an anime match. Falls back gracefully
-// when season is missing (which is common — TVDB returns the series, not the
-// specific season).
-function formatAnimeSub(m: MatchData): string {
-  const parts: string[] = [];
-  if (m.absoluteEpisode != null) parts.push(`Episode ${String(m.absoluteEpisode).padStart(2, '0')}`);
-  else if (m.episode != null)    parts.push(`Episode ${String(m.episode).padStart(2, '0')}`);
-  if (m.season != null && m.episode != null) {
-    parts.push(`(S${String(m.season).padStart(2, '0')}E${String(m.episode).padStart(2, '0')})`);
+/** Provider search/home page — the "Couldn't find it?" escape hatch link. */
+function providerRootUrl(provider: ProviderKey): string {
+  switch (provider) {
+    case 'TVDB': return 'https://thetvdb.com';
+    case 'AniDB': return 'https://anidb.net';
+    case 'MusicBrainz': return 'https://musicbrainz.org';
+    default: return 'https://www.themoviedb.org';
   }
-  if (m.episodeTitle) parts.push(m.episodeTitle);
-  return parts.length ? parts.join(' · ') : 'Anime · matched';
 }
 
-function formatTvSub(m: MatchData): string {
-  const parts: string[] = [];
-  if (m.season != null) parts.push(`Season ${m.season}`);
-  if (m.episode != null) parts.push(`Episode ${m.episode}`);
-  if (m.episodeTitle) parts.push(m.episodeTitle);
-  return parts.length ? parts.join(' · ') : 'TV · matched';
-}
-
-// Render the SxxExx portion of a candidate sub-line. Returns empty when
-// neither season nor episode is known.
-function candidateEpisodeLabel(c: { season?: number; episode?: number; absoluteEpisode?: number }, isAnime: boolean): string {
-  if (isAnime) {
-    if (c.absoluteEpisode != null && c.season != null && c.episode != null) {
-      return `Episode ${c.absoluteEpisode} (S${c.season}E${c.episode})`;
-    }
-    if (c.absoluteEpisode != null) return `Episode ${c.absoluteEpisode}`;
-    if (c.episode != null && c.season != null) return `S${c.season}E${c.episode}`;
-    if (c.episode != null) return `Episode ${c.episode}`;
-    return 'Series';
-  }
-  if (c.season != null && c.episode != null) return `Season ${c.season} · Episode ${c.episode}`;
-  if (c.episode != null) return `Episode ${c.episode}`;
-  return 'Movie';
-}
-
-function tmdbUrl(id: number | string, isTV: boolean): string {
-  return `https://www.themoviedb.org/${isTV ? 'tv' : 'movie'}/${id}`;
-}
-function anidbUrl(id: number | string): string {
-  return `https://anidb.net/anime/${id}`;
-}
-function musicbrainzUrl(mbid: string): string {
-  return `https://musicbrainz.org/release/${mbid}`;
-}
-function providerRootUrl(provider: string): string {
-  const map: Record<string, string> = {
-    TMDB: 'https://www.themoviedb.org',
-    TVDB: 'https://thetvdb.com',
-    AniDB: 'https://anidb.net',
-    MusicBrainz: 'https://musicbrainz.org',
-  };
-  return map[provider] ?? '#';
-}
-
-export function FileDetailsModal({ file, onClose, onApprove, onReject, onManualSearch, onPickCandidate, onFetchSubtitles }: {
-  file: MediaFile;
-  onClose: () => void;
-  onApprove: (id: string, status?: string) => void;
-  onReject: (id: string) => void;
-  onManualSearch: (f: MediaFile) => void;
-  onPickCandidate: (id: string, c: CandidateData) => void;
-  /** Download OpenSubtitles subtitles for this file as .srt sidecars. */
-  onFetchSubtitles?: (f: MediaFile) => Promise<void>;
-}) {
-  const [fetchingSubs, setFetchingSubs] = useState(false);
-  if (!file) return null;
-
-  const isMusic = file.mediaType === 'music';
-  const isAnime = file.mediaType === 'anime';
-  const isTV    = file.mediaType === 'tv';
-  const m       = file.match;
-
-  // Load providers once to know what Manual Search will actually open into,
-  // so the footer button says the truth instead of the wishful "Search AniDB".
-  const [providers, setProviders] = useState<ApiProvider[]>([]);
-  useEffect(() => { api.getProviders().then(setProviders).catch(() => { /* */ }); }, []);
-  const providerName = useMemo(() => {
-    const def = pickDefault(file, providers);
-    return def;
-  }, [file, providers]);
-
-  const title = !m ? 'No match' :
-    isMusic ? `${m.artist} — ${m.trackTitle}` :
-    `${m.title}${m.year ? ' · ' + m.year : ''}`;
-  const sub = !m ? 'Filename could not be matched automatically'
-    : isMusic ? `From ${m.album} (${m.albumYear || m.year}) · Track ${m.track}/${m.totalTracks} · ${m.duration}`
-    : isAnime ? formatAnimeSub(m)
-    : isTV    ? formatTvSub(m)
-    : 'Movie · TMDB match';
-
-  return (
-    <Modal
-      title={title}
-      sub={sub}
-      onClose={onClose}
-      size="lg"
-      footer={
-        <>
-          <div className="flex items-center gap-2">
-            <button className="btn btn-ghost" onClick={() => onManualSearch(file)}>
-              <IcSearch /> Search {providerName} manually
-            </button>
-            {m && onFetchSubtitles ? (
-              <button
-                className="btn btn-ghost"
-                disabled={fetchingSubs}
-                title="Download subtitles from OpenSubtitles as .srt sidecars (carried along on rename)"
-                onClick={async () => {
-                  setFetchingSubs(true);
-                  try { await onFetchSubtitles(file); }
-                  finally { setFetchingSubs(false); }
-                }}
-              >
-                {fetchingSubs ? <IcSpin /> : <IcDownload />} Fetch subtitles
-              </button>
-            ) : null}
-          </div>
-          <div className="right">
-            {file.status === 'pending' ? (
-              <>
-                <button className="btn btn-danger" onClick={() => { onReject(file.id); onClose(); }}>
-                  <IcX /> Reject
-                </button>
-                <button className="btn btn-primary" disabled={!file.match} onClick={() => { onApprove(file.id); onClose(); }}>
-                  <IcCheck /> Approve
-                </button>
-              </>
-            ) : (
-              <button className="btn" onClick={() => { onApprove(file.id, 'pending'); onClose(); }}>
-                <IcUndo /> Move back to Pending
-              </button>
-            )}
-          </div>
-        </>
-      }
-    >
-      <div style={{ display: 'grid', gridTemplateColumns: isMusic ? '160px 1fr' : '120px 1fr', gap: 20, marginBottom: 20 }}>
-        <Poster
-          data={isMusic ? m?.art : m?.poster}
-          imgUrl={m?.posterUrl}
-          size="lg"
-          shape={isMusic ? 'square' : 'poster'}
-        />
-        <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 10 }}>
-          <div className="flex items-center gap-2" style={{ flexWrap: 'wrap' }}>
-            <ConfidenceBadge value={file.confidence} />
-            <StatusPill status={file.status} />
-            <span className="badge badge-neutral">
-              <span className="dot" style={{ background: TYPE_COLOR[file.mediaType] }} />
-              {isMusic ? 'Music' : isAnime ? 'Anime' : isTV ? 'TV Series' : 'Movie'}
-            </span>
-            {isAnime && file.releaseGroup ? (
-              <span className="rg-chip">[{file.releaseGroup}]</span>
-            ) : null}
-            {isMusic && m?.acoustidMatch ? (
-              <span className="acoustid-match">
-                <IcWaveform /> AcoustID match · {m.acoustidConfidence}%
-              </span>
-            ) : null}
-          </div>
-
-          {isAnime && m?.titleRomaji && m.titleRomaji !== m.title ? (
-            <div style={{ fontSize: 13, color: 'var(--ink-3)', fontStyle: 'italic' }}>
-              {m.titleRomaji}
-            </div>
-          ) : null}
-
-          {m?.overview ? (
-            <p style={{ margin: 0, fontSize: 13, lineHeight: 1.55, color: 'var(--ink-2)' }}>{m.overview}</p>
-          ) : null}
-
-          <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '6px 14px', alignItems: 'center', fontSize: 12, marginTop: 4 }}>
-            <Meta label="Filename" value={<span className="text-mono" style={{ color: 'var(--ink-2)' }}>{file.filename}</span>} />
-            <Meta label="Source folder" value={<span className="text-mono" style={{ color: 'var(--ink-3)' }}>{file.folder}</span>} />
-            {isMusic && m?.mbid ? <Meta label="MusicBrainz" value={<ProviderLink href={musicbrainzUrl(m.mbid)}>{m.mbid}</ProviderLink>} /> : null}
-            {isAnime && m?.anidbId ? <Meta label="AniDB ID" value={<ProviderLink href={anidbUrl(m.anidbId)}>{m.anidbId}</ProviderLink>} /> : null}
-            {!isMusic && !isAnime && m?.tmdbId ? <Meta label="TMDB ID" value={<ProviderLink href={tmdbUrl(m.tmdbId, isTV)}>{m.tmdbId}</ProviderLink>} /> : null}
-            {isMusic && m?.genre ? <Meta label="Genre" value={m.genre} /> : null}
-            {isMusic && m?.duration ? <Meta label="Duration" value={<span className="text-mono">{m.duration}</span>} /> : null}
-          </div>
-        </div>
-      </div>
-
-      {m ? (
-        <div style={{ marginBottom: 18 }}>
-          <div className="opt-label" style={{ marginBottom: 8 }}>Will be renamed to</div>
-          <div className="preview-side new" style={{ padding: '10px 14px' }}>
-            <div className="preview-path">{highlightPath(formatPath(file, 'Plex'))}</div>
-          </div>
-        </div>
-      ) : null}
-
-      {file.candidates.length > 0 ? (
-        <div>
-          <div className="opt-label" style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
-            Other candidates
-            <span style={{ color: 'var(--ink-4)', fontWeight: 500 }}>({file.candidates.length})</span>
-          </div>
-          <div className="candidates" style={{ padding: 4 }}>
-            {file.candidates.map((c, i) => {
-              const isChosen = i === 0 && (
-                isMusic ? (m?.album === c.album && m?.track === c.track)
-                        : (m?.title === c.title && m?.year === c.year)
-              );
-              const level = confLevel(c.confidence);
-              return (
-                <div key={i} className={`candidate ${isChosen ? 'chosen' : ''}`} style={{ ['--i' as never]: i }}>
-                  <Poster data={isMusic ? c.art : c.poster} imgUrl={c.posterUrl} size="xs" shape={isMusic ? 'square' : 'poster'} />
-                  <div style={{ minWidth: 0 }}>
-                    <div className="candidate-title">
-                      {isMusic
-                        ? <>{c.artist} — <span style={{ color: 'var(--ink-2)' }}>{c.album}</span></>
-                        : <>{c.title}{c.year ? ` (${c.year})` : ''}</>}
-                      {isChosen ? <span className="badge badge-high" style={{ marginLeft: 8, padding: '1px 6px', fontSize: 10 }}>Current pick</span> : null}
-                    </div>
-                    <div className="candidate-meta">
-                      {isMusic ? `Track ${c.track} · ${c.year}` : (
-                        <>
-                          {candidateEpisodeLabel(c, isAnime)}
-                          {c.year ? <span style={{ color: 'var(--ink-4)' }}> · {c.year}</span> : null}
-                        </>
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <div className="confidence-bar"><div style={{ width: c.confidence + '%', background: `var(--conf-${level})` }} /></div>
-                    <span className="text-xs font-medium" style={{ color: `var(--conf-${level})`, minWidth: 32, textAlign: 'right' }}>{c.confidence}%</span>
-                  </div>
-                  {isChosen ? (
-                    <span style={{ padding: '6px 10px', color: 'var(--ink-3)', fontSize: 11 }}>Selected</span>
-                  ) : (
-                    <button className="btn btn-sm" onClick={() => onPickCandidate(file.id, c)}>
-                      <IcCheck /> Use
-                    </button>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      ) : (
-        <div className="card" style={{ padding: 16, textAlign: 'center' }}>
-          <div className="text-sm font-medium" style={{ marginBottom: 4 }}>No automatic matches.</div>
-          <div className="text-xs text-muted" style={{ marginBottom: 12 }}>The filename couldn't be parsed confidently.</div>
-          <button className="btn btn-sm btn-primary" onClick={() => onManualSearch(file)}><IcSearch /> Open manual search</button>
-        </div>
-      )}
-    </Modal>
-  );
-}
+// (FileDetailsModal removed — it was UNREACHABLE (nothing opened the
+//  'fileDetails' modal kind) and its client-side legacy-Plex rename
+//  preview ignored the saved naming profile. Its useful part — the
+//  candidates list — lives in CoverPopup/CandidateList now.)

@@ -74,6 +74,10 @@ async def run_subtitle_upgrade() -> dict:
             for asset in assets:
                 done += 1
                 activity.progress(SUBTITLE_UPGRADE_JOB, done, len(assets))
+                # A deliberate MANUAL pick is never auto-replaced, even below
+                # the upgrade threshold — the user chose it (audit §20 m).
+                if isinstance(asset.reasons, list) and "manual pick" in asset.reasons:
+                    continue
                 mf = await session.get(MediaFile, asset.media_file_id)
                 if mf is None or not mf.file_path:
                     continue
@@ -96,6 +100,17 @@ async def run_subtitle_upgrade() -> dict:
                     logger.warning(f"upgrade: download failed for {mf.id}: {e!r}")
                     res = None
                 if res is not None:
+                    # Cross-ext strand (audit §20 m): replacing an `.srt` with a
+                    # better `.ass` (or vice versa) left the OLD file on disk —
+                    # and the srt-first sidecar probe kept preferring it. Remove
+                    # the superseded file when the extension changed.
+                    try:
+                        if (asset.path and res.path
+                                and Path(asset.path).suffix.lower() != Path(res.path).suffix.lower()
+                                and Path(asset.path).exists()):
+                            Path(asset.path).unlink()
+                    except OSError:
+                        pass
                     asset.active = False  # supersede the old record
                     await _store.record_results(session, mf.id, asset.title, [res])
                     summary["upgraded"] += 1
@@ -136,6 +151,15 @@ def spawn_subtitle_backfill(file_ids: list[int], *, language_override: list[str]
         asyncio.get_running_loop()
     except RuntimeError:
         return False
+    # In-flight guard: a second click (or a scan-triggered backfill racing a
+    # manual one) would otherwise run two concurrent sweeps over the same
+    # files — burning provider quota twice and fighting over the activity pill.
+    # Mark active SYNCHRONOUSLY here (not just in the async task's own begin,
+    # which runs later) so a second call in the same tick is rejected.
+    from kira import activity
+    if activity.is_active(SUBTITLE_BACKFILL_JOB):
+        return False
+    activity.begin(SUBTITLE_BACKFILL_JOB, "Finding subtitles")
     from kira.tasks import spawn_tracked
     spawn_tracked(
         run_subtitle_backfill(list(file_ids), language_override=language_override),
@@ -205,7 +229,7 @@ async def build_context(session, mf, prefs, languages: list[str]) -> SearchConte
         subdl_api_key=prefs.subdl_api_key, subsource_api_key=prefs.subsource_api_key,
         hearing_impaired=prefs.hearing_impaired or "", forced=prefs.forced or "",
         blacklist=await _store.load_blacklist(session, mf.id),
-        min_score=prefs.min_score_for(mf.media_type),
+        min_score=prefs.min_score_for(media_type),
         thorough=prefs.thorough_search,
     )
 
@@ -306,11 +330,27 @@ async def harvest_from_cached_pack(session, source_mf, provider: str, ref: str, 
         durations = await asyncio.to_thread(_pack.entry_durations, subs)
         siblings = await _find_pack_siblings(session, source_mf)
 
+        # The pack was downloaded for the SOURCE file's season. Siblings from
+        # OTHER seasons must not harvest from it: an episode-less entry name
+        # ("Show - 05.srt") explicit-matches the wrong season's E05 with full
+        # confidence — S1 subs written onto S2 episodes.
+        _src_parsed = source_mf.parsed_data if isinstance(source_mf.parsed_data, dict) else {}
+        _src_sel = next((m for m in source_mf.matches if getattr(m, "is_selected", False)), None)
+        _src_season = (_src_parsed.get("season") if _src_parsed.get("season") is not None
+                       else (_src_sel.season_number if _src_sel else None))
+
         saved = 0
         for mf in siblings:
             if mf.id == source_mf.id or not mf.file_path:
                 continue
             if mf.media_type not in ("tv", "anime"):
+                continue
+            _sib_parsed = mf.parsed_data if isinstance(mf.parsed_data, dict) else {}
+            _sib_sel = next((m for m in mf.matches if getattr(m, "is_selected", False)), None)
+            _sib_season = (_sib_parsed.get("season") if _sib_parsed.get("season") is not None
+                           else (_sib_sel.season_number if _sib_sel else None))
+            if (_src_season is not None and _sib_season is not None
+                    and _sib_season != _src_season):
                 continue
             if _common.has_sidecar(mf.file_path, lang):
                 continue
@@ -485,6 +525,19 @@ async def run_subtitle_backfill(file_ids: list[int], *, language_override: list[
                 except Exception as e:
                     logger.warning(f"backfill: {mf.file_path} failed (non-fatal): {e!r}")
                     saved = []
+                    # Rate-limit backoff (non-OS providers raise generic HTTP
+                    # errors): consecutive 429s used to hammer a throttling
+                    # provider once per remaining file. Slow down, then stop.
+                    if "429" in str(e):
+                        _throttle_hits = summary.get("throttle_hits", 0) + 1
+                        summary["throttle_hits"] = _throttle_hits
+                        if _throttle_hits >= 5:
+                            summary["aborted"] = True
+                            summary.setdefault("hints", []).append(
+                                "A subtitle provider is rate-limiting — the sweep "
+                                "stopped early; re-run it later.")
+                            break
+                        await asyncio.sleep(min(60.0, 10.0 * _throttle_hits))
 
                 if saved:
                     summary["saved"] += len(saved)

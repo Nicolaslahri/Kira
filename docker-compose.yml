@@ -10,13 +10,22 @@ services:
       - "8445:8000"
     volumes:
       # SQLite DB + persisted state. Keep this to survive container recreation.
-      - ./config:/config
+      # NOTE (Portainer git stacks): a RELATIVE ./config resolves inside
+      # Portainer's own project directory and is easily lost on stack
+      # delete/recreate. Prefer an ABSOLUTE host path you control, e.g.:
+      #   - /mnt/dietpi_userdata/kira-config:/config
+      - ${KIRA_CONFIG_HOST:-./config}:/config
       # YOUR media library — mounted read-write so Kira can rename/move in place.
       # This is the NAS-local path behind the SMB share \\192.168.0.63\Data —
       # confirmed from `path =` under [Data] in DietPi's /etc/samba/smb.conf.
       # Override KIRA_MEDIA_HOST in Portainer's env to point elsewhere.
       - ${KIRA_MEDIA_HOST:-/mnt/dietpi_userdata/data}:/media
     environment:
+      # Run as your host user so files Kira creates on the share keep YOUR
+      # ownership (matches the Samba user on the NAS). Comment out to run as
+      # root (old behaviour).
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       - KIRA_DATABASE_URL=sqlite+aiosqlite:////config/kira.db
       - KIRA_MEDIA_ROOT=/media
       - KIRA_BROWSE_ROOT=/media          # the folder-picker can browse here
@@ -29,6 +38,21 @@ services:
       # - KIRA_AUTH_USER=admin
       # - KIRA_AUTH_PASS=change-me
     restart: unless-stopped
+    # Bound the Docker json-file log so a chatty INFO-level app can't fill the
+    # DietPi system disk (default driver rotates nothing).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Give the cooperative-cancel shutdown drain (up to ~10s) room to finish
+    # before Docker SIGKILLs mid-drain (default stop grace is 10s).
+    stop_grace_period: 20s
+    # Optional memory cap. Uncomment + tune for your box — set too low and a
+    # large scan (mediainfo enrich + WAL) gets OOM-killed mid-run, so leave it
+    # off unless the host needs protecting from Kira. On a 1 GB DietPi, ~768m
+    # protects sshd/Samba while giving scans headroom:
+    #   mem_limit: 768m
     healthcheck:
       # No curl in python:slim — use the interpreter that's already here.
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=4).status == 200 else 1)"]

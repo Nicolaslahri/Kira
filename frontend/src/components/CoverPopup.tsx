@@ -46,6 +46,10 @@ interface CoverPopupProps {
    *  "Approve & rename" button actually rename instead of just
    *  flipping status (which never moved files OR wrote History). */
   renameFilesDirectly?: (fileIds: string[]) => void | Promise<void>;
+  /** Switch a file to a different match candidate in place (wired to
+   *  POST /files/{id}/select/{matchId}). Lets a wrong auto-pick be corrected
+   *  from the popup without opening full Manual Search. */
+  onPickCandidate?: (fileId: string, candidate: { matchId?: number; title?: string; year?: number | null }) => void | Promise<void>;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -92,7 +96,7 @@ interface CoverPopupProps {
 
 export function CoverPopup({
   item, originRect, onClose, onUpdateItem, onManualSearch, pushToast,
-  renameFilesDirectly,
+  renameFilesDirectly, onPickCandidate,
 }: CoverPopupProps) {
   const stats = useMemo(() => libraryStats(item), [item]);
   const shape: 'poster' | 'square' = item.mediaType === 'music' ? 'square' : 'poster';
@@ -1151,9 +1155,13 @@ export function CoverPopup({
   }, [item, onUpdateItem, pushToast]);
 
   const handleRejectAll = useCallback(() => {
+    // Leave RENAMED files untouched (their move already happened on disk) and
+    // don't re-flip rejected ones — matches the footer label, which only
+    // counts the live files.
     const next: LibraryItem = {
       ...item,
-      files: item.files.map(f => ({ ...f, status: 'rejected' as const })),
+      files: item.files.map(f =>
+        (f.status === 'renamed' || f.status === 'rejected') ? f : { ...f, status: 'rejected' as const }),
     };
     onUpdateItem(next);
     pushToast?.({ title: 'All files rejected', sub: item.title, kind: 'error' });
@@ -1384,7 +1392,7 @@ export function CoverPopup({
           />
 
           {item.kind === 'movie'
-            ? <div className="cx-movie-scroll"><MovieBody item={item} /></div>
+            ? <div className="cx-movie-scroll"><MovieBody item={item} onPickCandidate={onPickCandidate} /></div>
             : item.kind === 'album'
             ? <MusicBody
                 item={item}
@@ -1885,10 +1893,15 @@ export function CoverPopup({
                         // updates so each row's UI flips visibly; the
                         // 250ms close lets the user see the badges
                         // disappear before the popup folds.
-                        item.files.forEach((f, idx) => {
-                          if (f.status === 'rejected') {
-                            updateFile(idx, { status: 'pending' });
-                          }
+                        // ONE batched update, not a per-file loop: each
+                        // `updateFile` rebuilds `next` from the SAME captured
+                        // `item`, so N sequential calls were last-write-wins —
+                        // only the final flipped file actually restored. Flip
+                        // them all in a single onUpdateItem instead.
+                        onUpdateItem({
+                          ...item,
+                          files: item.files.map(f =>
+                            f.status === 'rejected' ? { ...f, status: 'pending' as const } : f),
                         });
                         setTimeout(() => handleClose(), 250);
                       }}

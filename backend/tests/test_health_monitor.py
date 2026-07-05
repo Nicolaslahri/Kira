@@ -74,43 +74,64 @@ async def test_first_observation_records_but_does_not_notify(monkeypatch, fresh_
     assert sent == []
 
 
-async def test_ok_then_failed_fires_one_warning(monkeypatch, fresh_monitor):
+async def test_sustained_failure_fires_one_warning(monkeypatch, fresh_monitor):
+    """Debounced: a warning fires only after _FAIL_THRESHOLD consecutive
+    failures (a single slow probe must NOT alert), and only once per outage."""
     _patch_session(monkeypatch)
     _patch_configs(monkeypatch, {"sonarr": object()})
     sent = _capture_notifications(monkeypatch)
 
-    results = iter([(True, "Connected"), (False, "Cannot reach Sonarr: timeout")])
+    async def _probe(_key, _cfg):
+        return (False, "Cannot reach Sonarr: timeout")
+    monkeypatch.setattr(hm, "_probe", _probe)
+
+    for _ in range(hm._FAIL_THRESHOLD - 1):
+        await fresh_monitor.run_checks()
+    assert sent == []                              # below threshold → silent
+    await fresh_monitor.run_checks()
+    assert len(sent) == 1 and sent[0]["kind"] == "warning" and "Sonarr" in sent[0]["title"]
+    for _ in range(3):
+        await fresh_monitor.run_checks()
+    assert len(sent) == 1                          # still down → no duplicate
+    assert fresh_monitor.snapshot()["sonarr"]["ok"] is False
+
+
+async def test_transient_blip_is_silent(monkeypatch, fresh_monitor):
+    """A short outage under the threshold, then recovery, fires nothing."""
+    _patch_session(monkeypatch)
+    _patch_configs(monkeypatch, {"sonarr": object()})
+    sent = _capture_notifications(monkeypatch)
+
+    results = iter([(True, "ok"), (False, "timeout"), (False, "timeout"), (True, "ok")])
 
     async def _probe(_key, _cfg):
         return next(results)
     monkeypatch.setattr(hm, "_probe", _probe)
 
-    await fresh_monitor.run_checks()   # ok (first obs, no notify)
-    await fresh_monitor.run_checks()   # ok→failed transition → one warning
-
-    assert len(sent) == 1
-    assert sent[0]["kind"] == "warning"
-    assert "Sonarr" in sent[0]["title"]
-    assert fresh_monitor.snapshot()["sonarr"]["ok"] is False
+    for _ in range(4):
+        await fresh_monitor.run_checks()
+    assert sent == []
 
 
-async def test_failed_then_ok_fires_one_success(monkeypatch, fresh_monitor):
+async def test_restored_fires_after_a_real_outage(monkeypatch, fresh_monitor):
+    """'restored' fires only if a 'lost' was announced first."""
     _patch_session(monkeypatch)
     _patch_configs(monkeypatch, {"jellyfin": {"url": "http://jf", "api_key": "k"}})
     sent = _capture_notifications(monkeypatch)
 
-    results = iter([(False, "401"), (True, "Connected")])
+    seq = [(False, "401")] * hm._FAIL_THRESHOLD + [(True, "Connected")]
+    results = iter(seq)
 
     async def _probe(_key, _cfg):
         return next(results)
     monkeypatch.setattr(hm, "_probe", _probe)
 
-    await fresh_monitor.run_checks()   # failed (first obs, no notify)
-    await fresh_monitor.run_checks()   # failed→ok transition → one success
+    for _ in range(len(seq)):
+        await fresh_monitor.run_checks()
 
-    assert len(sent) == 1
-    assert sent[0]["kind"] == "success"
-    assert "Jellyfin" in sent[0]["title"]
+    kinds = [s["kind"] for s in sent]
+    assert kinds == ["warning", "success"]
+    assert "Jellyfin" in sent[-1]["title"]
 
 
 async def test_steady_state_does_not_spam(monkeypatch, fresh_monitor):

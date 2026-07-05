@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useState, useRef, type ReactNode } from 'react';
 import { IcSparkles, IcRefresh, IcTrash, IcCheck, IcAlertTri, IcFolder, IcPlus, IcX, IcCaption, IcShieldCheck, IcSpin } from '../../lib/icons';
 import { Select } from '../../components/ui';
 import { SettingsLayout, SectionHeader, NestedBox } from '../../components/settings-blocks';
@@ -168,6 +168,23 @@ export function PacksSection({ pushToast }: { pushToast: PushToast }) {
     }
   };
 
+  // Two-click arm for Remove (§5 M): every other destructive action in the app
+  // confirms; this was one-click gone. First click arms ("Really remove?",
+  // auto-disarms after 3s), second click deletes.
+  const [armedRemove, setArmedRemove] = useState<string | null>(null);
+  const armTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const askRemove = (p: ApiPack) => {
+    if (armedRemove === p.key) {
+      if (armTimer.current) clearTimeout(armTimer.current);
+      setArmedRemove(null);
+      void remove(p);
+      return;
+    }
+    setArmedRemove(p.key);
+    if (armTimer.current) clearTimeout(armTimer.current);
+    armTimer.current = setTimeout(() => setArmedRemove(null), 3000);
+  };
+
   const remove = async (p: ApiPack) => {
     setBusyKey(p.key);
     try {
@@ -210,7 +227,7 @@ export function PacksSection({ pushToast }: { pushToast: PushToast }) {
           accent
           icon={<IcSparkles />}
           title="Packs"
-          purpose="Teach Kira about fan-edits the metadata providers can't match — One Pace, custom cuts, re-numbered releases. Paste a pack URL and Kira rescues, names, posters, and subtitles those files. Packs only ever touch files Kira couldn't match, so your other titles are never affected."
+          purpose="Teach Kira about fan-edits the metadata providers can't match — One Pace, custom cuts, re-numbered releases. Paste a pack URL and Kira rescues, names, posters, and subtitles those files. Packs only ever touch files Kira couldn't match, so your other titles are never affected. Changes here apply instantly — no Save needed."
           status={<BadgeWithDot color={packs.length ? 'brand' : 'gray'}>{packs.length ? `${packs.length} installed` : 'None'}</BadgeWithDot>}
         />
       )}
@@ -374,7 +391,7 @@ export function PacksSection({ pushToast }: { pushToast: PushToast }) {
                       <span className="text-[11px] text-quaternary">{p.last_fetched ? `Refreshed ${new Date(p.last_fetched).toLocaleString()}` : 'Not yet refreshed'}</span>
                       <div className="flex items-center gap-2">
                         <Button color="secondary" size="sm" iconLeading={IcRefresh} isDisabled={busy} onClick={() => void refresh(p.key)}>Refresh</Button>
-                        <Button color="secondary-destructive" size="sm" iconLeading={IcTrash} isDisabled={busy} onClick={() => void remove(p)}>Remove</Button>
+                        <Button color="secondary-destructive" size="sm" iconLeading={IcTrash} isDisabled={busy} onClick={() => askRemove(p)}>{armedRemove === p.key ? 'Really remove?' : 'Remove'}</Button>
                       </div>
                     </div>
                   </div>

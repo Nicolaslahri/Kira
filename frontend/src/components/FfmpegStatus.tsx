@@ -13,18 +13,28 @@ import { Button } from './base/buttons/button';
  * asked of the user. Progress narrates in the activity pill; the row
  * re-checks itself when the install job finishes (`kira:ffmpeg-changed`).
  */
-export function FfmpegStatusRow({ compact = false }: { compact?: boolean }) {
+export function FfmpegStatusRow({ compact = false, framed = false }: { compact?: boolean; framed?: boolean }) {
   const [status, setStatus] = useState<ApiFfmpegStatus | null>(null);
   const [requesting, setRequesting] = useState(false);
 
   const refresh = () => { void api.ffmpegStatus().then(setStatus).catch(() => {}); };
   useEffect(() => {
-    refresh();
+    let attempts = 0;
+    let timer: number | undefined;
+    // Retry the initial fetch a few times — a single blip during Settings load
+    // used to leave `status` null forever, hiding the whole row (return null
+    // below) with no way to recover short of a remount.
+    const tryLoad = () => {
+      void api.ffmpegStatus().then(setStatus).catch(() => {
+        if (++attempts < 4) timer = window.setTimeout(tryLoad, 1500);
+      });
+    };
+    tryLoad();
     window.addEventListener('kira:ffmpeg-changed', refresh);
-    return () => window.removeEventListener('kira:ffmpeg-changed', refresh);
+    return () => { window.removeEventListener('kira:ffmpeg-changed', refresh); if (timer) clearTimeout(timer); };
   }, []);
 
-  if (!status) return null;
+  if (!status) return null;   // framed too — no empty card shell while loading
 
   const install = async () => {
     if (requesting) return;
@@ -40,7 +50,7 @@ export function FfmpegStatusRow({ compact = false }: { compact?: boolean }) {
     }
   };
 
-  return (
+  const body = (
     <div className="flex items-center justify-between gap-3">
       <span className={compact ? 'text-[12.5px] text-ink' : 'text-[13px] text-ink'}>
         ffmpeg
@@ -69,4 +79,5 @@ export function FfmpegStatusRow({ compact = false }: { compact?: boolean }) {
       )}
     </div>
   );
+  return framed ? <div className="onb-folder-card">{body}</div> : body;
 }

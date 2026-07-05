@@ -11,10 +11,14 @@ import os
 from pathlib import Path
 
 
-def subtitle_sidecar_name(video_path: str | os.PathLike, language: str, ext: str = "srt") -> str:
-    """`<video stem>.<lang>.<ext>` — the Plex/Jellyfin language-tagged sidecar
-    convention (default `.srt`; embedded extraction passes `ass`/`vtt` to keep
-    a track's native format). The existing rename sidecar co-move already
-    carries these on every move. Pure."""
+def subtitle_sidecar_name(video_path: str | os.PathLike, language: str, ext: str = "srt",
+                          *, forced: bool = False) -> str:
+    """`<video stem>.<lang>[.forced].<ext>` — the Plex/Jellyfin language-tagged
+    sidecar convention (default `.srt`; embedded extraction passes `ass`/`vtt`
+    to keep a track's native format). `forced=True` inserts the standard
+    `.forced` tag so a forced track and the full same-language sub can coexist
+    (they used to collide on one name — the second variant was unreachable).
+    The rename sidecar co-move carries both on every move. Pure."""
     stem = Path(video_path).stem
-    return f"{stem}.{language.lower()}.{ext.lstrip('.').lower()}"
+    tag = ".forced" if forced else ""
+    return f"{stem}.{language.lower()}{tag}.{ext.lstrip('.').lower()}"

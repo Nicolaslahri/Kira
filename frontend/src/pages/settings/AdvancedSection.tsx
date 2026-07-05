@@ -27,9 +27,15 @@ export function AdvancedSection({
     typeof retentionRaw === 'number' ? String(retentionRaw) :
     typeof retentionRaw === 'string' && retentionRaw !== '' ? retentionRaw :
     '30';
-  const concurrency = typeof rawSettings['rename.concurrency'] === 'number'
-    ? rawSettings['rename.concurrency'] as number
-    : 4;
+  // Accept BOTH shapes: the draft/save path stores a STRING (`String(v)` in
+  // the NumberField onChange) while an API-set value can be a number. The
+  // number-only read snapped the field back to 4 after every edit — the UI
+  // then disagreed with the backend (which int()-coerces strings) forever.
+  const concurrencyRaw = rawSettings['rename.concurrency'];
+  const concurrency =
+    typeof concurrencyRaw === 'number' ? concurrencyRaw :
+    typeof concurrencyRaw === 'string' && concurrencyRaw.trim() && !isNaN(+concurrencyRaw) ? +concurrencyRaw :
+    4;
   // MediaInfo (Phase 16) toggles — BOTH default OFF to match the backend, which
   // treats an unset key as False (`_read_mediainfo_setting` /
   // `_read_mediainfo_authoritative_setting`). Enrichment runs in the background
@@ -132,7 +138,7 @@ export function AdvancedSection({
           <SettingRow
             settingKeys="history.retention_days"
             label="History retention"
-            desc="How long to keep the rename log for undo. Older entries are pruned daily."
+            desc="How long to keep the rename log for undo. Older entries are pruned at startup and after each scan."
           >
             <div className="w-[160px]">
               <Select<string>
@@ -312,7 +318,7 @@ export function AdvancedSection({
       <div className="settings-danger-zone flex flex-col gap-2.5 pt-6">
       <div className="flex items-center gap-2.5">
         <IcAlertTri className="size-3.5 shrink-0 text-conf-low" />
-        <span className="text-[11px] font-semibold uppercase tracking-[0.1em] text-conf-low">Danger zone</span>
+        <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-conf-low">Danger zone</span>
         <span className="h-px flex-1 bg-[var(--conf-low-24)]" />
       </div>
       <SectionCard
@@ -321,14 +327,14 @@ export function AdvancedSection({
         title="Reset"
         desc="Four levels, lightest first — each shows exactly what survives and what is lost. Files already on disk are never touched."
       >
-        {/* Blast-radius ladder — a gradient spine threads four rungs of
-            strictly-growing destruction. Each rung carries its own cumulative
-            radius bar; the arm / typed-confirm safety flow is unchanged. */}
-        <div className="relative flex flex-col gap-2.5 pl-5">
-          <span aria-hidden className="absolute left-[7px] top-3 bottom-3 w-0.5 rounded-full" style={{ background: 'linear-gradient(var(--conf-mid), color-mix(in srgb, var(--conf-mid) 45%, var(--conf-low)), var(--conf-low), var(--danger))' }} />
+        {/* Blast-radius ladder — four rungs of strictly-growing destruction.
+            Rows rest NEUTRAL (the tier dot + compact blast meter carry the
+            escalation); a row only turns red once ARMED. The arm / typed-
+            confirm safety flow is unchanged. */}
+        <div className="flex flex-col gap-2">
           <DangerRow
             level={1}
-            badge="history"
+            cta="Clear"
             name="Clear rename history"
             survives="Files · matches · settings · account"
             lost="The rename log and undo."
@@ -340,7 +346,7 @@ export function AdvancedSection({
           />
           <DangerRow
             level={2}
-            badge="matches"
+            cta="Forget"
             name="Forget all matches"
             survives="Files · history · settings · account"
             lost="Every identification — files flip back to pending for a fresh re-match."
@@ -353,7 +359,7 @@ export function AdvancedSection({
           />
           <DangerRow
             level={3}
-            badge="library data"
+            cta="Reset"
             name="Reset database"
             survives="Settings · your account"
             lost="All files, matches, history, and notifications. Renames on disk are NOT undone."
@@ -366,7 +372,7 @@ export function AdvancedSection({
           />
           <DangerRow
             level={4}
-            badge="everything"
+            cta="Erase"
             name="Factory reset"
             survives="Nothing but the files already on disk"
             lost="Everything above PLUS every setting, API key, and the account itself — back to first-run."
@@ -396,11 +402,12 @@ export function AdvancedSection({
 // deepest-red climb so the blast-radius ladder is honest.
 const DANGER_COLORS = ['var(--conf-mid)', 'color-mix(in srgb, var(--conf-mid) 45%, var(--conf-low))', 'var(--conf-low)', 'var(--danger)'];
 
-function DangerRow({ level, badge, name, survives, lost, confirmWord, onRun }: {
+function DangerRow({ level, cta, name, survives, lost, confirmWord, onRun }: {
   level: 1 | 2 | 3 | 4;
-  badge: string;
+  /** Short verb for the resting button ("Clear" / "Forget" / "Reset" / "Erase"). */
+  cta: string;
   name: string;
-  /** What this tier spares — the green half of the survives/lost split. */
+  /** What this tier spares — the green half of the keeps/removes split. */
   survives: string;
   lost: string;
   /** null = two-click arm; string = must be typed to enable the button. */
@@ -426,65 +433,60 @@ function DangerRow({ level, badge, name, survives, lost, confirmWord, onRun }: {
     setBusy(false);
   };
 
+  // Resting rows sit on the standard neutral inner-row recipe — only the tier
+  // dot + blast meter speak colour. ARMING escalates the whole row to the
+  // danger tint so the state change is unmissable.
   return (
     <div
-      className="flex flex-col gap-2 rounded-xl border px-3.5 py-3"
-      style={{
-        borderColor: `color-mix(in srgb, ${color} 30%, transparent)`,
-        background: `color-mix(in srgb, ${color} ${level === 4 ? 8 : 5}%, transparent)`,
-        ...(level === 4 ? { boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--danger) 30%, transparent)' } : {}),
-      }}
+      className={
+        armed
+          ? 'flex flex-col gap-3 rounded-xl bg-[var(--conf-low-bg)] px-3.5 py-3 ring-1 ring-inset ring-[var(--conf-low-32)] transition-[background-color,box-shadow]'
+          : 'flex flex-col rounded-xl bg-tertiary px-3.5 py-3 ring-1 ring-inset ring-secondary transition-[background-color,box-shadow] hover:ring-primary'
+      }
     >
       <div className="flex items-center gap-3">
-        <span className="size-2 shrink-0 rounded-full" style={{ background: color, boxShadow: `0 0 8px ${color}` }} />
+        <span
+          className="size-2 shrink-0 rounded-full"
+          style={{ background: color, boxShadow: armed ? `0 0 10px ${color}` : 'none' }}
+        />
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <span className="text-[13px] font-semibold text-ink">{name}</span>
+          <div className="text-[13.5px] font-semibold text-primary">{name}</div>
+          <div className="mt-0.5 text-[12.5px] leading-relaxed text-secondary">{lost}</div>
+          <div className="text-[12px] leading-relaxed text-tertiary">
+            Keeps: <span className="text-secondary">{survives}</span>
+          </div>
+        </div>
+        {/* Compact blast meter — one lit segment per tier of destruction. */}
+        <div
+          className="flex h-1 w-14 shrink-0 gap-px overflow-hidden rounded-full"
+          title={`Blast radius: ${level} of 4`}
+          aria-label={`Blast radius ${level} of 4`}
+        >
+          {[0, 1, 2, 3].map(i => (
             <span
-              className="rounded-full px-2 py-px text-[9.5px] font-semibold uppercase tracking-[0.07em]"
-              style={{
-                color,
-                background: `color-mix(in srgb, ${color} 12%, transparent)`,
-                border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`,
-              }}
-            >
-              {badge}
-            </span>
-          </div>
-          {/* Cumulative blast bar — lights one more segment per tier. */}
-          <div className="mt-1.5 flex h-1.5 gap-px overflow-hidden rounded-full">
-            {[0, 1, 2, 3].map(i => (
-              <span
-                key={i}
-                className={`flex-1 ${i <= level - 1 ? '' : 'bg-tertiary opacity-30'}`}
-                style={i <= level - 1 ? { background: DANGER_COLORS[i] } : undefined}
-              />
-            ))}
-          </div>
-          <div className="mt-1.5 text-[11.5px] leading-relaxed">
-            <span className="font-semibold text-conf-low">Lost:</span> <span className="text-ink-muted">{lost}</span>
-          </div>
-          <div className="text-[11px] leading-relaxed">
-            <span className="font-semibold" style={{ color: 'var(--conf-high)' }}>Survives:</span> <span className="text-tertiary">{survives}</span>
-          </div>
+              key={i}
+              className="flex-1"
+              style={i <= level - 1 ? { background: DANGER_COLORS[i] } : { background: 'var(--surface-2)' }}
+            />
+          ))}
         </div>
         {!armed ? (
           <Button color="secondary-destructive" size="sm" className="shrink-0" onClick={() => setArmed(true)}>
-            {name}…
+            {cta}…
           </Button>
         ) : null}
       </div>
       {armed ? (
-        <div className="flex flex-wrap items-center gap-2 pl-5">
+        <div className="anim-rise-sm flex flex-wrap items-center gap-2 pl-5">
           {confirmWord ? (
             <>
-              <span className="shrink-0 text-[11.5px] text-conf-low">
-                Type <span className="font-mono font-semibold text-ink">{confirmWord}</span>:
+              <span className="shrink-0 text-[12.5px] text-conf-low">
+                Type <span className="font-mono font-semibold text-primary">{confirmWord}</span> to confirm:
               </span>
               <Input wrapperClassName="w-40" mono value={typed} onChange={e => setTyped(e.target.value)} placeholder={confirmWord} autoFocus />
             </>
           ) : (
-            <span className="flex-1 text-[11.5px] text-conf-low">Sure? This can't be undone.</span>
+            <span className="flex-1 text-[12.5px] text-conf-low">Sure? This can't be undone.</span>
           )}
           <Button
             color="primary-destructive"
@@ -499,7 +501,7 @@ function DangerRow({ level, badge, name, survives, lost, confirmWord, onRun }: {
           <Button color="tertiary" size="sm" isDisabled={busy} onClick={() => { setArmed(false); setTyped(''); setErr(null); }}>
             Cancel
           </Button>
-          {err ? <span className="w-full text-[11.5px] text-conf-low">{err}</span> : null}
+          {err ? <span className="w-full text-[12.5px] text-conf-low">{err}</span> : null}
         </div>
       ) : null}
     </div>

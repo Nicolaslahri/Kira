@@ -84,8 +84,20 @@ class MBRelease:
 
     def cover_art_front_url(self) -> str:
         # Cover Art Archive 302-redirects this to the actual image; the image
-        # proxy / <img> follows it. `-500` asks for the 500px thumbnail.
+        # proxy / <img> follows it. `-500` asks for the 500px thumbnail (popup hero).
         return f"https://coverartarchive.org/release/{self.id}/front-500"
+
+    def cover_art_thumb_url(self) -> str:
+        # 250px variant for grid/mosaic — a quarter of the bytes of -500, which
+        # is all a ~120px card can show. Popup keeps the -500 hero above.
+        return f"https://coverartarchive.org/release/{self.id}/front-250"
+
+    def cover_art_group_url(self) -> str | None:
+        # Release-GROUP front cover — a fallback when the specific release has
+        # no front art (common) but the group (album across all pressings)
+        # does. `release_group_id` is captured at parse time.
+        return (f"https://coverartarchive.org/release-group/{self.release_group_id}/front-500"
+                if self.release_group_id else None)
 
 
 @dataclass
@@ -116,6 +128,11 @@ class MBRecordingHit:
 
     def cover_art_front_url(self) -> str | None:
         return (f"https://coverartarchive.org/release/{self.release_id}/front-500"
+                if self.release_id else None)
+
+    def cover_art_thumb_url(self) -> str | None:
+        # 250px grid/mosaic variant (parity with MBRelease.cover_art_thumb_url).
+        return (f"https://coverartarchive.org/release/{self.release_id}/front-250"
                 if self.release_id else None)
 
 

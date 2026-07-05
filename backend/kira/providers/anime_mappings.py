@@ -32,7 +32,8 @@ from kira.providers.base import KIRA_USER_AGENT
 
 logger = logging.getLogger(__name__)
 
-_CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache"
+from kira.config import cache_dir as _kira_cache_dir
+_CACHE_DIR = _kira_cache_dir()
 _MAPPING_FILE = _CACHE_DIR / "anime-mappings.json"
 _MAPPING_URL = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json"
 _REFRESH_AGE_SEC = 7 * 24 * 3600  # weekly
@@ -341,6 +342,13 @@ class AnimeMappings:
         chronological cour order, which the bipartite refinement / per-
         file routing pass relies on for episode-range assignment).
         Empty list if nothing matches.
+       
+        KNOWN LIMITATION (KI-9 family, audit §21): within one TVDB season
+        every sibling shares the SAME Fribb season, so the Fribb-season
+        sort that fixed franchise-LEVEL ordering offers no signal here —
+        ascending AID is the only order available without per-AID air-date
+        fetches. A reboot/side-story cour registered out of order would
+        mis-route; none are known among multi-cour titles in the wild.
         """
         await cls._ensure_loaded()
         return sorted(cls._by_tvdb_season.get((tvdb_id, season), ()))

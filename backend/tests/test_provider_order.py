@@ -100,3 +100,13 @@ def test_crossref_wrapper_and_non_list_tolerated():
         == ["tmdb", "tvdb"]
     assert resolve_anime_crossref_order({"matching.anime_crossref_order": "tmdb"}) \
         == ["tvdb", "tmdb"]
+
+
+def test_unknown_media_type_is_searchable():
+    """A parser 'unknown' (title but no year/episode) must resolve to a real
+    provider order — an empty order silently left it no_match forever."""
+    from kira.matcher.engine import resolve_provider_order
+    order = resolve_provider_order("unknown", None)
+    assert order == ["tmdb", "tvdb"]
+    # Music stays intentionally empty (separate audio engine).
+    assert resolve_provider_order("music", None) == []

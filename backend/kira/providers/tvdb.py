@@ -659,11 +659,16 @@ class TVDBProvider(MetadataProvider):
                 # against the right TVDB episode when AniDB is unreachable
                 # — closes the orphan window during an AniDB ban for
                 # long-running absolute-numbered anime.
+                # Explicit None-check, not `or`: episode 0 (a legitimate
+                # special) is falsy and used to fall through / vanish.
+                _ep_num = ep.get("number")
+                if _ep_num is None:
+                    _ep_num = ep.get("episodeNumber")
                 out.append(EpisodeResult(
                     provider="tvdb",
                     series_id=series_id,
                     season=ep.get("seasonNumber"),
-                    episode=ep.get("number") or ep.get("episodeNumber"),
+                    episode=_ep_num,
                     absolute_number=ep.get("absoluteNumber"),
                     title=ep.get("name"),
                     air_date=ep.get("aired"),

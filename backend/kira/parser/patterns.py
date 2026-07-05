@@ -222,6 +222,11 @@ def extract_sxe(name: str) -> SxEMatch | None:
         # glued end (`S01E01E02`). Either supplies the multi-episode upper bound.
         end_str = m.group(3) or m.group(4)
         end = int(end_str) if end_str else None
+        # A span must run FORWARD: "E05-E02" is a parse artifact (checksum,
+        # date fragment), not a 4-episode range — drop the bogus end rather
+        # than let an inverted span flow into rename templates.
+        if end is not None and end <= e:
+            end = None
         if _sane(s, e):
             return SxEMatch(s, e, end, confidence=0.95, pattern="SxxExx", match_span=m.span())
 
@@ -319,10 +324,19 @@ def extract_sxe(name: str) -> SxEMatch | None:
     if m:
         digit_str = m.group(1)
         abs_ep = int(digit_str)
+        # Title-with-number guard: a dash-number IMMEDIATELY followed by a
+        # release year is part of the title, not an episode — `Catch-22.2019`,
+        # `Fahrenheit-451 (1966)`. Real anime ("Blood War-38 [1080p]") is
+        # followed by tags/brackets, never a bare year, so this only suppresses
+        # the false positives. (A single `.`/space separator, then a 4-digit
+        # year with no bracket/paren in between.)
+        _after = name[m.end():]
+        _year_follows = bool(re.match(r"[. ](?:19|20)\d\d\b", _after))
         if (
             1 <= abs_ep <= 9999
             and not (len(digit_str) == 1 and abs_ep < 10)
             and not (1900 <= abs_ep <= 2099)
+            and not _year_follows
         ):
             # If a SEPARATE bracket-absolute exists, IT is the real absolute and
             # the dash-number is the season-local episode (`S3 - 12 [36]` → ep
@@ -341,7 +355,11 @@ def extract_sxe(name: str) -> SxEMatch | None:
     m = _P5_EPISODE_ONLY.search(name)
     if m:
         e = int(m.group(1))
-        if 1 <= e <= 9999:
+        # Year guard (same as P4 / P5B / P6): a 4-digit value in the 1900-2099
+        # window is a release year, not an episode — `WALL-E.2008` matched the
+        # trailing `E` + `2008` and became "anime episode 2008". Real
+        # absolute-numbered anime never reaches this window (One Piece ~1100).
+        if 1 <= e <= 9999 and not (1900 <= e <= 2099):
             abs_hint = e if e >= 100 else None
             return SxEMatch(None, e, absolute=abs_hint, confidence=0.60,
                             pattern="EpNN", match_span=m.span())
@@ -460,6 +478,11 @@ def _sane(season: int, episode: int, strict: bool = False) -> bool:
     if episode < 0 or episode > cap:
         return False
     if strict:
+        # Episode 0 in the compressed form is spurious — `300` → S03E00 is the
+        # movie "300", not a real episode. (An explicit `S01E00` pilot/special
+        # uses the NON-strict path, so it's unaffected.)
+        if episode == 0:
+            return False
         combined = int(f"{season}{episode:02d}")
         # Reject "1900" → S19E00, "2024" → S20E24 (year as accidental SxE)
         if 1900 <= combined <= 2100:

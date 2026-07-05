@@ -233,12 +233,15 @@ def parse_filename(filename: str, parent_path: str = "") -> ParsedFile:
     if sxe is not None and sxe.absolute is None and sxe.season is not None:
         # Edge case: P1's multi-episode group greedily absorbed the
         # trailing absolute as `episode_end` (e.g. "S06E15 - 128" parses
-        # as the implausible batch S06E15-E128). Re-classify when the
-        # span is wider than any realistic multi-ep release — anime
-        # multi-eps are typically 2-4, never 100+. Treat such big
-        # spans as absolute hints instead.
+        # as the implausible batch S06E15-E128). Re-classify only when the
+        # end is implausibly high FOR AN EPISODE NUMBER — no seasoned
+        # release numbers a within-season episode past ~100, whereas a
+        # legitimate "complete season" batch spans a normal range
+        # (S01E01-E26). Using `> 100` (not `episode + 20`) keeps E01-E26 a
+        # real multi-ep TV span while still catching an absorbed absolute.
         if (
             sxe.episode_end is not None
+            and sxe.episode_end > 100
             and sxe.episode_end > sxe.episode + 20
         ):
             sxe.absolute = sxe.episode_end
@@ -256,11 +259,15 @@ def parse_filename(filename: str, parent_path: str = "") -> ParsedFile:
                 # SxE match leaves `sxe.absolute = None`, dropping the
                 # cour-routing signal. Scan the WHOLE cleaned name for
                 # `[NNNN]` with the same year-range guard P5B uses.
-                from kira.parser.patterns import _P5B_BRACKET_ABS
+                from kira.parser.patterns import _P5B_BRACKET_ABS, _RESOLUTION_NUMBERS
                 bm = _P5B_BRACKET_ABS.search(cleaned)
                 if bm:
                     bv = int(bm.group(1))
-                    if 1 <= bv <= 9999 and not (1900 <= bv <= 2049):
+                    # Same guards as `_bracket_absolute`: skip release years AND
+                    # bare resolution numbers — `[1080]` is a resolution, not
+                    # absolute episode 1080 (which would misroute the file to
+                    # anime).
+                    if 1 <= bv <= 9999 and not (1900 <= bv <= 2049) and bv not in _RESOLUTION_NUMBERS:
                         sxe.absolute = bv
 
     media_type = _classify(tokens, sxe, parent_path, year)
@@ -586,8 +593,10 @@ def _classify(tokens: FormatTokens, sxe: SxEMatch | None,
     # TV path hints — covers common Plex/Jellyfin/Sonarr layouts. A `Season N`
     # folder is a near-certain TV signal even when the episode title is the
     # only thing in the filename.
+    # A season hint needs a DIGIT ("/season 2") — the bare substring match
+    # classified movie folders like "Season of the Witch" as TV.
     if any(p in parent for p in ("/tv/", "/tv shows/", "/series/", "/shows/")) \
-       or "/season " in parent or parent.endswith("/season"):
+       or re.search(r"/season[ ._-]*\d", parent) is not None:
         return "tv"
 
     # Movie path hints — /Movies/, /Films/, /Cinema/

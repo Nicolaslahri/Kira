@@ -44,7 +44,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache"
+from kira.config import cache_dir as _kira_cache_dir
+_CACHE_DIR = _kira_cache_dir()
 
 
 def _rules_path() -> Path:

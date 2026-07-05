@@ -116,6 +116,16 @@ export function SubtitleBrowseModal({ pushToast }: { pushToast: PushToast }) {
   const epLabel = episodeLabel(target.filename);
   const allPacks = !!cands && cands.length > 0 && cands.every(c => c.is_pack);
 
+  // Target switch mid-flight (§20 m): a pack choice initiated for one file
+  // must never apply to the file the modal was re-targeted at — drop all
+  // in-flight pick state whenever the target changes.
+  useEffect(() => {
+    setPicking(null);
+    setPackChoice(null);
+    setPackOffer(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target.fileId]);
+
   const pick = async (c: ApiSubtitleCandidate) => {
     const key = `${c.provider}:${c.ref}`;
     setPicking(key);

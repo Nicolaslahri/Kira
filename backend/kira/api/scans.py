@@ -14,6 +14,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import delete, or_, select
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kira import activity
@@ -44,8 +45,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/scans", tags=["scans"])
 
 # How often to commit during the walk — every N files, push a checkpoint
-# so the polling client sees rows appear in real time.
-SCAN_COMMIT_EVERY = 5
+# so the polling client sees rows appear in real time. 100 (was 5): each WAL
+# commit is an fsync (~5-30ms on NAS storage), so 5 meant 2,000 fsyncs per
+# 10k-file ingest — 10-60s of pure commit overhead plus 2,000 write-lock
+# acquisitions competing with API writes ("database is locked"). At walk
+# speeds 100 still checkpoints multiple times per poll tick (800ms).
+# Bounded width for the parallel (non-AniDB) match lane — see _match_phase.
+_PARALLEL_MATCH_WIDTH = 4
+SCAN_COMMIT_EVERY = 100
 MATCH_COMMIT_EVERY = 3
 
 # PERF (NAS responsiveness): how many directory entries the discovery walk
@@ -91,6 +98,35 @@ _SCAN_TASKS: dict[int, asyncio.Task] = {}
 # enough that a slow scan never gets pre-empted but narrow enough that
 # a crashed scan unblocks the next-day boot.
 _SCAN_LOCK_MAX_AGE_SEC = 6 * 3600
+
+# Heartbeat throttle for _touch_db_scan_lock (monotonic seconds).
+_LAST_LOCK_TOUCH = 0.0
+
+
+async def _touch_db_scan_lock() -> None:
+    """Refresh the DB scan-lock timestamp (throttled to every 5 min). A legit
+    scan that outlives _SCAN_LOCK_MAX_AGE_SEC used to become claimable by
+    another process mid-run; the match phase calls this from its progress
+    writes so a LIVE scan keeps re-asserting its claim. Best-effort."""
+    global _LAST_LOCK_TOUCH
+    import time as _t
+    _now = _t.monotonic()
+    if _now - _LAST_LOCK_TOUCH < 300:
+        return
+    _LAST_LOCK_TOUCH = _now
+    try:
+        from sqlalchemy import update as _sql_update
+        from kira.models import Setting as _Setting
+        async with SessionLocal() as _sess:
+            await _sess.execute(
+                _sql_update(_Setting)
+                .where(_Setting.key == "system.scan_running")
+                .where(_Setting.value != 0)
+                .values(value=int(_t.time()))
+            )
+            await _sess.commit()
+    except Exception:
+        pass
 
 
 async def _read_mediainfo_setting(session) -> bool:
@@ -360,7 +396,7 @@ async def enrich_mediainfo_background(file_ids: list[int], *, reason: str | None
                     _c_val = _c_val["value"]
                 width = max(1, min(32, int(_c_val)))  # type: ignore[arg-type]
             except (TypeError, ValueError):
-                width = 8
+                width = 4   # match the Settings UI default + rename.py's resolver
             sem = asyncio.Semaphore(width)
 
             # Sidecar subtitle languages already on disk — one directory listing
@@ -396,6 +432,13 @@ async def enrich_mediainfo_background(file_ids: list[int], *, reason: str | None
 
             path_by_fid = {w[0]: w[1] for w in work}
             done = 0
+            # Commit in batches, not per changed file: a 10k-file backfill used
+            # to fire 10k fsyncs exactly while subtitle backfill / poster warmup
+            # / boot heal were also writing — the observed "database is locked"
+            # neighborhood. A crash loses at most one batch, which just re-
+            # enriches next pass (stamps weren't persisted).
+            _COMMIT_EVERY = 50
+            _dirty = 0
             # Process in bounded chunks so a large (up to 20k-file) backfill can't
             # materialize tens of thousands of Tasks at once. The `sem` still caps
             # CONCURRENT NAS reads to its width; this caps SCHEDULED coroutines.
@@ -423,18 +466,24 @@ async def enrich_mediainfo_background(file_ids: list[int], *, reason: str | None
                                     changed = True
                                 if changed:
                                     mf.parsed_data = parsed.to_dict()
-                                    await session.commit()
                                     updated += 1
+                                    _dirty += 1
+                                    if _dirty >= _COMMIT_EVERY:
+                                        await session.commit()
+                                        _dirty = 0
                     except Exception as e:
                         done += 1
                         logger.warning(f"enrich_mediainfo_background: file failed (non-fatal): {e!r}")
                         try:
                             await session.rollback()
+                            _dirty = 0
                         except Exception:
                             pass
                     # Report after every completion: cheap in-memory write, and it
                     # keeps the job from being marked stale during a slow NAS read.
                     activity.progress(_MI_ENRICH_JOB, done, total)
+            if _dirty:
+                await session.commit()
     except Exception as e:
         logger.warning(f"enrich_mediainfo_background: aborted (non-fatal): {e!r}")
     finally:
@@ -605,7 +654,20 @@ async def _match_singleton(session, engine, fid: int) -> None:
                     for d in _ep_dicts
                     if d.get("absolute_number") is not None and d.get("episode") is not None
                 }
-                _l2a = {loc: ab for ab, loc in _a2l.items()}
+                # Same ambiguity guard as the cluster path: if two absolutes
+                # share a local index, last-writer-wins could pick the wrong
+                # season's absolute — drop ambiguous keys (file stays
+                # un-remapped rather than mis-mapped).
+                _l2a: dict[int, int] = {}
+                _dropped: set[int] = set()
+                for _ab, _loc in _a2l.items():
+                    if _loc in _dropped:
+                        continue
+                    if _loc in _l2a and _l2a[_loc] != _ab:
+                        del _l2a[_loc]
+                        _dropped.add(_loc)
+                    else:
+                        _l2a[_loc] = _ab
                 stored_ep = remap_umbrella_local_to_absolute(
                     ep_num, is_flat_umbrella=True, routed_aid=None, local_to_abs=_l2a,
                 )
@@ -1846,7 +1908,14 @@ async def _match_music(session, fids: list[int]) -> None:
     from kira.settings_store import get_raw, unwrap
     _aid_key: str | None = None
     try:
-        if bool(unwrap(await get_raw(session, "providers.acoustid.auto_fingerprint"))) and _fp.resolve_fpcalc():
+        # NOT bool(): a legacy string "false" is truthy. Only a real True or a
+        # truthy string token enables fingerprinting (parity with every other
+        # bool reader in the codebase).
+        _af_raw = unwrap(await get_raw(session, "providers.acoustid.auto_fingerprint"))
+        _af_on = _af_raw is True or (
+            isinstance(_af_raw, str) and _af_raw.strip().lower() in ("1", "true", "yes", "on")
+        )
+        if _af_on and _fp.resolve_fpcalc():
             _aid_key = unwrap(await get_raw(session, "providers.acoustid.api_key")) or _ac.PROJECT_KEY
     except Exception as e:  # noqa: BLE001 — config read must never crash a scan
         logger.warning(f"_match_music: AcoustID config read failed (skipping fingerprint): {e!r}")
@@ -1959,141 +2028,240 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
     music_enabled = _mval is True or (isinstance(_mval, str) and _mval.strip().lower() in ("true", "1", "yes", "on"))
 
     matched = 0
+
+    # ── Two-lane dispatch (audit §3 C1) ──────────────────────────────────
+    # The match phase used to be FULLY serial across clusters, so on a mixed
+    # library every TMDB/TVDB cluster queued behind AniDB's protocol-mandated
+    # ~4s-per-request pacing (30–90+ min for 10k files). Now:
+    #   • SERIAL lane — anime + music clusters (AniDB / MusicBrainz are hard
+    #     rate-limited; their pacing is per protocol rules and must stay
+    #     sequential). Runs on THIS session, exactly like the old loop.
+    #   • PARALLEL lane — movie/TV/unknown clusters, bounded width. Each task
+    #     gets its OWN SessionLocal session (AsyncSession is not concurrency-
+    #     safe); SQLite WAL + busy_timeout=15s serializes the actual writes,
+    #     and clusters touch disjoint file ids so there are no row conflicts.
+    # Progress (Scan.matched_count / current_path) is written ONLY here on the
+    # phase session, per completed cluster.
+    _serial_lane: list[tuple[str | int, list[int]]] = []
+    _parallel_lane: list[tuple[str | int, list[int]]] = []
     for bucket_key, cfids in clusters.items():
-        # Shimmer the cluster's rows while it resolves.
-        _rep_path: str | None = None
-        for fid in cfids:
-            mf = await session.get(MediaFile, fid)
-            if mf:
-                mf.status = "matching"
-                if _rep_path is None and mf.file_path:
-                    _rep_path = mf.file_path
-                # Title rescue for files the filename couldn't identify — reads
-                # the container's embedded title and re-parses. Bounded to files
-                # with no usable title (they'd never match otherwise), so the one
-                # read is worth it even on a NAS.
-                try:
-                    await _maybe_rescue_title_from_mediainfo(mf)
-                except Exception as e:
-                    logger.warning(f"_match_phase: title rescue failed for {fid}: {e!r}")
-        # PB-jank: surface WHICH cluster is matching NOW, BEFORE we dispatch it.
-        # A rate-limited cluster (AniDB / MusicBrainz, ≤1 req/s plus episode-list
-        # fetches) can take tens of seconds; without a pre-dispatch write the
-        # current_path sat frozen the whole time, reading as "the scan hung".
-        # Folded into the existing shimmer commit — no extra DB round-trip.
-        if _rep_path:
-            _sc = await session.get(Scan, scan_id)
-            if _sc is not None:
-                _sc.current_path = _rep_path
+        _first = await session.get(MediaFile, cfids[0])
+        _mt = _first.media_type if _first is not None else None
+        (_serial_lane if _mt in ("anime", "music") else _parallel_lane).append(
+            (bucket_key, cfids))
+
+    async def _bump_progress(rep_path: str | None) -> None:
+        await _touch_db_scan_lock()   # keep the >6h-stale lock claim fresh mid-scan
+        _sc = await session.get(Scan, scan_id)
+        if _sc is not None:
+            _sc.matched_count = matched
+            if rep_path:
+                _sc.current_path = rep_path
         await session.commit()
-        await asyncio.sleep(0)
 
-        # Files an override pack already claimed are NOT re-dispatched — the
-        # dispatcher clears matches first, which would discard the pack row.
-        dispatch_fids = [f for f in cfids if f not in overridden] if overridden else cfids
-        if dispatch_fids:
-            # Music → the ISOLATED kira.music plugin (ONE seam, gated on
-            # music.enabled). It never reaches the movie/TV/anime cascade below
-            # (engine.match short-circuits music), so this branch can't affect it.
-            _first = await session.get(MediaFile, dispatch_fids[0])
-            if _first is not None and _first.media_type == "music":
-                if music_enabled:
-                    await _match_music(session, dispatch_fids)
-                # else: music off → leave as no_match (the status sweep handles it)
-            elif isinstance(bucket_key, str) and len(dispatch_fids) >= 2:
-                await _match_cluster(session, engine, dispatch_fids)
-            else:
-                await _match_singleton(session, engine, dispatch_fids[0])
+    if _parallel_lane:
+        from kira.database import SessionLocal
+        _sem = asyncio.Semaphore(_PARALLEL_MATCH_WIDTH)
 
-        # Resolve "which files got a match" and "their selected provider" in
-        # TWO grouped queries for the whole cluster, instead of 1-2 SELECTs per
-        # file inside the loop. (`session.get(MediaFile, fid)` below stays
-        # per-file but is served from the identity map — the rows were just
-        # loaded by the cluster matcher — so it costs no extra round-trip.)
-        matched_fids = set((await session.scalars(
-            select(Match.media_file_id).where(Match.media_file_id.in_(cfids))
-        )).all())
-        sel_rows = (await session.execute(
-            select(Match.media_file_id, Match.provider, Match.confidence,
-                   Match.provider_id, Match.match_type).where(
-                Match.media_file_id.in_(cfids), Match.is_selected.is_(True)
-            )
-        )).all()
-        sel_provider_by_fid = {fid: prov for fid, prov, _, _, _ in sel_rows}
-        sel_conf_by_fid = {fid: conf for fid, _, conf, _, _ in sel_rows}
-        sel_pid_by_fid = {fid: pid for fid, _, _, pid, _ in sel_rows}
-        sel_mtype_by_fid = {fid: mt for fid, _, _, _, mt in sel_rows}
-
-        for fid in cfids:
-            has_match = fid in matched_fids
-            mf = await session.get(MediaFile, fid)
-            if has_match:
-                matched += 1
-                if mf and mf.status == "matching":
-                    # Auto-approve high-confidence hits past the threshold so they
-                    # skip Review; everything else stays "matched" for the user.
-                    sel_conf = sel_conf_by_fid.get(fid)
-                    if auto_enabled and sel_conf is not None and sel_conf >= auto_th:
-                        mf.status = "approved"
-                    else:
-                        mf.status = "matched"
-                # Correct media_type from the matched provider. AniDB is an
-                # anime-only source, so an AniDB match means this file IS anime
-                # even when the parser guessed "tv" (e.g. the file lives outside
-                # an /anime/ path, like a release-named download folder). Without
-                # this the show lands in the "TV Series" group and splits from
-                # its anime siblings. Recompute the series/variant keys off the
-                # corrected media_type so it re-clusters under the anime identity.
-                if mf and mf.media_type != "anime" and mf.parsed_data:
-                    # Anime detection independent of folder: a direct AniDB match
-                    # OR a TVDB/TMDB series whose id cross-refs to an AniDB id in
-                    # Fribb (so anime in a generic /tv/ folder is caught too).
-                    if await _selected_match_is_anime(
-                        sel_provider_by_fid.get(fid),
-                        sel_pid_by_fid.get(fid),
-                        sel_mtype_by_fid.get(fid),
-                    ):
-                        # CR-09: shared helper sets media_type FIRST then
-                        # recomputes the keys, so even if the recompute raises
-                        # the grouping fix ("at least set media_type=anime")
-                        # still lands. Surrounding try/except preserves the
-                        # original best-effort + log behavior.
+        async def _run_parallel(bkey, bfids) -> tuple[int, str | None]:
+            async with _sem:
+                async with SessionLocal() as s2:
+                    try:
+                        return await _process_match_cluster(
+                            s2, engine, bkey, bfids,
+                            overridden=overridden, music_enabled=music_enabled,
+                            auto_enabled=auto_enabled, auto_th=auto_th,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"_match_phase: parallel cluster {bkey!r} failed (isolated): {e!r}")
+                        # Never strand rows in 'matching' — resolve the failed
+                        # cluster to no_match so the scan still completes and the
+                        # user can manually match. (The old serial code would
+                        # have failed the ENTIRE scan here.)
                         try:
-                            apply_media_type_and_recompute_keys(mf, "anime")
-                        except Exception as e:
-                            mf.media_type = "anime"  # at least fix the grouping
-                            logger.warning(f"_match_phase: media_type correction key recompute failed for {fid}: {e!r}")
-            elif mf and mf.status == "matching":
-                # ── Kira Packs: FALLBACK rescue ─────────────────────────────
-                # Last chance before no_match: a community pack (One Pace, etc.)
-                # may claim this file the providers couldn't place. This is the
-                # ONLY seam where a pack touches matching — so a pack can never
-                # alter a title the providers already matched (isolation).
-                rescued = False
-                try:
-                    from kira.packs.apply import try_pack_match
-                    rescued = await try_pack_match(session, fid, mf)
-                except Exception as e:
-                    logger.warning(f"_match_phase: pack fallback failed for {fid}: {e!r}")
-                if rescued:
-                    matched += 1
-                    # Pack matches are authoritative (confidence 1.0): respect
-                    # the same auto-approve threshold as a provider match.
-                    if auto_enabled and 1.0 >= auto_th:
-                        mf.status = "approved"
-                    else:
-                        mf.status = "matched"
-                else:
-                    mf.status = "no_match"
+                            await s2.rollback()
+                            for _fid in bfids:
+                                _mf2 = await s2.get(MediaFile, _fid)
+                                if _mf2 is not None and _mf2.status == "matching":
+                                    _mf2.status = "no_match"
+                            await s2.commit()
+                        except Exception:
+                            pass
+                        return 0, None
 
-        scan = await session.get(Scan, scan_id)
-        if scan:
-            scan.matched_count = matched
-            last_mf = await session.get(MediaFile, cfids[-1])
-            scan.current_path = last_mf.file_path if last_mf else None
-        await session.commit()
-        await asyncio.sleep(0)
+        _tasks = [asyncio.create_task(_run_parallel(k, v)) for k, v in _parallel_lane]
+        try:
+            for _fut in asyncio.as_completed(_tasks):
+                _n, _rep = await _fut
+                matched += _n
+                await _bump_progress(_rep)
+        finally:
+            # Cancellation propagates (scan stop) — don't orphan running tasks.
+            for _t in _tasks:
+                if not _t.done():
+                    _t.cancel()
+        # The worker sessions committed status changes this session's identity
+        # map may still hold stale copies of — expire so every later read in
+        # this phase/worker refetches fresh rows.
+        session.expire_all()
+
+    for bucket_key, cfids in _serial_lane:
+        # Liveness pre-write: an AniDB cluster can take tens of seconds; show
+        # WHICH cluster is resolving before dispatching it (PB-jank fix kept).
+        _pre = await session.get(MediaFile, cfids[0])
+        if _pre is not None and _pre.file_path:
+            await _bump_progress(_pre.file_path)
+        _n, _rep = await _process_match_cluster(
+            session, engine, bucket_key, cfids,
+            overridden=overridden, music_enabled=music_enabled,
+            auto_enabled=auto_enabled, auto_th=auto_th,
+        )
+        matched += _n
+        await _bump_progress(_rep)
     return matched
+
+
+
+async def _process_match_cluster(
+    session, engine, bucket_key, cfids: list[int], *,
+    overridden: set[int], music_enabled: bool,
+    auto_enabled: bool, auto_th: float,
+) -> tuple[int, str | None]:
+    """Match ONE cluster on the GIVEN session: shimmer + title rescue →
+    dispatch (music plugin / cluster / singleton) → resolve statuses
+    (auto-approve, anime media_type correction, pack fallback). Commits its own
+    file-row work but NEVER touches the Scan row — live progress belongs to the
+    orchestrator in _match_phase, because this helper may run on a parallel
+    worker session and two sessions must not fight over one Scan row.
+
+    Returns (files matched in this cluster, representative path for progress).
+    Extracted verbatim from the old serial loop so both lanes behave
+    identically per-cluster; only the scheduling around it changed."""
+    _cluster_matched = 0
+    # Shimmer the cluster's rows while it resolves.
+    _rep_path: str | None = None
+    for fid in cfids:
+        mf = await session.get(MediaFile, fid)
+        if mf:
+            mf.status = "matching"
+            if _rep_path is None and mf.file_path:
+                _rep_path = mf.file_path
+            # Title rescue for files the filename couldn't identify — reads
+            # the container's embedded title and re-parses. Bounded to files
+            # with no usable title (they'd never match otherwise), so the one
+            # read is worth it even on a NAS.
+            try:
+                await _maybe_rescue_title_from_mediainfo(mf)
+            except Exception as e:
+                logger.warning(f"_match_phase: title rescue failed for {fid}: {e!r}")
+    # Progress (current_path / matched_count) belongs to the ORCHESTRATOR in
+    # _match_phase — this helper may run on a parallel worker session, and two
+    # sessions writing the same Scan row would fight. Shimmer commit only.
+    await session.commit()
+    await asyncio.sleep(0)
+
+    # Files an override pack already claimed are NOT re-dispatched — the
+    # dispatcher clears matches first, which would discard the pack row.
+    dispatch_fids = [f for f in cfids if f not in overridden] if overridden else cfids
+    if dispatch_fids:
+        # Music → the ISOLATED kira.music plugin (ONE seam, gated on
+        # music.enabled). It never reaches the movie/TV/anime cascade below
+        # (engine.match short-circuits music), so this branch can't affect it.
+        _first = await session.get(MediaFile, dispatch_fids[0])
+        if _first is not None and _first.media_type == "music":
+            if music_enabled:
+                await _match_music(session, dispatch_fids)
+            # else: music off → leave as no_match (the status sweep handles it)
+        elif isinstance(bucket_key, str) and len(dispatch_fids) >= 2:
+            await _match_cluster(session, engine, dispatch_fids)
+        else:
+            await _match_singleton(session, engine, dispatch_fids[0])
+
+    # Resolve "which files got a match" and "their selected provider" in
+    # TWO grouped queries for the whole cluster, instead of 1-2 SELECTs per
+    # file inside the loop. (`session.get(MediaFile, fid)` below stays
+    # per-file but is served from the identity map — the rows were just
+    # loaded by the cluster matcher — so it costs no extra round-trip.)
+    matched_fids = set((await session.scalars(
+        select(Match.media_file_id).where(Match.media_file_id.in_(cfids))
+    )).all())
+    sel_rows = (await session.execute(
+        select(Match.media_file_id, Match.provider, Match.confidence,
+               Match.provider_id, Match.match_type).where(
+            Match.media_file_id.in_(cfids), Match.is_selected.is_(True)
+        )
+    )).all()
+    sel_provider_by_fid = {fid: prov for fid, prov, _, _, _ in sel_rows}
+    sel_conf_by_fid = {fid: conf for fid, _, conf, _, _ in sel_rows}
+    sel_pid_by_fid = {fid: pid for fid, _, _, pid, _ in sel_rows}
+    sel_mtype_by_fid = {fid: mt for fid, _, _, _, mt in sel_rows}
+
+    for fid in cfids:
+        has_match = fid in matched_fids
+        mf = await session.get(MediaFile, fid)
+        if has_match:
+            _cluster_matched += 1
+            if mf and mf.status == "matching":
+                # Auto-approve high-confidence hits past the threshold so they
+                # skip Review; everything else stays "matched" for the user.
+                sel_conf = sel_conf_by_fid.get(fid)
+                if auto_enabled and sel_conf is not None and sel_conf >= auto_th:
+                    mf.status = "approved"
+                else:
+                    mf.status = "matched"
+            # Correct media_type from the matched provider. AniDB is an
+            # anime-only source, so an AniDB match means this file IS anime
+            # even when the parser guessed "tv" (e.g. the file lives outside
+            # an /anime/ path, like a release-named download folder). Without
+            # this the show lands in the "TV Series" group and splits from
+            # its anime siblings. Recompute the series/variant keys off the
+            # corrected media_type so it re-clusters under the anime identity.
+            if mf and mf.media_type != "anime" and mf.parsed_data:
+                # Anime detection independent of folder: a direct AniDB match
+                # OR a TVDB/TMDB series whose id cross-refs to an AniDB id in
+                # Fribb (so anime in a generic /tv/ folder is caught too).
+                if await _selected_match_is_anime(
+                    sel_provider_by_fid.get(fid),
+                    sel_pid_by_fid.get(fid),
+                    sel_mtype_by_fid.get(fid),
+                ):
+                    # CR-09: shared helper sets media_type FIRST then
+                    # recomputes the keys, so even if the recompute raises
+                    # the grouping fix ("at least set media_type=anime")
+                    # still lands. Surrounding try/except preserves the
+                    # original best-effort + log behavior.
+                    try:
+                        apply_media_type_and_recompute_keys(mf, "anime")
+                    except Exception as e:
+                        mf.media_type = "anime"  # at least fix the grouping
+                        logger.warning(f"_match_phase: media_type correction key recompute failed for {fid}: {e!r}")
+        elif mf and mf.status == "matching":
+            # ── Kira Packs: FALLBACK rescue ─────────────────────────────
+            # Last chance before no_match: a community pack (One Pace, etc.)
+            # may claim this file the providers couldn't place. This is the
+            # ONLY seam where a pack touches matching — so a pack can never
+            # alter a title the providers already matched (isolation).
+            rescued = False
+            try:
+                from kira.packs.apply import try_pack_match
+                rescued = await try_pack_match(session, fid, mf)
+            except Exception as e:
+                logger.warning(f"_match_phase: pack fallback failed for {fid}: {e!r}")
+            if rescued:
+                _cluster_matched += 1
+                # Pack matches are authoritative (confidence 1.0): respect
+                # the same auto-approve threshold as a provider match.
+                if auto_enabled and 1.0 >= auto_th:
+                    mf.status = "approved"
+                else:
+                    mf.status = "matched"
+            else:
+                mf.status = "no_match"
+
+    await session.commit()
+    await asyncio.sleep(0)
+    return _cluster_matched, _rep_path
 
 
 async def _prune_missing_files(
@@ -2597,7 +2765,7 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
                 # Always release the walk thread — success, error, cancellation.
                 # wait=False so a cancel isn't held up by an in-flight stat on a
                 # wedged mount: the bounded batch finishes and the thread exits.
-                walk_executor.shutdown(wait=False)
+                walk_executor.shutdown(wait=False, cancel_futures=True)
 
             # After the final commit every mf.id is populated; no need to
             # re-query. This is also faster than running a SELECT over the
@@ -2853,6 +3021,14 @@ async def _scan_worker(scan_id: int, root_paths: list[str] | str) -> list[int] |
             except Exception as e:
                 logger.warning(f"_scan_worker: history prune failed (non-fatal): {e!r}")
 
+            # Cap the notifications table (unbounded before — a flapping
+            # integration health check could grow it forever).
+            try:
+                from kira.api.system import prune_old_notifications
+                await prune_old_notifications(session)
+            except Exception as e:
+                logger.warning(f"_scan_worker: notification prune failed (non-fatal): {e!r}")
+
             # Reap expired subtitle reuse-cache entries on the same recurring
             # event (subtitles.cache_retention_days; 0 = keep forever). Riding
             # along with the history prune keeps the "self-prunes without a
@@ -3029,15 +3205,36 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
                 # discovered so far (unlike the failure path below, which deletes the
                 # scan's rows). The outer finally still releases the lock; re-raise so
                 # the task ends cancelled.
-                try:
-                    async with SessionLocal() as _cx_sess:
-                        _cx = await _cx_sess.get(Scan, scan_id)
-                        if _cx is not None and _cx.status in ("scanning", "matching"):
-                            _cx.status = "cancelled"
-                            _cx.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                #
+                # The status write is retried once on a FRESH session: the likeliest
+                # failure here is SQLite "database is locked" — and Stop lands exactly
+                # when write load is heaviest. A swallowed failure used to leave the
+                # row at scanning/matching forever (a phantom "running" scan that made
+                # the next real scan render as a double).
+                for _attempt in (1, 2):
+                    try:
+                        async with SessionLocal() as _cx_sess:
+                            _cx = await _cx_sess.get(Scan, scan_id)
+                            if _cx is not None and _cx.status in ("scanning", "matching"):
+                                _cx.status = "cancelled"
+                                _cx.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                            # Files the cancelled cluster left mid-flight would
+                            # otherwise be stranded: the resume logic only picks up
+                            # 'discovered'/'no_match', so 'matching'/'parsing' rows
+                            # stayed in the spinner forever (until a full restart's
+                            # reconcile). Same repair boot reconcile does.
+                            await _cx_sess.execute(
+                                sa_update(MediaFile)
+                                .where(or_(MediaFile.status == "matching",
+                                           MediaFile.status == "parsing"))
+                                .values(status="discovered")
+                            )
                             await _cx_sess.commit()
-                except Exception as _ce:
-                    logger.warning(f"_scan_worker_locked: marking cancelled failed: {_ce!r}")
+                        break
+                    except Exception as _ce:
+                        logger.warning(
+                            f"_scan_worker_locked: marking cancelled failed "
+                            f"(attempt {_attempt}): {_ce!r}")
                 raise
             except Exception as e:
                 async with SessionLocal() as cleanup:
@@ -3059,12 +3256,33 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
                     # the lock released, but the status never flipped, so a crash
                     # before the first file showed in the UI as an eternal
                     # in-progress scan at 0 files (exactly what the user saw).
+                    #
+                    # The gate covers EVERY non-terminal status, not just
+                    # "scanning": an exception escaping during Phase 2 (status
+                    # "matching" — e.g. `database is locked` under write
+                    # contention) used to leave the row running forever with a
+                    # dead task and freed locks. The next scan then started
+                    # fine, and the DB held TWO rows that both read as live —
+                    # the reported "scan seems to run 2 times".
                     _failed = await cleanup.get(Scan, scan_id)
-                    if _failed is not None and _failed.status == "scanning":
+                    if _failed is not None and not str(_failed.status or "").startswith(
+                        ("completed", "cancelled", "failed")
+                    ):
                         # Record the REAL reason (e.g. "database is locked") instead
                         # of a bare "failed", so the UI + logs explain the failure.
                         _failed.status = f"failed: {e}"[:200]
                         _failed.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    # Files from EARLIER scans that this run resumed (leftover /
+                    # no_match retries) aren't covered by the scan_id delete
+                    # above — if the crash caught them mid-'matching' they'd be
+                    # stranded in the spinner and invisible to the next scan's
+                    # resume query. Reset them like boot reconcile does.
+                    await cleanup.execute(
+                        sa_update(MediaFile)
+                        .where(or_(MediaFile.status == "matching",
+                                   MediaFile.status == "parsing"))
+                        .values(status="discovered")
+                    )
                     await cleanup.commit()
                 logger.exception(f"_scan_worker_locked: scan {scan_id} failed — marked failed")
                 raise
@@ -3503,10 +3721,15 @@ async def cancel_scan(
     scan.status = "cancelled"
     scan.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await session.commit()
-    try:
-        await _release_db_scan_lock()
-    except Exception as e:
-        logger.warning(f"cancel_scan: stale-lock release failed: {e!r}")
+    # Only release the DB lock when NO other scan task is live — force-cancelling
+    # an old stuck row while a NEW scan runs must not yank the lock out from
+    # under the live worker (its own finally releases it when it exits).
+    _any_live = any(not t.done() for t in _SCAN_TASKS.values())
+    if not _any_live:
+        try:
+            await _release_db_scan_lock()
+        except Exception as e:
+            logger.warning(f"cancel_scan: stale-lock release failed: {e!r}")
     return {"ok": True, "status": "cancelled", "forced": True}
 
 

@@ -43,6 +43,9 @@ class ScanOut(BaseModel):
     id: int
     root_path: str
     status: str
+    # 'manual' | 'reparse' | 'watch' | ... — lets the UI label a resumed job
+    # ("Resuming re-parse…") instead of always saying "scan".
+    source: str = "manual"
     file_count: int
     matched_count: int = 0
     # PB-4: known after Phase 1 (file-walk) completes. Frontend uses it
@@ -137,3 +140,13 @@ class ProviderTestResponse(BaseModel):
     ok: bool
     detail: str | None = None
     latency_ms: int | None = None
+
+
+class ProviderTestBody(BaseModel):
+    """Candidate credentials for the 'Test' button. The settings page buffers
+    edits until Save, so Test must validate the JUST-TYPED draft key, not the
+    stale value on the server. All optional — an empty body falls back to the
+    stored config (the 'test the saved key' behavior)."""
+    api_key: str | None = None
+    username: str | None = None
+    password: str | None = None

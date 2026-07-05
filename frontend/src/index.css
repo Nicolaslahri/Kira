@@ -21,7 +21,8 @@
   --active:       rgba(255,255,255,0.10);
 
   /* Brand: monochrome logo gradient (white → grey). The whole app is black +
-     white + greys now — no hue anywhere. */
+     white + greys now — no hue anywhere. Colour is MEANING (indigo = action,
+     green/amber/red = status) — see DESIGN_GUIDELINES.md. */
   --brand-a:      #ffffff;
   --brand-b:      #7a7a7a;
   --brand-grad:   linear-gradient(135deg, var(--brand-a) 0%, var(--brand-b) 100%);
@@ -682,14 +683,18 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 }
 .btn-primary:hover { background: var(--accent-bright); }
 
+/* A primary CTA — indigo like every other action in the app (guidelines §1:
+   "everything interactive speaks indigo"; the old --brand-grad fill rendered
+   it as a silver blob that matched nothing). */
 .btn-brand {
-  background: var(--brand-grad);
-  color: var(--ink);
+  background: var(--accent-deep);
+  color: #fff;
   border-color: transparent;
   font-weight: 600;
-  box-shadow: 0 10px 24px -10px var(--brand-50);
+  box-shadow: 0 8px 18px -8px var(--accent-50);
+  transition: background 150ms ease, transform 160ms var(--ease-out, ease-out);
 }
-.btn-brand:hover { filter: brightness(1.08); }
+.btn-brand:hover { background: var(--accent); transform: translateY(-1px); }
 
 .btn-danger {
   background: var(--conf-low-16);
@@ -1780,16 +1785,16 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   position: relative;
   display: flex; flex-direction: column;
   padding: 28px 22px 22px;
-  background: linear-gradient(200deg, var(--warn-12), var(--panel-40) 55%, var(--brand-8));
+  background: var(--panel-40);
   border-right: 1px solid var(--border-1);
   overflow: hidden;
 }
 .onb-rail::before {
   content: '';
   position: absolute; inset: -40%;
-  background:
-    radial-gradient(40% 34% at 24% 18%, var(--warn-24), transparent 70%),
-    radial-gradient(34% 30% at 80% 86%, var(--brand-16), transparent 70%);
+  /* One faint top-corner glow only — the old two-blob drifting wash sat
+     right behind the step list and washed its contrast out. */
+  background: radial-gradient(42% 34% at 22% 12%, var(--surface-2), transparent 70%);
   animation: onbRailDrift 16s ease-in-out infinite alternate;
   pointer-events: none;
 }
@@ -1803,16 +1808,14 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   margin-bottom: 30px;
 }
 .onb-rail .brand .mark {
-  width: 40px; height: 40px;
+  width: 34px; height: 34px;
   display: grid; place-items: center;
-  border-radius: 13px;
-  background: var(--brand-grad);
-  box-shadow: 0 10px 28px var(--brand-32);
   color: var(--ink);
+  filter: drop-shadow(0 6px 18px var(--brand-32));
 }
-.onb-rail .brand .mark svg { width: 22px; height: 21px; }
+.onb-rail .brand .mark svg { width: 30px; height: 29px; }
 .onb-rail .brand .name { font-size: 17px; font-weight: 700; letter-spacing: -0.02em; }
-.onb-rail .brand .sub { font-size: 11px; color: var(--ink-3); margin-top: 1px; }
+.onb-rail .brand .sub { font-size: 12px; color: var(--ink-3); margin-top: 1px; }
 
 .onb-rail .steps { display: flex; flex-direction: column; gap: 4px; flex: 1; }
 .onb-rail .step {
@@ -1830,15 +1833,15 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   display: grid; place-items: center;
   border-radius: 10px;
   font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums;
-  color: var(--ink-3);
-  border: 1px solid var(--border-1);
+  color: var(--ink-2);
+  border: 1px solid var(--border-2);
   background: var(--surface-1);
   transition: all var(--dur-2) var(--ease-out);
 }
 .onb-rail .step .dot svg { width: 13px; height: 13px; }
 .onb-rail .step .txt { display: flex; flex-direction: column; min-width: 0; }
-.onb-rail .step .l { font-size: 13px; font-weight: 600; color: var(--ink-3); transition: color var(--dur-1) ease; }
-.onb-rail .step .h { font-size: 10.5px; color: var(--ink-3); opacity: 0.7; }
+.onb-rail .step .l { font-size: 13.5px; font-weight: 600; color: var(--ink-2); transition: color var(--dur-1) ease; }
+.onb-rail .step .h { font-size: 11.5px; color: var(--ink-3); }
 .onb-rail .step.active .dot {
   background: var(--accent);
   border-color: var(--accent);
@@ -1852,7 +1855,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   color: var(--accent);
 }
 .onb-rail .step.done .l { color: var(--ink-2); }
-.onb-rail .foot { font-size: 11px; color: var(--ink-3); padding: 8px 10px 0; }
+.onb-rail .foot { font-size: 11.5px; color: var(--ink-3); padding: 8px 10px 0; }
 
 /* ── Right pane ── */
 .onb-pane {
@@ -1908,7 +1911,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 }
 .onb-sub a { color: var(--accent); text-decoration: none; }
 .onb-sub a:hover { text-decoration: underline; }
-.onb-hint { font-size: 12px; color: var(--ink-3); }
+.onb-hint { font-size: 12.5px; color: var(--ink-2); }
 
 .onb-foot {
   display: flex; align-items: center; justify-content: space-between;
@@ -1919,7 +1922,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   flex-shrink: 0;
 }
 .onb-foot .right { display: flex; gap: 10px; align-items: center; }
-.onb-foot .hint { font-size: 12px; color: var(--ink-3); }
+.onb-foot .hint { font-size: 12.5px; color: var(--ink-3); }
 
 /* Welcome (step 0) */
 .onb-hero {
@@ -1938,7 +1941,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   animation: heroBreathe 4s ease-in-out infinite, riseIn 0.55s var(--ease-out) both;
 }
 .onb-hero .mark img,
-.onb-hero .mark svg { width: 76px; height: 72px; }
+.onb-hero .mark svg { width: 58px; height: 55px; filter: drop-shadow(0 8px 22px var(--brand-50)); }
 .onb-hero h1 {
   margin: 0;
   font-size: 40px;
@@ -1986,7 +1989,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   padding: 1px 7px;
 }
 .onb-keyfield .req.opt { color: var(--ink-3); background: var(--glass); border-color: var(--border-1); }
-.onb-keyfield .head a { margin-left: auto; font-size: 12px; color: var(--accent); text-decoration: none; }
+.onb-keyfield .head a { margin-left: auto; font-size: 12.5px; color: var(--accent); text-decoration: none; }
 .onb-keyfield .head a:hover { text-decoration: underline; }
 .onb-input-wrap {
   position: relative;
@@ -2047,7 +2050,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   margin-bottom: 4px;
   word-break: break-all;
 }
-.onb-folder-card .meta { font-size: 12px; color: var(--ink-3); }
+.onb-folder-card .meta { font-size: 12.5px; color: var(--ink-3); }
 .onb-checkrow {
   display: flex; align-items: flex-start; gap: 10px;
   margin-top: 6px;
@@ -2055,7 +2058,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   cursor: pointer;
 }
 .onb-checkrow input { margin-top: 2px; accent-color: var(--accent); }
-.onb-checkrow .sub { display: block; font-size: 11.5px; color: var(--ink-3); margin-top: 2px; }
+.onb-checkrow .sub { display: block; font-size: 12.5px; color: var(--ink-3); margin-top: 2px; }
 
 /* Naming profile step */
 .onb-naming {
@@ -2190,7 +2193,12 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   animation: riseIn 0.5s var(--ease-out) both;
   animation-delay: calc(var(--i, 0) * 80ms + 100ms);
 }
-.onb-body > * {
+.onb-step {
+  display: flex; flex-direction: column;
+  gap: 16px;
+  flex: 1; min-height: 0;
+}
+.onb-step > * {
   animation: riseInSm 0.42s var(--ease-out) both;
   animation-delay: calc(var(--i, 0) * 60ms + 80ms);
 }
@@ -2225,7 +2233,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 
 @media (prefers-reduced-motion: reduce) {
   .onb-hero .mark, .onb-rail::before, .onb-shell,
-  .onb-hero > *, .onb-body > *, .naming-card.selected {
+  .onb-hero > *, .onb-step > *, .naming-card.selected {
     animation: none !important;
   }
 }
@@ -3186,11 +3194,11 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .ct-card.selected .ct-icon {
   background: var(--line);
 }
-.ct-name { font-size: 13.5px; font-weight: 600; }
-.ct-desc { font-size: 11.5px; color: var(--ink-3); margin-top: 2px; line-height: 1.4; }
+.ct-name { font-size: 14px; font-weight: 600; }
+.ct-desc { font-size: 12.5px; color: var(--ink-2); margin-top: 2px; line-height: 1.45; }
 .ct-ex {
-  font-size: 10.5px;
-  color: var(--ink-4);
+  font-size: 11.5px;
+  color: var(--ink-3);
   letter-spacing: 0.01em;
   padding-left: 43px;
   margin-top: -2px;
@@ -3201,7 +3209,7 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 /* Inline badge on a card title — "Coming soon" (muted) / "Recommended" (accent). */
 .ct-soon {
   margin-left: 8px;
-  font-size: 9.5px; font-weight: 600;
+  font-size: 10px; font-weight: 600;
   text-transform: uppercase; letter-spacing: 0.07em;
   color: var(--ink-3);
   background: var(--hover);
@@ -3375,6 +3383,13 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
   gap: 10px;
   cursor: pointer;
   animation: cardIn 0.42s var(--ease-out) both;
+  /* Browser-native render virtualization: off-screen cards skip layout and
+     paint entirely, so a multi-thousand-card grid stops burning main-thread
+     time on every scan-poll re-render. `auto 340px` reserves an estimated
+     footprint before first render (the browser then remembers the real
+     size), keeping the scrollbar stable. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 340px;
   /* Stagger by grid index, but cap the cohort at ~16 so a 200-card library
      doesn't make the last rows wait 4s+ to appear — beyond a screenful the
      stagger is invisible anyway (those cards are below the fold). */
@@ -8711,4 +8726,153 @@ button:disabled:hover,
     min-height: 48px;
     font-size: 14px;
   }
+}
+
+
+/* ════════════════════════════════════════════════════════════════════
+   MOTION LAYER 2 — "alive by default" pass
+   ════════════════════════════════════════════════════════════════════
+   Everything below sticks to transform/opacity/filter (GPU-cheap) and is
+   neutralised by the global prefers-reduced-motion block. */
+
+/* ── Springy press on EVERY real button ── */
+button:not(:disabled) { transition: transform var(--dur-1, 120ms) var(--ease-spring, cubic-bezier(.34,1.56,.64,1)); }
+button:not(:disabled):active { transform: scale(0.965); }
+/* Cover-card internals opt out — the card itself lifts, its controls shouldn't
+   double-transform inside it. */
+.cc button:active { transform: scale(0.94); }
+
+/* ── Cover cards: living hover ── */
+.cc { transition: transform 200ms var(--ease-out, ease-out), background 150ms ease; }
+.cc:hover { transform: translateY(-4px); }
+.cc:hover .cc-cover { box-shadow: 0 18px 44px var(--scrim-60, rgba(0,0,0,.55)), 0 0 0 1px var(--surface-2, rgba(255,255,255,.08)); }
+.cc-cover { transition: box-shadow 220ms var(--ease-out, ease-out); position: relative; }
+.cc-cover img { transition: transform 320ms var(--ease-out-expo, cubic-bezier(.16,1,.3,1)); }
+.cc:hover .cc-cover img { transform: scale(1.045); }
+/* Light sweep across the poster on hover — one diagonal gradient pass. */
+.cc-cover::after {
+  content: '';
+  position: absolute; inset: 0;
+  background: linear-gradient(115deg, transparent 30%, rgba(255,255,255,0.10) 48%, transparent 62%);
+  transform: translateX(-120%);
+  pointer-events: none;
+}
+.cc:hover .cc-cover::after { animation: ccSheen 700ms var(--ease-out, ease-out) 1; }
+@keyframes ccSheen { to { transform: translateX(120%); } }
+
+/* ── Grid entrance: first rows cascade up as a page opens ── */
+.page-stage .cc { animation: kRiseSm 0.5s var(--ease-out-expo, cubic-bezier(.16,1,.3,1)) both; }
+.page-stage .cc:nth-child(1)  { animation-delay: 0.02s; }
+.page-stage .cc:nth-child(2)  { animation-delay: 0.05s; }
+.page-stage .cc:nth-child(3)  { animation-delay: 0.08s; }
+.page-stage .cc:nth-child(4)  { animation-delay: 0.11s; }
+.page-stage .cc:nth-child(5)  { animation-delay: 0.14s; }
+.page-stage .cc:nth-child(6)  { animation-delay: 0.17s; }
+.page-stage .cc:nth-child(7)  { animation-delay: 0.20s; }
+.page-stage .cc:nth-child(8)  { animation-delay: 0.23s; }
+.page-stage .cc:nth-child(9)  { animation-delay: 0.26s; }
+.page-stage .cc:nth-child(10) { animation-delay: 0.29s; }
+.page-stage .cc:nth-child(11) { animation-delay: 0.32s; }
+.page-stage .cc:nth-child(12) { animation-delay: 0.35s; }
+/* Rows past the first screen enter instantly — no 5-second tail on big grids. */
+.page-stage .cc:nth-child(n+13) { animation-delay: 0.38s; }
+
+/* ── Count badges pop when their number changes (FilterChip re-keys them) ── */
+@keyframes kNumPop { from { transform: scale(1.45); } to { transform: scale(1); } }
+.anim-pop { display: inline-block; animation: kNumPop 320ms var(--ease-spring, cubic-bezier(.34,1.56,.64,1)) both; }
+
+/* ── Empty-state hero: slow float + soft glow breathing ── */
+@keyframes kFloatY { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-7px); } }
+.lib-empty .hero { animation: kFloatY 4.5s ease-in-out infinite; }
+.lib-empty .hero svg { filter: drop-shadow(0 6px 24px var(--brand-24, rgba(99,102,241,.25))); }
+
+/* ── Shimmering gradient text (hero headings) ── */
+.text-shimmer {
+  background: linear-gradient(100deg,
+    var(--brand-a) 25%, var(--brand-b) 45%, var(--brand-a) 55%, var(--brand-b) 75%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent; color: transparent;
+  animation: textShimmer 5.5s ease-in-out infinite;
+}
+@keyframes textShimmer { 0% { background-position: 115% 0; } 100% { background-position: -115% 0; } }
+
+/* ── Dashboard cards lift on hover ── */
+.dash-lift { transition: transform 200ms var(--ease-out, ease-out), box-shadow 200ms var(--ease-out, ease-out); }
+.dash-lift:hover { transform: translateY(-3px); box-shadow: 0 14px 40px var(--scrim-40, rgba(0,0,0,.4)); }
+
+/* ════════════════════════════════════════════════════════════════════
+   ONBOARDING 2.0 — motion additions
+   ════════════════════════════════════════════════════════════════════ */
+
+/* Animated gradient progress bar with a glowing head. */
+.onb-progress .bar {
+  background: linear-gradient(90deg, var(--accent, #6366f1), #a855f7 55%, #ec4899);
+  background-size: 200% 100%;
+  animation: onbBarFlow 3s linear infinite;
+  box-shadow: 0 0 12px var(--brand-40, rgba(99,102,241,.45));
+  transition: width 600ms var(--ease-out-expo, cubic-bezier(.16,1,.3,1));
+}
+@keyframes onbBarFlow { to { background-position: -200% 0; } }
+
+/* Rail: the active step carries a sliding glow pill (motion layoutId). */
+.onb-rail .step { position: relative; }
+.onb-step-glow {
+  position: absolute; inset: -2px -6px;
+  border-radius: 10px;
+  background: var(--accent-8);
+  box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px var(--accent-line);
+  pointer-events: none;
+  z-index: 0;
+}
+.onb-rail .step > * { position: relative; z-index: 1; }
+/* Done-check pops in with a spring. */
+@keyframes kPopIn { 0% { transform: scale(0); opacity: 0; } 70% { transform: scale(1.25); } 100% { transform: scale(1); opacity: 1; } }
+.onb-rail .step.done .dot svg { animation: kPopIn 380ms var(--ease-spring, cubic-bezier(.34,1.56,.64,1)) both; }
+
+/* Welcome hero: the live rename demo card. */
+.onb-demo {
+  margin: 20px auto 0;
+  width: min(520px, 100%);
+  border-radius: 14px;
+  background: var(--surface-1, rgba(255,255,255,.04));
+  box-shadow: inset 0 0 0 1px var(--border-2, rgba(255,255,255,.08));
+  padding: 16px 18px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12.5px;
+  text-align: left;
+  overflow: hidden;
+  position: relative;
+}
+.onb-demo::before {
+  content: '';
+  position: absolute; inset: -60%;
+  background: radial-gradient(35% 40% at 20% 20%, var(--brand-16, rgba(99,102,241,.14)), transparent 70%);
+  animation: auroraDrift 12s ease-in-out infinite alternate;
+  pointer-events: none;
+}
+.onb-demo .dl { display: flex; align-items: center; gap: 8px; min-height: 21px; }
+.onb-demo .dl + .dl { margin-top: 3px; }
+.onb-demo .messy { color: var(--conf-low-bright, #f87171); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--conf-low) 55%, transparent); opacity: 0.8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.onb-demo .clean { color: var(--conf-high, #3cb371); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.onb-demo .arrow { color: var(--accent-bright); display: inline-flex; flex: none; }
+.onb-demo .arrow svg { width: 13px; height: 13px; }
+
+/* Content-type cards: lively hover + selected pulse ring. */
+.ct-card { transition: transform 180ms var(--ease-out, ease-out), box-shadow 180ms var(--ease-out, ease-out), background 150ms ease, border-color 150ms ease; }
+.ct-card:not(.soon):hover { transform: translateY(-3px); }
+.ct-card.selected { animation: ctPulse 500ms var(--ease-out, ease-out) 1; }
+@keyframes ctPulse {
+  0% { box-shadow: 0 0 0 0 var(--accent-32); }
+  100% { box-shadow: 0 0 0 10px transparent; }
+}
+.ct-check.on svg { animation: kPopIn 320ms var(--ease-spring, cubic-bezier(.34,1.56,.64,1)) both; }
+
+/* Launch button (final step): one soft, slow accent breathe — restrained
+   (guidelines §8: loops only where they earn their keep; this is the single
+   "you're done, press me" affordance of the whole wizard). */
+.onb-foot .btn-primary.launch { animation: launchGlow 3.2s ease-in-out infinite; }
+@keyframes launchGlow {
+  0%,100% { box-shadow: 0 8px 18px -8px var(--accent-50); }
+  50%     { box-shadow: 0 8px 26px -6px var(--accent-50); }
 }

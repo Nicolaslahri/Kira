@@ -80,7 +80,12 @@ def cyan(s: str) -> str: return _c("36", s)
 class Api:
     def __init__(self, base: str, timeout: float) -> None:
         self.base = base.rstrip("/")
-        self._client = httpx.Client(base_url=self.base, timeout=timeout)
+        # X-Requested-With: the server's CSRF guard rejects state-changing
+        # requests without a custom header (browser forms can't set one).
+        self._client = httpx.Client(
+            base_url=self.base, timeout=timeout,
+            headers={"X-Requested-With": "Kira-CLI"},
+        )
 
     def __enter__(self) -> "Api":
         return self

@@ -307,26 +307,40 @@ async def get_queue(cfg: RadarrConfig) -> list[RadarrQueueItem]:
     same across *arrs). `includeMovie=true` embeds each record's movie so we get
     its `tmdbId` in one round-trip. Drops records without a usable tmdb id."""
     from kira.integrations.sonarr import _normalize_status, _parse_timeleft
+    _PAGE_SIZE = 200
+    _MAX_PAGES = 25   # 5,000 records — hard stop against a broken API
+    records: list = []
     async with _client(cfg) as c:
-        try:
-            r = await c.get("api/v3/queue", params={
-                "pageSize": 200,
-                "includeMovie": "true",
-                "includeUnknownMovieItems": "false",
-            })
-        except httpx.RequestError as e:
-            raise RadarrError(f"Cannot reach Radarr at {cfg.base_url}: {e}") from e
-        if r.status_code != 200:
-            raise RadarrError(
-                f"Radarr /queue returned HTTP {r.status_code}",
-                status=r.status_code, body=r.text[:200],
-            )
-        try:
-            data = r.json()
-        except ValueError as e:
-            raise RadarrError(f"Radarr /queue returned non-JSON: {e}") from e
-        records = data.get("records") if isinstance(data, dict) else None
-        if not isinstance(records, list):
+        page = 1
+        while page <= _MAX_PAGES:
+            try:
+                r = await c.get("api/v3/queue", params={
+                    "page": page,
+                    "pageSize": _PAGE_SIZE,
+                    "includeMovie": "true",
+                    "includeUnknownMovieItems": "false",
+                })
+            except httpx.RequestError as e:
+                raise RadarrError(f"Cannot reach Radarr at {cfg.base_url}: {e}") from e
+            if r.status_code != 200:
+                raise RadarrError(
+                    f"Radarr /queue returned HTTP {r.status_code}",
+                    status=r.status_code, body=r.text[:200],
+                )
+            try:
+                data = r.json()
+            except ValueError as e:
+                raise RadarrError(f"Radarr /queue returned non-JSON: {e}") from e
+            page_records = data.get("records") if isinstance(data, dict) else None
+            if not isinstance(page_records, list) or not page_records:
+                break
+            records.extend(page_records)
+            total = data.get("totalRecords") if isinstance(data, dict) else None
+            if len(page_records) < _PAGE_SIZE or (isinstance(total, int) and len(records) >= total):
+                break
+            page += 1
+
+        if not records:
             return []
 
         items: list[RadarrQueueItem] = []

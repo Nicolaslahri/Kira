@@ -16,7 +16,7 @@ from kira.config import settings as app_settings
 from kira.database import get_session
 from kira.matcher.engine import registry_from_settings
 from kira.models import Setting
-from kira.schemas import ProviderTestResponse, SettingsBody
+from kira.schemas import ProviderTestBody, ProviderTestResponse, SettingsBody
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +148,16 @@ async def put_settings(
         if _is_secret_key(key) and _looks_like_mask(value):
             continue
         existing = await session.get(Setting, key)
+        # EXPLICIT clear sentinel: {"clear": true} deletes the stored row
+        # entirely, reverting the key to its bundled/env fallback. This is the
+        # deliberate, unambiguous way to blank a secret (a bare '' is still
+        # refused below as a likely client accident) — and the only way to get
+        # BACK to a bundled provider key after saving a bad personal one.
+        if isinstance(value, dict) and value.get("clear") is True:
+            if existing is not None:
+                await session.delete(existing)
+                n += 1
+            continue
         # Refuse to clear a CONFIGURED secret with a BLANK value. A masked field's
         # editable value is '' (the plaintext never leaves the server), so a stray
         # empty onChange/blur on the client would otherwise persist '' and the next
@@ -254,6 +264,7 @@ async def put_settings(
 @router.post("/providers/{provider}/test", response_model=ProviderTestResponse)
 async def test_provider(
     provider: Literal["tmdb", "tvdb", "anidb", "fanarttv", "opensubtitles", "subdl", "subsource", "musicbrainz", "acoustid"],
+    body: ProviderTestBody | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> ProviderTestResponse:
     """Actually call the provider with the configured credentials and report ok/error.
@@ -262,7 +273,17 @@ async def test_provider(
     fanart.tv is artwork-only (not in the matcher registry), so it's tested by
     pinging its API with the saved key. (`provider` is a free string rather than
     the matcher `ProviderKey` enum precisely so artwork-only sources fit here.)
+
+    A `body.api_key` (etc.) is the JUST-TYPED draft from the settings page — the
+    page buffers edits until Save, so without this the Test button validated the
+    STALE saved key (false pass/fail, then Save persists a broken key). Candidate
+    creds win over the stored value; an empty body tests the saved config.
     """
+    # Candidate (just-typed) credentials override the stored ones. Trimmed;
+    # an empty string means "not provided" so it falls back to storage.
+    cand_key = (body.api_key or "").strip() if body else ""
+    cand_user = (body.username or "").strip() if body else ""
+    cand_pass = (body.password or "") if body else ""
     # MusicBrainz — the music matcher's metadata source. KEYLESS, so "Test" is a
     # reachability ping (a tiny search via the matcher's own client); no creds.
     if provider == "musicbrainz":
@@ -285,11 +306,14 @@ async def test_provider(
         from kira.subtitles.errors import AuthRejected
         from kira.subtitles.prefs import load_subtitle_prefs
         prefs = await load_subtitle_prefs(session)
-        if not prefs.api_key:
+        os_key = cand_key or prefs.api_key
+        if not os_key:
             return ProviderTestResponse(ok=False, detail="No API key configured")
+        os_user = cand_user or prefs.username
+        os_pass = cand_pass or prefs.password
         t0 = time.monotonic()
         async with httpx.AsyncClient() as client:
-            osc = OpenSubtitlesClient(prefs.api_key, client)
+            osc = OpenSubtitlesClient(os_key, client)
             try:
                 cands = await osc.search(query="inception", languages=["en"])
             except AuthRejected:
@@ -300,8 +324,8 @@ async def test_provider(
             if not cands:
                 return ProviderTestResponse(ok=False, detail="Search returned nothing — check the API key")
             detail = "key OK"
-            if prefs.has_download_creds:
-                token = await osc.login(prefs.username, prefs.password)
+            if os_user and os_pass:
+                token = await osc.login(os_user, os_pass)
                 detail = "key OK · login OK" if token else "key OK · login FAILED — check username/password"
                 if not token:
                     return ProviderTestResponse(ok=False, detail=detail)
@@ -316,13 +340,14 @@ async def test_provider(
         from kira.subtitles import subdl
         from kira.subtitles.prefs import load_subtitle_prefs
         prefs = await load_subtitle_prefs(session)
-        if not prefs.subdl_api_key:
+        subdl_key = cand_key or prefs.subdl_api_key
+        if not subdl_key:
             return ProviderTestResponse(ok=False, detail="No API key configured")
         t0 = time.monotonic()
         async with httpx.AsyncClient() as client:
             r = await client.get(
                 "https://api.subdl.com/api/v1/subtitles",
-                params={"api_key": prefs.subdl_api_key, "film_name": "inception", "languages": "EN"},
+                params={"api_key": subdl_key, "film_name": "inception", "languages": "EN"},
                 headers={"Accept": "application/json"}, timeout=20.0, follow_redirects=True,
             )
         if r.status_code in (401, 403):
@@ -342,7 +367,8 @@ async def test_provider(
         from kira.subtitles import subsource
         from kira.subtitles.prefs import load_subtitle_prefs
         prefs = await load_subtitle_prefs(session)
-        if not prefs.subsource_api_key:
+        subsource_key = cand_key or prefs.subsource_api_key
+        if not subsource_key:
             return ProviderTestResponse(ok=False, detail="No API key configured")
         t0 = time.monotonic()
         try:
@@ -350,7 +376,7 @@ async def test_provider(
                 r = await client.get(
                     f"{subsource._BASE}/movies/search",
                     params={"searchType": "text", "q": "inception"},
-                    headers={"X-API-Key": prefs.subsource_api_key,
+                    headers={"X-API-Key": subsource_key,
                              "User-Agent": subsource._UA, "Accept": "application/json"},
                     timeout=20.0, follow_redirects=True,
                 )
@@ -376,9 +402,13 @@ async def test_provider(
         key = row.value if row else None
         if isinstance(key, dict):           # tolerate a {"value": …} wrapper
             key = key.get("value")
+        # candidate > saved > BUNDLED project key (same fallback the artwork
+        # pipeline uses) — a fresh install's Test used to fail "No API key
+        # configured" while artwork actually worked, contradicting the card.
+        eff_key = cand_key or (key.strip() if isinstance(key, str) else "") or fanarttv.PROJECT_KEY
         t0 = time.monotonic()
         async with httpx.AsyncClient() as client:
-            ok, detail = await fanarttv.test_key(key if isinstance(key, str) else None, client)
+            ok, detail = await fanarttv.test_key(eff_key, client)
         return ProviderTestResponse(
             ok=ok, detail=detail,
             latency_ms=int((time.monotonic() - t0) * 1000) if ok else None,
@@ -424,17 +454,29 @@ async def test_provider(
         )
 
     async with httpx.AsyncClient() as client:
-        registry = await registry_from_settings(client)
-        if not registry.has(provider):
-            return ProviderTestResponse(ok=False, detail=f"{provider} has no API key configured")
-        try:
-            p = registry.build(provider)
-        except ValueError as e:
-            return ProviderTestResponse(ok=False, detail=str(e))
-
         if provider not in ("tmdb", "tvdb", "anidb"):
             # Other providers not implemented yet.
             return ProviderTestResponse(ok=False, detail=f"{provider} test not implemented yet")
+
+        # A just-typed candidate key (tmdb/tvdb) builds a one-off provider so
+        # Test validates THAT key, not the stored one. AniDB is keyless — its
+        # candidate would be a client name/version, so it keeps the registry.
+        if cand_key and provider in ("tmdb", "tvdb"):
+            from kira.providers.base import ProviderConfig, ProviderMode
+            from kira.providers.factory import build_provider
+            cfg = ProviderConfig(mode=ProviderMode.DIRECT, api_key=cand_key)
+            try:
+                p = build_provider(provider, cfg, client)
+            except ValueError as e:
+                return ProviderTestResponse(ok=False, detail=str(e))
+        else:
+            registry = await registry_from_settings(client)
+            if not registry.has(provider):
+                return ProviderTestResponse(ok=False, detail=f"{provider} has no API key configured")
+            try:
+                p = registry.build(provider)
+            except ValueError as e:
+                return ProviderTestResponse(ok=False, detail=str(e))
 
         t0 = time.monotonic()
         try:

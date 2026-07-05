@@ -44,6 +44,11 @@ def signature(provider: str, ctx: Any) -> str:
     langs = ",".join(sorted((l or "").lower() for l in (getattr(ctx, "languages", None) or [])))
     parts = (
         provider,
+        # Per-FILE, not per-episode: hash-match results (+50 "guaranteed sync")
+        # are only guaranteed for the EXACT file they were computed against —
+        # two releases of the same episode sharing a cache slot let one
+        # release's hash-matched flag leak onto the other's subs.
+        getattr(ctx, "video_path", None) or "",
         getattr(ctx, "media_type", None) or "",
         getattr(ctx, "tmdb_id", None),
         getattr(ctx, "imdb_id", None),

@@ -44,7 +44,10 @@ export function FilterChip({ on, onClick, label, num, accent, icon, dot }: {
       <span style={on && accent ? { color: accent } : undefined}>{label}</span>
       {num != null ? (
         <span
-          className={cn('ml-0.5 min-w-[1.25rem] rounded-md px-1 py-px text-center text-[10.5px] font-semibold tabular-nums', !on && 'bg-tertiary text-tertiary')}
+          // key={num}: remount on change so the pop animation replays — the
+          // count visibly "ticks" when files resolve during a scan.
+          key={num}
+          className={cn('anim-pop ml-0.5 min-w-[1.25rem] rounded-md px-1 py-px text-center text-[10.5px] font-semibold tabular-nums', !on && 'bg-tertiary text-tertiary')}
           style={on ? { background: `color-mix(in srgb, ${c} 20%, transparent)`, color: c } : undefined}
         >{num}</span>
       ) : null}
@@ -72,6 +75,8 @@ interface Props {
    *  Approve & rename actions now go through this so the user doesn't
    *  have to click through a modal every time. */
   renameFilesDirectly?: (fileIds: string[]) => void | Promise<void>;
+  /** Switch a file to a different match candidate (POST /files/{id}/select/{matchId}). */
+  onPickCandidate?: (fileId: string, candidate: { matchId?: number; title?: string; year?: number | null }) => void | Promise<void>;
 }
 
 // A "collection gap" = the missing parts of a TMDB collection you partially own
@@ -130,7 +135,7 @@ function ghostItem(c: CollectionGap, m: CollectionGap['missing'][number], bandKe
 export function ReviewPage({
   state, openModal, focusedId, setFocusedId,
   setFileStatus, setFileStatusBulk, searchQuery, pushToast, onBulkManualMatch,
-  renameFilesDirectly,
+  renameFilesDirectly, onPickCandidate,
 }: Props) {
   // Local state for the bulk-match modal — a tiny piece of UI that lives
   // entirely in this page; doesn't go through App's modal system because
@@ -138,6 +143,9 @@ export function ReviewPage({
   const [bulkMatchSeed, setBulkMatchSeed] = useState<MediaFile | null>(null);
   const [conf, setConf] = useState<'all' | 'high' | 'mid' | 'low'>('all');
   const [type, setType] = useState<'all' | 'movie' | 'tv' | 'anime' | 'music'>('all');
+  // Sort (§10): default keeps the grid's natural grouping; the others order
+  // items inside the section layout by title, confidence, or file size.
+  const [sortBy, setSortBy] = useState<'default' | 'title' | 'confidence' | 'size'>('default');
   // `pending` = anything needing user action: matched-but-unreviewed,
   // mid-match (`matching`), AND no_match files (which the user has to
   // manually point at the right show). `no_match` filter isolates JUST
@@ -163,6 +171,20 @@ export function ReviewPage({
   // ── Apply filters to flat files first, then group into LibraryItems ────
   const visibleFiles = useMemo(() => {
     let xs = state.files;
+    // SEARCH SPANS EVERYTHING (§10 M): a query bypasses the status slice —
+    // searching for a renamed title used to return "Nothing matches" because
+    // only the Pending slice was searched. Status/conf/type chips still apply
+    // when the search box is empty.
+    const _query = searchQuery.trim().toLowerCase();
+    if (_query) {
+      return state.files.filter(f => {
+        const hay = [
+          f.filename, f.folder,
+          f.match?.title, f.match?.artist, f.match?.album, f.match?.trackTitle,
+        ].filter(Boolean).join(' ').toLowerCase();
+        return hay.includes(_query);
+      });
+    }
     if (statusF === 'pending') {
       xs = xs.filter(f => f.status === 'pending' || f.status === 'matching' || f.status === 'no_match');
     } else if (statusF !== 'all') {
@@ -203,6 +225,22 @@ export function ReviewPage({
     [visibleFiles]
   );
 
+  // Prune orphaned selection ids whenever the visible items change. Hover
+  // approve/reject, a filter switch, or a manual re-match (which mints a NEW
+  // item id) all leave `selected` holding ids no longer present — the bulk bar
+  // then reads "2 selected / Approve (0)" and silently no-ops. Dropping the
+  // dead ids keeps the count honest. No-op (returns prev) when nothing changed
+  // so it can't loop.
+  useEffect(() => {
+    const live = new Set(items.map(it => it.id));
+    setSelected(prev => {
+      let changed = false;
+      const next = new Set<string>();
+      prev.forEach(id => { if (live.has(id)) next.add(id); else changed = true; });
+      return changed ? next : prev;
+    });
+  }, [items]);
+
   // Merge collection gaps into the grid: rewrite a collection's owned films to
   // share a band key (so they shelf together) + append ghost cards for the
   // missing parts. Only collections WITH gaps reach here (the endpoint omits
@@ -233,6 +271,23 @@ export function ReviewPage({
     }
     return out;
   }, [items, collections]);
+
+  // Sorted view for the grid (§10 sort control). 'default' passes through
+  // untouched (stable grouped order). Ghost cards sink to the end for every
+  // explicit sort so real files stay in front.
+  const sortedItems: LibraryItem[] = useMemo(() => {
+    if (sortBy === 'default') return itemsWithGaps;
+    const conf = (it: LibraryItem) => Math.max(0, ...it.files.map(f => f.confidence ?? 0));
+    const size = (it: LibraryItem) => it.files.reduce((a, f) => a + (f.sizeBytes ?? 0), 0);
+    const xs = [...itemsWithGaps];
+    xs.sort((a, b) => {
+      if (!!a.ghost !== !!b.ghost) return a.ghost ? 1 : -1;
+      if (sortBy === 'title') return (a.title || '').localeCompare(b.title || '');
+      if (sortBy === 'confidence') return conf(b) - conf(a);
+      return size(b) - size(a);
+    });
+    return xs;
+  }, [itemsWithGaps, sortBy]);
 
   // One-click "Get from Radarr" for a ghost cover. Adds the movie (or searches
   // it if already in Radarr) + toasts the outcome; returns the result so the
@@ -287,7 +342,16 @@ export function ReviewPage({
     return m;
   }, [allItemsById]);
 
+  // Re-sync the popup ONLY when the underlying data (state.files →
+  // allItemsById) changes — NOT on every popup change. Depending on `popup`
+  // made this effect fire right after handleUpdateItem's OPTIMISTIC setPopup,
+  // and since allItemsById was still pre-mutation, it overwrote the optimistic
+  // item with the stale one: every per-row approve/reject visibly reverted
+  // until the PATCH landed (and invited double-clicks on a slow backend).
+  const popupRef2 = useRef(popup);
+  popupRef2.current = popup;
   useEffect(() => {
+    const popup = popupRef2.current;
     if (!popup) return;
     let fresh = allItemsById.get(popup.item.id);
     if (!fresh) {
@@ -312,7 +376,8 @@ export function ReviewPage({
     if (fresh && fresh !== popup.item) {
       setPopup(p => p ? { ...p, item: fresh as LibraryItem } : p);
     }
-  }, [allItemsById, popup, fileIdToItem]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allItemsById, fileIdToItem]);
 
   // User feedback: do NOT auto-switch tabs after a rename. The previous
   // behavior jumped to the "Renamed" filter automatically, which was
@@ -438,6 +503,32 @@ export function ReviewPage({
     return ids;
   }, [items, selected]);
 
+  // Eligibility-scoped views of the selection (audit §16 M4/M5): the raw
+  // selectedFileIds includes EVERY file of every selected card, so bulk
+  // Approve used to shove no_match files into 'approved' limbo (then fail
+  // their renames), and bulk Reject flipped already-RENAMED files to
+  // 'rejected' (losing their Renamed record though the file moved on disk).
+  const selectedApprovableIds = useMemo(() => {
+    const ids: string[] = [];
+    items.forEach(it => {
+      if (!selected.has(it.id)) return;
+      it.files.forEach(f => {
+        if (f.matchedToEpisode != null && f.status !== 'renamed' && f.status !== 'rejected') ids.push(f.id);
+      });
+    });
+    return ids;
+  }, [items, selected]);
+  const selectedRejectableIds = useMemo(() => {
+    const ids: string[] = [];
+    items.forEach(it => {
+      if (!selected.has(it.id)) return;
+      it.files.forEach(f => {
+        if (f.status !== 'renamed' && f.status !== 'rejected') ids.push(f.id);
+      });
+    });
+    return ids;
+  }, [items, selected]);
+
   // Subset of selected items that have NO match — drives the "Match all
   // to..." bulk affordance. Composite count of underlying files because
   // a single no_match card may cluster 10+ files (e.g. One Pace Season 14
@@ -466,19 +557,30 @@ export function ReviewPage({
   // approved limbo, never reaching disk, never appearing in History.
   // Now the green check does the whole thing using saved profile + op.
   const approveItem = async (item: LibraryItem) => {
-    const ids = item.files.filter(f => f.matchedToEpisode != null).map(f => f.id);
+    // Eligibility filter (§16 M4 sibling): a matched file that is ALREADY
+    // 'renamed' must not re-rename, and a 'rejected' one must not be silently
+    // un-rejected. Only pending/matched files are approvable — mirrors the
+    // bulk-bar `selectedApprovableIds` and CoverPopup's eligible filter.
+    const ids = item.files
+      .filter(f => f.matchedToEpisode != null && f.status !== 'renamed' && f.status !== 'rejected')
+      .map(f => f.id);
     if (!ids.length) return;
     await setFileStatusBulk(ids, 'approved');
     if (renameFilesDirectly) await renameFilesDirectly(ids);
   };
   const rejectItem = (item: LibraryItem) => {
-    const ids = item.files.map(f => f.id);
+    // Never flip already-RENAMED files (the move happened on disk — losing the
+    // 'renamed' record corrupts the funnel) or re-reject rejected ones.
+    const ids = item.files.filter(f => f.status !== 'renamed' && f.status !== 'rejected').map(f => f.id);
     void setFileStatusBulk(ids, 'rejected');
     // Reject was the one mutation with no success feedback — approve renames
     // (which toasts), manual match toasts, but a reject just silently greyed
     // the card. Confirm it landed.
     pushToast?.({
       title: `Rejected ${ids.length === 1 ? item.title || 'item' : `${ids.length} files`}`,
+      // Rejects aren't renames, so they never appear on the History page —
+      // point at where they actually live so they don't seem to vanish.
+      sub: 'Find it under the “Rejected” filter here in Review — undo by restoring it there.',
       kind: 'error',
     });
   };
@@ -491,7 +593,15 @@ export function ReviewPage({
       ? item.files[fileIdx]
       : [...item.files].sort((a, b) => b.confidence - a.confidence)[0];
     const file = state.files.find(f => f.id === target?.id);
-    if (file) openModal('manualSearch', file);
+    if (!file) return;
+    // Scope the eventual pick to EXACTLY what the user is looking at:
+    //  - per-file action (fileIdx set) → just that one file, so picking a show
+    //    for one wrong orphan can't clobber correctly-matched siblings;
+    //  - card-level Re-identify → the card's ACTUAL file set, so the pick
+    //    covers every file on the card (the old parsed-seriesKey expansion
+    //    could miss half a merged cluster — the cover then "didn't change").
+    const scopeIds = fileIdx != null ? [file.id] : item.files.map(f => f.id);
+    openModal('manualSearch', { ...file, _clusterFileIds: scopeIds });
   };
 
   // Popup-local handler — fires individual setFileStatus calls per changed file.
@@ -519,6 +629,69 @@ export function ReviewPage({
     const full = allItemsById.get(item.id) ?? item;
     setPopup({ item: full, rect: coverEl.getBoundingClientRect() });
   };
+
+  // ── Keyboard review flow (rebuilt on the LibraryItem focus model) ─────────
+  // Operates on the SAME items the grid renders + their `data-cardid`, so the
+  // `focused` ring lands and every action targets the focused card. Replaces
+  // the old App-level handler that keyed off raw file ids (which never matched
+  // the grid's `lib_…` ids, so j/k moved an invisible cursor and a/r/m/Enter
+  // silently died after any card click).
+  const navItemsRef = useRef<LibraryItem[]>([]);
+  navItemsRef.current = sortedItems;
+  const focusRef = useRef(focusedId);
+  focusRef.current = focusedId;
+  useEffect(() => {
+    const openFocused = () => {
+      const it = navItemsRef.current.find(i => i.id === focusRef.current);
+      if (!it) return;
+      const el = document.querySelector<HTMLElement>(`[data-cardid="${CSS.escape(it.id)}"]`);
+      if (el) handleOpenCover(it, el);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      // Ignore while typing, holding a modifier (leave ⌘/Ctrl combos to
+      // global shortcuts), or when a modal/popup is open.
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (popup) return;
+      // Walk cards in DOM order — the grid groups items into shelves/franchise
+      // bands, so the raw items-array order is NOT the visual order (j/k used
+      // to jump around the screen seemingly at random). The rendered
+      // [data-cardid] sequence IS what the user sees.
+      const byId = new Map(navItemsRef.current.map(i => [i.id, i]));
+      const list = Array.from(document.querySelectorAll<HTMLElement>('[data-cardid]'))
+        .map(el => byId.get(el.dataset.cardid ?? ''))
+        .filter((i): i is LibraryItem => !!i && !i.ghost);
+      if (list.length === 0) return;
+      const rawIdx = list.findIndex(i => i.id === focusRef.current);
+      const hasFocus = rawIdx >= 0;
+      const idx = hasFocus ? rawIdx : 0;
+      const cur = hasFocus ? list[idx] : undefined;
+      const focusAt = (n: number) => {
+        const it = list[Math.max(0, Math.min(list.length - 1, n))];
+        if (!it) return;
+        setFocusedId(it.id);
+        document.querySelector<HTMLElement>(`[data-cardid="${CSS.escape(it.id)}"]`)
+          ?.scrollIntoView({ block: 'nearest' });
+      };
+      switch (e.key) {
+        // First nav press with nothing focused yet → land on the first card.
+        case 'j': case 'ArrowDown': e.preventDefault(); focusAt(hasFocus ? idx + 1 : 0); break;
+        case 'k': case 'ArrowUp': e.preventDefault(); focusAt(hasFocus ? idx - 1 : 0); break;
+        case 'a': if (cur && !cur.ghost) { e.preventDefault(); void approveItem(cur); } break;
+        case 'r': if (cur && !cur.ghost) { e.preventDefault(); rejectItem(cur); } break;
+        case 'm': if (cur && !cur.ghost) { e.preventDefault(); manualSearchItem(cur); } break;
+        case 'x': if (cur && !cur.ghost) {
+          e.preventDefault();
+          setSelected(prev => { const s = new Set(prev); s.has(cur.id) ? s.delete(cur.id) : s.add(cur.id); return s; });
+        } break;
+        case 'Enter': case ' ': e.preventDefault(); openFocused(); break;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [popup]);
 
   // ── Scan progress relayed from AppState for the floating banner ───────
   const scanRunning = state.scanRunning;
@@ -643,6 +816,15 @@ export function ReviewPage({
             <FilterChip on={type === 'anime'} onClick={() => setType('anime')} label="Anime" num={counts.anime} accent="var(--media-anime)" icon={<IcAnime />} />
             <FilterChip on={type === 'music'} onClick={() => setType('music')} label="Music" num={counts.music} accent="var(--media-music)" icon={<IcMusic />} />
           </div>
+
+          <span aria-hidden className="hidden h-5 w-px bg-white/10 sm:block" />
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="mr-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Sort</span>
+            <FilterChip on={sortBy === 'default'} onClick={() => setSortBy('default')} label="Default" />
+            <FilterChip on={sortBy === 'title'} onClick={() => setSortBy('title')} label="A–Z" />
+            <FilterChip on={sortBy === 'confidence'} onClick={() => setSortBy('confidence')} label="Confidence" />
+            <FilterChip on={sortBy === 'size'} onClick={() => setSortBy('size')} label="Size" />
+          </div>
         </div>
       </div>
       )}
@@ -667,8 +849,9 @@ export function ReviewPage({
               size="sm"
               iconLeading={IcX}
               onClick={() => {
-                const n = selectedFileIds.length;
-                void setFileStatusBulk(selectedFileIds, 'rejected');
+                const n = selectedRejectableIds.length;
+                if (!n) return;
+                void setFileStatusBulk(selectedRejectableIds, 'rejected');
                 setSelected(new Set());
                 pushToast?.({ title: `Rejected ${n} file${n === 1 ? '' : 's'}`, kind: 'error' });
               }}
@@ -701,7 +884,7 @@ export function ReviewPage({
                 // Approve + rename in one shot using saved profile + op. On the
                 // Approved tab the approve is a no-op (already approved), so this
                 // is effectively just "rename" — hence the label below.
-                const ids = selectedFileIds;
+                const ids = selectedApprovableIds;
                 if (!ids.length) return;
                 setRenaming(true);
                 try {
@@ -712,13 +895,14 @@ export function ReviewPage({
                   setRenaming(false);
                 }
               }}
-            >{statusF === 'approved' ? 'Rename' : 'Approve & rename'} ({selectedFileIds.length})</Button>
+            >{statusF === 'approved' ? 'Rename' : 'Approve & rename'} ({selectedApprovableIds.length})</Button>
           </div>
         </div>
       ) : null}
 
       <LibraryGrid
-        items={itemsWithGaps}
+          defaultView={statusF === 'pending' && conf === 'all' && type === 'all' && !searchQuery.trim()}
+        items={sortedItems}
         onGetMovie={handleGetMovie}
         selected={selected}
         setSelected={setSelected}
@@ -751,6 +935,7 @@ export function ReviewPage({
           onManualSearch={manualSearchItem}
           pushToast={pushToast}
           renameFilesDirectly={renameFilesDirectly}
+          onPickCandidate={onPickCandidate}
         />
       ) : null}
 

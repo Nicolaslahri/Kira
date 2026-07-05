@@ -1,12 +1,14 @@
 """Cascade runner — evaluates every metric, aggregates into a CascadeTrace.
 
-Tier aggregation rule (user-locked):
-    final_score = max(tier_1_max, weighted_avg(tier_2_max, tier_3_max))
+Tier aggregation rule:
+    final_score = max(tier_1_max, tier_2_max boosted by tier-3 corroboration)
 
 Tier-1 always wins when ANY tier-1 metric fires (because tier-1 lands in
-[0.85, 1.00] and tier-2 caps below 0.85). Tier-2 and tier-3 contribute a
-weighted average that can never overshadow a tier-1 hit but DO produce a
-useful confidence when no tier-1 metric fired.
+[0.85, 1.00] and tier-2 caps below 0.85). Without tier-1, the score is the
+best tier-2 similarity, BOOSTED (never diluted) toward the tier-2 band top by
+tier-3 corroboration — scaled by both signals' within-band strength so weak
+similarity can't ride corroboration up, and the result still can't beat a
+tier-1 hit.
 
 Veto handling: a metric returning raw=-1.0 vetoes the candidate
 (final_score forced to 0.0). Used by FribbAidFilterMetric to drop
@@ -39,6 +41,10 @@ _funnel_log = logging.getLogger("kira.matcher.funnel")
 # both effectively "fired identically" (e.g. two AIDs that both score
 # 1.0 substring + 1.0 folder identity).
 _AMBIGUITY_EPSILON = 0.01
+
+# Fraction of the tier-2 headroom that corroboration can add (scaled by both
+# within-band confidences — see the aggregation comment in score_one).
+_CORROBORATION_BOOST = 0.5
 
 # Only ambiguity at the tier-1 ceiling matters for the matcher's
 # "should I auto-commit this?" decision. A tier-2 tie just means two
@@ -158,16 +164,34 @@ class Cascade:
         tier_1_max = max((r.score for r in tier_1_results), default=0.0)
         tier_1_dom = max(tier_1_results, key=lambda r: r.score, default=None)
 
-        # Tier 2/3: weighted average (tier-2 weighs 0.7, tier-3 weighs 0.3).
-        # Each tier contributes its MAX score, not sum, so multiple
-        # similarity metrics don't double-count overlapping signals.
+        # Tier 2/3 aggregation. Each tier contributes its MAX score, not sum,
+        # so multiple similarity metrics don't double-count overlapping signals.
         tier_2_max = max((r.score for r in tier_2_results), default=0.0)
         tier_3_max = max((r.score for r in tier_3_results), default=0.0)
         if tier_2_max > 0 and tier_3_max > 0:
-            # Both fired: blend (tier-2 0.7, tier-3 0.3). Weights chosen so a
-            # perfect tier-2 + perfect tier-3 land exactly at the top of
-            # tier-2's band (≈0.85), preserving "tier-2 can't beat tier-1".
-            weighted = 0.7 * tier_2_max + 0.3 * tier_3_max
+            # Corroboration BOOSTS similarity toward (never past) the top of
+            # tier-2's band — it must not dilute it. The old 0.7/0.3 weighted
+            # average CAPPED the no-tier-1 score at 0.745 (its own comment
+            # claimed ≈0.85): because RankMetric fires for every candidate,
+            # tier-3 was ALWAYS present, so tier-2 was always dragged down and
+            # anime (MIN_CONFIDENCE_ANIME = 0.80) could NEVER match on
+            # similarity alone — a one-typo romaji title was a guaranteed
+            # no_match even at trigram 0.95.
+            #
+            # New rule: the boost consumes a fraction of the headroom to the
+            # band top, scaled by BOTH within-band confidences — strong
+            # similarity with strong corroboration gains the most; weak
+            # similarity gains little (junk can't ride corroboration up).
+            # Perfect tier-2 + perfect tier-3 now lands exactly at the top of
+            # the tier-2 band, preserving "tier-2 can't beat tier-1".
+            # Calibration: trigram 0.73 ("One Pace" vs "One Piece") + rank-0
+            # → 0.789, still under the 0.80 anime floor; trigram 0.80 + full
+            # corroboration → 0.808, correctly over it.
+            t2_lo, t2_hi = TIER_BANDS[MetricTier.SIMILARITY]
+            t3_lo, t3_hi = TIER_BANDS[MetricTier.CORROBORATION]
+            t2_conf = max(0.0, min(1.0, (tier_2_max - t2_lo) / (t2_hi - t2_lo)))
+            t3_conf = max(0.0, min(1.0, (tier_3_max - t3_lo) / (t3_hi - t3_lo)))
+            weighted = tier_2_max + _CORROBORATION_BOOST * t2_conf * t3_conf * (t2_hi - tier_2_max)
         elif tier_2_max > 0:
             weighted = tier_2_max
         elif tier_3_max > 0:

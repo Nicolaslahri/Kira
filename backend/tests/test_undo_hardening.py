@@ -291,7 +291,9 @@ async def test_trash_on_undo_moves_nfo_to_trash_dir(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_hard_delete_when_trash_off(tmp_path, monkeypatch):
-    # Default (no rename.cleanup_trash) → asset is hard-unlinked, no trash dir.
+    # rename.cleanup_trash EXPLICITLY off → asset is hard-unlinked, no trash
+    # dir. (The default flipped to ON in the audit — recoverable-by-default —
+    # so hard delete is now the opt-in this test sets explicitly.)
     sm = await _fresh_db(tmp_path, monkeypatch)
     import kira.xattr_store as xs
     monkeypatch.setattr(xs, "supported", lambda p: False)
@@ -304,6 +306,7 @@ async def test_hard_delete_when_trash_off(tmp_path, monkeypatch):
     _touch(nfo)
     async with sm() as s:
         s.add(Setting(key="paths.library_root", value=str(root)))
+        s.add(Setting(key="rename.cleanup_trash", value=False))
         s.add(RenameHistory(id=1, old_path=str(old), new_path=str(new),
                             operation="move", created_assets=[str(nfo)]))
         await s.commit()

@@ -8,6 +8,19 @@ import path from 'path'
 // `@` resolves to ./src so Untitled UI components' `@/...` imports work.
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  build: {
+    rollupOptions: {
+      output: {
+        // Split the two heavyweight vendor libs into their own cacheable
+        // chunks — the app code changes every release, recharts/motion don't;
+        // one monolithic bundle forced a full re-download each deploy.
+        manualChunks(id: string) {
+          if (id.includes('node_modules/recharts') || id.includes('node_modules/d3-')) return 'charts';
+          if (id.includes('node_modules/motion') || id.includes('node_modules/framer-motion')) return 'motion';
+        },
+      },
+    },
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),

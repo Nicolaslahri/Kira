@@ -76,7 +76,8 @@ _anidb_log = logging.getLogger("kira.anidb")
 # franchise via live AniDB calls → a library-wide re-match trips AniDB's
 # rate-limit ban → the walk falls back to per-season ids → season grouping
 # silently breaks until it heals. Persisting it under /config prevents that.
-_CACHE_DIR = Path(os.environ.get("KIRA_CACHE_DIR") or (Path(__file__).resolve().parents[2] / ".cache"))
+from kira.config import cache_dir as _kira_cache_dir
+_CACHE_DIR = _kira_cache_dir()
 _TITLES_PATH = _CACHE_DIR / "anidb-titles.xml.gz"
 _TITLES_URL = "https://anidb.net/api/anime-titles.xml.gz"
 _TITLE_MAX_AGE_SEC = 24 * 3600  # AniDB regenerates daily; refresh same cadence.
@@ -842,9 +843,28 @@ class AniDBProvider(MetadataProvider):
     # the AID + local episode it belongs to. Built by walking the relations
     # chain (cached) then fetching each member's episode count (cached).
     _FRANCHISE_OFFSETS_PATH: ClassVar[Path] = _CACHE_DIR / "anidb-franchise-offsets.json"
-    # Maps canonical_aid (str) → list of [aid, abs_start, abs_end] tuples.
-    _franchise_offsets_cache: ClassVar[dict[str, list[list[int]]] | None] = None
+    # Maps canonical_aid (str) → {"ts": epoch, "v": [[aid, abs_start, abs_end], …]}.
+    # (Legacy entries are a bare list with no timestamp — treated as expired so
+    # they refetch once and upgrade to the timestamped form.)
+    _franchise_offsets_cache: ClassVar[dict | None] = None
     _franchise_offsets_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+    # A franchise's offsets can go STALE while it's still airing (a cour cached
+    # mid-run understates its episode count, shifting every later cour). Expire
+    # entries so an airing show self-corrects instead of misrouting until the
+    # cache file is hand-deleted. 14 days: well under a cour, cheap to refresh.
+    _FRANCHISE_OFFSETS_TTL: ClassVar[float] = 14 * 24 * 3600
+
+    @classmethod
+    def _franchise_entry_fresh(cls, entry) -> bool:
+        """True when a cache entry is the timestamped form AND within the TTL.
+        Legacy bare-list entries (no timestamp) return False → refetch once."""
+        if not isinstance(entry, dict):
+            return False
+        ts = entry.get("ts")
+        if not isinstance(ts, (int, float)):
+            return False
+        import time
+        return (time.time() - ts) < cls._FRANCHISE_OFFSETS_TTL
 
     @classmethod
     def _load_franchise_offsets(cls) -> dict[str, list[list[int]]]:
@@ -899,8 +919,9 @@ class AniDBProvider(MetadataProvider):
         canonical = min(chain)
         cache = self._load_franchise_offsets()
         cached = cache.get(str(canonical))
-        if cached:
-            return [(int(a), int(s), int(e)) for a, s, e in cached]
+        if cached and self._franchise_entry_fresh(cached):
+            offsets = cached["v"] if isinstance(cached, dict) else cached
+            return [(int(a), int(s), int(e)) for a, s, e in offsets]
 
         # Fetch counts for every member. Members already in the episode-
         # count cache are free; cold members each cost ~4s.
@@ -992,8 +1013,9 @@ class AniDBProvider(MetadataProvider):
             offsets.append((member, cursor, cursor + n - 1))
             cursor += n
 
+        import time
         async with AniDBProvider._franchise_offsets_lock:
-            cache[str(canonical)] = [[a, s, e] for a, s, e in offsets]
+            cache[str(canonical)] = {"ts": time.time(), "v": [[a, s, e] for a, s, e in offsets]}
             await asyncio.to_thread(self._save_franchise_offsets)
         return offsets
 

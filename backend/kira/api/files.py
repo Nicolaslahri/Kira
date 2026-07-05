@@ -144,10 +144,26 @@ async def reconcile_files(session: AsyncSession = Depends(get_session)) -> dict:
         except OSError:
             return False  # permission / NAS blip → keep (never hide a real file)
 
+    # Stat CONCURRENTLY (bounded) — the old one-at-a-time `to_thread` loop was
+    # 10k sequential SMB round-trips on every Review mount: 20-100s of request
+    # runtime holding a session. 24-wide keeps the NAS comfortable while
+    # collapsing wall-clock ~20×. DB writes stay strictly on this coroutine
+    # (the AsyncSession is not concurrency-safe).
+    sem = asyncio.Semaphore(24)
+
+    async def _check(fid: int, fp: str) -> int | None:
+        if not fp:
+            return None
+        async with sem:
+            return fid if await asyncio.to_thread(_gone, fp) else None
+
+    gone_ids = [
+        fid for fid in await asyncio.gather(*(_check(fid, fp) for fid, fp in rows))
+        if fid is not None
+    ]
+
     removed: list[int] = []
-    for fid, fp in rows:
-        if not fp or not await asyncio.to_thread(_gone, fp):
-            continue
+    for fid in gone_ids:
         mf = await session.get(MediaFile, fid)
         if mf is None:
             continue

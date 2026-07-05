@@ -76,12 +76,17 @@ class TrigramMetric:
                 best = sim
                 best_text = h
 
-        # Sub-floor trigrams contribute nothing.
-        if best < 0.3:
+        # Sub-floor trigrams contribute nothing. 0.45 (was 0.30): the tier-2
+        # band floor is 0.50, so ANY firing trigram lands ≥ 0.50 — and with
+        # rank-0 corroboration a 0.30-similar junk candidate cleared the 0.55
+        # movie/TV auto-commit floor whenever the real title was absent from
+        # the provider. 0.45 keeps genuinely-similar titles (typos, word-order
+        # shuffles score well above it) while junk abstains entirely.
+        if best < 0.45:
             return MetricResult(
                 metric=self.name, tier=self.tier,
                 raw=0.0, score=0.0,
-                reason=f"best trigram {best:.2f} < 0.3",
+                reason=f"best trigram {best:.2f} < 0.45",
             )
 
         return MetricResult(
