@@ -34,7 +34,21 @@ export function FfmpegStatusRow({ compact = false, framed = false }: { compact?:
     return () => { window.removeEventListener('kira:ffmpeg-changed', refresh); if (timer) clearTimeout(timer); };
   }, []);
 
+  // While an install runs, poll for the live progress label ("downloading
+  // 12 / 90 MB"). The row is the ONLY visible surface during onboarding —
+  // the activity pill it used to point at sits behind the wizard overlay.
+  const installing = !!status?.installing;
+  useEffect(() => {
+    if (!installing) return;
+    const t = window.setInterval(refresh, 1500);
+    return () => clearInterval(t);
+  }, [installing]);
+
   if (!status) return null;   // framed too — no empty card shell while loading
+
+  // "Installing ffmpeg · downloading 12 / 90 MB" → the row already says
+  // "ffmpeg" on the left, so show just the part after the "·".
+  const progressText = status.progress?.split('·').pop()?.trim() || 'Installing…';
 
   const install = async () => {
     if (requesting) return;
@@ -66,7 +80,8 @@ export function FfmpegStatusRow({ compact = false, framed = false }: { compact?:
         </span>
       ) : status.installing ? (
         <span className="inline-flex items-center gap-1.5 text-[12px] text-ink-muted">
-          Installing… <span className="text-ink-soft">(see activity)</span>
+          <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-[var(--accent)]" aria-hidden />
+          {progressText}
         </span>
       ) : status.installable ? (
         <Button color="secondary" size="sm" iconLeading={IcDownload} isLoading={requesting} onClick={() => void install()}>

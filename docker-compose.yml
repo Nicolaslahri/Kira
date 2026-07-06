@@ -2,9 +2,11 @@
 #   docker compose up -d   →   http://localhost:8000
 services:
   kira:
-    build: .
-    # Once a published image exists, swap `build: .` for:
-    #   image: ghcr.io/nicolaslahri/kira:latest
+    # Prebuilt multi-arch image (amd64+arm64), published by GitHub Actions on
+    # every push to main — the 1 GB NAS pulls instead of compiling Vite + Rust
+    # wheels on-box. To build locally instead, comment `image:` and uncomment:
+    #   build: .
+    image: ghcr.io/nicolaslahri/kira:latest
     container_name: kira
     ports:
       - "8445:8000"

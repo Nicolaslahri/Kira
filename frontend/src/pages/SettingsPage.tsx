@@ -7,6 +7,7 @@ import { ProviderCard, ProviderLogo, NamingTemplateTabs, SETTINGS_NESTED, SETTIN
 import { Button } from '../components/base/buttons/button';
 import { FeaturedIcon } from '../components/base/featured-icons/featured-icon';
 import { FpcalcStatusRow } from '../components/FpcalcStatus';
+import { DatasetStatusBlock } from '../components/DatasetStatus';
 import { BadgeWithDot } from '../components/base/badges/badges';
 import { Toggle } from '../components/base/toggle/toggle';
 import { Input } from '../components/base/input/input';
@@ -867,6 +868,13 @@ export function SettingsPage({ pushToast, section, setSection, onDirtyChange }: 
                 bannedUntil={providers['anidb']?.banned_until}
                 fallbackChain={providers['anidb']?.fallback_chain ?? ['tvdb', 'tmdb']}
               />
+
+              {/* Local anime datasets — the offline half of anime matching:
+                  the AniDB title dump + manami episode-count index. Shows age,
+                  refresh cadence and live MB progress while a refresh runs. */}
+              <div className="rounded-xl bg-secondary px-3.5 py-2.5 ring-1 ring-inset ring-secondary shadow-xs">
+                <DatasetStatusBlock />
+              </div>
 
               {MUSIC_PROVIDERS_ENABLED && (<>
               <ProviderCard

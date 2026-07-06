@@ -210,6 +210,44 @@ async def list_files(
     return files
 
 
+@router.get("/delta")
+async def list_files_delta(
+    since: str = Query(..., description="ISO timestamp from a previous response's `now`"),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Incremental follow-up to GET /files for mid-scan refreshes: rows whose
+    `updated_at` moved past `since`, plus the full current id set (so the
+    client can drop deletions). The FULL fetch stays the source of truth for
+    initial hydrate + scan completion; this keeps the 10s-poll cheap on
+    libraries where shipping every row each tick was megabytes."""
+    from datetime import datetime as _dt
+    try:
+        cutoff = _dt.fromisoformat(since.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        raise HTTPException(400, "`since` must be an ISO timestamp.")
+    now = _dt.utcnow()
+
+    changed = list(await session.scalars(
+        select(MediaFile)
+        .options(selectinload(MediaFile.matches))
+        .where(MediaFile.updated_at.is_not(None), MediaFile.updated_at > cutoff)
+        .order_by(MediaFile.created_at.desc())
+        .limit(5000)
+    ))
+    from kira.subtitles.coverage import missing_languages
+    from kira.subtitles.prefs import load_subtitle_prefs
+    prefs = await load_subtitle_prefs(session)
+    for f in changed:
+        f.matches.sort(key=lambda m: m.confidence, reverse=True)
+        f.missing_subs = missing_languages(f.parsed_data, prefs.languages_for(f.media_type))
+    ids = [r[0] for r in (await session.execute(select(MediaFile.id))).all()]
+    return {
+        "now": now.isoformat(),
+        "changed": [MediaFileOut.model_validate(f).model_dump(mode="json") for f in changed],
+        "ids": ids,
+    }
+
+
 @router.patch("/{file_id}", response_model=MediaFileOut)
 async def update_file(
     file_id: int,

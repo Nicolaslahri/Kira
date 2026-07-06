@@ -1,11 +1,13 @@
 import { memo, useState, useEffect, useRef, useCallback, type CSSProperties, type ReactNode } from 'react';
 import type { LibraryItem, LibEpisode, LibFile } from '../../lib/types';
 import { api } from '../../lib/api';
-import { IcCheck, IcX, IcSearch, IcAlertTri, IcDownload, Ic4K, Ic1080, IcCaption } from '../../lib/icons';
+import { IcCheck, IcX, IcSearch, IcAlertTri, IcDownload, IcCaption } from '../../lib/icons';
 import { ButtonGroup, ButtonGroupItem } from '../base/button-group/button-group';
 import { cn } from '../../lib/utils';
 import { confTier } from '../LibraryGrid';
 import { audioLangChip, subLangChip, missingSubChip, inferQuality, inferSource } from './quality';
+import { TechBadges } from '../TechBadge';
+import { CandidateList } from './CandidateList';
 import { detectFromFilename, formatEta, formatBytes, statusLabel, formatUpcomingAirDate } from './format';
 import { MarqueeText } from './MarqueeText';
 import { ForceImportConfirmModal } from './ForceImportModal';
@@ -122,6 +124,10 @@ interface RowCellProps {
   /** First-paint stagger index — drives the CSS entrance delay. Only the
    *  first ~24 rows stagger; the rest mount flat (cheap). */
   staggerIndex?: number;
+  /** Switch this row's file to a different match candidate — same handler the
+   *  movie body's CandidateList uses (POST /files/{id}/select/{matchId}).
+   *  Present ⇒ episodes with 2+ candidates grow an "N matches" expander. */
+  onPickCandidate?: (fileId: string, candidate: { matchId?: number; title?: string; year?: number | null }) => void | Promise<void>;
 }
 
 // Row-level memoization. Equality checks the row-identifying + row-mutable
@@ -216,8 +222,12 @@ function badgeContent(
 
 function PairRowCellImpl({
   row, item, updateFile, onManualSearch, onOpenDupeModal,
-  queueEntry, justImported, pushToast, onRequestEpisode, staggerIndex,
+  queueEntry, justImported, pushToast, onRequestEpisode, staggerIndex, onPickCandidate,
 }: RowCellProps) {
+  // Per-episode alternatives expander (audit §10 / M1 follow-through): movies
+  // got one-click candidate switching; episodes now get the same, inline.
+  const [altsOpen, setAltsOpen] = useState(false);
+
   const { episode: ep, file } = row;
   const fileIdx = file ? item.files.indexOf(file) : -1;
   const isAlbum = item.kind === 'album';
@@ -397,22 +407,31 @@ function PairRowCellImpl({
           </MarqueeText>
           <div className="flex flex-wrap items-center gap-1">
             {f.size ? <RowTag>{f.size}</RowTag> : null}
-            {(() => {
-              const q = inferQuality(f);
-              if (!q) return null;
-              if (q === '2160p') return <Ic4K className="h-[17px] w-auto shrink-0" aria-label="4K" />;
-              if (q === '1080p') return <Ic1080 className="h-[17px] w-auto shrink-0" aria-label="1080p" />;
-              return <RowTag>{q}</RowTag>;
-            })()}
+            {/* Tech specs — one unified Apple-TV-style white badge rail
+                (4K · DOLBY VISION · HEVC · DOLBY ATMOS · 7.1). Replaces the
+                old mix of gold 4K art + amber HDR chip + grey codec chips. */}
+            <TechBadges file={{ ...f, quality: inferQuality(f) ?? f.quality }} />
             {(() => { const s = inferSource(f); return s ? <RowTag>{s}</RowTag> : null; })()}
-            {f.codec ? <RowTag>{f.codec}</RowTag> : null}
-            {f.hdr ? <RowTag className="bg-[var(--conf-mid-12)] text-[var(--conf-mid)] ring-[var(--conf-mid-32)]">{f.hdr}</RowTag> : null}
-            {f.channels ? <RowTag>{f.channels}</RowTag> : null}
-            {f.audio?.[0] ? <RowTag>{f.audio[0]}</RowTag> : null}
             {(() => { const a = audioLangChip(f); return a ? <RowTag className="text-[var(--accent)] ring-[var(--accent-line)]">{a}</RowTag> : null; })()}
             {(() => { const s = subLangChip(f); return s ? <RowTag><IcCaption className="mr-1 inline-block size-3 align-[-1px]" />{s.replace(/^SUB /, '')}</RowTag> : null; })()}
             <MissingSubAction file={f} />
             {f.releaseGroup ? <RowTag className="font-mono text-quaternary" title={f.releaseGroup}>[{f.releaseGroup}]</RowTag> : null}
+            {onPickCandidate && f.candidates && f.candidates.length > 1 ? (
+              <button
+                type="button"
+                onClick={() => setAltsOpen(v => !v)}
+                aria-expanded={altsOpen}
+                title="This episode matched more than one candidate — click to compare and switch"
+                className="inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-[var(--accent-8)] px-1.5 py-[3px] text-[10.5px] font-medium leading-none text-[var(--accent-bright)] ring-1 ring-inset ring-[var(--accent-line)] transition-colors hover:bg-[var(--accent-12)]"
+              >
+                {f.candidates.length} matches {altsOpen ? '▴' : '▾'}
+              </button>
+            ) : null}
+            {altsOpen && onPickCandidate ? (
+              <div className="w-full pt-1">
+                <CandidateList file={f} onPick={onPickCandidate} />
+              </div>
+            ) : null}
             {row.kind === 'dupe-primary' && row.dupeAll && row.dupeAll.length > 1 ? (
               <button
                 onClick={(ev) => {

@@ -81,6 +81,18 @@ _CACHE_DIR = _kira_cache_dir()
 _TITLES_PATH = _CACHE_DIR / "anidb-titles.xml.gz"
 _TITLES_URL = "https://anidb.net/api/anime-titles.xml.gz"
 _TITLE_MAX_AGE_SEC = 24 * 3600  # AniDB regenerates daily; refresh same cadence.
+# Activity-job name for the dump download — read by GET /system/datasets so
+# the UI can show live progress while a scan refreshes the index.
+TITLES_JOB = "anidb-titles-refresh"
+
+
+def titles_dump_status() -> dict:
+    """On-disk state of the AniDB title dump, for GET /system/datasets."""
+    try:
+        st = _TITLES_PATH.stat()
+        return {"exists": True, "size_bytes": st.st_size, "updated_at": st.st_mtime}
+    except OSError:
+        return {"exists": False, "size_bytes": None, "updated_at": None}
 
 # AniDB docs say 1 req / 2s, but real-world experience says network jitter
 # makes a 2-second client-side gap insufficient: two requests sent 2s apart
@@ -91,6 +103,15 @@ _TITLE_MAX_AGE_SEC = 24 * 3600  # AniDB regenerates daily; refresh same cadence.
 # the cross-process disk timestamp (see _http_api), so this floor is
 # enforced both within a process and across uvicorn workers.
 _API_DELAY_SEC = 5.0
+
+# Per-AID anime XML disk cache (audit: anime matching "painfully slow").
+# Every OTHER AniDB payload (episode counts, relations, franchise offsets,
+# pictures) persists to disk — but the raw anime XML they all derive from
+# only lived in a 6h in-memory TTLCache, so each process restart or later
+# scan re-paid one 5-second throttle slot per anime series. 24h TTL keeps
+# airing shows at most a day stale (auto-heal refreshes titles later) while
+# making repeat scans near-instant for anime.
+_XML_CACHE_TTL_SEC = 24 * 3600
 
 # Circuit-breaker thresholds. If we see >= N AniDB-side errors (5xx, 4xx
 # 'banned', client-version rejections) within ERROR_WINDOW seconds, the
@@ -249,18 +270,38 @@ class AniDBProvider(MetadataProvider):
         return (time.time() - _TITLES_PATH.stat().st_mtime) < _TITLE_MAX_AGE_SEC
 
     async def _download_titles(self) -> None:
+        from kira import activity
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         # AniDB blocks default Python user-agents with 403 — must identify as
         # a real client. The dump host also throttles aggressively, so one
-        # attempt with a generous timeout.
-        r = await self.client.get(
-            _TITLES_URL,
-            headers={"User-Agent": _USER_AGENT, "Accept-Encoding": "gzip"},
-            timeout=60.0,
-            follow_redirects=True,
-        )
-        r.raise_for_status()
-        _TITLES_PATH.write_bytes(r.content)
+        # attempt with a generous timeout. Streamed so the activity job (and
+        # the /system/datasets card) can narrate MB-by-MB progress.
+        activity.begin(TITLES_JOB, "Updating AniDB title index · downloading")
+        try:
+            buf = bytearray()
+            async with self.client.stream(
+                "GET", _TITLES_URL,
+                headers={"User-Agent": _USER_AGENT, "Accept-Encoding": "gzip"},
+                timeout=60.0,
+                follow_redirects=True,
+            ) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length") or 0) or None
+                async for chunk in r.aiter_bytes(1 << 16):
+                    buf.extend(chunk)
+                    if total:
+                        activity.set_label(
+                            TITLES_JOB,
+                            f"Updating AniDB title index · {len(buf) >> 20} / {total >> 20} MB",
+                        )
+            # Write only a COMPLETE download — a partial dump at this path
+            # would parse as a truncated index and poison title search until
+            # the next refresh.
+            _TITLES_PATH.write_bytes(bytes(buf))
+            activity.end(TITLES_JOB, ok=True, detail="AniDB title index refreshed")
+        except Exception:
+            activity.end(TITLES_JOB, ok=False, detail="AniDB title index download failed — keeping the previous copy")
+            raise
 
     def _parse_titles(self) -> None:
         """Decompress + walk the XML, building two structures:
@@ -625,15 +666,26 @@ class AniDBProvider(MetadataProvider):
         if cls._ep_count_cache is not None:
             return cls._ep_count_cache
         import json
+        live: dict[int, int] = {}
         if cls._EP_COUNT_CACHE_PATH.exists():
             try:
                 raw = json.loads(cls._EP_COUNT_CACHE_PATH.read_text())
                 # JSON keys come back as strings — coerce to int.
-                cls._ep_count_cache = {int(k): int(v) for k, v in raw.items()}
+                live = {int(k): int(v) for k, v in raw.items()}
             except Exception:
-                cls._ep_count_cache = {}
-        else:
-            cls._ep_count_cache = {}
+                live = {}
+        # Offline base layer (anime-offline-database, FINISHED shows only) —
+        # prefills counts for ~14.5k AIDs so cour routing / franchise offsets /
+        # the count-sanity metric skip the 5s-throttled live fetch on FIRST
+        # encounter. Live write-through values override (fresher, and they
+        # cover airing shows the offline index deliberately excludes).
+        try:
+            from kira.providers.anime_offline_db import load_index
+            merged = dict(load_index())
+            merged.update(live)
+            cls._ep_count_cache = merged
+        except Exception:
+            cls._ep_count_cache = live
         return cls._ep_count_cache
 
     @classmethod
@@ -1440,6 +1492,41 @@ class AniDBProvider(MetadataProvider):
         except Exception:
             pass
 
+    @classmethod
+    def _xml_cache_path(cls, aid: str) -> "Path":
+        d = _CACHE_DIR / "anidb-xml"
+        # AIDs are numeric; guard anyway so a weird value can't traverse.
+        safe = "".join(ch for ch in str(aid) if ch.isdigit()) or "0"
+        return d / f"{safe}.xml"
+
+    @classmethod
+    def _read_xml_cache(cls, aid: str) -> Element | None:
+        """Fresh (<24h) cached anime XML for `aid`, parsed — or None. Sync;
+        call via to_thread."""
+        try:
+            p = cls._xml_cache_path(aid)
+            if not p.is_file():
+                return None
+            if (time.time() - p.stat().st_mtime) > _XML_CACHE_TTL_SEC:
+                return None
+            return ET.fromstring(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None   # unreadable/corrupt → treat as a miss
+
+    @classmethod
+    def _write_xml_cache(cls, aid: str, body: str) -> None:
+        """Persist a successful anime XML response (atomic tmp+replace). Sync;
+        call via to_thread. Best-effort — a failed write just means the next
+        call pays the throttle again."""
+        try:
+            p = cls._xml_cache_path(aid)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".xml.tmp")
+            tmp.write_text(body, encoding="utf-8")
+            os.replace(tmp, p)
+        except Exception:
+            pass
+
     async def _http_api(self, aid: str) -> Element | None:
         """Throttled call to AniDB's HTTP API. 1 request per 4 seconds,
         enforced **across uvicorn workers** via a disk-backed wall-clock
@@ -1455,6 +1542,12 @@ class AniDBProvider(MetadataProvider):
           5. Fire the request, write the new timestamp BEFORE releasing
              the lock so the next worker's read sees a fresh value.
         """
+        # Disk cache FIRST — before ban/circuit/throttle checks, so a cached
+        # AID costs zero sleep and even a banned period can serve known shows.
+        cached_root = await asyncio.to_thread(AniDBProvider._read_xml_cache, aid)
+        if cached_root is not None:
+            return cached_root
+
         if AniDBProvider._client_rejected:
             return None
         if AniDBProvider.is_banned():
@@ -1635,6 +1728,9 @@ class AniDBProvider(MetadataProvider):
                     err_msg = f"api_error_{code}"
                     return None
                 outcome = "ok"
+                # Write-through so the NEXT scan / restart skips the throttle
+                # for this AID entirely. Best-effort, off-loop.
+                await asyncio.to_thread(AniDBProvider._write_xml_cache, aid, body)
                 return root
             finally:
                 # PB-1: emit one structured event per HTTP call. Single

@@ -8,6 +8,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
+from sqlalchemy import func as _sql_func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kira.api.match_cleanup import detach_and_delete_matches
@@ -1689,7 +1690,7 @@ async def _heal_title_mismatch_matches(session: AsyncSession) -> int:
         await session.execute(
             sql_update(MediaFile)
             .where(MediaFile.id == mf.id)
-            .values(status="no_match")
+            .values(status="no_match", updated_at=_sql_func.now())
         )
         nuked += 1
     return nuked
@@ -1973,7 +1974,7 @@ async def _recompute_series_keys(session: AsyncSession) -> int:
             await session.execute(
                 sql_update(MediaFile)
                 .where(MediaFile.id == mf_id)
-                .values(series_key=new_key)
+                .values(series_key=new_key, updated_at=_sql_func.now())
             )
             fixed += 1
     return fixed

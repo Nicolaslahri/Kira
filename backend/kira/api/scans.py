@@ -14,6 +14,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import delete, or_, select
+from sqlalchemy import func as _sql_func
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -2042,13 +2043,20 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
     #     and clusters touch disjoint file ids so there are no row conflicts.
     # Progress (Scan.matched_count / current_path) is written ONLY here on the
     # phase session, per completed cluster.
-    _serial_lane: list[tuple[str | int, list[int]]] = []
+    # Anime and music are BOTH rate-limited (AniDB ~1 req/5s, MusicBrainz
+    # ~1 req/s) so each stays internally serial — but their limits are
+    # independent providers, so the two lanes run CONCURRENTLY instead of
+    # music stacking behind every AniDB sleep (and vice versa).
+    _anidb_lane: list[tuple[str | int, list[int]]] = []
+    _music_lane: list[tuple[str | int, list[int]]] = []
     _parallel_lane: list[tuple[str | int, list[int]]] = []
     for bucket_key, cfids in clusters.items():
         _first = await session.get(MediaFile, cfids[0])
         _mt = _first.media_type if _first is not None else None
-        (_serial_lane if _mt in ("anime", "music") else _parallel_lane).append(
-            (bucket_key, cfids))
+        lane = (_anidb_lane if _mt == "anime"
+                else _music_lane if _mt == "music"
+                else _parallel_lane)
+        lane.append((bucket_key, cfids))
 
     async def _bump_progress(rep_path: str | None) -> None:
         await _touch_db_scan_lock()   # keep the >6h-stale lock claim fresh mid-scan
@@ -2106,19 +2114,60 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
         # this phase/worker refetches fresh rows.
         session.expire_all()
 
-    for bucket_key, cfids in _serial_lane:
-        # Liveness pre-write: an AniDB cluster can take tens of seconds; show
-        # WHICH cluster is resolving before dispatching it (PB-jank fix kept).
-        _pre = await session.get(MediaFile, cfids[0])
-        if _pre is not None and _pre.file_path:
-            await _bump_progress(_pre.file_path)
-        _n, _rep = await _process_match_cluster(
-            session, engine, bucket_key, cfids,
-            overridden=overridden, music_enabled=music_enabled,
-            auto_enabled=auto_enabled, auto_th=auto_th,
-        )
-        matched += _n
-        await _bump_progress(_rep)
+    # Music lane: its own worker session (the phase session is busy in the
+    # anime loop below and AsyncSession is not concurrency-safe). Serial
+    # internally; failures isolate per-cluster like the parallel lane.
+    async def _run_music_lane() -> int:
+        if not _music_lane:
+            return 0
+        from kira.database import SessionLocal
+        _lane_matched = 0
+        async with SessionLocal() as s3:
+            for bkey, bfids in _music_lane:
+                try:
+                    _n, _ = await _process_match_cluster(
+                        s3, engine, bkey, bfids,
+                        overridden=overridden, music_enabled=music_enabled,
+                        auto_enabled=auto_enabled, auto_th=auto_th,
+                    )
+                    _lane_matched += _n
+                except Exception as e:
+                    logger.warning(f"_match_phase: music cluster {bkey!r} failed (isolated): {e!r}")
+                    try:
+                        await s3.rollback()
+                        for _fid in bfids:
+                            _mf3 = await s3.get(MediaFile, _fid)
+                            if _mf3 is not None and _mf3.status == "matching":
+                                _mf3.status = "no_match"
+                        await s3.commit()
+                    except Exception:
+                        pass
+        return _lane_matched
+
+    _music_task = asyncio.create_task(_run_music_lane()) if _music_lane else None
+    try:
+        for bucket_key, cfids in _anidb_lane:
+            # Liveness pre-write: an AniDB cluster can take tens of seconds; show
+            # WHICH cluster is resolving before dispatching it (PB-jank fix kept).
+            _pre = await session.get(MediaFile, cfids[0])
+            if _pre is not None and _pre.file_path:
+                await _bump_progress(_pre.file_path)
+            _n, _rep = await _process_match_cluster(
+                session, engine, bucket_key, cfids,
+                overridden=overridden, music_enabled=music_enabled,
+                auto_enabled=auto_enabled, auto_th=auto_th,
+            )
+            matched += _n
+            await _bump_progress(_rep)
+        if _music_task is not None:
+            matched += await _music_task
+            # The music worker session committed rows this session may hold
+            # stale copies of.
+            session.expire_all()
+            await _bump_progress(None)
+    finally:
+        if _music_task is not None and not _music_task.done():
+            _music_task.cancel()
     return matched
 
 
@@ -3150,7 +3199,7 @@ async def reconcile_orphaned_scans() -> tuple[int, int]:
         file_res = await sess.execute(
             sql_update(MediaFile)
             .where(or_(MediaFile.status == "matching", MediaFile.status == "parsing"))
-            .values(status="discovered")
+            .values(status="discovered", updated_at=_sql_func.now())
         )
         n_files = file_res.rowcount or 0
         if n_files:
@@ -3227,7 +3276,7 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
                                 sa_update(MediaFile)
                                 .where(or_(MediaFile.status == "matching",
                                            MediaFile.status == "parsing"))
-                                .values(status="discovered")
+                                .values(status="discovered", updated_at=_sql_func.now())
                             )
                             await _cx_sess.commit()
                         break
@@ -3281,7 +3330,7 @@ async def _scan_worker_locked(scan_id: int, root_paths: list[str] | str) -> None
                         sa_update(MediaFile)
                         .where(or_(MediaFile.status == "matching",
                                    MediaFile.status == "parsing"))
-                        .values(status="discovered")
+                        .values(status="discovered", updated_at=_sql_func.now())
                     )
                     await cleanup.commit()
                 logger.exception(f"_scan_worker_locked: scan {scan_id} failed — marked failed")

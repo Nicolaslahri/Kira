@@ -17,6 +17,8 @@ export function AdvancedSection({
   saveKey: SaveKeyFn;
   pushToast: PushToast;
 }) {
+  // Hidden file input for "Import backup…" — clicked programmatically.
+  const backupFileRef = useRef<HTMLInputElement>(null);
   // Retention round-trip: settings stores `0` for "forever" (no upper
   // bound) and N for "N days". The select uses the string 'forever' for
   // the unbounded option. Map 0 → 'forever' on read so the select
@@ -312,6 +314,71 @@ export function AdvancedSection({
       </SectionCard>
       </div>
       </div>
+
+      {/* ── Backup & schedule ── */}
+      <SectionCard
+        tone="default"
+        icon={<IcRefresh />}
+        title="Backup &amp; schedule"
+        desc="Export your whole configuration to a file (includes API keys — store it safely), restore it on any Kira, and let Kira rescan the library on a nightly clock."
+      >
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button color="secondary" size="sm" onClick={() => {
+              void api.downloadSettingsBackup().catch(e =>
+                pushToast({ title: 'Backup failed', sub: (e as Error).message, kind: 'error' }));
+            }}>Export settings…</Button>
+            <Button color="secondary" size="sm" onClick={() => backupFileRef.current?.click()}>Import backup…</Button>
+            <input
+              ref={backupFileRef}
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              onChange={e => {
+                const f = e.target.files?.[0];
+                e.target.value = '';
+                if (!f) return;
+                void (async () => {
+                  try {
+                    const parsed = JSON.parse(await f.text());
+                    const r = await api.restoreSettingsBackup(parsed);
+                    pushToast({ title: 'Backup restored', sub: `${r.restored} settings applied — reloading…`, kind: 'success' });
+                    setTimeout(() => window.location.reload(), 900);
+                  } catch (err) {
+                    pushToast({ title: 'Restore failed', sub: (err as Error).message, kind: 'error' });
+                  }
+                })();
+              }}
+            />
+            <span className="text-[12px] text-tertiary">The export contains your provider keys in plaintext.</span>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 border-t border-secondary pt-3">
+            <div className="min-w-0">
+              <div className="text-[13.5px] font-medium text-primary">Scheduled rescan</div>
+              <div className="mt-0.5 text-[12.5px] text-tertiary">Run a full library scan every night at the set time — catches deletions and metadata refreshes the folder watcher can't.</div>
+            </div>
+            <div className="flex shrink-0 items-center gap-2.5">
+              <Input
+                wrapperClassName="w-[76px]"
+                mono
+                value={strSetting(rawSettings, 'scanning.scheduled_time') || '04:00'}
+                placeholder="04:00"
+                aria-label="Scheduled rescan time (HH:MM)"
+                onChange={e => {
+                  const v = e.target.value.trim();
+                  if (/^([01]?\d|2[0-3]):[0-5]\d$/.test(v) || v === '') saveKey('scanning.scheduled_time')(v || '04:00');
+                }}
+              />
+              <Toggle
+                isSelected={rawSettings['scanning.scheduled'] === true}
+                onChange={() => saveKey('scanning.scheduled')(!(rawSettings['scanning.scheduled'] === true))}
+                aria-label="Enable scheduled nightly rescan"
+              />
+            </div>
+          </div>
+        </div>
+      </SectionCard>
 
       {/* Danger zone — visually quarantined: its own labelled group + the
           red-tinted SectionCard tone. */}

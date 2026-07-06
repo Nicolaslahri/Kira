@@ -2060,6 +2060,65 @@ svg { width: 1em; height: 1em; flex-shrink: 0; }
 .onb-checkrow input { margin-top: 2px; accent-color: var(--accent); }
 .onb-checkrow .sub { display: block; font-size: 12.5px; color: var(--ink-3); margin-top: 2px; }
 
+/* Nightly-rescan time picker (Folder step, shown when scheduled is on) */
+.onb-schedtime {
+  display: flex; align-items: center; gap: 10px;
+  margin: 2px 0 0 26px;                    /* aligns under the checkbox label */
+  font-size: 13px; color: var(--ink-2);
+}
+.onb-schedtime .sub { font-size: 12.5px; color: var(--ink-3); }
+
+/* Subtitles step — compact language chips */
+.onb-langs-lbl {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.14em; color: var(--ink-3);
+  margin-bottom: 8px;
+}
+.onb-langs { display: flex; flex-wrap: wrap; gap: 8px; }
+.onb-lang {
+  display: inline-flex; align-items: center; gap: 5px;
+  height: 30px; padding: 0 12px; border-radius: 999px;
+  font-size: 12.5px; font-weight: 550; font-family: inherit;
+  color: var(--ink-2); background: var(--glass);
+  border: 1px solid var(--line);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+.onb-lang svg { width: 12px; height: 12px; }
+.onb-lang:hover { color: var(--ink-1); }
+.onb-lang.on {
+  color: var(--ink-1);
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+
+/* Integrations step — one compact row per service */
+.onb-svcs { display: flex; flex-direction: column; gap: 10px; }
+.onb-svc {
+  background: var(--glass);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.onb-svc .head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.onb-svc .nm { font-size: 13px; font-weight: 650; color: var(--ink-1); }
+.onb-svc .pill {
+  font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--accent); background: var(--accent-8);
+  padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+}
+.onb-svc .desc {
+  font-size: 12px; color: var(--ink-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.onb-svc .fields { display: flex; gap: 8px; }
+.onb-svc .fields .input { flex: 1; min-width: 0; font-size: 12.5px; padding: 7px 10px; }
+@media (max-width: 720px) {
+  .onb-svc .fields { flex-direction: column; }
+  .onb-svc .desc { white-space: normal; }
+}
+
 /* Naming profile step */
 .onb-naming {
   display: grid; grid-template-columns: 1fr 1fr;
@@ -8875,4 +8934,26 @@ button:not(:disabled):active { transform: scale(0.965); }
 @keyframes launchGlow {
   0%,100% { box-shadow: 0 8px 18px -8px var(--accent-50); }
   50%     { box-shadow: 0 8px 26px -6px var(--accent-50); }
+}
+
+
+/* ── Apple-TV-style tech-spec badges ─────────────────────────────────
+   Thin white-bordered rounded rectangles, white wordmark text, uniform
+   height — the treatment Apple TV uses for 4K / DOLBY VISION / DOLBY
+   ATMOS on detail pages. Transparent fill so they sit on any surface. */
+.tech-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 17px;
+  padding: 0 6px;
+  border-radius: 4px;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.42);
+  color: rgba(255,255,255,0.92);
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  line-height: 1;
+  white-space: nowrap;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
 }

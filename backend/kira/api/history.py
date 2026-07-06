@@ -867,10 +867,41 @@ async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)
         # Docker container restarts mid-copy. `asyncio.to_thread`
         # punts the blocking work to a worker thread; the event loop
         # stays responsive for poll / health / other-tab requests.
+        # Write-ahead intent (§19 M): journal the undo BEFORE moving bytes.
+        # `operation="undo:<op>"` — boot reconcile recognises the prefix and,
+        # when it finds the move-back completed but uncommitted (old_path
+        # occupied, new_path gone), marks THIS history row undone instead of
+        # inventing a new rename record.
+        _undo_intent = None
+        try:
+            from kira.models import RenameIntent
+            _undo_intent = RenameIntent(
+                media_file_id=entry.media_file_id,
+                src=entry.new_path, dst=entry.old_path,
+                operation=f"undo:{entry.operation}",
+            )
+            session.add(_undo_intent)
+            await session.commit()
+        except Exception:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            _undo_intent = None
         await asyncio.to_thread(
             undo_op, op, Path(entry.old_path), Path(entry.new_path),
         )
     except Exception as e:
+        # Move-back never happened — retire the journal entry.
+        if _undo_intent is not None:
+            try:
+                await session.delete(_undo_intent)
+                await session.commit()
+            except Exception:
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
         raise HTTPException(500, f"Undo failed: {e}") from e
     # Sync the database to match what just happened on disk. Must run
     # AFTER the physical undo succeeded — if `undo_op` raised, the file
@@ -889,6 +920,12 @@ async def undo_entry(entry_id: int, session: AsyncSession = Depends(get_session)
         pass
 
     entry.undone_at = _utcnow_naive()
+    # Retire the write-ahead undo intent in the SAME commit as undone_at.
+    if _undo_intent is not None:
+        try:
+            await session.delete(_undo_intent)
+        except Exception:
+            pass
     # Tier 1.2: cascade to sidecar children. Subtitle / sub files that
     # rode along with the video at rename time also ride back at undo
     # time — otherwise the user ends up with subs at the new location

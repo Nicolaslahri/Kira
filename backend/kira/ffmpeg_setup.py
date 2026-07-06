@@ -87,12 +87,22 @@ def ffmpeg_status() -> dict:
         "source": source,
         "installable": key in _DOWNLOADS,
         "installing": _install_running(),
+        # Live install-job label ("Installing ffmpeg · downloading 12 / 90 MB")
+        # so the status row can show real progress inline — the activity pill
+        # is invisible during onboarding (the wizard overlays it).
+        "progress": _install_label(),
     }
 
 
 def _install_running() -> bool:
     snap = activity.snapshot()
     return any(j["name"] == FFMPEG_INSTALL_JOB and j["active"] for j in snap["jobs"])
+
+
+def _install_label() -> str | None:
+    snap = activity.snapshot()
+    return next((j["label"] for j in snap["jobs"]
+                 if j["name"] == FFMPEG_INSTALL_JOB and j["active"]), None)
 
 
 async def install_ffmpeg() -> dict:

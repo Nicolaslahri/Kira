@@ -85,12 +85,21 @@ def fpcalc_status() -> dict:
         "source": source,
         "installable": key in _DOWNLOADS,
         "installing": _install_running(),
+        # Live install-job label for inline progress on the status row (same
+        # contract as ffmpeg_status — the activity pill isn't always visible).
+        "progress": _install_label(),
     }
 
 
 def _install_running() -> bool:
     snap = activity.snapshot()
     return any(j["name"] == FPCALC_INSTALL_JOB and j["active"] for j in snap["jobs"])
+
+
+def _install_label() -> str | None:
+    snap = activity.snapshot()
+    return next((j["label"] for j in snap["jobs"]
+                 if j["name"] == FPCALC_INSTALL_JOB and j["active"]), None)
 
 
 async def install_fpcalc() -> dict:
@@ -117,11 +126,17 @@ async def install_fpcalc() -> dict:
         with open(archive, "wb") as out:
             async with client.stream("GET", url, follow_redirects=True, timeout=60.0) as r:
                 r.raise_for_status()
+                total = int(r.headers.get("content-length") or 0) or None
                 async for chunk in r.aiter_bytes(1 << 16):
                     received += len(chunk)
                     if received > _MAX_ARCHIVE_BYTES:
                         raise RuntimeError("download exceeded the size cap")
                     out.write(chunk)
+                    if total:
+                        activity.set_label(
+                            FPCALC_INSTALL_JOB,
+                            f"Installing fpcalc · downloading {received >> 20} / {total >> 20} MB",
+                        )
 
         activity.set_label(FPCALC_INSTALL_JOB, "Installing fpcalc · unpacking")
         await asyncio.to_thread(_extract_binary, archive)

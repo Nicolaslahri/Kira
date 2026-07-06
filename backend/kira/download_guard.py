@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:  # httpx only needed for the type hint; keep the module light
     import httpx
@@ -28,6 +28,7 @@ async def fetch_capped(
     guard: bool = True,
     follow_redirects: bool = False,
     revalidate_redirects: bool = False,
+    on_progress: Callable[[int, int | None], None] | None = None,
 ) -> tuple[bytes, str] | None:
     """GET `url`, STREAMING the body and aborting the moment it exceeds
     `max_bytes`, and (by default) validating the URL through the SSRF guard
@@ -43,7 +44,12 @@ async def fetch_capped(
     `follow_redirects` is opt-in for providers whose download endpoint legitimately
     302s to a file host (SubSource, some CDNs). The INITIAL host is still SSRF-
     validated; following the provider's own redirect chain is an accepted
-    tradeoff for those (same fail-open posture as the rest of the outbound guard)."""
+    tradeoff for those (same fail-open posture as the rest of the outbound guard).
+
+    `on_progress(received_bytes, total_bytes_or_None)` fires per chunk — used by
+    large dataset downloads (anime-offline-database) to narrate MB progress to
+    the activity pill. Exceptions from the callback are treated as a failed
+    fetch (same never-raises contract)."""
     import time as _time
     from kira.url_guard import is_safe_outbound_url
 
@@ -92,12 +98,15 @@ async def fetch_capped(
                     _log.info("fetch_capped: %s → HTTP %s (not 200)", current, resp.status_code)
                     return None
                 ct = resp.headers.get("content-type", "")
+                total = int(resp.headers.get("content-length") or 0) or None
                 buf = bytearray()
                 async for chunk in resp.aiter_bytes():
                     buf += chunk
                     if len(buf) > max_bytes:
                         _log.info("fetch_capped: %s exceeded %d bytes — rejected", current, max_bytes)
                         return None  # over cap → reject (unbounded-download guard)
+                    if on_progress is not None:
+                        on_progress(len(buf), total)
                 return bytes(buf), ct
         except Exception as e:
             _log.info("fetch_capped: %s failed: %r", current, e)

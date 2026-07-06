@@ -2,6 +2,7 @@ import { useState, useEffect, type ReactNode } from 'react';
 import type { LibraryItem, LibEpisode, LibFile } from '../../lib/types';
 import { IcX, IcTrash, IcAlertTri } from '../../lib/icons';
 import { inferQuality, inferSource, audioLangChip, subLangChip } from './quality';
+import { TechBadges } from '../TechBadge';
 import { Chip } from './format';
 
 // ─────────────────────────────────────────────────────────────────────
@@ -245,12 +246,9 @@ function DupeFileCard({ file, isKept, suggested, onKeep, onDelete }: DupeFileCar
           {file.folder}
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-          {(() => { const q = inferQuality(file); return q ? <Chip>{q}</Chip> : null; })()}
+          {/* Same unified Apple-TV white badge rail as the popup rows. */}
+          <TechBadges file={{ ...file, quality: inferQuality(file) ?? file.quality }} />
           {(() => { const s = inferSource(file); return s ? <Chip>{s}</Chip> : null; })()}
-          {file.codec ? <Chip>{file.codec}</Chip> : null}
-          {file.hdr ? <Chip>{file.hdr}</Chip> : null}
-          {file.channels ? <Chip>{file.channels}</Chip> : null}
-          {file.audio?.[0] ? <Chip>{file.audio[0]}</Chip> : null}
           {(() => { const a = audioLangChip(file); return a ? <Chip>{a}</Chip> : null; })()}
           {(() => { const s = subLangChip(file); return s ? <Chip>{s}</Chip> : null; })()}
           {file.releaseGroup ? <Chip accent>[{file.releaseGroup}]</Chip> : null}

@@ -40,6 +40,12 @@ class MediaFile(Base):
     scan_id: Mapped[int | None] = mapped_column(ForeignKey("scans.id"), nullable=True)
     file_path: Mapped[str] = mapped_column(String, unique=True)
     file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Change stamp for the /files/delta endpoint: bumped by every ORM update
+    # (onupdate) and explicitly by the bulk-UPDATE sites (which bypass ORM
+    # events). NULL on legacy rows — they simply never appear in a delta,
+    # which is fine because full loads cover the initial hydrate.
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, server_default=func.now(), onupdate=func.now())
     media_type: Mapped[str | None] = mapped_column(String, nullable=True)  # movie|tv|anime|music
     # Statuses: discovered | parsed | matching | matched | approved | rejected | renamed
     status: Mapped[str] = mapped_column(String, default="discovered")

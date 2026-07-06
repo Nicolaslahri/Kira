@@ -11,6 +11,7 @@ import {
 } from '../lib/icons';
 import { cn } from '../lib/utils';
 import { getConfBands } from '../lib/confBands';
+import { buildLibraryItems } from '../lib/adapters';
 import { Button } from '../components/base/buttons/button';
 import { FeaturedIcon } from '../components/base/featured-icons/featured-icon';
 import { MetricCard } from '../components/base/metrics/metric-card';
@@ -294,6 +295,110 @@ function SubtitleCoverageCard({ setActive }: { setActive: (p: 'dashboard' | 'rev
 }
 
 export function DashboardPage({ state, openModal, runScan, runReparse, setActive, scanRoot: SCAN_ROOT }: Props) {
+  // Hardlink savings (fetched once per mount + after files change).
+  const [hardlinkSaved, setHardlinkSaved] = useState<{ files: number; bytes_saved: number } | null>(null);
+  useEffect(() => {
+    const load = () => { void api.hardlinkSavings().then(setHardlinkSaved).catch(() => {}); };
+    load();
+    window.addEventListener('kira:files-changed', load);
+    return () => window.removeEventListener('kira:files-changed', load);
+  }, []);
+
+  // ── Duplicates (same logic as the Review page's Duplicates lens) ─────
+  // Groups where 2+ files landed on the same episode slot / movie, plus the
+  // bytes you'd reclaim keeping only the largest file of each group.
+  const dupes = useMemo(() => {
+    let groups = 0, wasted = 0;
+    const wastedOf = (files: { sizeBytes?: number }[]) => {
+      const sizes = files.map(f => f.sizeBytes ?? 0).sort((a, b) => b - a);
+      return sizes.slice(1).reduce((a, b) => a + b, 0);
+    };
+    for (const it of buildLibraryItems(state.files)) {
+      if (it.ghost || it.files.length < 2) continue;
+      if (it.kind === 'movie') {
+        groups++;
+        wasted += wastedOf(it.files);
+        continue;
+      }
+      const perSlot = new Map<number, typeof it.files>();
+      for (const f of it.files) {
+        if (f.matchedToEpisode == null) continue;
+        let slot = perSlot.get(f.matchedToEpisode);
+        if (!slot) { slot = []; perSlot.set(f.matchedToEpisode, slot); }
+        slot.push(f);
+      }
+      let hit = false;
+      for (const files of perSlot.values()) {
+        if (files.length < 2) continue;
+        hit = true;
+        wasted += wastedOf(files);
+      }
+      if (hit) groups++;
+    }
+    return { groups, wasted };
+  }, [state.files]);
+
+  // ── Automation status (which hands-off features are actually armed) ──
+  const [automation, setAutomation] = useState<{
+    watch: boolean; scheduled: boolean; schedTime: string;
+    autoApprove: boolean; subsAuto: boolean; webhook: boolean;
+  } | null>(null);
+  useEffect(() => {
+    void api.getSettings().then(st => {
+      const b = (v: unknown): boolean =>
+        v === true || (typeof v === 'object' && v !== null && (v as { value?: unknown }).value === true);
+      const wc = st['watch.config'] as { auto_scan?: unknown } | undefined;
+      const time = st['scanning.scheduled_time'];
+      setAutomation({
+        watch: !!wc && wc.auto_scan === true,
+        scheduled: b(st['scanning.scheduled']),
+        schedTime: typeof time === 'string' && /^\d{2}:\d{2}$/.test(time) ? time : '03:00',
+        autoApprove: b(st['matching.auto_approve']),
+        subsAuto: b(st['subtitles.auto_fetch']),
+        webhook: (() => {
+          const v = st['integrations.webhook.token'];
+          return (typeof v === 'object' && v !== null && (v as { set?: boolean }).set === true)
+            || (typeof v === 'string' && v.length > 0);
+        })(),
+      });
+    }).catch(() => {});
+  }, []);
+
+  // ── Library quality insights (the tech-tag payoff) ──────────────────
+  // Resolution mix, HDR share, codec split, and the "worth re-downloading"
+  // list — all derived from the MediaInfo tags scans already collect.
+  const quality = useMemo(() => {
+    const files = state.files.filter(f => f.mediaType !== 'music');
+    const tier = (q?: string) => {
+      const v = (q || '').toLowerCase();
+      if (v.includes('2160') || v.includes('4k')) return '4K';
+      if (v.includes('1080')) return 'HD';
+      if (v.includes('720')) return '720p';
+      if (v.includes('480') || v.includes('576')) return 'SD';
+      return null;
+    };
+    const mix = { '4K': 0, HD: 0, '720p': 0, SD: 0 } as Record<string, number>;
+    let tagged = 0, hdr = 0;
+    const codecs = new Map<string, number>();
+    const weak: { title: string; q: string }[] = [];
+    const seen = new Set<string>();
+    for (const f of files) {
+      const t = tier(f.quality);
+      if (!t) continue;
+      tagged++;
+      mix[t]++;
+      if (f.hdr) hdr++;
+      const c = (f.codec || '').toUpperCase();
+      if (c) codecs.set(c, (codecs.get(c) ?? 0) + 1);
+      if ((t === '720p' || t === 'SD') && f.match?.title && !seen.has(f.match.title)) {
+        seen.add(f.match.title);
+        weak.push({ title: f.match.title, q: t });
+      }
+    }
+    const topCodecs = [...codecs.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+    return { tagged, mix, hdr, topCodecs, weak: weak.slice(0, 5), weakTotal: seen.size };
+  }, [state.files]);
+
   void openModal; void SCAN_ROOT;
   // Re-parse scope menu (whole library vs one media type). Per-album reparse lives
   // in the cover popup; this is the bulk "just music / anime / …" entry point.
@@ -474,10 +579,16 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
   return (
     <div className="page relative">
       {/* ── Hero band ───────────────────────────────────────────── */}
-      <section className={cn('dash-hero anim-rise relative z-10 mb-5 overflow-hidden rounded-3xl border border-secondary p-7 sm:p-8', scanning && 'dash-hero-live')}>
-        <PosterFan urls={posterUrls} />
-        {/* readability scrim over the poster fan */}
-        <div className="dash-hero-scrim pointer-events-none absolute inset-0" />
+      {/* NOTE: no overflow-hidden on the section — it was clipping the
+          Re-parse dropdown (the menu lives inside this stacking context).
+          The decorative layers that DO need clipping (poster fan + scrim)
+          are wrapped in their own clipped, rounded inset layer instead. */}
+      <section className={cn('dash-hero anim-rise relative z-10 mb-5 rounded-3xl border border-secondary p-7 sm:p-8', scanning && 'dash-hero-live')}>
+        <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-3xl">
+          <PosterFan urls={posterUrls} />
+          {/* readability scrim over the poster fan */}
+          <div className="dash-hero-scrim absolute inset-0" />
+        </div>
 
         <div className="relative z-10 flex flex-wrap items-end justify-between gap-x-6 gap-y-5">
           <div className="min-w-0 max-w-xl">
@@ -487,6 +598,15 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
             <h1 className="dash-hero-title bg-gradient-to-br from-white via-white to-white/45 bg-clip-text text-[40px] font-bold leading-[1.04] tracking-[-0.03em] text-transparent sm:text-[46px]">
               Welcome back
             </h1>
+            {/* Hardlink bragging rights — how much disk the link strategy is
+                saving right now (each hardlinked file would otherwise exist
+                twice). Hidden until at least one hardlink exists. */}
+            {hardlinkSaved && hardlinkSaved.bytes_saved > 0 ? (
+              <div className="mt-1.5 flex items-center gap-1.5 text-[12.5px] text-tertiary">
+                <IcLink className="size-3.5 text-[var(--accent-bright)]" />
+                <span><b className="font-semibold text-secondary">{formatBytes(hardlinkSaved.bytes_saved)}</b> saved by hardlinks across {hardlinkSaved.files.toLocaleString()} files</span>
+              </div>
+            ) : null}
 
             {scanning ? (
               <div className="mt-4 max-w-md">
@@ -625,6 +745,50 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
       {/* ── Main region: left stack + full-height activity ─────── */}
       <div className="relative z-10 mt-4 grid grid-cols-1 gap-4 xl:grid-cols-3">
         <div className="flex flex-col gap-4 xl:col-span-2">
+          {/* Library quality — resolution mix bar + HDR share + upgrade list.
+              Monochrome ramp (brighter = better) per the design language;
+              hidden until MediaInfo has tagged at least a few files. */}
+          {quality.tagged >= 3 ? (
+            <Card
+              title="Library quality"
+              icon={<FeaturedIcon size="sm" color="gray" icon={<IcFilm />} />}
+              action={quality.weakTotal > 0 ? <span className="text-[11.5px] text-tertiary">{quality.weakTotal} title{quality.weakTotal === 1 ? '' : 's'} below 1080p</span> : undefined}
+            >
+              <div className="flex flex-col gap-3.5">
+                {/* Mix bar — one segment per resolution tier present. */}
+                <div className="flex h-2 gap-px overflow-hidden rounded-full" role="img" aria-label="Resolution mix">
+                  {([['4K', 'rgba(255,255,255,0.92)'], ['HD', 'rgba(255,255,255,0.55)'], ['720p', 'rgba(255,255,255,0.28)'], ['SD', 'var(--conf-low)']] as const).map(([k, color]) => (
+                    quality.mix[k] > 0 ? (
+                      <span key={k} title={`${k}: ${quality.mix[k]}`} style={{ flex: quality.mix[k], background: color }} />
+                    ) : null
+                  ))}
+                </div>
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[12.5px] text-tertiary">
+                  {(['4K', 'HD', '720p', 'SD'] as const).map(k => quality.mix[k] > 0 ? (
+                    <span key={k} className="tabular-nums"><b className="font-semibold text-secondary">{Math.round((quality.mix[k] / quality.tagged) * 100)}%</b> {k}</span>
+                  ) : null)}
+                  <span className="tabular-nums"><b className="font-semibold text-secondary">{Math.round((quality.hdr / quality.tagged) * 100)}%</b> HDR</span>
+                  {quality.topCodecs.map(([c, n]) => (
+                    <span key={c} className="tabular-nums text-quaternary">{c} ×{n}</span>
+                  ))}
+                </div>
+                {quality.weak.length > 0 ? (
+                  <div className="border-t border-secondary pt-3">
+                    <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Upgrade candidates</div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {quality.weak.map(w => (
+                        <span key={w.title} className="inline-flex items-center gap-1.5 rounded-md bg-tertiary px-2 py-1 text-[12px] text-secondary ring-1 ring-inset ring-secondary">
+                          {w.title}
+                          <span className="tech-badge">{w.q}</span>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </Card>
+          ) : null}
+
           {/* Match quality — ring + confidence buckets */}
           <Card
             title="Match quality"
@@ -736,6 +900,26 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
                       </div>
                     ))}
                   </div>
+                  {dupes.groups > 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        try { sessionStorage.setItem('kira.review.dupes', '1'); } catch { /* */ }
+                        setActive('review');
+                      }}
+                      className="group -mx-1 flex items-center justify-between gap-2 rounded-lg px-1 py-1 text-left text-[12px] transition-colors hover:bg-white/[0.04]"
+                      title="Open the Review page with the Duplicates filter on"
+                    >
+                      <span className="inline-flex items-center gap-1.5 text-secondary">
+                        <IcAlertTri className="size-3.5 text-[var(--conf-mid)]" />
+                        {dupes.groups} duplicate group{dupes.groups === 1 ? '' : 's'}
+                      </span>
+                      <span className="inline-flex items-center gap-1 font-mono tabular-nums text-tertiary">
+                        {dupes.wasted > 0 ? <>{formatBytes(dupes.wasted)} reclaimable</> : 'review'}
+                        <IcArrowRight className="size-3 opacity-0 transition-opacity group-hover:opacity-100" />
+                      </span>
+                    </button>
+                  ) : null}
                 </div>
               ) : (
                 <div className="flex h-full flex-col items-center justify-center gap-1 py-4 text-center">
@@ -744,6 +928,37 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
                 </div>
               )}
             </Card>
+
+            {/* Automation — which hands-off features are actually armed. The
+                settings exist whether or not anyone turned them on; this makes
+                a silently-off watcher/schedule visible at a glance. */}
+            {automation ? (
+              <Card
+                title="Automation"
+                icon={<FeaturedIcon size="sm" tint="#8b95ff" icon={<IcRefresh />} />}
+                action={<CardLink label="Configure" onClick={() => setActive('settings')} />}
+              >
+                <div className="flex flex-col gap-3">
+                  {[
+                    { label: 'Watch folders', note: 'scan when new files appear', on: automation.watch, detail: null as string | null },
+                    { label: 'Nightly rescan', note: 'full sweep for files the watcher missed', on: automation.scheduled, detail: automation.scheduled ? automation.schedTime : null },
+                    { label: 'Auto-approve', note: 'confident matches skip Review', on: automation.autoApprove, detail: null },
+                    { label: 'Subtitle auto-fetch', note: 'grab missing subs after rename + scan', on: automation.subsAuto, detail: null },
+                    { label: 'Inbound webhooks', note: 'Sonarr / Radarr push imports instantly', on: automation.webhook, detail: null },
+                  ].map(r => (
+                    <div key={r.label} className="flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-[13px] font-medium text-primary">{r.label}</div>
+                        <div className="truncate text-[11px] text-quaternary">{r.note}</div>
+                      </div>
+                      <BadgeWithDot color={r.on ? 'success' : 'gray'}>
+                        {r.on ? (r.detail ?? 'On') : 'Off'}
+                      </BadgeWithDot>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            ) : null}
           </div>
 
           {/* Subtitle coverage — hidden until there's something to report */}

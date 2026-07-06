@@ -477,6 +477,7 @@ export default function App() {
       // the scan worker. Gating on matched_count kills that flood.
       let lastMatched = -1;
       let lastFilesRefetchAt = 0;
+      let deltaSince: string | null = null;
       let lastCount = -1;
       let lastPath: string | null = null;
       let stopped = false;
@@ -525,10 +526,30 @@ export default function App() {
           lastCount = s.file_count;
           try {
             const gen = filesGenRef.current;
-            const rows = await api.listAllFiles();
-            // Drop this background replace if a user mutation bumped the gen
-            // while we were fetching — don't clobber a fresh manual match.
-            setState(st => (gen === filesGenRef.current ? { ...st, files: rows.map(apiToMediaFile) } : st));
+            if (finishing || !deltaSince) {
+              // Full fetch: initial tick + terminal tick (source of truth).
+              const rows = await api.listAllFiles();
+              setState(st => (gen === filesGenRef.current ? { ...st, files: rows.map(apiToMediaFile) } : st));
+              deltaSince = new Date().toISOString();
+            } else {
+              // Delta: only rows changed since the last tick + the id set for
+              // deletions — kilobytes instead of the whole library per poll.
+              const d = await api.filesDelta(deltaSince);
+              deltaSince = d.now;
+              if (d.changed.length || d.ids.length) {
+                const changed = new Map(d.changed.map(r => [String(r.id), apiToMediaFile(r)]));
+                const alive = new Set(d.ids.map(String));
+                setState(st => {
+                  if (gen !== filesGenRef.current) return st;
+                  const merged = st.files
+                    .filter(f => alive.has(String(f.id)))
+                    .map(f => changed.get(String(f.id)) ?? f);
+                  const known = new Set(merged.map(f => String(f.id)));
+                  for (const [id, row] of changed) if (!known.has(id)) merged.push(row);
+                  return { ...st, files: merged };
+                });
+              }
+            }
           } catch { /* swallow */ }
         }
 
@@ -956,6 +977,7 @@ export default function App() {
       let pollFailures = 0;
       let lastMatched = -1;
       let lastFilesRefetchAt = 0;
+      let deltaSince: string | null = null;
       let lastCount = -1;
       while (!done) {
         await new Promise(r => setTimeout(r, 800));
@@ -991,10 +1013,30 @@ export default function App() {
           lastCount = s.file_count;
           try {
             const gen = filesGenRef.current;
-            const rows = await api.listAllFiles();
-            // Drop this background replace if a user mutation bumped the gen
-            // mid-fetch — don't revert a manual match made during reparse.
-            setState(st => (gen === filesGenRef.current ? { ...st, files: rows.map(apiToMediaFile) } : st));
+            if (finishing || !deltaSince) {
+              // Full fetch: initial tick + terminal tick (source of truth).
+              const rows = await api.listAllFiles();
+              setState(st => (gen === filesGenRef.current ? { ...st, files: rows.map(apiToMediaFile) } : st));
+              deltaSince = new Date().toISOString();
+            } else {
+              // Delta: only rows changed since the last tick + the id set for
+              // deletions — kilobytes instead of the whole library per poll.
+              const d = await api.filesDelta(deltaSince);
+              deltaSince = d.now;
+              if (d.changed.length || d.ids.length) {
+                const changed = new Map(d.changed.map(r => [String(r.id), apiToMediaFile(r)]));
+                const alive = new Set(d.ids.map(String));
+                setState(st => {
+                  if (gen !== filesGenRef.current) return st;
+                  const merged = st.files
+                    .filter(f => alive.has(String(f.id)))
+                    .map(f => changed.get(String(f.id)) ?? f);
+                  const known = new Set(merged.map(f => String(f.id)));
+                  for (const [id, row] of changed) if (!known.has(id)) merged.push(row);
+                  return { ...st, files: merged };
+                });
+              }
+            }
           } catch { /* swallow */ }
         }
         if (s.status.startsWith('failed')) throw new Error(s.status);

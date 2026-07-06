@@ -129,6 +129,10 @@ async def lifespan(app: FastAPI):
     import asyncio as _asyncio
     from kira.database import run_deferred_data_ops
     _deferred_ops_task = _asyncio.create_task(run_deferred_data_ops())
+    # Scheduled full rescan (Settings → Advanced): a 1-minute clock that fires
+    # a whole-library scan at the configured HH:MM when enabled.
+    from kira.scheduler import scheduled_rescan_loop
+    _scheduler_task = _asyncio.create_task(scheduled_rescan_loop())
     # Security posture check: if exposed beyond localhost, warn the operator
     # about opt-in auth / unconfined browsing rather than silently running open.
     try:
@@ -487,6 +491,20 @@ async def _basic_auth_mw(request: Request, call_next):
         # during the boot window. Cached once the first read succeeds, so this
         # only bites a genuine DB fault, not steady-state traffic.
         return Response(status_code=503, headers={"Retry-After": "2"})
+    if acct is None:
+        # Pre-setup window, option (b): with NO credentials configured, only
+        # LOOPBACK clients get the fully-open instance. A remote client (the
+        # instance is exposed / port-forwarded) may reach exactly the exempt
+        # endpoints + /auth/setup — enough to load the SPA and create the
+        # account, nothing else. Closes the "open instance + account takeover"
+        # window without adding any friction to localhost use.
+        _client_host = request.client.host if request.client else ""
+        _is_loopback = _client_host in ("127.0.0.1", "::1", "localhost", "testclient")
+        if not _is_loopback and request.url.path.startswith("/api/") and not _is_setup_post:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Server not set up yet — create the account first (open Kira in a browser)."},
+            )
     if acct is not None:
         if not db_auth_ok(request.headers.get("Authorization"), acct[0], acct[1]):
             _rem = _rl_locked_for(_ip)

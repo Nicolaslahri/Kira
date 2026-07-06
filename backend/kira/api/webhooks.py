@@ -185,8 +185,47 @@ async def _handle(kind: str, request: Request, token: str | None, session: Async
     from kira.api.scans import _start_scan
     scan_id = await _start_scan(scan_paths, source="auto")
     if scan_id is None:
-        return {"ok": True, "queued": False, "detail": "A scan is already running.", "source": kind}
+        # A scan is already running — QUEUE the paths instead of dropping the
+        # event (an import completing mid-scan used to be silently lost until
+        # the next poll/webhook). The waiter merges everything queued while
+        # waiting and fires ONE follow-up scan.
+        _queue_pending_scan(scan_paths)
+        return {"ok": True, "queued": True, "deferred": True,
+                "detail": "A scan is running — queued for a follow-up scan when it finishes.",
+                "source": kind}
     return {"ok": True, "queued": True, "scan_id": scan_id, "scanned": scan_paths, "source": kind}
+
+
+# ── Pending-scan queue (mid-scan webhook events) ─────────────────────────────
+_PENDING_PATHS: set[str] = set()
+_PENDING_WAITER: "asyncio.Task | None" = None
+
+
+def _queue_pending_scan(paths: list[str]) -> None:
+    global _PENDING_WAITER
+    import asyncio
+    _PENDING_PATHS.update(paths)
+    if _PENDING_WAITER is None or _PENDING_WAITER.done():
+        from kira.tasks import spawn_tracked
+        _PENDING_WAITER = spawn_tracked(_pending_scan_waiter(), label="webhook-pending-scan")
+
+
+async def _pending_scan_waiter() -> None:
+    """Poll until the running scan releases the lock, then fire one merged
+    scan for every path queued meanwhile. Gives up after 2 hours (a scan that
+    long has bigger problems; the paths stay queued for the next event)."""
+    import asyncio
+    from kira.api.scans import _start_scan
+    for _ in range(240):                    # 240 × 30s = 2h
+        await asyncio.sleep(30)
+        if not _PENDING_PATHS:
+            return
+        paths = sorted(_PENDING_PATHS)
+        scan_id = await _start_scan(paths, source="auto")
+        if scan_id is not None:
+            _PENDING_PATHS.difference_update(paths)
+            logger.info("webhook: deferred scan fired (scan_id=%s, %d paths)", scan_id, len(paths))
+            return
 
 
 # ── routes ───────────────────────────────────────────────────────────────────

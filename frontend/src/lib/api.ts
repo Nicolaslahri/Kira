@@ -356,10 +356,27 @@ export interface ApiFfmpegStatus {
   source: 'system' | 'managed' | null;
   installable: boolean;
   installing: boolean;
+  /** Live install-job label ("Installing ffmpeg · downloading 12 / 90 MB")
+   *  while installing — lets the status row show progress inline instead of
+   *  pointing at the activity pill (invisible during onboarding). */
+  progress: string | null;
 }
 
 // fpcalc (Chromaprint) status has the identical shape — drives the AcoustID row.
 export type ApiFpcalcStatus = ApiFfmpegStatus;
+
+/** One local anime reference dataset (AniDB title dump / offline episode DB). */
+export interface ApiDataset {
+  id: string;
+  label: string;
+  desc: string;
+  refresh: string;
+  exists: boolean;
+  size_bytes: number | null;
+  updated_at: string | null;
+  /** Live activity label while a refresh download runs, else null. */
+  downloading: string | null;
+}
 
 export interface ApiSubtitleAsset {
   id: number;
@@ -552,6 +569,10 @@ export const api = {
    *  progress + final state narrate through the activity pill. */
   installFfmpeg: () =>
     request<ApiFfmpegStatus>('/ffmpeg/install', { method: 'POST' }),
+
+  /** Local anime reference datasets — on-disk age/size + live refresh progress. */
+  datasetsStatus: () =>
+    request<{ datasets: ApiDataset[] }>('/datasets'),
 
   fpcalcStatus: () =>
     request<ApiFpcalcStatus>('/fpcalc'),
@@ -1024,6 +1045,32 @@ export const api = {
    *  sessionStorage, attached only by request()), so with Basic auth enabled
    *  the link 401'd instead of downloading. Fetch as a blob + synthetic
    *  anchor keeps the header on the request. */
+  /** Full settings backup (INCLUDES provider keys in plaintext — it's the
+   *  user's own server backup). Downloads as a dated JSON file. */
+  downloadSettingsBackup: async (): Promise<void> => {
+    const data = await request<Record<string, unknown>>('/settings/backup');
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `kira-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  },
+  restoreSettingsBackup: (backup: unknown) =>
+    request<{ restored: number }>('/settings/restore', {
+      method: 'POST', body: JSON.stringify(backup),
+    }),
+  /** Incremental /files follow-up: rows changed since `since` + the full id
+   *  set (deletion detection). Used by the mid-scan pollers; the full
+   *  listAllFiles stays the source of truth for hydrate + scan completion. */
+  filesDelta: (since: string) =>
+    request<{ now: string; changed: ApiMediaFile[]; ids: number[] }>(
+      `/files/delta?since=${encodeURIComponent(since)}`),
+
+  hardlinkSavings: () =>
+    request<{ files: number; bytes_saved: number }>('/system/hardlink-savings'),
+
   downloadHistoryCsv: async (): Promise<void> => {
     const auth = getStoredAuth();
     const res = await fetch(`${API_BASE}/history/export.csv`, {

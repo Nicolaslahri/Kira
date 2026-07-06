@@ -1431,6 +1431,7 @@ export function CoverPopup({
                 queueByEpisode={queueByEpisode}
                 recentlyImported={recentlyImported}
                 pushToast={pushToast}
+              onPickCandidate={onPickCandidate}
               />
           }
         </div>

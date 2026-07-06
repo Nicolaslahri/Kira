@@ -32,7 +32,18 @@ export function FpcalcStatusRow({ compact = false }: { compact?: boolean }) {
     return () => { window.removeEventListener('kira:fpcalc-changed', refresh); if (timer) clearTimeout(timer); };
   }, []);
 
+  // While an install runs, poll for the live progress label — same inline
+  // treatment as the ffmpeg row (the activity pill isn't always in view).
+  const installing = !!status?.installing;
+  useEffect(() => {
+    if (!installing) return;
+    const t = window.setInterval(refresh, 1500);
+    return () => clearInterval(t);
+  }, [installing]);
+
   if (!status) return null;
+
+  const progressText = status.progress?.split('·').pop()?.trim() || 'Installing…';
 
   const install = async () => {
     if (requesting) return;
@@ -64,7 +75,8 @@ export function FpcalcStatusRow({ compact = false }: { compact?: boolean }) {
         </span>
       ) : status.installing ? (
         <span className="inline-flex items-center gap-1.5 text-[12px] text-ink-muted">
-          Installing… <span className="text-ink-soft">(see activity)</span>
+          <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-[var(--accent)]" aria-hidden />
+          {progressText}
         </span>
       ) : status.installable ? (
         <Button color="secondary" size="sm" iconLeading={IcDownload} isLoading={requesting} onClick={() => void install()}>

@@ -163,4 +163,8 @@ def spawn_poster_warmup() -> bool:
     from kira.tasks import spawn_tracked
     spawn_tracked(warm_anime_posters(), label=POSTER_WARMUP_JOB)
     spawn_tracked(warm_music_covers(), label="music_cover_warmup")
+    # Weekly anime-offline-database refresh — prefills AniDB episode counts so
+    # anime matching skips most throttled live calls (no-op when fresh).
+    from kira.providers.anime_offline_db import refresh_if_stale
+    spawn_tracked(refresh_if_stale(), label="anime_offline_db")
     return True

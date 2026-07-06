@@ -146,6 +146,21 @@ export function ReviewPage({
   // Sort (§10): default keeps the grid's natural grouping; the others order
   // items inside the section layout by title, confidence, or file size.
   const [sortBy, setSortBy] = useState<'default' | 'title' | 'confidence' | 'size'>('default');
+  // Duplicates lens: only cards where 2+ files landed on the same episode
+  // slot (or a movie with 2+ files) — the popup's per-episode dupe tooling
+  // already handles the cleanup; this makes them FINDABLE in one click.
+  const [dupesOnly, setDupesOnly] = useState(false);
+  // One-shot deep link from the Dashboard's duplicates stat: arrive with the
+  // Duplicates filter already on. sessionStorage (not props) because the
+  // Dashboard is unmounted before this page mounts.
+  useEffect(() => {
+    try {
+      if (sessionStorage.getItem('kira.review.dupes') === '1') {
+        sessionStorage.removeItem('kira.review.dupes');
+        setDupesOnly(true);
+      }
+    } catch { /* private mode — the filter chip still works manually */ }
+  }, []);
   // `pending` = anything needing user action: matched-but-unreviewed,
   // mid-match (`matching`), AND no_match files (which the user has to
   // manually point at the right show). `no_match` filter isolates JUST
@@ -288,6 +303,27 @@ export function ReviewPage({
     });
     return xs;
   }, [itemsWithGaps, sortBy]);
+
+  const itemHasDupes = (it: LibraryItem): boolean => {
+    if (it.ghost || it.files.length < 2) return false;
+    if (it.kind === 'movie') return it.files.length > 1;
+    const perSlot = new Map<number, number>();
+    for (const f of it.files) {
+      if (f.matchedToEpisode == null) continue;
+      const n = (perSlot.get(f.matchedToEpisode) ?? 0) + 1;
+      if (n > 1) return true;
+      perSlot.set(f.matchedToEpisode, n);
+    }
+    return false;
+  };
+  const dupeCount = useMemo(() => sortedItems.filter(itemHasDupes).length,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [sortedItems]);
+  const displayedItems = useMemo(
+    () => (dupesOnly ? sortedItems.filter(itemHasDupes) : sortedItems),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [sortedItems, dupesOnly]);
+
 
   // One-click "Get from Radarr" for a ghost cover. Adds the movie (or searches
   // it if already in Radarr) + toasts the outcome; returns the result so the
@@ -637,7 +673,7 @@ export function ReviewPage({
   // the grid's `lib_…` ids, so j/k moved an invisible cursor and a/r/m/Enter
   // silently died after any card click).
   const navItemsRef = useRef<LibraryItem[]>([]);
-  navItemsRef.current = sortedItems;
+  navItemsRef.current = displayedItems;
   const focusRef = useRef(focusedId);
   focusRef.current = focusedId;
   useEffect(() => {
@@ -825,6 +861,20 @@ export function ReviewPage({
             <FilterChip on={sortBy === 'confidence'} onClick={() => setSortBy('confidence')} label="Confidence" />
             <FilterChip on={sortBy === 'size'} onClick={() => setSortBy('size')} label="Size" />
           </div>
+
+          {dupeCount > 0 ? (
+            <>
+              <span aria-hidden className="hidden h-5 w-px bg-white/10 sm:block" />
+              <FilterChip
+                on={dupesOnly}
+                onClick={() => setDupesOnly(v => !v)}
+                label="Duplicates"
+                num={dupeCount}
+                accent="var(--conf-mid)"
+                dot
+              />
+            </>
+          ) : null}
         </div>
       </div>
       )}
@@ -902,7 +952,7 @@ export function ReviewPage({
 
       <LibraryGrid
           defaultView={statusF === 'pending' && conf === 'all' && type === 'all' && !searchQuery.trim()}
-        items={sortedItems}
+        items={displayedItems}
         onGetMovie={handleGetMovie}
         selected={selected}
         setSelected={setSelected}

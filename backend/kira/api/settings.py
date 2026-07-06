@@ -492,3 +492,58 @@ async def test_provider(
             return ProviderTestResponse(ok=False, detail=str(e))
         latency_ms = int((time.monotonic() - t0) * 1000)
         return ProviderTestResponse(ok=True, latency_ms=latency_ms)
+
+
+# ── Backup / restore ─────────────────────────────────────────────────────────
+# The entire config lives in one SQLite file on the NAS; before this there was
+# a factory RESET but no way to save what you'd configured. Export dumps every
+# settings row (including provider keys — it's the user's own backup for their
+# own server; the UI says so); import upserts them and refreshes caches.
+
+@router.get("/backup")
+async def export_settings_backup(session: AsyncSession = Depends(get_session)) -> dict:
+    """Full settings export. Secrets are INCLUDED in plaintext — this is a
+    self-hosted backup of your own server; store the file accordingly."""
+    from sqlalchemy import select as _select
+    rows = list(await session.scalars(_select(Setting)))
+    from kira import __version__ as _v
+    import time as _time
+    return {
+        "kira_backup": 1,
+        "version": _v,
+        "exported_at": int(_time.time()),
+        "settings": {r.key: r.value for r in rows},
+    }
+
+
+@router.post("/restore")
+async def restore_settings_backup(
+    payload: dict,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, int]:
+    """Upsert every settings row from a backup file made by /settings/backup.
+    Existing keys are overwritten; keys not in the backup are left alone (this
+    is a restore, not a factory-reset-then-load — safer for partial backups)."""
+    values = payload.get("settings")
+    if payload.get("kira_backup") != 1 or not isinstance(values, dict):
+        raise HTTPException(400, "Not a Kira backup file (missing kira_backup/settings).")
+    n = 0
+    for key, value in values.items():
+        if not isinstance(key, str) or not key.strip():
+            continue
+        existing = await session.get(Setting, key)
+        if existing is None:
+            session.add(Setting(key=key, value=value))
+        else:
+            existing.value = value
+        n += 1
+    await session.commit()
+    # Same cache invalidation as a normal settings save.
+    from kira.matcher.engine import invalidate_settings_cache
+    invalidate_settings_cache()
+    try:
+        from kira.watcher import watcher
+        await watcher.reconfigure()
+    except Exception:
+        pass
+    return {"restored": n}

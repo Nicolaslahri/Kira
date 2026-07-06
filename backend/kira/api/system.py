@@ -10,6 +10,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import delete
+from sqlalchemy import func as _sql_func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kira.database import get_session
@@ -174,6 +175,48 @@ async def install_ffmpeg_endpoint() -> dict:
     return status
 
 
+@router.get("/datasets")
+async def get_datasets_status() -> dict:
+    """Local anime reference datasets: what's on disk, how old it is, the
+    refresh cadence, and — while a refresh runs — the live download progress.
+    Drives the Settings → Connections 'Anime data' block."""
+    from kira import activity
+    from kira.providers.anidb import TITLES_JOB, titles_dump_status
+    from kira.providers.anime_offline_db import AODB_JOB, index_status
+
+    snap = activity.snapshot()
+
+    def job_label(name: str) -> str | None:
+        return next((j["label"] for j in snap["jobs"] if j["name"] == name and j["active"]), None)
+
+    def entry(dataset_id: str, label: str, desc: str, refresh: str, st: dict, job: str) -> dict:
+        return {
+            "id": dataset_id,
+            "label": label,
+            "desc": desc,
+            "refresh": refresh,
+            "exists": st["exists"],
+            "size_bytes": st["size_bytes"],
+            "updated_at": (datetime.utcfromtimestamp(st["updated_at"]).isoformat()
+                           if st["updated_at"] else None),
+            "downloading": job_label(job),
+        }
+
+    return {"datasets": [
+        entry("anidb_titles", "AniDB title index",
+              "Every anime title/synonym — search runs on this, not live API calls.",
+              "AniDB publishes a fresh dump daily; Kira re-downloads its copy when "
+              "older than 24 h, at the first anime lookup that needs it.",
+              titles_dump_status(), TITLES_JOB),
+        entry("anime_offline_db", "Anime offline database",
+              "Episode counts for finished shows (manami-project) — powers cour "
+              "routing without per-series AniDB calls.",
+              "Updated upstream ~weekly; Kira re-downloads when its copy is older "
+              "than 7 days, checked at startup poster warm-up.",
+              index_status(), AODB_JOB),
+    ]}
+
+
 @router.get("/fpcalc")
 async def get_fpcalc_status() -> dict:
     """Is fpcalc (Chromaprint) usable, and can this platform one-click install it?
@@ -230,7 +273,7 @@ async def reset_matches(
     await session.execute(
         update(MediaFile)
         .where(MediaFile.status.notin_(("pending", "renamed")))
-        .values(status="pending")
+        .values(status="pending", updated_at=_sql_func.now())
     )
     await session.commit()
     return {"matches_deleted": res.rowcount or 0}
@@ -376,3 +419,25 @@ async def mark_all_read(session: AsyncSession = Depends(get_session)) -> dict[st
     result = await session.execute(update(Notification).where(Notification.read.is_(False)).values(read=True))
     await session.commit()
     return {"updated": result.rowcount or 0}
+
+
+@router.get("/hardlink-savings")
+async def hardlink_savings(session=Depends(get_session)) -> dict:
+    """Disk space the hardlink strategy is saving: the summed size of every
+    file whose LIVE (non-undone) rename was a hardlink — each of those would
+    otherwise exist twice on disk. Dashboard bragging rights."""
+    from sqlalchemy import func, select
+    from kira.models import MediaFile, RenameHistory
+    row = (await session.execute(
+        select(func.count(func.distinct(MediaFile.id)), func.sum(MediaFile.file_size))
+        .select_from(RenameHistory)
+        .join(MediaFile, MediaFile.id == RenameHistory.media_file_id)
+        .where(
+            RenameHistory.operation == "hardlink",
+            RenameHistory.undone_at.is_(None),
+            RenameHistory.parent_id.is_(None),
+        )
+    )).one()
+    files = int(row[0] or 0)
+    saved = int(row[1] or 0)
+    return {"files": files, "bytes_saved": saved}

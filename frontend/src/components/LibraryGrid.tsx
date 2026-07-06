@@ -388,11 +388,11 @@ export function CoverCard({
   return (
     <div
       className={cn(
-        'group/cc relative flex cursor-pointer flex-col gap-2.5 rounded-xl outline-none transition',
-        // Keyboard-focus ring: must be UNMISSABLE — this is the cursor for the
-        // j/k review flow (the old 1px 20%-white outline was invisible, so the
-        // user had no idea which card a/r/x/Enter would act on).
-        focused && 'outline outline-2 outline-[var(--accent)] outline-offset-3 shadow-[0_0_0_5px_rgba(99,102,241,0.28)]',
+        'group/cc relative flex cursor-pointer flex-col gap-2.5 rounded-xl outline-none transition hover:z-10',
+        // Lifted covers (selected / keyboard cursor) rise OVER their
+        // neighbors — without the z bump the pop-out shadow clips under
+        // the next card in the grid.
+        (selected || focused) && 'z-10',
         stats.cardState === 'rejected' && 'opacity-50 grayscale-[0.35] hover:opacity-75',
       )}
       onClick={handleCardClick}
@@ -402,16 +402,27 @@ export function CoverCard({
       aria-label={`Open ${item.title || 'file'}${item.year ? `, ${item.year}` : ''}`}
       data-cardid={item.id}
     >
-      {/* Cover — Untitled UI card surface (ring + shadow) wrapping the poster. */}
+      {/* Cover — Untitled UI card surface (ring + shadow) wrapping the poster.
+          Selection/focus reads as PHYSICAL LIFT (3D pop with a slight tilt +
+          deep shadow), not a colored outline: the accent ring fought every
+          poster it sat on. Hover previews the same lift; the keyboard cursor
+          (j/k flow) uses lift + a white ring so it stays unmissable on any
+          artwork without the old accent glow. */}
       <div
         data-cover
         className={cn(
-          'relative flex aspect-[2/3] items-center justify-center overflow-hidden rounded-xl bg-[var(--panel)] text-center font-bold tracking-tight text-white shadow-md ring-inset transition duration-200 ease-out group-hover/cc:-translate-y-0.5',
+          'relative flex aspect-[2/3] items-center justify-center overflow-hidden rounded-xl bg-[var(--panel)] text-center font-bold tracking-tight text-white shadow-md ring-inset transition duration-200 ease-out will-change-transform motion-reduce:transition-none',
           isMusic && '!aspect-square rounded-lg',
           stats.cardState === 'approved' ? 'ring-2 ring-[var(--color-fg-success-primary)]'
             : stats.cardState === 'rejected' ? 'ring-2 ring-[var(--color-fg-error-primary)]'
-            : selected ? 'ring-2 ring-brand'
+            : focused ? 'ring-2 ring-white/70'
+            : selected ? 'ring-1 ring-white/40'
             : 'ring-1 ring-secondary group-hover/cc:ring-primary',
+          selected
+            ? '[transform:perspective(900px)_translateY(-8px)_rotateX(3deg)_rotate(-1.2deg)_scale(1.04)] shadow-[0_18px_40px_-14px_rgba(0,0,0,0.65)]'
+            : focused
+              ? '[transform:perspective(900px)_translateY(-6px)_rotateX(2deg)_scale(1.02)] shadow-[0_14px_32px_-14px_rgba(0,0,0,0.6)]'
+              : 'group-hover/cc:[transform:perspective(900px)_translateY(-6px)_rotateX(2deg)_scale(1.02)] group-hover/cc:shadow-[0_14px_32px_-14px_rgba(0,0,0,0.6)]',
         )}
         style={{ background: (item.noMatch || !effectivePosterUrl) ? `linear-gradient(135deg, ${tint[0]}, ${tint[1]})` : undefined }}
       >

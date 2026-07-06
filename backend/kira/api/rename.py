@@ -1224,6 +1224,34 @@ async def reconcile_pending_renames() -> tuple[int, int]:
                 # the source as canonical and drop the partial dst record
                 # (old behaviour) rather than risk pointing the DB at a
                 # truncated file.
+                # UNDO intents (`undo:<op>`) reconcile differently: the move
+                # was new_path→old_path to REVERSE a rename. When it completed
+                # (dst=old occupied, src=new gone) the right bookkeeping is to
+                # mark the ORIGINAL history row undone — not to invent a new
+                # rename record for the reversal.
+                if str(it.operation).startswith("undo:"):
+                    if dst_exists and not src_exists:
+                        _orig = await session.scalar(
+                            select(RenameHistory)
+                            .where(
+                                RenameHistory.old_path == it.dst,
+                                RenameHistory.new_path == it.src,
+                                RenameHistory.undone_at.is_(None),
+                            )
+                            .limit(1)
+                        )
+                        if _orig is not None:
+                            from datetime import datetime, timezone
+                            _orig.undone_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                        mf = await session.get(MediaFile, it.media_file_id) if it.media_file_id else None
+                        if mf is not None:
+                            mf.file_path = it.dst
+                            mf.status = "pending"
+                        finalized += 1
+                    else:
+                        discarded += 1
+                    await session.delete(it)
+                    continue
                 if src_exists and dst_exists and str(it.operation).lower() == "move":
                     try:
                         _ss = (await asyncio.to_thread(src.stat)).st_size

@@ -5,7 +5,7 @@ import { api } from '../lib/api';
 import {
   IcLogoMark, IcScan, IcSparkles, IcShieldCheck, IcLink,
   IcCheck, IcX, IcAlertTri, IcSpin, IcFolder, IcKey, IcArrowRight,
-  IcFilm, IcTv, IcAnime, IcMusic, IcTag, IcUndo,
+  IcFilm, IcTv, IcAnime, IcMusic, IcTag, IcUndo, IcCaption, IcExternal,
 } from '../lib/icons';
 import { FolderPickerModal } from './FolderPickerModal';
 import { useScrollLock } from './LoginGate';
@@ -113,6 +113,7 @@ function WelcomeStep() {
         <div><IcSparkles /><span>Matches against TMDB, TVDB &amp; AniDB</span></div>
         <div><IcShieldCheck /><span>Nothing renamed without your approval</span></div>
         <div><IcUndo /><span>Every rename is one click to undo</span></div>
+        <div><IcCaption /><span>Fetches missing subtitles automatically</span></div>
         <div><IcLink /><span>Hardlinks keep disk usage flat</span></div>
       </div>
     </div>
@@ -139,7 +140,7 @@ function ContentTypeStep({ types, setTypes }: { types: ContentTypes; setTypes: (
   return (
     <>
       <div className="onb-eyebrow" style={idx(0)}>
-        <span className="step-n">Step 1 of 6</span>
+        <span className="step-n">Step 1 of 8</span>
         <span>Required</span>
       </div>
       <div className="onb-title" style={idx(1)}>What's in your library?</div>
@@ -328,7 +329,7 @@ function ConnectStep({ types, tmdbKey, setTmdbKey, tmdbVal, setTmdbVal, tvdbKey,
   return (
     <>
       <div className="onb-eyebrow" style={idx(0)}>
-        <span className="step-n">Step 2 of 6</span>
+        <span className="step-n">Step 2 of 8</span>
         <span>{types.movies ? 'Required' : 'Optional'}</span>
       </div>
       <div className="onb-title" style={idx(1)}>Connect your metadata</div>
@@ -375,28 +376,25 @@ function ConnectStep({ types, tmdbKey, setTmdbKey, tmdbVal, setTmdbVal, tvdbKey,
         </div>
       ) : null}
 
-      {/* ffmpeg check — extras like embedded-subtitle extraction need it.
-          Docker ships it (the row just shows Ready); on bare installs the
-          one-click button has Kira install its own copy, nothing else needed. */}
-      <div style={{ marginTop: 14, ...idx(5) }}>
-        <FfmpegStatusRow compact framed />
-      </div>
     </>
   );
 }
 
 // ─── Step 3 · Folder ─────────────────────────────────────────────────
 
-function MediaFolderStep({ folder, setFolder, watchFolder, setWatchFolder, folderErr, clearFolderErr }: {
+function MediaFolderStep({ folder, setFolder, watchFolder, setWatchFolder, scheduled, setScheduled, schedTime, setSchedTime, mediainfo, setMediainfo, folderErr, clearFolderErr }: {
   folder: string; setFolder: (s: string) => void;
   watchFolder: boolean; setWatchFolder: (v: boolean) => void;
+  scheduled: boolean; setScheduled: (v: boolean) => void;
+  schedTime: string; setSchedTime: (v: string) => void;
+  mediainfo: boolean; setMediainfo: (v: boolean) => void;
   folderErr: string | null; clearFolderErr: () => void;
 }) {
   const [pickerOpen, setPickerOpen] = useState(false);
   return (
     <>
       <div className="onb-eyebrow" style={idx(0)}>
-        <span className="step-n">Step 3 of 6</span>
+        <span className="step-n">Step 3 of 8</span>
         <span>Required</span>
       </div>
       <div className="onb-title" style={idx(1)}>Where's your media?</div>
@@ -429,8 +427,48 @@ function MediaFolderStep({ folder, setFolder, watchFolder, setWatchFolder, folde
         </span>
       </label>
 
+      <label className="onb-checkrow" style={idx(5)}>
+        <input
+          type="checkbox"
+          checked={scheduled}
+          onChange={e => setScheduled(e.target.checked)}
+          style={{ accentColor: 'var(--accent)' }}
+        />
+        <span>
+          Also run a full rescan every night
+          <span className="sub">A safety net for files the watcher can’t see — NAS shares and network mounts especially.</span>
+        </span>
+      </label>
+      {scheduled ? (
+        <div className="onb-schedtime" style={idx(5)}>
+          <span>Run at</span>
+          <input
+            type="time"
+            className="input"
+            value={schedTime}
+            onChange={e => setSchedTime(e.target.value)}
+            aria-label="Nightly rescan time"
+            style={{ width: 110, padding: '6px 10px' }}
+          />
+          <span className="sub">server time</span>
+        </div>
+      ) : null}
+
+      <label className="onb-checkrow" style={idx(6)}>
+        <input
+          type="checkbox"
+          checked={mediainfo}
+          onChange={e => setMediainfo(e.target.checked)}
+          style={{ accentColor: 'var(--accent)' }}
+        />
+        <span>
+          Read technical metadata from the files themselves
+          <span className="sub">Powers the resolution / HDR / audio badges and quality insights even when filenames carry no tags. Slightly slower scans on network shares.</span>
+        </span>
+      </label>
+
       {folderErr ? (
-        <div className="onb-state error" style={idx(5)} role="alert"><IcAlertTri /><span>{folderErr}</span></div>
+        <div className="onb-state error" style={idx(7)} role="alert"><IcAlertTri /><span>{folderErr}</span></div>
       ) : null}
 
       {pickerOpen ? (
@@ -446,9 +484,10 @@ function MediaFolderStep({ folder, setFolder, watchFolder, setWatchFolder, folde
 
 // ─── Step 4 · Handling (file operation + rename mode) ────────────────
 
-function HandlingStep({ op, setOp, mode, setMode }: {
+function HandlingStep({ op, setOp, mode, setMode, autoApprove, setAutoApprove }: {
   op: string; setOp: (v: string) => void;
   mode: string; setMode: (v: string) => void;
+  autoApprove: boolean; setAutoApprove: (v: boolean) => void;
 }) {
   const ops = [
     { key: 'hardlink', label: 'Hardlink', rec: true,
@@ -469,7 +508,7 @@ function HandlingStep({ op, setOp, mode, setMode }: {
   return (
     <>
       <div className="onb-eyebrow" style={idx(0)}>
-        <span className="step-n">Step 4 of 6</span>
+        <span className="step-n">Step 4 of 8</span>
         <span>Optional</span>
       </div>
       <div className="onb-title" style={idx(1)}>How should files be placed?</div>
@@ -512,13 +551,30 @@ function HandlingStep({ op, setOp, mode, setMode }: {
           </button>
         ))}
       </div>
+
+      <label className="onb-checkrow" style={idx(5)}>
+        <input
+          type="checkbox"
+          checked={autoApprove}
+          onChange={e => setAutoApprove(e.target.checked)}
+          style={{ accentColor: 'var(--accent)' }}
+        />
+        <span>
+          Auto-approve confident matches
+          <span className="sub">Matches scoring 95% or higher skip the Review queue. Anything less certain still waits for you — and every rename stays one click to undo.</span>
+        </span>
+      </label>
     </>
   );
 }
 
 // ─── Step 5 · Naming ─────────────────────────────────────────────────
 
-function NamingStep({ profile, setProfile }: { profile: string; setProfile: (p: string) => void }) {
+function NamingStep({ profile, setProfile, writeNfo, setWriteNfo, artwork, setArtwork }: {
+  profile: string; setProfile: (p: string) => void;
+  writeNfo: boolean; setWriteNfo: (v: boolean) => void;
+  artwork: boolean; setArtwork: (v: boolean) => void;
+}) {
   const profiles = [
     {
       key: 'Plex',
@@ -557,7 +613,7 @@ function NamingStep({ profile, setProfile }: { profile: string; setProfile: (p: 
   return (
     <>
       <div className="onb-eyebrow" style={idx(0)}>
-        <span className="step-n">Step 5 of 6</span>
+        <span className="step-n">Step 5 of 8</span>
         <span>Optional</span>
       </div>
       <div className="onb-title" style={idx(1)}>Pick a naming style</div>
@@ -588,20 +644,233 @@ function NamingStep({ profile, setProfile }: { profile: string; setProfile: (p: 
           </button>
         ))}
       </div>
+
+      <label className="onb-checkrow" style={idx(4)}>
+        <input
+          type="checkbox"
+          checked={writeNfo}
+          onChange={e => setWriteNfo(e.target.checked)}
+          style={{ accentColor: 'var(--accent)' }}
+        />
+        <span>
+          Write .nfo metadata files
+          <span className="sub">Kodi / Jellyfin-style metadata saved next to each file, built from the matched IDs — your server never has to guess.</span>
+        </span>
+      </label>
+      <label className="onb-checkrow" style={idx(5)}>
+        <input
+          type="checkbox"
+          checked={artwork}
+          onChange={e => setArtwork(e.target.checked)}
+          style={{ accentColor: 'var(--accent)' }}
+        />
+        <span>
+          Download artwork into folders
+          <span className="sub">Posters and fanart land beside the files, so the library looks right even fully offline.</span>
+        </span>
+      </label>
     </>
   );
 }
 
-// ─── Step 5 · Launch ─────────────────────────────────────────────────
+// ─── Step 6 · Subtitles ──────────────────────────────────────────────
+
+// Compact common-language picker — the full list (plus per-type overrides,
+// hearing-impaired and quality preferences) lives in Settings → Subtitles.
+const ONB_LANGS: Array<[string, string]> = [
+  ['en', 'English'], ['es', 'Spanish'], ['fr', 'French'], ['de', 'German'],
+  ['it', 'Italian'], ['pt', 'Portuguese'], ['nl', 'Dutch'], ['pl', 'Polish'],
+  ['ru', 'Russian'], ['tr', 'Turkish'], ['ar', 'Arabic'], ['hi', 'Hindi'],
+  ['ja', 'Japanese'], ['ko', 'Korean'], ['zh', 'Chinese'], ['sv', 'Swedish'],
+];
+
+function SubtitlesStep({ auto, setAuto, langs, setLangs }: {
+  auto: boolean; setAuto: (v: boolean) => void;
+  langs: string[]; setLangs: (l: string[]) => void;
+}) {
+  // Keep any prefilled code that isn't in the compact list visible as a chip,
+  // so a re-run over a configured server can't silently drop e.g. `th`.
+  const extra = langs.filter(c => !ONB_LANGS.some(([code]) => code === c));
+  const all: Array<[string, string]> = [...ONB_LANGS, ...extra.map(c => [c, c.toUpperCase()] as [string, string])];
+  const toggle = (code: string) => {
+    if (langs.includes(code)) {
+      if (langs.length === 1) return;       // always keep at least one language
+      setLangs(langs.filter(c => c !== code));
+    } else {
+      setLangs([...langs, code]);
+    }
+  };
+  return (
+    <>
+      <div className="onb-eyebrow" style={idx(0)}>
+        <span className="step-n">Step 6 of 8</span>
+        <span>Optional</span>
+      </div>
+      <div className="onb-title" style={idx(1)}>Subtitles, handled for you</div>
+      <div className="onb-sub" style={idx(2)}>
+        Kira searches five subtitle sources, scores every candidate against the
+        exact release, and saves the best one next to the file.
+      </div>
+
+      <label className="onb-checkrow" style={idx(3)}>
+        <input
+          type="checkbox"
+          checked={auto}
+          onChange={e => setAuto(e.target.checked)}
+          style={{ accentColor: 'var(--accent)' }}
+        />
+        <span>
+          Fetch missing subtitles automatically
+          <span className="sub">After every rename, plus a backfill sweep after each scan. Only languages that are actually missing get fetched.</span>
+        </span>
+      </label>
+
+      <div style={idx(4)}>
+        <div className="onb-langs-lbl">Languages you want</div>
+        <div className="onb-langs" role="group" aria-label="Subtitle languages">
+          {all.map(([code, label]) => {
+            const on = langs.includes(code);
+            return (
+              <button key={code} type="button" role="checkbox" aria-checked={on}
+                      className={`onb-lang ${on ? 'on' : ''}`} onClick={() => toggle(code)}>
+                {on ? <IcCheck /> : null}{label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="onb-hint" style={idx(5)}>
+        More languages, per-media-type overrides and hearing-impaired preferences
+        live in Settings → Subtitles.
+      </div>
+
+      {/* ffmpeg check — embedded-subtitle extraction (and audio tags) need it.
+          Docker ships it (the row just shows Ready); on bare installs the
+          one-click button has Kira install its own copy, nothing else needed. */}
+      <div style={{ marginTop: 4, ...idx(6) }}>
+        <FfmpegStatusRow compact framed />
+      </div>
+    </>
+  );
+}
+
+// ─── Step 7 · Integrations ───────────────────────────────────────────
+
+export interface IntegDraft {
+  sonarrUrl: string; sonarrKey: string;
+  radarrUrl: string; radarrKey: string;
+  plexUrl: string; plexToken: string;
+  jfUrl: string; jfKey: string;
+}
+
+type SvcTest = { state: 'idle' | 'checking' | 'ok' | 'err'; msg?: string };
+
+function IntegrationsStep({ integ, setInteg, existing }: {
+  integ: IntegDraft; setInteg: (v: IntegDraft) => void;
+  existing: Record<string, boolean>;
+}) {
+  const [tests, setTests] = useState<Record<string, SvcTest>>({});
+  const runTest = async (svc: 'sonarr' | 'radarr') => {
+    const url = svc === 'sonarr' ? integ.sonarrUrl : integ.radarrUrl;
+    const key = svc === 'sonarr' ? integ.sonarrKey : integ.radarrKey;
+    setTests(t => ({ ...t, [svc]: { state: 'checking' } }));
+    try {
+      const res = svc === 'sonarr'
+        ? await api.testSonarr({ url: url.trim(), api_key: key.trim() })
+        : await api.testRadarr({ url: url.trim(), api_key: key.trim() });
+      setTests(t => ({ ...t, [svc]: res.ok ? { state: 'ok' } : { state: 'err', msg: res.detail || 'Connection failed.' } }));
+    } catch (e) {
+      setTests(t => ({ ...t, [svc]: { state: 'err', msg: friendlyError((e as Error).message) } }));
+    }
+  };
+
+  const services: Array<{
+    id: string; name: string; desc: string;
+    urlKey: keyof IntegDraft; keyKey: keyof IntegDraft;
+    urlPh: string; keyPh: string; testable?: 'sonarr' | 'radarr';
+  }> = [
+    { id: 'sonarr', name: 'Sonarr', desc: 'Finished TV downloads land in Review on their own — no manual scans.',
+      urlKey: 'sonarrUrl', keyKey: 'sonarrKey', urlPh: 'http://sonarr:8989', keyPh: 'API key · Settings → General', testable: 'sonarr' },
+    { id: 'radarr', name: 'Radarr', desc: 'Same for movies — plus relinking after quality upgrades.',
+      urlKey: 'radarrUrl', keyKey: 'radarrKey', urlPh: 'http://radarr:7878', keyPh: 'API key · Settings → General', testable: 'radarr' },
+    { id: 'plex', name: 'Plex', desc: 'Library refresh fires after every rename — new files show up instantly.',
+      urlKey: 'plexUrl', keyKey: 'plexToken', urlPh: 'http://plex:32400', keyPh: 'X-Plex-Token' },
+    { id: 'jellyfin', name: 'Jellyfin', desc: 'Library refresh fires after every rename — new files show up instantly.',
+      urlKey: 'jfUrl', keyKey: 'jfKey', urlPh: 'http://jellyfin:8096', keyPh: 'API key · Dashboard → API Keys' },
+  ];
+
+  return (
+    <>
+      <div className="onb-eyebrow" style={idx(0)}>
+        <span className="step-n">Step 7 of 8</span>
+        <span>Optional</span>
+      </div>
+      <div className="onb-title" style={idx(1)}>Plug into your stack</div>
+      <div className="onb-sub" style={idx(2)}>
+        All optional — connect what you run and Kira closes the loop: downloads
+        flow in, renames flow out, your media server refreshes itself.
+      </div>
+
+      <div className="onb-svcs" style={idx(3)}>
+        {services.map(s => {
+          const t = tests[s.id] ?? { state: 'idle' };
+          const url = integ[s.urlKey], key = integ[s.keyKey];
+          return (
+            <div key={s.id} className="onb-svc">
+              <div className="head">
+                <span className="nm">{s.name}</span>
+                {existing[s.id] ? <span className="pill">Already connected</span> : null}
+                <span className="desc">{s.desc}</span>
+              </div>
+              <div className="fields">
+                <input className="input mono" placeholder={s.urlPh} value={url} spellCheck={false}
+                       aria-label={`${s.name} URL`}
+                       onChange={e => setInteg({ ...integ, [s.urlKey]: e.target.value })} />
+                <input className="input mono" type="password" placeholder={existing[s.id] ? 'saved — paste to replace' : s.keyPh}
+                       value={key} spellCheck={false} autoComplete="off"
+                       aria-label={`${s.name} API key`}
+                       onChange={e => setInteg({ ...integ, [s.keyKey]: e.target.value })} />
+                {s.testable ? (
+                  <button type="button" className="btn btn-sm" disabled={!url.trim() || !key.trim() || t.state === 'checking'}
+                          onClick={() => void runTest(s.testable!)}>
+                    {t.state === 'checking' ? <IcSpin /> : t.state === 'ok' ? <IcCheck /> : t.state === 'err' ? <IcX /> : null}
+                    Test
+                  </button>
+                ) : null}
+              </div>
+              {t.state === 'ok' ? <div className="onb-state success"><IcCheck /><span><b>Connected.</b></span></div> : null}
+              {t.state === 'err' ? <div className="onb-state error" role="alert"><IcAlertTri /><span>{t.msg}</span></div> : null}
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="onb-hint" style={idx(4)}>
+        A service saves only when both fields are filled — half-filled entries are
+        ignored. Webhooks, quality profiles and Discord notifications live in
+        Settings → Integrations.
+      </div>
+    </>
+  );
+}
+
+// ─── Step 8 · Launch ─────────────────────────────────────────────────
 
 function ReadyStep({ data, gotoStep }: {
-  data: { apiKey: string; tmdbExisting: boolean; folder: string; profile: string; contentTypes: ContentTypes; watchFolder: boolean; fileOp: string; renameMode: string };
+  data: {
+    apiKey: string; tmdbExisting: boolean; folder: string; profile: string; contentTypes: ContentTypes;
+    watchFolder: boolean; fileOp: string; renameMode: string;
+    scheduled: boolean; schedTime: string; mediainfo: boolean; autoApprove: boolean;
+    writeNfo: boolean; artwork: boolean;
+    subsAuto: boolean; subsLangs: string[]; integNames: string[];
+  };
   gotoStep: (n: number) => void;
 }) {
   return (
     <>
       <div className="onb-eyebrow" style={idx(0)}>
-        <span className="step-n">Step 6 of 6</span>
+        <span className="step-n">Step 8 of 8</span>
         <span>Ready</span>
       </div>
       <div className="onb-title" style={idx(1)}>You're all set.</div>
@@ -644,6 +913,8 @@ function ReadyStep({ data, gotoStep }: {
             <div className="val">
               {data.folder}
               {data.watchFolder ? <span className="chip" style={{ marginLeft: 8 }}>auto-scan on</span> : null}
+              {data.scheduled ? <span className="chip" style={{ marginLeft: 8 }}>rescan {data.schedTime}</span> : null}
+              {data.mediainfo ? <span className="chip" style={{ marginLeft: 8 }}>tech metadata</span> : null}
             </div>
           </div>
           <button className="edit" onClick={() => gotoStep(3)}>Edit</button>
@@ -654,6 +925,7 @@ function ReadyStep({ data, gotoStep }: {
             <div className="lbl">File handling</div>
             <div className="val" style={{ textTransform: 'capitalize' }}>
               {data.fileOp} · {data.renameMode === 'in-place' ? 'in place' : 'into the library'}
+              {data.autoApprove ? <span className="chip" style={{ marginLeft: 8, textTransform: 'none' }}>auto-approve ≥95%</span> : null}
             </div>
           </div>
           <button className="edit" onClick={() => gotoStep(4)}>Edit</button>
@@ -662,9 +934,37 @@ function ReadyStep({ data, gotoStep }: {
           <div className="icon"><IcTag /></div>
           <div>
             <div className="lbl">Naming profile</div>
-            <div className="val">{data.profile || 'Plex (default) — customize later'}</div>
+            <div className="val">
+              {data.profile || 'Plex (default) — customize later'}
+              {data.writeNfo ? <span className="chip" style={{ marginLeft: 8 }}>.nfo</span> : null}
+              {data.artwork ? <span className="chip" style={{ marginLeft: 8 }}>artwork</span> : null}
+            </div>
           </div>
           <button className="edit" onClick={() => gotoStep(5)}>Edit</button>
+        </div>
+        <div className="row">
+          <div className="icon"><IcCaption /></div>
+          <div>
+            <div className="lbl">Subtitles</div>
+            <div className="val">
+              {data.subsAuto
+                ? <>Auto-fetch on · {data.subsLangs.map(c => c.toUpperCase()).join(' · ')}</>
+                : 'Manual — fetch per file from Review'}
+            </div>
+          </div>
+          <button className="edit" onClick={() => gotoStep(6)}>Edit</button>
+        </div>
+        <div className="row">
+          <div className="icon"><IcExternal /></div>
+          <div>
+            <div className="lbl">Integrations</div>
+            <div className="val">
+              {data.integNames.length
+                ? data.integNames.map(n => <span key={n} className="chip" style={{ marginRight: 6 }}>{n}</span>)
+                : 'None — connect anytime in Settings'}
+            </div>
+          </div>
+          <button className="edit" onClick={() => gotoStep(7)}>Edit</button>
         </div>
       </div>
     </>
@@ -674,16 +974,20 @@ function ReadyStep({ data, gotoStep }: {
 // ─── Shell ───────────────────────────────────────────────────────────
 
 const RAIL_STEPS = [
-  { n: 1, label: 'Library',  hint: 'What you have' },
-  { n: 2, label: 'Connect',  hint: 'Metadata keys' },
-  { n: 3, label: 'Folder',   hint: 'Where it lives' },
-  { n: 4, label: 'Handling', hint: 'Move or link' },
-  { n: 5, label: 'Naming',   hint: 'How it looks' },
-  { n: 6, label: 'Launch',   hint: 'First scan' },
+  { n: 1, label: 'Library',      hint: 'What you have' },
+  { n: 2, label: 'Connect',      hint: 'Metadata keys' },
+  { n: 3, label: 'Folder',       hint: 'Where it lives' },
+  { n: 4, label: 'Handling',     hint: 'Move or link' },
+  { n: 5, label: 'Naming',       hint: 'How it looks' },
+  { n: 6, label: 'Subtitles',    hint: 'Auto-download' },
+  { n: 7, label: 'Integrations', hint: 'Your stack' },
+  { n: 8, label: 'Launch',       hint: 'First scan' },
 ];
+const LAST_STEP = 8;
 
 export function Onboarding({ onComplete }: OnboardingProps) {
-  // 0=Welcome · 1=Library · 2=Connect · 3=Folder · 4=Handling · 5=Naming · 6=Launch
+  // 0=Welcome · 1=Library · 2=Connect · 3=Folder · 4=Handling · 5=Naming ·
+  // 6=Subtitles · 7=Integrations · 8=Launch
   const [step, setStep] = useState(0);
   const [contentTypes, setContentTypes] = useState<ContentTypes>({ movies: true, tv: true, anime: false, music: false });
   const [tmdbKey, setTmdbKey] = useState('');
@@ -695,6 +999,30 @@ export function Onboarding({ onComplete }: OnboardingProps) {
   const [profile, setProfile] = useState('Plex');
   const [fileOp, setFileOp] = useState('hardlink');
   const [renameMode, setRenameMode] = useState('in-place');
+  // Nightly full rescan (scanning.scheduled) — the watcher's safety net.
+  const [scheduled, setScheduled] = useState(false);
+  const [schedTime, setSchedTime] = useState('03:00');
+  // parsing.read_mediainfo — tech badges/insights from the files themselves.
+  const [mediainfo, setMediainfo] = useState(false);
+  // matching.auto_approve — threshold stays at the backend default (95).
+  const [autoApprove, setAutoApprove] = useState(false);
+  // naming.write_nfo / naming.download_artwork output extras.
+  const [writeNfo, setWriteNfo] = useState(false);
+  const [artwork, setArtwork] = useState(false);
+  // Subtitles: ON by default for a fresh setup (it's a headline feature and
+  // the whole step exists to surface it) — but a RE-RUN prefills the real
+  // saved value below, so completing again can't silently flip a server that
+  // deliberately turned it off.
+  const [subsAuto, setSubsAuto] = useState(true);
+  const [subsLangs, setSubsLangs] = useState<string[]>(['en']);
+  const [integ, setInteg] = useState<IntegDraft>({
+    sonarrUrl: '', sonarrKey: '', radarrUrl: '', radarrKey: '',
+    plexUrl: '', plexToken: '', jfUrl: '', jfKey: '',
+  });
+  // Which services the SERVER already has credentials for (re-run) — shown as
+  // "Already connected"; complete() only writes fully-filled pairs, so an
+  // untouched existing service is never clobbered.
+  const [integExisting, setIntegExisting] = useState<Record<string, boolean>>({});
   const [version, setVersion] = useState<string | null>(null);
   // Final-save state: without this, a failed complete() used to be swallowed
   // and the wizard dismissed anyway — the first scan then ran against an
@@ -750,6 +1078,53 @@ export function Onboarding({ onComplete }: OnboardingProps) {
         if (typeof w.auto_scan === 'boolean') setWatchFolder(w.auto_scan);
         if (w.folders && typeof w.folders === 'object') setExistingWatchFolders(w.folders as Record<string, unknown>);
       }
+      // Booleans can be stored bare or {value: …}-wrapped like strings above.
+      const bval = (v: unknown): boolean | null => {
+        if (typeof v === 'boolean') return v;
+        if (v && typeof v === 'object' && typeof (v as { value?: unknown }).value === 'boolean') {
+          return (v as { value: boolean }).value;
+        }
+        return null;
+      };
+      const setIf = (key: string, set: (b: boolean) => void) => {
+        const b = bval(st[key]);
+        if (b !== null) set(b);
+      };
+      setIf('scanning.scheduled', setScheduled);
+      const stime = unwrap(st['scanning.scheduled_time']);
+      if (/^\d{2}:\d{2}$/.test(stime)) setSchedTime(stime);
+      setIf('parsing.read_mediainfo', setMediainfo);
+      setIf('matching.auto_approve', setAutoApprove);
+      setIf('naming.write_nfo', setWriteNfo);
+      setIf('naming.download_artwork', setArtwork);
+      // Subtitles: only a re-run adopts the saved state — on a FRESH server the
+      // key is absent (backend default off) and the wizard's opt-out default
+      // should win, not get clobbered to off.
+      if (bval(st['onboarding.completed']) === true) {
+        setSubsAuto(bval(st['subtitles.auto_fetch']) === true);
+      }
+      const langs = unwrap(st['subtitles.languages']);
+      if (langs.trim()) setSubsLangs(langs.split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
+      // Integrations: URLs are stored plaintext (prefill them); keys come back
+      // masked as {set:true} — flag those as "already connected" instead.
+      const secretSet = (k: string): boolean => {
+        const v = st[k];
+        return (typeof v === 'object' && v !== null && (v as { set?: boolean }).set === true)
+          || (typeof v === 'string' && v.length > 0);
+      };
+      setInteg(prev => ({
+        ...prev,
+        sonarrUrl: unwrap(st['integrations.sonarr.url']) || prev.sonarrUrl,
+        radarrUrl: unwrap(st['integrations.radarr.url']) || prev.radarrUrl,
+        plexUrl: unwrap(st['integrations.plex.url']) || prev.plexUrl,
+        jfUrl: unwrap(st['integrations.jellyfin.url']) || prev.jfUrl,
+      }));
+      setIntegExisting({
+        sonarr: secretSet('integrations.sonarr.api_key'),
+        radarr: secretSet('integrations.radarr.api_key'),
+        plex: secretSet('integrations.plex.token'),
+        jellyfin: secretSet('integrations.jellyfin.api_key'),
+      });
     }).catch(() => {});
     return () => { cancelled = true; };
   }, []);
@@ -766,7 +1141,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
     if (step === 3) return folder.length > 0;
     return true;
   };
-  const isOptional = step === 4 || step === 5;
+  const isOptional = step >= 4 && step <= 7;
 
   // Validate the chosen media folder exists before leaving step 3 — the
   // default '/media' (and any typed path) can point at nothing on bare metal,
@@ -795,9 +1170,9 @@ export function Onboarding({ onComplete }: OnboardingProps) {
 
   const advance = () => {
     // Honor an in-progress "Edit from summary": one change, straight back to
-    // the Launch summary (step 6).
-    if (returnToSummary) { setReturnToSummary(false); setStep(6); return; }
-    if (step < 6) setStep(step + 1); else void complete();
+    // the Launch summary.
+    if (returnToSummary) { setReturnToSummary(false); setStep(LAST_STEP); return; }
+    if (step < LAST_STEP) setStep(step + 1); else void complete();
   };
   const next = () => {
     dirRef.current = 1;
@@ -810,9 +1185,8 @@ export function Onboarding({ onComplete }: OnboardingProps) {
     // over a configured server the prefill loaded the real values, and
     // clobbering them (profile→'', op→hardlink) rewrote e.g. a Jellyfin
     // server to Plex. Just advance; complete() persists whatever's current.
-    if (returnToSummary) { setReturnToSummary(false); setStep(6); return; }
-    if (step === 4) setStep(5);
-    else if (step === 5) setStep(6);
+    if (returnToSummary) { setReturnToSummary(false); setStep(LAST_STEP); return; }
+    if (step >= 4 && step < LAST_STEP) setStep(step + 1);
   };
   const back = () => { if (step > 0) { dirRef.current = -1; setStep(step - 1); } };
   // Edit-from-summary: jump to the step AND arm the return so Continue/Skip
@@ -854,6 +1228,37 @@ export function Onboarding({ onComplete }: OnboardingProps) {
       debounce_seconds: 30, poll_interval_seconds: 900,
       folders: existingWatchFolders,   // preserve per-folder config on re-run
     };
+    // Scanning extras. Like watch.config these are ALWAYS written so a re-run
+    // can turn them off — the prefill loaded the saved values, so an untouched
+    // toggle round-trips unchanged.
+    values['scanning.scheduled'] = scheduled;
+    if (scheduled) values['scanning.scheduled_time'] = schedTime;
+    values['parsing.read_mediainfo'] = mediainfo;
+    // Auto-approve: the THRESHOLD is deliberately not written — the backend
+    // default (95) applies, and a custom threshold set in Settings survives a
+    // re-run untouched.
+    values['matching.auto_approve'] = autoApprove;
+    values['naming.write_nfo'] = writeNfo;
+    values['naming.download_artwork'] = artwork;
+    // Subtitles: one wizard toggle drives both fetch-after-rename and the
+    // post-scan backfill sweep (the split lives in Settings → Subtitles).
+    values['subtitles.auto_fetch'] = subsAuto;
+    values['subtitles.backfill_after_scan'] = subsAuto;
+    values['subtitles.languages'] = subsLangs.join(', ');
+    // Integrations: only complete url+key pairs are saved — a half-filled or
+    // untouched service leaves whatever the server already has alone.
+    const svcPairs: Array<[string, string, string, string]> = [
+      [integ.sonarrUrl, integ.sonarrKey, 'integrations.sonarr.url', 'integrations.sonarr.api_key'],
+      [integ.radarrUrl, integ.radarrKey, 'integrations.radarr.url', 'integrations.radarr.api_key'],
+      [integ.plexUrl, integ.plexToken, 'integrations.plex.url', 'integrations.plex.token'],
+      [integ.jfUrl, integ.jfKey, 'integrations.jellyfin.url', 'integrations.jellyfin.api_key'],
+    ];
+    for (const [url, key, urlSetting, keySetting] of svcPairs) {
+      if (url.trim() && key.trim()) {
+        values[urlSetting] = url.trim();
+        values[keySetting] = key.trim();
+      }
+    }
     try {
       await api.putSettings(values);
     } catch (e) {
@@ -869,7 +1274,15 @@ export function Onboarding({ onComplete }: OnboardingProps) {
   };
 
   const tmdbExisting = tmdbVal.state === 'success' && !!tmdbVal.existing;
-  const progress = step === 0 ? 0 : (step / 6) * 100;
+  const progress = step === 0 ? 0 : (step / LAST_STEP) * 100;
+  // Summary chips: a service counts as connected if this run filled both
+  // fields OR the server already had credentials.
+  const integNames = [
+    (integ.sonarrUrl.trim() && integ.sonarrKey.trim()) || integExisting.sonarr ? 'Sonarr' : null,
+    (integ.radarrUrl.trim() && integ.radarrKey.trim()) || integExisting.radarr ? 'Radarr' : null,
+    (integ.plexUrl.trim() && integ.plexToken.trim()) || integExisting.plex ? 'Plex' : null,
+    (integ.jfUrl.trim() && integ.jfKey.trim()) || integExisting.jellyfin ? 'Jellyfin' : null,
+  ].filter((n): n is string => n !== null);
 
   const shellRef = useRef<HTMLDivElement>(null);
   // Focus containment + Enter-to-advance for the modal overlay. The app renders
@@ -881,7 +1294,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
       // Don't hijack Enter on the actual buttons (they have their own onClick)
       // or textareas; do advance from text inputs / the shell itself.
       if (tag !== 'BUTTON' && tag !== 'TEXTAREA' && step > 0) {
-        if (step === 6) { if (!completing) void complete(); }
+        if (step === LAST_STEP) { if (!completing) void complete(); }
         else if (canContinue() && !checkingFolder) { e.preventDefault(); next(); }
       }
       return;
@@ -976,13 +1389,26 @@ export function Onboarding({ onComplete }: OnboardingProps) {
               />
             )}
             {step === 3 && (
-              <MediaFolderStep folder={folder} setFolder={setFolder} watchFolder={watchFolder} setWatchFolder={setWatchFolder} folderErr={folderErr} clearFolderErr={() => setFolderErr(null)} />
+              <MediaFolderStep
+                folder={folder} setFolder={setFolder}
+                watchFolder={watchFolder} setWatchFolder={setWatchFolder}
+                scheduled={scheduled} setScheduled={setScheduled}
+                schedTime={schedTime} setSchedTime={setSchedTime}
+                mediainfo={mediainfo} setMediainfo={setMediainfo}
+                folderErr={folderErr} clearFolderErr={() => setFolderErr(null)}
+              />
             )}
-            {step === 4 && <HandlingStep op={fileOp} setOp={setFileOp} mode={renameMode} setMode={setRenameMode} />}
-            {step === 5 && <NamingStep profile={profile} setProfile={setProfile} />}
-            {step === 6 && (
+            {step === 4 && <HandlingStep op={fileOp} setOp={setFileOp} mode={renameMode} setMode={setRenameMode} autoApprove={autoApprove} setAutoApprove={setAutoApprove} />}
+            {step === 5 && <NamingStep profile={profile} setProfile={setProfile} writeNfo={writeNfo} setWriteNfo={setWriteNfo} artwork={artwork} setArtwork={setArtwork} />}
+            {step === 6 && <SubtitlesStep auto={subsAuto} setAuto={setSubsAuto} langs={subsLangs} setLangs={setSubsLangs} />}
+            {step === 7 && <IntegrationsStep integ={integ} setInteg={setInteg} existing={integExisting} />}
+            {step === 8 && (
               <ReadyStep
-                data={{ apiKey: tmdbKey, tmdbExisting, folder, profile, contentTypes, watchFolder, fileOp, renameMode }}
+                data={{
+                  apiKey: tmdbKey, tmdbExisting, folder, profile, contentTypes, watchFolder, fileOp, renameMode,
+                  scheduled, schedTime, mediainfo, autoApprove, writeNfo, artwork,
+                  subsAuto, subsLangs, integNames,
+                }}
                 gotoStep={editFromSummary}
               />
             )}
@@ -993,7 +1419,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
           <div className="onb-foot">
             {step === 0 ? (
               <>
-                <div className="hint">Takes about two minutes</div>
+                <div className="hint">Takes about three minutes — every step past the folder is skippable</div>
                 <button className="btn btn-brand" style={{ padding: '12px 24px', fontSize: 14 }} onClick={next}>
                   Get started <IcArrowRight />
                 </button>
@@ -1002,13 +1428,13 @@ export function Onboarding({ onComplete }: OnboardingProps) {
               <>
                 <button className="btn btn-ghost" onClick={back} disabled={completing}>← Back</button>
                 <div className="right">
-                  {completeError && step === 6 && (
+                  {completeError && step === LAST_STEP && (
                     <span className="onb-save-error" role="alert" style={{ color: 'var(--conf-low, #f87171)', fontSize: 12, marginRight: 8 }}>
                       {completeError}
                     </span>
                   )}
                   {isOptional && <button className="onb-skip" onClick={skip}>Skip — set up later</button>}
-                  {step === 6 ? (
+                  {step === LAST_STEP ? (
                     <button className="btn btn-primary launch" style={{ padding: '11px 22px' }} onClick={() => void complete()} disabled={completing}>
                       {completing ? <><IcSpin /> Saving…</> : completeError ? <><IcScan /> Retry</> : <><IcScan /> Start first scan</>}
                     </button>

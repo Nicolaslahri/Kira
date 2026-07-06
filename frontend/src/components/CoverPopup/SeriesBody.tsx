@@ -4,6 +4,8 @@ import type { SonarrQueueEntry, PairedRowShape } from './types';
 import { PairRowCell, SkeletonRow } from './rows';
 
 interface SeriesBodyProps {
+  /** One-click candidate switch, threaded down to each episode row. */
+  onPickCandidate?: (fileId: string, candidate: { matchId?: number; title?: string; year?: number | null }) => void | Promise<void>;
   item: LibraryItem;
   rows: PairedRowShape[];
   updateFile: (idx: number, patch: Partial<LibFile>) => void;
@@ -42,6 +44,7 @@ interface SeriesBodyProps {
 export function SeriesBody({
   item, rows, updateFile, onManualSearch, onOpenDupeModal,
   episodesLoading, queueByEpisode, recentlyImported, pushToast, onRequestEpisode,
+  onPickCandidate,
 }: SeriesBodyProps) {
   // ── Adaptive missing-episode collapse (the One Piece "1090 blank rows") ──
   // A "blank" row is an episode with no file. For a normal season that's a
@@ -194,6 +197,7 @@ export function SeriesBody({
         pushToast={pushToast}
         onRequestEpisode={onRequestEpisode}
         staggerIndex={i}
+        onPickCandidate={onPickCandidate}
       />,
     );
   });
