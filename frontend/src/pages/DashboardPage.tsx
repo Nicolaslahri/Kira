@@ -583,7 +583,11 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
           Re-parse dropdown (the menu lives inside this stacking context).
           The decorative layers that DO need clipping (poster fan + scrim)
           are wrapped in their own clipped, rounded inset layer instead. */}
-      <section className={cn('dash-hero anim-rise relative z-10 mb-5 rounded-3xl border border-secondary p-7 sm:p-8', scanning && 'dash-hero-live')}>
+      {/* z-20 (not z-10 like the siblings below): .dash-hero is isolation:isolate,
+          so the re-parse menu's z-50 is trapped INSIDE the hero's stacking
+          context — at equal sibling z, the later-DOM KPI strip painted over the
+          open menu and swallowed clicks on every option below the hero edge. */}
+      <section className={cn('dash-hero anim-rise relative z-20 mb-5 rounded-3xl border border-secondary p-7 sm:p-8', scanning && 'dash-hero-live')}>
         <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-3xl">
           <PosterFan urls={posterUrls} />
           {/* readability scrim over the poster fan */}

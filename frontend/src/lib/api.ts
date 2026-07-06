@@ -1069,7 +1069,9 @@ export const api = {
       `/files/delta?since=${encodeURIComponent(since)}`),
 
   hardlinkSavings: () =>
-    request<{ files: number; bytes_saved: number }>('/system/hardlink-savings'),
+    // The system router mounts UNPREFIXED (like /ffmpeg, /datasets) — a
+    // /system/… path 404s silently and the hero stat never renders.
+    request<{ files: number; bytes_saved: number }>('/hardlink-savings'),
 
   downloadHistoryCsv: async (): Promise<void> => {
     const auth = getStoredAuth();
