@@ -7,13 +7,18 @@ import type { LibFile } from '../lib/types';
  *  for brand logos (Dolby/DTS marks are trademarks — the bordered-wordmark
  *  treatment is exactly how Apple TV renders them at this size anyway). */
 
-export function TechBadge({ label, title }: { label: string; title?: string }) {
+export type BadgeTone = 'neutral' | 'hdr' | 'sub' | 'audio' | 'warn' | 'group';
+
+export function TechBadge({ label, title, tone = 'neutral' }: { label: string; title?: string; tone?: BadgeTone }) {
   return (
-    <span className="tech-badge" title={title ?? label}>
+    <span className={tone === 'neutral' ? 'tech-badge' : `tech-badge tb-${tone}`} title={title ?? label}>
       {label}
     </span>
   );
 }
+
+/** The marks hdrMark() emits — used to tint HDR badges gold in the rail. */
+const HDR_MARKS = new Set(['DOLBY VISION', 'HDR10+', 'HDR', 'HLG']);
 
 /* ── normalizers ─────────────────────────────────────────────────────────── */
 
@@ -84,7 +89,7 @@ export function TechBadges({ file }: { file: Pick<LibFile, 'quality' | 'hdr' | '
   if (!marks.length) return null;
   return (
     <span className="inline-flex flex-wrap items-center gap-1">
-      {marks.map(m => <TechBadge key={m} label={m} />)}
+      {marks.map(m => <TechBadge key={m} label={m} tone={HDR_MARKS.has(m) ? 'hdr' : 'neutral'} />)}
     </span>
   );
 }

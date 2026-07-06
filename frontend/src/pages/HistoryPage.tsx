@@ -416,9 +416,18 @@ export function HistoryPage({ pushToast }: Props) {
   return (
     <div className="page">
       <div className="mb-4">
-        {/* ROW 1 — title + undo-status strip + view toggle + actions */}
+        {/* ROW 1 — title + view toggle (pinned right after the title so it
+            never shifts) + undo-status strip + actions. Keeping the toggle
+            anchored means switching tabs doesn't slide it sideways. */}
         <div className="mb-2.5 flex flex-wrap items-center gap-x-3 gap-y-2">
           <h1 className="mr-1 text-[22px] font-semibold leading-none tracking-tight text-primary">History</h1>
+
+          {/* View toggle stays a SegmentedControl — it's a mode switch, not a filter. */}
+          <SegmentedControl
+            value={view}
+            onChange={v => setView(v as 'renames' | 'subtitles' | 'trash')}
+            options={[{ value: 'renames', label: 'Renames' }, { value: 'subtitles', label: 'Subtitles' }, { value: 'trash', label: 'Trash' }]}
+          />
 
           {/* UNDO-STATUS STRIP — the one compact "wow", nested in the title-row
               dead space (≈0 added height). Presentational: there is no
@@ -435,13 +444,6 @@ export function HistoryPage({ pushToast }: Props) {
             </div>
           ) : null}
 
-          {/* View toggle stays a SegmentedControl — it's a mode switch, not a filter. */}
-          <SegmentedControl
-            value={view}
-            onChange={v => setView(v as 'renames' | 'subtitles' | 'trash')}
-            options={[{ value: 'renames', label: 'Renames' }, { value: 'subtitles', label: 'Subtitles' }, { value: 'trash', label: 'Trash' }]}
-          />
-
           {view === 'renames' ? (
             <div className="ml-auto flex items-center gap-2">
               <Button color="secondary" size="sm" iconLeading={IcSparkles} isLoading={cleaning} onClick={() => void cleanupOrphans()} title="Remove leftover sidecar files (NFO, posters, subtitles) that undone renames left on disk">Clean undo leftovers</Button>
@@ -456,9 +458,18 @@ export function HistoryPage({ pushToast }: Props) {
           ) : null}
         </div>
 
-        {/* ROW 2 — period + operation FilterChips + search (renames view only) */}
-        {view === 'renames' ? (
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+        {/* ROW 2 — always mounted at a stable height so switching tabs doesn't
+            collapse the header and jump the content below. Renames gets the
+            period/operation filters + search; the other tabs get a one-line
+            caption in the same vertical slot. */}
+        {view !== 'renames' ? (
+          <div className="flex min-h-[36px] items-center text-[12px] text-tertiary">
+            {view === 'subtitles'
+              ? 'Every subtitle Kira fetched, newest first — language, source and match score per file.'
+              : 'Items the cleanup sweep recycled — restore any one, or remove it for good.'}
+          </div>
+        ) : (
+          <div className="flex min-h-[36px] flex-wrap items-center gap-x-4 gap-y-2">
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="mr-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-quaternary">Period</span>
               <FilterChip on={period === 'today'} onClick={() => setPeriod('today')} label="Today" num={counts.today} />
@@ -499,7 +510,7 @@ export function HistoryPage({ pushToast }: Props) {
               />
             </div>
           </div>
-        ) : null}
+        )}
       </div>
 
       {view === 'trash' ? <TrashView pushToast={pushToast} /> : view === 'subtitles' ? <SubtitleHistory pushToast={pushToast} /> : (

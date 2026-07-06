@@ -5,6 +5,7 @@ import { IcCheck, IcX, IcSearch, IcAlertTri, IcDownload, IcCaption } from '../..
 import { ButtonGroup, ButtonGroupItem } from '../base/button-group/button-group';
 import { cn } from '../../lib/utils';
 import { confTier } from '../LibraryGrid';
+import { confLevel } from '../../lib/confBands';
 import { audioLangChip, subLangChip, missingSubChip, inferQuality, inferSource } from './quality';
 import { TechBadges } from '../TechBadge';
 import { CandidateList } from './CandidateList';
@@ -33,14 +34,15 @@ import type { SonarrQueueEntry, PairedRowShape } from './types';
 //    tints specific specs (HDR amber, audio-language emerald, release
 //    group monospace). Shared by every paired/orphan/download row so the
 //    tag rail reads consistently.
-function RowTag({ children, className, title }: { children: ReactNode; className?: string; title?: string }) {
+/** Spec chip in the tech-badge family (same height / radius / border as the
+ *  4K · HEVC · DD+ rail) so size, source, subtitle and audio chips all read as
+ *  one row instead of two mismatched styles. `tone` adds the semantic accents
+ *  (sub = cyan, audio = indigo, group = dim mono). */
+function RowTag({ children, className, title, tone }: { children: ReactNode; className?: string; title?: string; tone?: 'neutral' | 'sub' | 'audio' | 'group' }) {
   return (
     <span
       title={title}
-      className={cn(
-        'inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-white/[0.05] px-1.5 py-[3px] text-[10.5px] font-medium leading-none text-tertiary ring-1 ring-white/[0.07] ring-inset',
-        className,
-      )}
+      className={cn('tech-badge', tone && tone !== 'neutral' && `tb-${tone}`, className)}
     >
       {children}
     </span>
@@ -93,7 +95,7 @@ function MissingSubAction({ file }: { file: LibFile }) {
     <button
       onClick={browse}
       title={`Missing preferred subtitles (${(file.missingSubs ?? []).map(l => l.toUpperCase()).join(', ')}) — click to browse & pick`}
-      className="inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-[var(--warn-bg)] px-1.5 py-[3px] text-[10.5px] font-semibold leading-none text-[var(--warn)] ring-1 ring-[var(--warn-line)] ring-inset transition-colors hover:bg-[var(--warn-line)] hover:ring-[var(--warn)] disabled:cursor-progress disabled:opacity-60 [&_svg]:size-[11px]"
+      className="tech-badge tb-warn [&_svg]:size-[10px]"
     >
       {label}
       <IcDownload />
@@ -407,16 +409,21 @@ function PairRowCellImpl({
           </MarqueeText>
           <div className="flex flex-wrap items-center gap-1">
             {f.size ? <RowTag>{f.size}</RowTag> : null}
-            {/* Tech specs — one unified Apple-TV-style white badge rail
-                (4K · DOLBY VISION · HEVC · DOLBY ATMOS · 7.1). Replaces the
-                old mix of gold 4K art + amber HDR chip + grey codec chips. */}
+            {/* Tech specs — one unified Apple-TV-style badge rail
+                (4K · DOLBY VISION · HEVC · DOLBY ATMOS · 7.1). Size / source /
+                subtitle / audio chips below share the exact same geometry so
+                the whole row reads as one family; a few carry semantic colour. */}
             <TechBadges file={{ ...f, quality: inferQuality(f) ?? f.quality }} />
             {(() => { const s = inferSource(f); return s ? <RowTag>{s}</RowTag> : null; })()}
-            {(() => { const a = audioLangChip(f); return a ? <RowTag className="text-[var(--accent)] ring-[var(--accent-line)]">{a}</RowTag> : null; })()}
-            {(() => { const s = subLangChip(f); return s ? <RowTag><IcCaption className="mr-1 inline-block size-3 align-[-1px]" />{s.replace(/^SUB /, '')}</RowTag> : null; })()}
+            {(() => { const a = audioLangChip(f); return a ? <RowTag tone="audio">{a}</RowTag> : null; })()}
+            {(() => { const s = subLangChip(f); return s ? <RowTag tone="sub"><IcCaption className="inline-block size-3 align-[-1px]" />{s.replace(/^SUB /, '')}</RowTag> : null; })()}
             <MissingSubAction file={f} />
-            {f.releaseGroup ? <RowTag className="font-mono text-quaternary" title={f.releaseGroup}>[{f.releaseGroup}]</RowTag> : null}
-            {onPickCandidate && f.candidates && f.candidates.length > 1 ? (
+            {f.releaseGroup ? <RowTag tone="group" title={f.releaseGroup}>[{f.releaseGroup}]</RowTag> : null}
+            {/* Alternate-candidate expander — only worth surfacing when the
+                match is NOT high-confidence. On a 100% match it's just noise
+                (the user can always Re-identify); on an ambiguous one it's the
+                fast path to switch without leaving the row. */}
+            {onPickCandidate && f.candidates && f.candidates.length > 1 && confLevel(f.confidence ?? 0) !== 'high' ? (
               <button
                 type="button"
                 onClick={() => setAltsOpen(v => !v)}

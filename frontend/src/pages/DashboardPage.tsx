@@ -650,7 +650,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
                 Re-parse ▾
               </Button>
               {reparseOpen ? (
-                <div className="absolute right-0 z-50 mt-1.5 min-w-[180px] overflow-hidden rounded-xl bg-secondary p-1 shadow-lg ring-1 ring-inset ring-secondary">
+                <div className="absolute right-0 z-50 mt-1.5 min-w-[180px] overflow-hidden rounded-xl bg-[var(--panel-90)] p-1 shadow-[var(--shadow-3)] ring-1 ring-inset ring-secondary backdrop-blur-xl">
                   {([
                     ['Whole library', undefined],
                     ['Music only', 'music'],
@@ -662,7 +662,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
                       key={label}
                       type="button"
                       onClick={() => { setReparseOpen(false); runReparse(mt ? { media_type: mt } : undefined); }}
-                      className="block w-full rounded-lg px-3 py-2 text-left text-[13px] font-medium text-secondary transition-colors hover:bg-tertiary hover:text-primary"
+                      className="block w-full rounded-lg px-3 py-2 text-left text-[13px] font-medium text-primary transition-colors hover:bg-tertiary"
                     >
                       {label}
                     </button>
@@ -677,7 +677,7 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
                         window.dispatchEvent(new CustomEvent('kira:files-changed'));
                       }).catch(() => { /* connectivity UI covers failures */ });
                     }}
-                    className="block w-full rounded-lg px-3 py-2 text-left text-[13px] font-medium text-secondary transition-colors hover:bg-tertiary hover:text-primary"
+                    className="block w-full rounded-lg px-3 py-2 text-left text-[13px] font-medium text-primary transition-colors hover:bg-tertiary"
                     title="Re-run matching only (keeps existing parse data) — faster than a full re-parse"
                   >
                     Re-match only (faster)

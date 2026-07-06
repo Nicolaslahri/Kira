@@ -75,6 +75,14 @@ async def search_provider(
     if not q.strip():
         return {"provider": provider, "results": []}
 
+    # MusicBrainz is keyless and lives in its own client (kira.music.musicbrainz),
+    # NOT the MetadataProvider registry — so route it directly instead of through
+    # registry.build(), which would raise NotImplementedError. This is what made
+    # the modal wrongly say "MusicBrainz needs an API key": /providers reported it
+    # configured (keyless) but the search path couldn't build it.
+    if provider == "musicbrainz":
+        return await _search_musicbrainz(q.strip())
+
     async with httpx.AsyncClient() as client:
         registry = await registry_from_settings(client)
         if not registry.has(provider):
@@ -109,6 +117,48 @@ async def search_provider(
             raise HTTPException(502, f"{provider} request failed: {e}") from e
 
     return {"provider": provider, "results": results}
+
+
+async def _search_musicbrainz(q: str) -> dict[str, Any]:
+    """Free-text album/artist search against MusicBrainz for the Manual Search
+    modal. Keyless — needs only a descriptive User-Agent (the shared client
+    supplies it). Maps release hits into the modal's result shape; the album
+    MBID rides in `provider_id` so a manual pick round-trips like any other."""
+    from kira.music import musicbrainz as mb
+
+    async with httpx.AsyncClient() as client:
+        try:
+            # The box is one free-text field, so search it as the album title
+            # (artist empty) — MusicBrainz's own relevance handles "Artist Album".
+            hits = await mb.search_releases(client, artist="", album=q, limit=12)
+        except Exception as e:  # noqa: BLE001 — surface as a clean 502, never 500
+            raise HTTPException(502, f"MusicBrainz request failed: {e}") from e
+
+    results: list[dict[str, Any]] = []
+    for h in hits:
+        # Cover Art Archive front thumbnail (allow-listed host); 404s fall back
+        # to the placeholder card client-side, so it's safe to always offer.
+        poster = f"https://coverartarchive.org/release/{h.id}/front-250" if h.id else None
+        results.append({
+            "provider_id": h.id,
+            "title": h.title,
+            "year": _year_of(h.date),
+            "overview": h.artist or None,
+            "poster_url": poster,
+            "popularity": h.score,
+            "media_type": "music",
+            "aliases": None,
+        })
+    return {"provider": "musicbrainz", "results": results}
+
+
+def _year_of(date: str | None) -> int | None:
+    if not date:
+        return None
+    try:
+        return int(date[:4])
+    except (ValueError, TypeError):
+        return None
 
 
 def _to_dict(r: Any, media_type: str) -> dict[str, Any]:
