@@ -46,6 +46,16 @@ _AMBIGUITY_EPSILON = 0.01
 # within-band confidences — see the aggregation comment in score_one).
 _CORROBORATION_BOOST = 0.5
 
+# Metrics that are SELF-REFERENTIAL and therefore excluded from fueling the
+# corroboration boost. `rank` says "this candidate came first when the
+# provider was searched for the query's own string" — fine for ORDERING
+# candidates against each other, but it is not independent evidence the match
+# is RIGHT: searching "One Pace" puts "One Piece" at rank 0 by construction,
+# and that rank-0 boost is exactly what pushed a known-bad fuzzy (levenshtein
+# 0.772) over the 0.80 anime floor to 0.802. Real corroboration — a year that
+# matches, episode-count sanity, external cross-refs — still boosts.
+_SELF_REFERENTIAL_METRICS = frozenset({"rank"})
+
 # Only ambiguity at the tier-1 ceiling matters for the matcher's
 # "should I auto-commit this?" decision. A tier-2 tie just means two
 # similarly-named shows scored similarly — the engine's existing
@@ -168,7 +178,14 @@ class Cascade:
         # so multiple similarity metrics don't double-count overlapping signals.
         tier_2_max = max((r.score for r in tier_2_results), default=0.0)
         tier_3_max = max((r.score for r in tier_3_results), default=0.0)
-        if tier_2_max > 0 and tier_3_max > 0:
+        # Boost fuel excludes self-referential metrics (rank) — see the
+        # _SELF_REFERENTIAL_METRICS comment. tier_3_max keeps the full set for
+        # the lone-tier-3 fallback below (ordering only, under MIN_CONFIDENCE).
+        tier_3_boost_max = max(
+            (r.score for r in tier_3_results if r.metric not in _SELF_REFERENTIAL_METRICS),
+            default=0.0,
+        )
+        if tier_2_max > 0 and tier_3_boost_max > 0:
             # Corroboration BOOSTS similarity toward (never past) the top of
             # tier-2's band — it must not dilute it. The old 0.7/0.3 weighted
             # average CAPPED the no-tier-1 score at 0.745 (its own comment
@@ -184,13 +201,16 @@ class Cascade:
             # similarity gains little (junk can't ride corroboration up).
             # Perfect tier-2 + perfect tier-3 now lands exactly at the top of
             # the tier-2 band, preserving "tier-2 can't beat tier-1".
-            # Calibration: trigram 0.73 ("One Pace" vs "One Piece") + rank-0
-            # → 0.789, still under the 0.80 anime floor; trigram 0.80 + full
-            # corroboration → 0.808, correctly over it.
+            # Calibration ("One Pace" vs "One Piece": trigram 0.667,
+            # levenshtein/LCS 0.778 → tier-2 max 0.772): rank is excluded from
+            # the boost, so with no real corroboration the score STAYS 0.772 —
+            # under the 0.80 anime floor. A one-typo romaji title (trigram
+            # 0.95 → 0.833) still clears the floor on similarity alone, and
+            # real corroboration (year match etc.) still boosts past it.
             t2_lo, t2_hi = TIER_BANDS[MetricTier.SIMILARITY]
             t3_lo, t3_hi = TIER_BANDS[MetricTier.CORROBORATION]
             t2_conf = max(0.0, min(1.0, (tier_2_max - t2_lo) / (t2_hi - t2_lo)))
-            t3_conf = max(0.0, min(1.0, (tier_3_max - t3_lo) / (t3_hi - t3_lo)))
+            t3_conf = max(0.0, min(1.0, (tier_3_boost_max - t3_lo) / (t3_hi - t3_lo)))
             weighted = tier_2_max + _CORROBORATION_BOOST * t2_conf * t3_conf * (t2_hi - tier_2_max)
         elif tier_2_max > 0:
             weighted = tier_2_max

@@ -299,10 +299,15 @@ class MatchEngine:
     # through to TVDB. Pitched HIGH (0.80) on purpose: real anime
     # matches hit 0.85+ or 1.0 because either the canonical title
     # matches exactly or an AniDB alias does. The 0.55–0.79 band is
-    # fuzzy "could-be-right" territory — "One Pace" scores 0.73 against
-    # "One Piece" because the strings differ by 1 character, but that
+    # fuzzy "could-be-right" territory — "One Pace" reaches 0.772
+    # against "One Piece" (levenshtein; trigram only 0.667), but that
     # similarity isn't trustworthy: One Pace is a fan re-edit, not One
     # Piece. Better to mark as no_match and let the user decide.
+    # Guarded in the cascade: the rank metric (self-referential — One
+    # Piece is trivially the top hit when searching "One Pace") is
+    # excluded from the corroboration boost, so a fuzzy near-miss can't
+    # ride its own search position over this floor (it did once: 0.772
+    # + rank boost = 0.802).
     ANIME_ANIDB_TRUST_FLOOR = 0.80
 
     # Minimum confidence to return any match at all. Below this the

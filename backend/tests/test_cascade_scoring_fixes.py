@@ -102,6 +102,59 @@ async def test_one_pace_stays_below_anime_floor():
     assert final < MatchEngine.MIN_CONFIDENCE_ANIME
 
 
+async def test_one_pace_real_pipeline_numbers_stay_below_floor():
+    """The case the trigram-only calibration missed (found in production):
+    LEVENSHTEIN scores 'One Pace' vs 'One Piece' at raw 0.778 — higher than
+    trigram's 0.667 — and rank fired 1.0 because One Piece is trivially the
+    top hit when searching AniDB for "One Pace". That combination scored
+    0.802: over the 0.80 anime floor, over the AniDB early-exit, matched.
+
+    Rank is SELF-REFERENTIAL (a candidate's position in the provider's own
+    search for the query string is not independent evidence) so it must not
+    fuel the corroboration boost. With real-pipeline numbers the score stays
+    at the bare tier-2 value, under the floor → no_match, user decides."""
+    from kira.matcher.engine import MatchEngine
+    final = await _final(
+        _FixedMetric("trigram", MetricTier.SIMILARITY, 0.667),
+        _FixedMetric("levenshtein", MetricTier.SIMILARITY, 0.778),
+        _FixedMetric("lcs", MetricTier.SIMILARITY, 0.778),
+        _FixedMetric("rank", MetricTier.CORROBORATION, 1.0),
+    )
+    assert final < MatchEngine.MIN_CONFIDENCE_ANIME
+    assert final < MatchEngine.ANIME_ANIDB_TRUST_FLOOR
+    # Score equals bare tier-2 (rank added nothing).
+    assert final == pytest.approx(clamp_to_tier(0.778, MetricTier.SIMILARITY), abs=1e-6)
+
+
+async def test_rank_alone_does_not_boost_but_real_corroboration_does():
+    """Same fuzzy similarity, two corroboration shapes: rank-only must add
+    nothing; independent evidence (year match) still boosts. This is the
+    line the fix draws — near-misses can't ride their own search position
+    over a decision floor, but genuine agreement still counts."""
+    sim = _FixedMetric("levenshtein", MetricTier.SIMILARITY, 0.778)
+    rank_only = await _final(sim, _FixedMetric("rank", MetricTier.CORROBORATION, 1.0))
+    with_year = await _final(
+        sim,
+        _FixedMetric("rank", MetricTier.CORROBORATION, 1.0),
+        _FixedMetric("year", MetricTier.CORROBORATION, 1.0),
+    )
+    bare = await _final(sim)
+    assert rank_only == pytest.approx(bare, abs=1e-9)
+    assert with_year > bare
+
+
+async def test_one_typo_romaji_still_clears_anime_floor_without_boost():
+    """The regression the boost redesign originally fixed must SURVIVE the
+    rank exclusion: a one-typo title (trigram ≈0.95) clears the 0.80 anime
+    floor on similarity alone — no corroboration needed."""
+    from kira.matcher.engine import MatchEngine
+    final = await _final(
+        _FixedMetric("trigram", MetricTier.SIMILARITY, 0.95),
+        _FixedMetric("rank", MetricTier.CORROBORATION, 1.0),
+    )
+    assert final >= MatchEngine.MIN_CONFIDENCE_ANIME
+
+
 async def test_tier1_still_wins_outright():
     final = await _final(
         _FixedMetric("id", MetricTier.IDENTITY, 0.9),
