@@ -112,6 +112,11 @@ _API_DELAY_SEC = 5.0
 # airing shows at most a day stale (auto-heal refreshes titles later) while
 # making repeat scans near-instant for anime.
 _XML_CACHE_TTL_SEC = 24 * 3600
+# Status-aware TTL (anime-speed Phase 5): a FINISHED show's episode list is
+# immutable in practice — its cached XML stays valid for a month (the weekly
+# offline-dump refresh catches the rare correction). Airing/unknown shows
+# keep the 24h TTL so new episodes appear within a day.
+_XML_CACHE_TTL_FINISHED_SEC = 30 * 24 * 3600
 
 # Circuit-breaker thresholds. If we see >= N AniDB-side errors (5xx, 4xx
 # 'banned', client-version rejections) within ERROR_WINDOW seconds, the
@@ -731,6 +736,23 @@ class AniDBProvider(MetadataProvider):
         # Cache miss — fetch via the rate-limited path.
         data = await self._http_api(str(aid_i))
         if data is None:
+            # Live failed (ban / circuit / error). Fall back to the offline
+            # dump — INCLUDING ongoing shows, where the ~weekly-stale count is
+            # a hint, not truth: still better than bailing an entire
+            # franchise-offsets table because one airing cour couldn't be
+            # counted. Deliberately NOT persisted to the authoritative cache,
+            # so a later live fetch can correct it.
+            try:
+                from kira.providers import anime_offline_db as aodb
+                off = aodb.offline_count(aid_i)
+            except Exception:  # noqa: BLE001
+                off = None
+            if off is not None:
+                count, status = off
+                _anidb_log.info(json.dumps({
+                    "evt": "offline_count_fallback",
+                    "aid": aid_i, "count": count, "status": status}))
+                return count
             return None
         count = sum(
             1 for ep in data.findall(".//episode")
@@ -748,6 +770,12 @@ class AniDBProvider(MetadataProvider):
     # Maps AID → sorted list of all AIDs in the franchise (including self).
     _relations_cache: ClassVar[dict[str, list[int]] | None] = None
     _relations_cache_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+    # Seeds resolved from the OFFLINE relations graph, awaiting verification
+    # by the real typed walk (drain_relations_verify — runs after a scan's
+    # match phase, off the critical path). In-memory only: on restart the
+    # next scan's offline path re-queues anything still unverified (the
+    # authoritative disk cache lacks it), so the set self-heals.
+    _relations_verify_pending: ClassVar[set[int]] = set()
 
     # Relation types we treat as "same franchise". AniDB also exposes
     # `side_story`, `alternative_setting`, `same_setting`, `parent_story`,
@@ -796,6 +824,21 @@ class AniDBProvider(MetadataProvider):
         if aid in cache:
             return cache[aid]
 
+        # Offline-first (anime-speed Phase 2): the manami relations graph
+        # resolves the closure with ZERO AniDB calls. Its edges are untyped,
+        # so the result is gated through Fribb (all cours of one franchise
+        # share one TVDB series; side stories / alt-setting spinoffs don't)
+        # and the seed is queued for background verification by the real
+        # typed walk — verified ground truth lands in the authoritative
+        # cache and wins from the next lookup on. Works even under a ban.
+        offline = await self._related_aids_offline(aid)
+        if offline is not None:
+            try:
+                AniDBProvider._relations_verify_pending.add(int(aid))
+            except (TypeError, ValueError):
+                pass
+            return offline
+
         # AniDB banned → don't walk. Every _http_api hop below already no-ops to
         # None under the ban, so the walk can only ever collapse to the seed AID
         # anyway. Bail to cache-only: any franchise we've previously resolved is
@@ -803,6 +846,53 @@ class AniDBProvider(MetadataProvider):
         # banned; a never-before-seen franchise just can't be resolved until the
         # ban lifts (impossible without the API). This skips the pointless,
         # 5s-gated no-op loop so a re-match under a ban stays fast and quiet.
+        if AniDBProvider.is_banned():
+            return []
+        return await self._related_aids_live(aid)
+
+    async def _related_aids_offline(self, aid: str) -> list[int] | None:
+        """Franchise closure from the weekly offline dump — no AniDB calls.
+        None → the AID isn't in the dump (very new show); caller walks live."""
+        try:
+            seed = int(aid)
+        except (TypeError, ValueError):
+            return None
+        try:
+            from kira.providers import anime_offline_db as aodb
+            closure = aodb.related_closure(seed)
+        except Exception:  # noqa: BLE001 — offline layer must never break matching
+            return None
+        if closure is None:
+            return None
+        if len(closure) <= 1:
+            return closure or [seed]
+        # Fribb same-series gate — approximates the live walk's relation-type
+        # filter (sequel/prequel only): every cour of a franchise maps to ONE
+        # TVDB series; side stories and alternative-setting spinoffs map to
+        # their own series and are cut. Members with NO Fribb mapping are
+        # KEPT (plenty of legit cours lack a row); background verification
+        # corrects any residue.
+        try:
+            from kira.providers.anime_mappings import AnimeMappings
+            seed_tv = await AnimeMappings.tvdb_id(seed)
+            if seed_tv is not None:
+                kept: list[int] = []
+                for member in closure:
+                    tv = seed_tv if member == seed else await AnimeMappings.tvdb_id(member)
+                    if tv is None or tv == seed_tv:
+                        kept.append(member)
+                closure = kept or [seed]
+        except Exception:  # noqa: BLE001 — gate is best-effort; ungated closure still verifies
+            _anidb_log.info(json.dumps({"evt": "offline_relations_gate_skipped", "seed": seed}))
+        _anidb_log.info(json.dumps({
+            "evt": "offline_relations", "seed": seed, "size": len(closure)}))
+        return closure
+
+    async def _related_aids_live(self, aid: str) -> list[int]:
+        """The real typed walk — one throttled AniDB call per franchise member.
+        Persists ground truth to the authoritative relations cache on full
+        success. Also the background verifier's workhorse (drain_relations_verify)."""
+        cache = self._load_relations_cache()
         if AniDBProvider.is_banned():
             return []
 
@@ -890,6 +980,58 @@ class AniDBProvider(MetadataProvider):
                 cache[str(member)] = group
             await asyncio.to_thread(self._save_relations_cache)
         return group
+
+    @classmethod
+    async def drain_relations_verify(cls, max_franchises: int = 12) -> int:
+        """Verify offline-resolved franchises with the real typed walk.
+
+        Runs AFTER a scan's match phase (spawned fire-and-forget) so the
+        throttled calls never gate matching. Each walk persists ground truth
+        to the authoritative relations cache — which the offline path never
+        writes — so any offline/live disagreement corrects itself on the next
+        scan or re-match. Bounded per drain (a franchise walk is one throttled
+        call per member); leftovers re-queue naturally on the next scan.
+        Returns the number of seeds verified."""
+        if not cls._relations_verify_pending:
+            return 0
+        import httpx
+        from kira.matcher.engine import registry_from_settings
+        verified = 0
+        try:
+            async with httpx.AsyncClient() as client:
+                registry = await registry_from_settings(client)
+                if not registry.has("anidb"):
+                    return 0
+                provider = registry.build("anidb")
+                while cls._relations_verify_pending and verified < max_franchises:
+                    if cls.is_banned():
+                        break
+                    seed = cls._relations_verify_pending.pop()
+                    # Another member's walk may have persisted this franchise
+                    # already — the closure is cached under every member.
+                    if str(seed) in cls._load_relations_cache():
+                        continue
+                    try:
+                        await provider._related_aids_live(str(seed))
+                        verified += 1
+                    except Exception as e:  # noqa: BLE001 — verify is best-effort
+                        _anidb_log.warning(json.dumps({
+                            "evt": "relations_verify_failed",
+                            "seed": seed, "err": str(e)[:160]}))
+        except Exception as e:  # noqa: BLE001
+            _anidb_log.warning(json.dumps({
+                "evt": "relations_verify_drain_failed", "err": str(e)[:160]}))
+        if verified:
+            _anidb_log.info(json.dumps({
+                "evt": "relations_verify_drained", "verified": verified,
+                "remaining": len(cls._relations_verify_pending)}))
+        return verified
+
+    @classmethod
+    def live_call_count(cls) -> int:
+        """Monotonic per-process count of live AniDB HTTP calls. Scan
+        instrumentation reads deltas around the anime lane (Phase 1)."""
+        return cls._http_call_count
 
     # ── Franchise offset table — converts an absolute episode number to
     # the AID + local episode it belongs to. Built by walking the relations
@@ -1501,13 +1643,23 @@ class AniDBProvider(MetadataProvider):
 
     @classmethod
     def _read_xml_cache(cls, aid: str) -> Element | None:
-        """Fresh (<24h) cached anime XML for `aid`, parsed — or None. Sync;
-        call via to_thread."""
+        """Fresh cached anime XML for `aid`, parsed — or None. TTL is
+        status-aware: 30 days for shows the offline dump marks FINISHED
+        (their episode data is immutable), 24h otherwise. Sync; call via
+        to_thread."""
         try:
             p = cls._xml_cache_path(aid)
             if not p.is_file():
                 return None
-            if (time.time() - p.stat().st_mtime) > _XML_CACHE_TTL_SEC:
+            ttl = _XML_CACHE_TTL_SEC
+            try:
+                from kira.providers.anime_offline_db import offline_count
+                off = offline_count(int(aid))
+                if off is not None and off[1] == "F":
+                    ttl = _XML_CACHE_TTL_FINISHED_SEC
+            except Exception:  # noqa: BLE001 — TTL pick is best-effort
+                pass
+            if (time.time() - p.stat().st_mtime) > ttl:
                 return None
             return ET.fromstring(p.read_text(encoding="utf-8"))
         except Exception:

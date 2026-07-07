@@ -6,17 +6,28 @@ dump, which is why per-AID HTTP calls exist at all. The community-maintained
 manami-project/anime-offline-database (ODbL) fills most of that gap: a weekly
 JSON with ~14.5k AniDB-linked entries, each carrying an episode count.
 
-Kira uses it for ONE thing: pre-filling the episode-count cache that cour
-routing, franchise offsets, and the episode-count sanity metric consume — the
-lazy per-sibling `get_episodes` fetches that used to cost one throttled
-5-second AniDB call each on first encounter. With the prefill, a first scan of
-a large anime library resolves counts from disk.
+Index v2 — Kira mines the dump for THREE things (anime-speed plan, Phase 2):
+  1. FINISHED episode counts → pre-fill the episode-count cache consumed by
+     cour routing, franchise offsets, and the episode-count sanity metric.
+  2. Per-AID entry facts (episodes, status, type, year) → lets callers use
+     ONGOING counts as guarded stale hints and reason about entry types
+     without a live call.
+  3. The RELATIONS graph (AID → related AIDs) → serves the franchise walk
+     offline. This was the single biggest cold-scan cost: the live walk pays
+     one throttled 5-second AniDB call per franchise member.
 
 Safety rules:
-  - Only FINISHED shows are indexed. An airing show's count changes weekly and
-    a stale count could misroute a cour; those still resolve live.
-  - The offline count is a BASE layer only — anything the live API ever
-    reported (the write-through cache) overrides it.
+  - Only FINISHED counts land in the base episode-count layer. An airing
+    show's count changes weekly; callers may read ONGOING counts explicitly
+    via `offline_count()` but must treat them as stale hints.
+  - Offline data is a BASE layer only — anything the live API ever reported
+    (the write-through caches) overrides it. Offline franchise closures are
+    verified by the real typed walk in the background (see
+    AniDBProvider.drain_relations_verify) and never written to the
+    authoritative relations cache.
+  - manami's relatedAnime edges are UNTYPED (no sequel-vs-side-story
+    distinction) — consumers gate the closure through the Fribb same-series
+    cross-ref to approximate the live walk's type filter.
   - Everything is best-effort: no dump → behaviour is exactly as before.
 
 The 62 MB raw JSON is parsed STREAMING (one entry decoded at a time) so peak
@@ -62,37 +73,66 @@ def index_status() -> dict:
     except OSError:
         return {"exists": False, "size_bytes": None, "updated_at": None}
 
-# Module-level lazy singleton of the reduced index ({aid: episode_count}).
-_index: dict[int, int] | None = None
+# Index format version. v2 added `entries` (episodes/status/type/year per AID)
+# and `relations` (the franchise graph); a v1 file on disk forces a rebuild.
+_INDEX_VERSION = 2
+
+# Module-level lazy singletons of the reduced index maps.
+_index: dict[int, int] | None = None                       # FINISHED counts
+_entries: dict[int, tuple[int, str, str, int | None]] | None = None
+_relations: dict[int, list[int]] | None = None
 _refresh_lock = asyncio.Lock()
 
+_STATUS_CHAR = {"FINISHED": "F", "ONGOING": "O", "UPCOMING": "U"}
+_TYPE_CHAR = {"TV": "T", "ONA": "O", "OVA": "V", "MOVIE": "M", "SPECIAL": "S"}
 
-def _build_index_from_raw(raw_path: Path) -> dict[int, int]:
+
+def _build_index_from_raw(raw_path: Path) -> dict:
     """Stream-parse the dump's `data` array with raw_decode — one entry object
     in memory at a time (the full tree would be ~10x the 62 MB text). Sync;
-    call via to_thread. Returns {anidb_id: episodes} for FINISHED entries."""
+    call via to_thread.
+
+    Returns {"counts": {aid: eps} FINISHED-only,
+             "entries": {aid: [eps, status_char, type_char, year|None]},
+             "relations": {aid: [related aids]}}."""
     # BOUNDED memory: read in 4 MB chunks into a rolling buffer, decode one
     # entry at a time, trim consumed text. A whole-file read + full-tree
     # json.load measured ~550 MB peak — this must coexist with the live app
     # on a 1 GB NAS. Chunked, the peak is ~one chunk + one entry.
     decoder = json.JSONDecoder()
     out: dict[int, int] = {}
+    entries: dict[int, list] = {}
+    relations: dict[int, list[int]] = {}
     _CHUNK = 4 * 1024 * 1024
     buf = ""
     started = False
 
     def _consume(entry: dict) -> None:
         try:
-            if entry.get("status") != "FINISHED":
-                return
-            eps = entry.get("episodes")
-            if not isinstance(eps, int) or eps <= 0:
-                return
+            aid: int | None = None
             for src in entry.get("sources", ()):
                 m = _ANIDB_SRC_RE.match(src)
                 if m:
-                    out[int(m.group(1))] = eps
-                    return
+                    aid = int(m.group(1))
+                    break
+            if aid is None:
+                return  # not AniDB-linked — useless to us
+            eps = entry.get("episodes")
+            eps_i = eps if isinstance(eps, int) and eps > 0 else 0
+            status = _STATUS_CHAR.get(entry.get("status") or "", "X")
+            typ = _TYPE_CHAR.get(entry.get("type") or "", "X")
+            season = entry.get("animeSeason") or {}
+            year = season.get("year") if isinstance(season.get("year"), int) else None
+            entries[aid] = [eps_i, status, typ, year]
+            if status == "F" and eps_i > 0:
+                out[aid] = eps_i
+            rel: list[int] = []
+            for r in entry.get("relatedAnime", ()):
+                m = _ANIDB_SRC_RE.match(r)
+                if m:
+                    rel.append(int(m.group(1)))
+            if rel:
+                relations[aid] = rel
         except Exception:  # noqa: BLE001 — one malformed entry must not kill the build
             return
 
@@ -134,7 +174,14 @@ def _build_index_from_raw(raw_path: Path) -> dict[int, int]:
                 _consume(entry)
             if done or not chunk:
                 break
-    return out
+    return {"counts": out, "entries": entries, "relations": relations}
+
+
+def _load_raw_index() -> dict:
+    try:
+        return json.loads(_INDEX_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 def load_index() -> dict[int, int]:
@@ -144,23 +191,102 @@ def load_index() -> dict[int, int]:
     if _index is not None:
         return _index
     try:
-        raw = json.loads(_INDEX_PATH.read_text(encoding="utf-8"))
+        raw = _load_raw_index()
         _index = {int(k): int(v) for k, v in raw.get("counts", {}).items()}
     except Exception:
         _index = {}
     return _index
 
 
+def load_entries() -> dict[int, tuple[int, str, str, int | None]]:
+    """{aid: (episodes, status F/O/U/X, type T/O/V/M/S/X, year|None)} — all
+    AniDB-linked entries regardless of status. Empty when never built or on a
+    pre-v2 index (a refresh rebuilds it)."""
+    global _entries
+    if _entries is not None:
+        return _entries
+    try:
+        raw = _load_raw_index()
+        _entries = {
+            int(k): (int(v[0]), str(v[1]), str(v[2]),
+                     int(v[3]) if v[3] is not None else None)
+            for k, v in raw.get("entries", {}).items()
+        }
+    except Exception:
+        _entries = {}
+    return _entries
+
+
+def load_relations() -> dict[int, list[int]]:
+    """{aid: [related aids]} — the UNTYPED franchise graph from the dump,
+    SYMMETRIZED at load (manami edges are per-entry and occasionally one-way;
+    a closure must reach A from B whenever it reaches B from A). Empty when
+    never built or on a pre-v2 index."""
+    global _relations
+    if _relations is not None:
+        return _relations
+    try:
+        raw = _load_raw_index()
+        fwd = {
+            int(k): [int(a) for a in v]
+            for k, v in raw.get("relations", {}).items()
+        }
+        sym: dict[int, set[int]] = {}
+        for src, targets in fwd.items():
+            for dst in targets:
+                sym.setdefault(src, set()).add(dst)
+                sym.setdefault(dst, set()).add(src)
+        _relations = {k: sorted(v) for k, v in sym.items()}
+    except Exception:
+        _relations = {}
+    return _relations
+
+
+def offline_count(aid: int) -> tuple[int, str] | None:
+    """(episodes, status_char) for an AID — INCLUDING ongoing shows. Callers
+    must treat non-FINISHED counts as stale hints (the dump is ~weekly).
+    None when the AID isn't in the dump or has no usable count."""
+    e = load_entries().get(aid)
+    if not e or e[0] <= 0:
+        return None
+    return e[0], e[1]
+
+
+def related_closure(aid: int) -> list[int] | None:
+    """Transitive closure of the offline relations graph from `aid` (self
+    included), sorted. None when the AID isn't in the dump at all — callers
+    fall back to the live walk. A known AID with no edges returns [aid]
+    (a genuine singleton, saving the live walk's one confirmation call)."""
+    entries = load_entries()
+    if aid not in entries:
+        return None
+    graph = load_relations()
+    visited: set[int] = set()
+    queue = [aid]
+    while queue:
+        cur = queue.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        for nxt in graph.get(cur, ()):
+            if nxt not in visited and nxt in entries:
+                queue.append(nxt)
+    return sorted(visited)
+
+
 async def refresh_if_stale() -> dict:
     """Download + reduce the dump when the local index is missing or older
     than a week. Best-effort; never raises. Returns a small summary."""
-    global _index
+    global _index, _entries, _relations
     summary = {"refreshed": False, "entries": 0}
     async with _refresh_lock:
         try:
             if _INDEX_PATH.exists():
                 age = time.time() - _INDEX_PATH.stat().st_mtime
-                if age < _REFRESH_SEC:
+                # A pre-v2 index lacks entries/relations — rebuild regardless
+                # of age (requires a re-download; the raw file was deleted).
+                current_version = _load_raw_index().get("v", 1)
+                if age < _REFRESH_SEC and current_version >= _INDEX_VERSION:
                     summary["entries"] = len(load_index())
                     return summary
             from kira import activity, net
@@ -195,12 +321,18 @@ async def refresh_if_stale() -> dict:
             await asyncio.to_thread(_RAW_PATH.write_bytes, content)
             del content
             activity.set_label(AODB_JOB, "Updating anime database · building index")
-            counts = await asyncio.to_thread(_build_index_from_raw, _RAW_PATH)
+            built = await asyncio.to_thread(_build_index_from_raw, _RAW_PATH)
+            counts = built["counts"]
             tmp = _INDEX_PATH.with_suffix(".json.tmp")
             await asyncio.to_thread(
                 tmp.write_text,
-                json.dumps({"built_at": int(time.time()),
-                            "counts": {str(k): v for k, v in counts.items()}}),
+                json.dumps({
+                    "v": _INDEX_VERSION,
+                    "built_at": int(time.time()),
+                    "counts": {str(k): v for k, v in counts.items()},
+                    "entries": {str(k): v for k, v in built["entries"].items()},
+                    "relations": {str(k): v for k, v in built["relations"].items()},
+                }),
                 "utf-8",
             )
             os.replace(tmp, _INDEX_PATH)
@@ -209,12 +341,17 @@ async def refresh_if_stale() -> dict:
                 _RAW_PATH.unlink()
             except OSError:
                 pass
+            # Reset ALL in-process singletons so the new maps load lazily.
             _index = counts
+            _entries = None
+            _relations = None
             summary["refreshed"] = True
             summary["entries"] = len(counts)
-            logger.info("anime-offline-database index built: %d finished shows", len(counts))
+            logger.info(
+                "anime-offline-database index built: %d finished counts, %d entries, %d relation nodes",
+                len(counts), len(built["entries"]), len(built["relations"]))
             activity.end(AODB_JOB, ok=True,
-                         detail=f"Anime database refreshed — {len(counts)} finished shows indexed")
+                         detail=f"Anime database refreshed — {len(built['entries'])} shows indexed")
         except Exception as e:  # noqa: BLE001 — a broken refresh must never break matching
             logger.warning("anime-offline-database refresh failed (non-fatal): %r", e)
             try:

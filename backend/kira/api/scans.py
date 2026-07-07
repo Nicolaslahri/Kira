@@ -53,6 +53,11 @@ router = APIRouter(prefix="/scans", tags=["scans"])
 # speeds 100 still checkpoints multiple times per poll tick (800ms).
 # Bounded width for the parallel (non-AniDB) match lane — see _match_phase.
 _PARALLEL_MATCH_WIDTH = 4
+# Bounded width for the anime lane (anime-speed Phase 4). Smaller than the
+# movie/TV width: anime clusters share the AniDB provider's global call lock,
+# so extra width only helps the LOCAL portion of the work. 1 = the old serial
+# behaviour (kill switch).
+_ANIME_MATCH_WIDTH = 3
 SCAN_COMMIT_EVERY = 100
 MATCH_COMMIT_EVERY = 3
 
@@ -2145,20 +2150,86 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
         return _lane_matched
 
     _music_task = asyncio.create_task(_run_music_lane()) if _music_lane else None
+    # ── Anime-lane instrumentation (anime-speed Phase 1) ────────────────
+    # Live AniDB calls ARE the lane's cost model (each throttled ~5s); the
+    # delta around the loop shows exactly how local-first the lane ran and
+    # verifies each offline-data phase actually lands.
+    import json as _json
+    import time as _time_mod
+    from kira.providers.anidb import AniDBProvider as _AniDBP
+    _lane_t0 = _time_mod.monotonic()
+    _live0 = _AniDBP.live_call_count()
     try:
-        for bucket_key, cfids in _anidb_lane:
-            # Liveness pre-write: an AniDB cluster can take tens of seconds; show
-            # WHICH cluster is resolving before dispatching it (PB-jank fix kept).
-            _pre = await session.get(MediaFile, cfids[0])
-            if _pre is not None and _pre.file_path:
-                await _bump_progress(_pre.file_path)
-            _n, _rep = await _process_match_cluster(
-                session, engine, bucket_key, cfids,
-                overridden=overridden, music_enabled=music_enabled,
-                auto_enabled=auto_enabled, auto_th=auto_th,
-            )
-            matched += _n
-            await _bump_progress(_rep)
+        # ── Anime lane: bounded-PARALLEL since anime-speed Phase 4 ──────
+        # The lane was serial because AniDB calls serialize anyway; but with
+        # the offline data (Phase 2) most clusters never touch AniDB, and the
+        # remaining per-cluster work (title-dump search, cascade scoring,
+        # TVDB cross-ref episode fetches) parallelizes exactly like the
+        # movie/TV lane. Ban-safety is unchanged BY CONSTRUCTION: every live
+        # AniDB call still serializes through the provider's _api_lock +
+        # cross-process disk ladder, no matter how many tasks queue on it.
+        # Own lane + own width (not merged into _parallel_lane) so a cluster
+        # blocked on a rare 5s AniDB slot can never starve movie/TV slots.
+        # Width 1 restores the old serial behaviour (kill switch).
+        if _anidb_lane:
+            from kira.database import SessionLocal as _SL
+            _anime_sem = asyncio.Semaphore(_ANIME_MATCH_WIDTH)
+
+            async def _run_anime(bkey, bfids) -> tuple[int, str | None]:
+                async with _anime_sem:
+                    async with _SL() as s4:
+                        try:
+                            return await _process_match_cluster(
+                                s4, engine, bkey, bfids,
+                                overridden=overridden, music_enabled=music_enabled,
+                                auto_enabled=auto_enabled, auto_th=auto_th,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"_match_phase: anime cluster {bkey!r} failed (isolated): {e!r}")
+                            # Same never-strand-in-'matching' contract as the
+                            # other lanes.
+                            try:
+                                await s4.rollback()
+                                for _fid in bfids:
+                                    _mf4 = await s4.get(MediaFile, _fid)
+                                    if _mf4 is not None and _mf4.status == "matching":
+                                        _mf4.status = "no_match"
+                                await s4.commit()
+                            except Exception:
+                                pass
+                            return 0, None
+
+            _anime_tasks = [asyncio.create_task(_run_anime(k, v)) for k, v in _anidb_lane]
+            try:
+                for _fut in asyncio.as_completed(_anime_tasks):
+                    _n, _rep = await _fut
+                    matched += _n
+                    await _bump_progress(_rep)
+            finally:
+                for _t in _anime_tasks:
+                    if not _t.done():
+                        _t.cancel()
+            # Worker sessions committed rows this session may hold stale
+            # copies of.
+            session.expire_all()
+        if _anidb_lane:
+            _live_calls = _AniDBP.live_call_count() - _live0
+            logger.info(_json.dumps({
+                "evt": "anime_lane_summary",
+                "clusters": len(_anidb_lane),
+                "live_anidb_calls": _live_calls,
+                "throttle_wait_s_est": round(_live_calls * 5.0, 1),
+                "lane_secs": round(_time_mod.monotonic() - _lane_t0, 1),
+                "relations_verify_pending": len(_AniDBP._relations_verify_pending),
+            }))
+            # Verify offline-resolved franchises with the real typed walk —
+            # fire-and-forget AFTER the lane so the throttled calls never
+            # gate matching (anime-speed Phase 2).
+            if _AniDBP._relations_verify_pending:
+                from kira.tasks import spawn_tracked
+                spawn_tracked(_AniDBP.drain_relations_verify(),
+                              label="anidb-relations-verify")
         if _music_task is not None:
             matched += await _music_task
             # The music worker session committed rows this session may hold
