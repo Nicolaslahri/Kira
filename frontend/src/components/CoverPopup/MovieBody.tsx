@@ -12,22 +12,30 @@ export function MovieBody({ item, onPickCandidate }: {
   item: LibraryItem;
   onPickCandidate?: (fileId: string, candidate: { matchId?: number; title?: string; year?: number | null }) => void | Promise<void>;
 }) {
-  const file = item.files[0];
-  if (!file) return null;
-  const conf = file.confidence;
-  const confT = confTier(conf);
-  const wrong = file.matchedWrong;
+  const files = item.files;
+  if (!files.length) return null;
   const tint = item.poster.tint;
-  const statusClass =
-    file.status === 'approved' ? 'approved' :
-    file.status === 'rejected' ? 'rejected' :
-    file.status === 'renamed' ? 'renamed' : '';
+  // Two files on one movie item = duplicate COPIES of the same film (the
+  // adapter clusters by matched movie id). Render every copy — hiding all
+  // but the first is how a duplicate stays invisible until rename time.
+  const isDupes = files.length > 1;
 
   return (
     <div className="cx-movie">
       <section className="cx-movie-section">
-        <div className="cx-movie-section-label">The file</div>
-        <div className={`cx-pair cx-pair-card ${statusClass} ${wrong ? 'wrong' : ''}`}>
+        <div className="cx-movie-section-label">
+          {isDupes ? `The files · ${files.length} copies of this movie` : 'The file'}
+        </div>
+        {files.map(file => {
+          const conf = file.confidence;
+          const confT = confTier(conf);
+          const wrong = file.matchedWrong;
+          const statusClass =
+            file.status === 'approved' ? 'approved' :
+            file.status === 'rejected' ? 'rejected' :
+            file.status === 'renamed' ? 'renamed' : '';
+          return (
+        <div key={file.id} className={`cx-pair cx-pair-card ${statusClass} ${wrong ? 'wrong' : ''}`}>
           <div
             className="cx-pair-thumb ep film-thumb"
             style={{ ['--ep-a' as never]: tint[0], ['--ep-b' as never]: tint[1] } as React.CSSProperties}
@@ -74,11 +82,13 @@ export function MovieBody({ item, onPickCandidate }: {
             <span className={`cx-row-conf ${confT}`}>{conf}%</span>
           </div>
         </div>
+          );
+        })}
       </section>
 
       {/* Alternative match candidates — one-click "Use" to correct a wrong
           auto-pick in place, instead of opening full Manual Search. */}
-      <CandidateList file={file} onPick={onPickCandidate} />
+      <CandidateList file={files[0]} onPick={onPickCandidate} />
 
       {item.cast?.length ? (
         <section className="cx-movie-section">

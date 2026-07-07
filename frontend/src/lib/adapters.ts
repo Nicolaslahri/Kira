@@ -579,10 +579,17 @@ export function buildLibraryItems(files: MediaFile[]): LibraryItem[] {
   const groups = new Map<string, MediaFile[]>();
   files.forEach(f => {
     let key: string;
-    // Movies stay solo even when matched — each is its own card, regardless
-    // of the franchise. (Otherwise all the Marvel movies would collapse.)
+    // Movies: DIFFERENT movies stay solo (Marvel doesn't collapse — distinct
+    // provider ids), but two files matched to the SAME movie id are duplicate
+    // COPIES of one film, not two library items. Split, a 2-copy movie
+    // rendered as two identical cards that the collection band then
+    // mislabeled "Part 1 / Part 2"; clustered, one card carries both files
+    // and the duplicates tooling (Review's Duplicates filter, the dashboard
+    // reclaimable-space math) actually sees them.
     if (f.mediaType === 'movie') {
-      key = `__solo_${f.id}`;
+      key = f.match?.provider && f.match.providerId
+        ? `movie|${f.match.provider}|${f.match.providerId}`
+        : `__solo_${f.id}`;
     } else if (f.match?.provider === 'pack' && f.match.seriesGroupId) {
       // A pack's provider_id is per-EPISODE ("<pack>:<season>:<episode>"), so the
       // generic `match|provider|providerId|season` key below would give every

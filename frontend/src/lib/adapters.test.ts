@@ -141,6 +141,27 @@ describe('buildLibraryItems — grid clustering', () => {
     expect(items.every(i => i.kind === 'movie')).toBe(true);
   });
 
+  it('clusters duplicate COPIES of the same movie into one card', () => {
+    // Two files matched to the SAME tmdb id are copies of one film. Split,
+    // they rendered as two identical cards the collection band mislabeled
+    // "Part 1 / Part 2"; clustered, the duplicates tooling sees them.
+    const items = buildLibraryItems([
+      apiToMediaFile(mkFile({ id: 1, media_type: 'movie', matches: [mkMatch({ provider: 'tmdb', provider_id: '1266127' })] })),
+      apiToMediaFile(mkFile({ id: 2, media_type: 'movie', matches: [mkMatch({ provider: 'tmdb', provider_id: '1266127' })] })),
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0].kind).toBe('movie');
+    expect(items[0].files).toHaveLength(2);
+  });
+
+  it('keeps unmatched movies solo (no id to cluster on)', () => {
+    const items = buildLibraryItems([
+      apiToMediaFile(mkFile({ id: 1, media_type: 'movie', status: 'no_match', matches: [] })),
+      apiToMediaFile(mkFile({ id: 2, media_type: 'movie', status: 'no_match', matches: [] })),
+    ]);
+    expect(items).toHaveLength(2);
+  });
+
   it('clusters episodes sharing (provider, id, season) into one series card', () => {
     const items = buildLibraryItems([
       epFile({ id: 1 }, { provider: 'anidb', provider_id: '69', season_number: 1, episode_number: 1, title: 'One Piece' }),
