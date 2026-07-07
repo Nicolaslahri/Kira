@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, type ReactNode, type Dispatch, type SetStateAction } from 'react';
 import { IcTv, IcRefresh, IcEyeOff, IcEye, IcCheck, IcAlertTri, IcLink, IcSettings, IcFilm, IcX } from '../../lib/icons';
 import { Select } from '../../components/ui';
-import { SettingsLayout, NestedBox, FieldRow, SETTINGS_NESTED, SectionHeader } from '../../components/settings-blocks';
+import { SettingsLayout, NestedBox, FieldRow, SETTINGS_NESTED, SectionHeader, ProviderLogo } from '../../components/settings-blocks';
 import { BadgeWithDot } from '../../components/base/badges/badges';
 import { Button } from '../../components/base/buttons/button';
 import { Input } from '../../components/base/input/input';
@@ -89,8 +89,8 @@ const BRAND = {
 // title + description + an optional header action (status badge / Test), and the
 // config body below a hairline divider. A connected card carries a faint green
 // ring so "wired up" reads at a glance (matches the Connections provider cards).
-function IntegrationCard({ icon, tint, title, desc, headerExtra, connected, children }: {
-  icon: ReactNode; tint: string; title: ReactNode; desc?: ReactNode;
+function IntegrationCard({ icon, logo, tint, title, desc, headerExtra, connected, children }: {
+  icon: ReactNode; logo?: string; tint: string; title: ReactNode; desc?: ReactNode;
   headerExtra?: ReactNode; connected?: boolean; children?: ReactNode;
 }) {
   return (
@@ -99,7 +99,9 @@ function IntegrationCard({ icon, tint, title, desc, headerExtra, connected, chil
       style={{ boxShadow: connected ? 'inset 0 0 0 1px color-mix(in srgb, var(--conf-high) 38%, transparent)' : 'inset 0 0 0 1px var(--color-border-secondary)' }}
     >
       <div className="flex items-start gap-3 p-4">
-        <FeaturedIcon size="md" tint={tint} icon={icon} />
+        {/* Real brand logo (white tile, same as Connections) when we have
+            one; brand-tinted glyph otherwise. */}
+        {logo ? <ProviderLogo src={logo} /> : <FeaturedIcon size="md" tint={tint} icon={icon} />}
         <div className="min-w-0 flex-1">
           <div className="text-[14px] font-semibold text-primary">{title}</div>
           {desc ? <div className="mt-1 text-[12px] leading-relaxed text-tertiary">{desc}</div> : null}
@@ -555,6 +557,7 @@ export function IntegrationsSection({
         tint={BRAND.sonarr}
         connected={testStatus === 'ok' || sonarrHealth === 'ok'}
         icon={<IcTv />}
+        logo="/providers/sonarr.svg"
         title="Sonarr"
         desc={<>When configured, the cover popup gets a <span className="font-mono text-ink">Get missing → Sonarr</span> button that one-clicks a search for every episode Kira knows you don't have. URL + API key live in Sonarr's <span className="font-mono text-ink">Settings → General → Security</span>.</>}
         headerExtra={(
@@ -713,6 +716,7 @@ export function IntegrationsSection({
         tint={BRAND.radarr}
         connected={radarrTestStatus === 'ok' || radarrHealth === 'ok'}
         icon={<IcFilm />}
+        logo="/providers/radarr.svg"
         title="Radarr"
         desc={<>When Kira reorganizes a movie's folder it re-points Radarr at the new path (and reverses it on undo), so Radarr keeps tracking the file instead of reading it as deleted + re-grabbing. URL + API key live in Radarr's <span className="font-mono text-ink">Settings → General → Security</span>.</>}
         headerExtra={(
