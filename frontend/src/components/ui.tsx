@@ -165,9 +165,11 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
 
   // Live app version — /health is the single source (backend truth), the
   // hardcoded fallback only covers "backend unreachable". Plus a gentle
-  // update notice from GitHub releases, gated by `advanced.update_check`
-  // (default on; flip it off in Settings → Advanced). No releases published
-  // / offline / rate-limited all degrade to silence.
+  // update notice from GitHub TAGS, gated by `advanced.update_check`
+  // (default on; flip it off in Settings → Advanced). Tags — not
+  // releases/latest — because every push is tagged vX.Y.Z but no GitHub
+  // release objects exist, so the releases endpoint 404'd forever and the
+  // badge never lit. Offline / rate-limited / no tags degrade to silence.
   const [version, setVersion] = useState<string | null>(null);
   const [updateTo, setUpdateTo] = useState<string | null>(null);
   useEffect(() => {
@@ -187,10 +189,17 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
         setVersion(h.version);
         const s = await api.getSettings();
         if (cancelled || s['advanced.update_check'] === false) return;
-        const r = await fetch('https://api.github.com/repos/Nicolaslahri/Kira/releases/latest');
+        const r = await fetch('https://api.github.com/repos/Nicolaslahri/Kira/tags?per_page=30');
         if (!r.ok) return;
-        const j = await r.json() as { tag_name?: string };
-        const latest = (j.tag_name || '').trim();
+        const j = await r.json() as Array<{ name?: string }>;
+        // The tags API has no ordering guarantee — pick the semver max of the
+        // vX.Y.Z-shaped names ourselves.
+        let latest = '';
+        for (const t of Array.isArray(j) ? j : []) {
+          const name = (t.name || '').trim();
+          if (!/^v?\d+\.\d+\.\d+$/.test(name)) continue;
+          if (!latest || newer(name, latest)) latest = name;
+        }
         if (!cancelled && latest && newer(latest, h.version)) setUpdateTo(latest.replace(/^v/i, ''));
       } catch { /* informational only */ }
     })();
@@ -219,10 +228,10 @@ export function Sidebar({ active, setActive, settingsSection, setSettingsSection
             v{version ?? '0.5.0'}
             {updateTo ? (
               <a
-                href="https://github.com/Nicolaslahri/Kira/releases"
+                href="https://github.com/Nicolaslahri/Kira/tags"
                 target="_blank" rel="noreferrer"
                 className="ml-1.5 font-medium text-info hover:underline"
-                title={`Version ${updateTo} is available on GitHub`}
+                title={`Version ${updateTo} is available on GitHub — pull the new image in Portainer`}
               >
                 · v{updateTo} out
               </a>
