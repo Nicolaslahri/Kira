@@ -64,11 +64,10 @@ export function AdvancedSection({
   const updateCheck = rawSettings['advanced.update_check'] !== false;
   const musicEnabled = rawSettings['music.enabled'] === true;
   const musicWriteTags = rawSettings['music.write_tags'] !== false;   // default ON
-  // Hidden file input for the settings-import flow — clicked via the Button.
-  const importInputRef = useRef<HTMLInputElement>(null);
 
-  // Settings backup: download everything except secrets (API keys leave the
+  // Keyless settings export: everything except secrets (API keys leave the
   // server masked, and a backup that embeds them would undo that protection).
+  // The full export (keys included) is the server-side /settings/backup.
   const doExport = async () => {
     try {
       const all = await api.getSettings();
@@ -284,43 +283,18 @@ export function AdvancedSection({
         </div>
       </SectionCard>
 
-      {/* Backup & restore — settings only (the database holds matches/history
-          and has its own lifecycle; this covers configuration). */}
-      <SectionCard
-        tint="var(--conf-high)"
-        icon={<IcDownload />}
-        title="Backup &amp; restore"
-        desc={<>Export every setting as a JSON file, or import one to restore a configuration. <strong className="text-ink">API keys are never included</strong> — they leave the server masked — so re-enter those after a restore.</>}
-      >
-        <div className="flex flex-wrap items-center gap-2.5">
-          <Button color="secondary" size="sm" iconLeading={IcDownload} onClick={() => void doExport()}>
-            Export settings
-          </Button>
-          <input
-            ref={importInputRef}
-            type="file"
-            accept="application/json,.json"
-            className="hidden"
-            onChange={e => {
-              const f = e.target.files?.[0];
-              if (f) void doImport(f);
-              e.target.value = '';
-            }}
-          />
-          <Button color="secondary" size="sm" iconLeading={IcRefresh} onClick={() => importInputRef.current?.click()}>
-            Import settings…
-          </Button>
-        </div>
-      </SectionCard>
       </div>
       </div>
 
-      {/* ── Backup & schedule ── */}
+      {/* ── Backup, restore & schedule — ONE card. Two export flavours with
+          different key handling: the full backup embeds provider keys
+          (disaster recovery on a fresh Kira), the keyless export strips them
+          (safe to share / commit). Import accepts either file shape. ── */}
       <SectionCard
         tone="default"
         icon={<IcRefresh />}
-        title="Backup &amp; schedule"
-        desc="Export your whole configuration to a file (includes API keys — store it safely), restore it on any Kira, and let Kira rescan the library on a nightly clock."
+        title="Backup &amp; restore"
+        desc="Export your configuration, restore it on any Kira, keep a daily auto-backup, and rescan the library on a nightly clock."
       >
         <div className="flex flex-col gap-3">
           {/* Daily auto-backup — same JSON as Export, written to the persisted
@@ -342,8 +316,11 @@ export function AdvancedSection({
             <Button color="secondary" size="sm" onClick={() => {
               void api.downloadSettingsBackup().catch(e =>
                 pushToast({ title: 'Backup failed', sub: (e as Error).message, kind: 'error' }));
-            }}>Export settings…</Button>
-            <Button color="secondary" size="sm" onClick={() => backupFileRef.current?.click()}>Import backup…</Button>
+            }}>Export (with keys)…</Button>
+            <Button color="secondary" size="sm" iconLeading={IcDownload} onClick={() => void doExport()}>
+              Export without keys…
+            </Button>
+            <Button color="secondary" size="sm" onClick={() => backupFileRef.current?.click()}>Import…</Button>
             <input
               ref={backupFileRef}
               type="file"
@@ -356,16 +333,23 @@ export function AdvancedSection({
                 void (async () => {
                   try {
                     const parsed = JSON.parse(await f.text());
-                    const r = await api.restoreSettingsBackup(parsed);
-                    pushToast({ title: 'Backup restored', sub: `${r.restored} settings applied — reloading…`, kind: 'success' });
-                    setTimeout(() => window.location.reload(), 900);
+                    // Shape-aware: full backups carry the kira_backup marker →
+                    // server restore; keyless exports are a bare settings map →
+                    // the client-side import path.
+                    if (parsed && typeof parsed === 'object' && 'kira_backup' in parsed) {
+                      const r = await api.restoreSettingsBackup(parsed);
+                      pushToast({ title: 'Backup restored', sub: `${r.restored} settings applied — reloading…`, kind: 'success' });
+                      setTimeout(() => window.location.reload(), 900);
+                    } else {
+                      await doImport(f);
+                    }
                   } catch (err) {
                     pushToast({ title: 'Restore failed', sub: (err as Error).message, kind: 'error' });
                   }
                 })();
               }}
             />
-            <span className="text-[12px] text-tertiary">The export contains your provider keys in plaintext.</span>
+            <span className="text-[12px] text-tertiary">“With keys” embeds provider keys in plaintext — store it safely. “Without keys” is safe to share; re-enter keys after importing it.</span>
           </div>
 
           <div className="flex items-center justify-between gap-4 border-t border-secondary pt-3">
