@@ -107,8 +107,51 @@ def _write_cache(key: str, pack: Pack) -> None:
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         _cache_path(key).write_text(pack.model_dump_json(), encoding="utf-8")
+        _invalidate_image_urls()
     except Exception as e:  # cache is an optimisation, never fatal
         logger.warning("packs: cache write failed for %s: %r", key, e)
+
+
+# ── Pack image allow-list (consumed by the /img proxy) ──────────────────────
+# Pack posters live wherever the pack author hosts them (GitHub raw, a fan
+# CDN…) — hosts the proxy's static provider allow-list rightly refuses. Rather
+# than widening by HOST (which would open the auth-exempt proxy to arbitrary
+# URLs on that host), allow the EXACT urls installed packs declare. The
+# proxy's SSRF guard still applies on top.
+_image_urls_memo: set[str] | None = None
+
+
+def _invalidate_image_urls() -> None:
+    global _image_urls_memo
+    _image_urls_memo = None
+
+
+def allowed_image_urls() -> set[str]:
+    """Every poster / season-poster URL declared by a cached pack (memory +
+    disk, so it survives a restart before any pack is re-fetched). Memoized;
+    invalidated on pack cache writes and evictions."""
+    global _image_urls_memo
+    if _image_urls_memo is not None:
+        return _image_urls_memo
+    packs: dict[str, Pack] = dict(_packs)
+    try:
+        if _CACHE_DIR.exists():
+            for p in _CACHE_DIR.glob("*.json"):
+                cached = _read_cache(p.stem)
+                if cached is not None and p.stem not in packs:
+                    packs[p.stem] = cached
+    except OSError:
+        pass
+    urls: set[str] = set()
+    for pack in packs.values():
+        try:
+            if pack.show.poster_url:
+                urls.add(pack.show.poster_url)
+            urls.update(u for u in pack.show.season_posters.values() if u)
+        except Exception:  # noqa: BLE001 — one odd pack must not break the proxy
+            continue
+    _image_urls_memo = urls
+    return urls
 
 
 def _read_cache(key: str) -> Pack | None:
@@ -161,6 +204,7 @@ def evict(key: str) -> None:
             p.unlink()
     except OSError:
         pass
+    _invalidate_image_urls()
 
 
 # ── Bindings persistence (settings table) ───────────────────────────────────

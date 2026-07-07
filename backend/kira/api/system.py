@@ -175,6 +175,17 @@ async def install_ffmpeg_endpoint() -> dict:
     return status
 
 
+@router.get("/logs")
+async def get_logs(
+    limit: int = Query(200, ge=1, le=500),
+    level: str | None = Query(None, description="Min level, e.g. WARNING"),
+) -> dict:
+    """Recent log records from the in-memory ring (newest last) — the UI log
+    viewer. Secrets are scrubbed at the handler; restarting clears the ring."""
+    from kira.log import ring_tail
+    return {"logs": ring_tail(limit=limit, level=level)}
+
+
 @router.get("/datasets")
 async def get_datasets_status() -> dict:
     """Local anime reference datasets: what's on disk, how old it is, the

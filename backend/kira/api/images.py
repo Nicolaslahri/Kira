@@ -170,7 +170,17 @@ def _img_host_allowed(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower().rstrip(".")
     if not host:
         return False
-    return any(host == d or host.endswith("." + d) for d in _ALLOWED_IMG_HOSTS)
+    if any(host == d or host.endswith("." + d) for d in _ALLOWED_IMG_HOSTS):
+        return True
+    # Kira Packs host their art wherever the pack author likes (GitHub raw, a
+    # fan CDN…). Allow the EXACT urls declared by installed packs — not their
+    # hosts — so pack covers render + disk-cache like provider art without
+    # widening the auth-exempt proxy. The SSRF guard downstream still applies.
+    try:
+        from kira.packs.loader import allowed_image_urls
+        return url in allowed_image_urls()
+    except Exception:  # noqa: BLE001 — packs are optional; never break the proxy
+        return False
 
 
 async def prefetch_into_cache(u: str) -> bool:

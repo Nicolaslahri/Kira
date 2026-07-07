@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { IcSettings, IcFilm, IcAlertTri, IcDownload, IcRefresh } from '../../lib/icons';
 import { Select } from '../../components/ui';
 import { SettingsLayout, SectionCard, SettingRow, NumberField, NestedBox, SectionHeader, StatusPill, ProviderField } from '../../components/settings-blocks';
@@ -323,6 +323,21 @@ export function AdvancedSection({
         desc="Export your whole configuration to a file (includes API keys — store it safely), restore it on any Kira, and let Kira rescan the library on a nightly clock."
       >
         <div className="flex flex-col gap-3">
+          {/* Daily auto-backup — same JSON as Export, written to the persisted
+              volume (backups/, newest 14 kept) by the scheduler clock. */}
+          <label className="flex cursor-pointer items-start gap-2.5 text-[13px] text-ink">
+            <input
+              type="checkbox"
+              checked={rawSettings['advanced.auto_backup'] === true}
+              onChange={e => saveKey('advanced.auto_backup')(e.target.checked)}
+              style={{ accentColor: 'var(--accent)' }}
+              className="mt-0.5"
+            />
+            <span>
+              Auto-backup settings daily
+              <span className="block text-[12px] text-ink-soft">One JSON per day into the config volume’s <span className="font-mono">backups/</span> folder — newest 14 kept. Includes API keys, like the manual export.</span>
+            </span>
+          </label>
           <div className="flex flex-wrap items-center gap-2">
             <Button color="secondary" size="sm" onClick={() => {
               void api.downloadSettingsBackup().catch(e =>
@@ -379,6 +394,9 @@ export function AdvancedSection({
           </div>
         </div>
       </SectionCard>
+
+      {/* ── Logs ── */}
+      <LogsCard />
 
       {/* Danger zone — visually quarantined: its own labelled group + the
           red-tinted SectionCard tone. */}
@@ -457,6 +475,76 @@ export function AdvancedSection({
   );
 }
 
+
+// ── Log viewer — tails the backend's in-memory ring (secrets scrubbed
+// server-side); refreshes every 3s while open. Newest first, so the thing
+// you're debugging is at the top without scrolling.
+function LogsCard() {
+  const [open, setOpen] = useState(false);
+  const [warnOnly, setWarnOnly] = useState(false);
+  const [rows, setRows] = useState<Array<{ ts: number; level: string; logger: string; msg: string }>>([]);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    const load = () => {
+      void api.systemLogs({ limit: 300, level: warnOnly ? 'WARNING' : undefined })
+        .then(r => { if (!cancelled) setRows(r.logs); })
+        .catch(() => {});
+    };
+    load();
+    const t = window.setInterval(load, 3000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [open, warnOnly]);
+
+  const fmtTs = (ts: number) => new Date(ts * 1000).toLocaleTimeString([], { hour12: false });
+  const levelColor = (lv: string) =>
+    lv === 'ERROR' || lv === 'CRITICAL' ? 'var(--conf-low)'
+      : lv === 'WARNING' ? 'var(--conf-mid)'
+      : 'var(--ink-3)';
+
+  return (
+    <SectionCard
+      tone="default"
+      icon={<IcSettings />}
+      title="Logs"
+      desc="The backend's recent log tail (last ~500 records, secrets scrubbed) — no docker exec needed. Clears on restart."
+    >
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <Button color="secondary" size="sm" onClick={() => setOpen(v => !v)}>
+            {open ? 'Hide logs' : 'Show logs'}
+          </Button>
+          {open ? (
+            <label className="flex cursor-pointer items-center gap-2 text-[12.5px] text-ink">
+              <input type="checkbox" checked={warnOnly}
+                     onChange={e => setWarnOnly(e.target.checked)}
+                     style={{ accentColor: 'var(--accent)' }} />
+              Warnings &amp; errors only
+            </label>
+          ) : null}
+        </div>
+        {open ? (
+          <div className="max-h-[420px] overflow-y-auto rounded-xl bg-black/30 p-3 ring-1 ring-inset ring-secondary">
+            {rows.length === 0 ? (
+              <div className="py-4 text-center text-[12px] text-ink-soft">
+                {warnOnly ? 'No warnings or errors in the ring — good sign.' : 'Nothing logged yet.'}
+              </div>
+            ) : (
+              [...rows].reverse().map((r, i) => (
+                <div key={`${r.ts}-${i}`} className="flex gap-2 py-0.5 font-mono text-[11px] leading-relaxed">
+                  <span className="shrink-0 text-ink-muted">{fmtTs(r.ts)}</span>
+                  <span className="w-[62px] shrink-0 font-semibold" style={{ color: levelColor(r.level) }}>{r.level}</span>
+                  <span className="shrink-0 text-ink-muted">{r.logger.replace(/^kira\./, '')}</span>
+                  <span className="min-w-0 whitespace-pre-wrap break-all text-ink">{r.msg}</span>
+                </div>
+              ))
+            )}
+          </div>
+        ) : null}
+      </div>
+    </SectionCard>
+  );
+}
 
 // ── Danger-zone row — one reset tier ──
 // Severity escalates 1→4 (amber → deep red). Light tiers confirm with a

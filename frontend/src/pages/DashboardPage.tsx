@@ -7,11 +7,12 @@ import {
   IcScan, IcCheck, IcX, IcHistory, IcArrowRight,
   IcFilm, IcTv, IcAnime, IcMusic, IcFolder, IcReview,
   IcShieldCheck, IcLink, IcAlertTri, IcSparkles, IcRefresh,
-  IcDownload, IcCaption,
+  IcDownload, IcCaption, IcTrash,
 } from '../lib/icons';
 import { cn } from '../lib/utils';
 import { getConfBands } from '../lib/confBands';
 import { buildLibraryItems } from '../lib/adapters';
+import { formatEta } from '../components/CoverPopup/format';
 import { Button } from '../components/base/buttons/button';
 import { FeaturedIcon } from '../components/base/featured-icons/featured-icon';
 import { MetricCard } from '../components/base/metrics/metric-card';
@@ -299,6 +300,62 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
   const [hardlinkSaved, setHardlinkSaved] = useState<{ files: number; bytes_saved: number } | null>(null);
   useEffect(() => {
     const load = () => { void api.hardlinkSavings().then(setHardlinkSaved).catch(() => {}); };
+    load();
+    window.addEventListener('kira:files-changed', load);
+    return () => window.removeEventListener('kira:files-changed', load);
+  }, []);
+
+  // In-flight *arr downloads — a compact card so "what's coming" is visible
+  // without opening Sonarr/Radarr. Hidden entirely when both queues are empty
+  // or the integrations aren't configured (the calls 400 → swallowed).
+  type DlRow = { key: string; label: string; sub: string | null; pct: number; eta: number | null; failed: boolean };
+  const [downloads, setDownloads] = useState<DlRow[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const rows: DlRow[] = [];
+      try {
+        const r = await api.sonarrQueue();
+        for (const it of r.items) {
+          rows.push({
+            key: `s${it.queue_id ?? it.download_id ?? rows.length}`,
+            label: it.episode_title
+              ? `S${String(it.season).padStart(2, '0')}E${String(it.episode_number).padStart(2, '0')} · ${it.episode_title}`
+              : (it.release_title ?? `S${it.season}E${it.episode_number}`),
+            sub: it.release_title,
+            pct: it.progress_pct, eta: it.eta_seconds,
+            failed: it.status === 'failed' || it.status === 'warning',
+          });
+        }
+      } catch { /* not configured / offline — card stays hidden */ }
+      try {
+        const r = await api.radarrQueue();
+        for (const it of r.items) {
+          rows.push({
+            key: `r${it.tmdb_id}`,
+            label: it.title ?? it.release_title ?? 'Movie',
+            sub: it.release_title,
+            pct: it.progress_pct, eta: it.eta_seconds,
+            failed: it.status === 'failed' || !!it.error_message,
+          });
+        }
+      } catch { /* ditto */ }
+      if (!cancelled) setDownloads(rows);
+    };
+    void load();
+    const t = window.setInterval(() => void load(), 30_000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  // Trash contents (the cleanup sweep's recycle bin) — a Storage-card row so
+  // reclaimable space is visible without digging into History → Trash.
+  const [trash, setTrash] = useState<{ count: number; bytes: number } | null>(null);
+  useEffect(() => {
+    const load = () => {
+      void api.listTrash()
+        .then(r => setTrash({ count: r.items.length, bytes: r.total_bytes }))
+        .catch(() => {});
+    };
     load();
     window.addEventListener('kira:files-changed', load);
     return () => window.removeEventListener('kira:files-changed', load);
@@ -924,6 +981,26 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
                       </span>
                     </button>
                   ) : null}
+                  {trash && trash.count > 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        try { sessionStorage.setItem('kira.history.view', 'trash'); } catch { /* */ }
+                        setActive('history');
+                      }}
+                      className="group -mx-1 flex items-center justify-between gap-2 rounded-lg px-1 py-1 text-left text-[12px] transition-colors hover:bg-white/[0.04]"
+                      title="Open History → Trash to restore or purge"
+                    >
+                      <span className="inline-flex items-center gap-1.5 text-secondary">
+                        <IcTrash className="size-3.5 text-tertiary" />
+                        {trash.count} item{trash.count === 1 ? '' : 's'} in trash
+                      </span>
+                      <span className="inline-flex items-center gap-1 font-mono tabular-nums text-tertiary">
+                        {trash.bytes > 0 ? formatBytes(trash.bytes) : 'manage'}
+                        <IcArrowRight className="size-3 opacity-0 transition-opacity group-hover:opacity-100" />
+                      </span>
+                    </button>
+                  ) : null}
                 </div>
               ) : (
                 <div className="flex h-full flex-col items-center justify-center gap-1 py-4 text-center">
@@ -960,6 +1037,34 @@ export function DashboardPage({ state, openModal, runScan, runReparse, setActive
                       </BadgeWithDot>
                     </div>
                   ))}
+                </div>
+              </Card>
+            ) : null}
+
+            {/* Downloads — live Sonarr/Radarr queue. Hidden when idle. */}
+            {downloads.length > 0 ? (
+              <Card
+                title="Downloading"
+                icon={<FeaturedIcon size="sm" tint="#6ec1ff" icon={<IcDownload />} />}
+                action={<span className="text-[11.5px] text-tertiary">{downloads.length} in flight</span>}
+              >
+                <div className="flex flex-col gap-3">
+                  {downloads.slice(0, 5).map(d => (
+                    <div key={d.key} className="flex flex-col gap-1">
+                      <div className="flex items-center justify-between gap-2 text-[12.5px]">
+                        <span className="min-w-0 truncate font-medium text-primary" title={d.sub ?? d.label}>{d.label}</span>
+                        <span className={cn('shrink-0 font-mono text-[11px] tabular-nums', d.failed ? 'text-error-primary' : 'text-tertiary')}>
+                          {d.failed ? 'failed' : d.eta != null && d.eta > 0 ? formatEta(d.eta) : `${Math.round(d.pct)}%`}
+                        </span>
+                      </div>
+                      <div className="flex h-1 w-full overflow-hidden rounded-full bg-white/[0.06]">
+                        <div style={{ width: `${Math.max(2, Math.min(100, d.pct))}%`, background: d.failed ? 'var(--conf-low)' : 'var(--info)' }} />
+                      </div>
+                    </div>
+                  ))}
+                  {downloads.length > 5 ? (
+                    <div className="text-[11px] text-quaternary">+{downloads.length - 5} more in the queue</div>
+                  ) : null}
                 </div>
               </Card>
             ) : null}

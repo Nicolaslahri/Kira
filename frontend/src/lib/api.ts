@@ -570,6 +570,17 @@ export const api = {
   installFfmpeg: () =>
     request<ApiFfmpegStatus>('/ffmpeg/install', { method: 'POST' }),
 
+  /** Recent backend log records (in-memory ring, secrets scrubbed) — the
+   *  Settings → Advanced log viewer. */
+  systemLogs: (opts?: { limit?: number; level?: string }) => {
+    const q = new URLSearchParams();
+    if (opts?.limit) q.set('limit', String(opts.limit));
+    if (opts?.level) q.set('level', opts.level);
+    const qs = q.toString();
+    return request<{ logs: Array<{ ts: number; level: string; logger: string; msg: string }> }>(
+      `/logs${qs ? `?${qs}` : ''}`);
+  },
+
   /** Local anime reference datasets — on-disk age/size + live refresh progress. */
   datasetsStatus: () =>
     request<{ datasets: ApiDataset[] }>('/datasets'),

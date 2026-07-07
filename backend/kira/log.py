@@ -50,7 +50,47 @@ class _SecretScrubFilter(logging.Filter):
         return True
 
 
+class _RingHandler(logging.Handler):
+    """Bounded in-memory tail of every log record — backs GET /logs so the UI
+    can show recent logs without a docker exec. 500 records ≈ a few minutes
+    of busy scanning; the deque drops the oldest automatically."""
+
+    def __init__(self, maxlen: int = 500):
+        super().__init__()
+        from collections import deque
+        self.records: deque[dict] = deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.records.append({
+                "ts": record.created,
+                "level": record.levelname,
+                "logger": record.name,
+                "msg": record.getMessage(),
+            })
+        except Exception:  # noqa: BLE001 — logging must never raise
+            pass
+
+
+ring_handler: _RingHandler | None = None
+
+
+def ring_tail(limit: int = 200, level: str | None = None) -> list[dict]:
+    """Newest-last slice of the in-memory log ring, optionally min-level
+    filtered ('WARNING' → warnings + errors only)."""
+    if ring_handler is None:
+        return []
+    rows = list(ring_handler.records)
+    if level:
+        floor = getattr(logging, level.upper(), None)
+        if isinstance(floor, int):
+            rows = [r for r in rows
+                    if getattr(logging, str(r["level"]), 0) >= floor]
+    return rows[-max(1, min(limit, 500)):]
+
+
 def setup_logging() -> None:
+    global ring_handler
     level_name = os.environ.get("KIRA_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     # force=False: respect handlers an embedding context (tests, uvicorn
@@ -67,3 +107,9 @@ def setup_logging() -> None:
     _scrub = _SecretScrubFilter()
     for _h in logging.getLogger().handlers:
         _h.addFilter(_scrub)
+    # In-memory ring for the UI log viewer — attached at ROOT so it sees every
+    # propagated record, WITH the scrubber so secrets never reach the API.
+    if ring_handler is None:
+        ring_handler = _RingHandler()
+        ring_handler.addFilter(_scrub)
+        logging.getLogger().addHandler(ring_handler)

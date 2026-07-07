@@ -113,7 +113,19 @@ export function HistoryPage({ pushToast }: Props) {
     cachedCounts ?? { today: 0, week: 0, all: 0 }
   );
   const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [view, setView] = useState<'renames' | 'subtitles' | 'trash'>('renames');
+  // One-shot deep link from the Dashboard's trash stat (same sessionStorage
+  // handoff the Review dupes filter uses — the Dashboard unmounts before we
+  // mount, so props can't carry it).
+  const [view, setView] = useState<'renames' | 'subtitles' | 'trash'>(() => {
+    try {
+      const v = sessionStorage.getItem('kira.history.view');
+      if (v === 'trash' || v === 'subtitles') {
+        sessionStorage.removeItem('kira.history.view');
+        return v;
+      }
+    } catch { /* private mode */ }
+    return 'renames';
+  });
   const [period, setPeriod] = useState<Period>('all');
   const [opFilter, setOpFilter] = useState<OpFilter>('all');
   const [query, setQuery] = useState('');
