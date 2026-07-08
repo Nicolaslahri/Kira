@@ -162,6 +162,57 @@ describe('buildLibraryItems — grid clustering', () => {
     expect(items).toHaveLength(2);
   });
 
+  it('does NOT collapse a Singles folder into one dupe slot (the delete-34 footgun)', () => {
+    // 35 different singles, each "track 1" of some release, all matched to
+    // the same release title with NO per-track title. The old song key fell
+    // back to match.title (the RELEASE title — identical for all), so every
+    // song merged into one "Track 1" slot whose dupe modal offered
+    // "keep one, delete the other 34". Distinct songs must get distinct slots.
+    const single = (id: number, name: string) => apiToMediaFile(mkFile({
+      id, media_type: 'music',
+      file_path: `/media/music/Singles/${name}.flac`,
+      matches: [mkMatch({
+        provider: 'musicbrainz', provider_id: `rec-${id}`, match_type: 'music_track',
+        title: 'Monster', episode_number: 1,
+        series_group_id: 'mb:release-1', metadata: { music: true },
+      })],
+    }));
+    const items = buildLibraryItems([
+      single(1, 'Justin Bieber - One Time'),
+      single(2, 'Justin Bieber - Sorry'),
+      single(3, 'Justin Bieber - Flatline'),
+    ]);
+    expect(items).toHaveLength(1);                 // one Singles card…
+    expect(items[0].episodes).toHaveLength(3);     // …but three song rows
+    // Nobody shares a slot → no dupe-primary row, no mass-delete modal.
+    const slots = new Set(items[0].files.map(f => f.matchedToEpisode));
+    expect(slots.size).toBe(3);
+    // Slots are titled by the per-file song (filename stem), not the release.
+    const titles = items[0].episodes.map(e => e.title);
+    expect(titles).toContain('Justin Bieber - Sorry');
+  });
+
+  it('still merges REAL copies of the same song into one dupe slot', () => {
+    const copy = (id: number, name: string, song: string) => apiToMediaFile(mkFile({
+      id, media_type: 'music',
+      file_path: `/media/music/Singles/${name}.flac`,
+      matches: [mkMatch({
+        provider: 'musicbrainz', provider_id: `rec-${id}`, match_type: 'music_track',
+        title: 'Monster', episode_number: 1,
+        series_group_id: 'mb:release-1', metadata: { music: true, title: song },
+      })],
+    }));
+    const items = buildLibraryItems([
+      copy(1, 'Monster', 'Monster'),
+      copy(2, 'Monster (copy)', 'Monster'),        // true duplicate (same track title)
+      copy(3, 'Justin Bieber - Sorry', 'Sorry'),
+    ]);
+    expect(items[0].episodes).toHaveLength(2);     // Monster + Sorry
+    const monsterIdx = items[0].episodes.findIndex(e => e.title === 'Monster');
+    const onMonster = items[0].files.filter(f => f.matchedToEpisode === monsterIdx);
+    expect(onMonster).toHaveLength(2);             // the pair shares one slot → dupe tooling applies
+  });
+
   it('clusters episodes sharing (provider, id, season) into one series card', () => {
     const items = buildLibraryItems([
       epFile({ id: 1 }, { provider: 'anidb', provider_id: '69', season_number: 1, episode_number: 1, title: 'One Piece' }),

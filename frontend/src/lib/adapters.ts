@@ -335,10 +335,20 @@ function buildItem(group: MediaFile[]): LibraryItem {
       let pos = 0;
       const byTitle = new Map<string, number>();
       group.forEach(f => {
-        const songKey = (f.match?.trackTitle || f.match?.title || '').trim().toLowerCase();
+        // Song identity: the per-track title when the match carries one,
+        // else the FILENAME stem. Never match.title — that's the RELEASE
+        // title, identical for every file matched to the same release, so
+        // keying on it collapsed a whole Singles folder (35 different
+        // songs, each "track 1" of some release) into ONE slot whose dupe
+        // modal then offered "keep one, delete the other 34". A false
+        // SPLIT (two real copies rendered as two rows) is benign; a false
+        // MERGE offers mass deletion of distinct songs.
+        const trackT = (f.match?.trackTitle || '').trim().toLowerCase();
+        const stem = f.filename.replace(/\.[^.]+$/, '').trim().toLowerCase();
+        const songKey = trackT || `stem:${stem}`;
         let epNo: number;
-        if (songKey && byTitle.has(songKey)) epNo = byTitle.get(songKey)!;     // same song → same track (a real dup)
-        else { epNo = ++pos; if (songKey) byTitle.set(songKey, epNo); }
+        if (byTitle.has(songKey)) epNo = byTitle.get(songKey)!;   // same song → same track (a real dup)
+        else { epNo = ++pos; byTitle.set(songKey, epNo); }
         byFile.set(f.id, epNo);   // local non-null ref — closure loses the narrowing
       });
     }
@@ -353,12 +363,20 @@ function buildItem(group: MediaFile[]): LibraryItem {
     if (episode == null) return;
     const key = `${season}-${episode}`;
     const existing = epMap.get(key);
+    // Music in per-song re-slot mode: title each slot by the SONG, not the
+    // release. match.title is the release title — with 35 re-slotted singles
+    // it would label every row "Monster"; the filename stem ("Justin Bieber -
+    // Sorry") is the honest per-file fallback when trackTitle is missing.
+    const musicSlotTitle = isMusic
+      ? (f.match?.trackTitle
+          || (musicEpByFile ? f.filename.replace(/\.[^.]+$/, '').trim() : f.match?.title))
+      : undefined;
     if (!existing) {
       epMap.set(key, {
         season,
         episode,
         absolute: abs ?? undefined,
-        title: f.match?.episodeTitle || (isMusic ? (f.match?.trackTitle || f.match?.title) : undefined) || undefined,
+        title: f.match?.episodeTitle || musicSlotTitle || undefined,
         track: isMusic ? episode : undefined,
         duration: isMusic ? (fmtDuration(f.durationSec) ?? undefined) : undefined,
         durationSec: isMusic ? f.durationSec : undefined,
