@@ -238,3 +238,75 @@ async def test_singles_album_skips_release_resolution(monkeypatch):
     # distinct tracks (no collapse) + one shared synthetic group (one "Singles" card)
     assert out[1].track_no == 1 and out[2].track_no == 2
     assert out[1].release_id == out[2].release_id and out[1].release_id.startswith("loose:")
+
+
+@pytest.mark.asyncio
+async def test_heterogeneous_singles_skip_release_resolution(monkeypatch):
+    """A Singles folder: per-file DIFFERENT album tags + release ids (each
+    single is its own release). Resolving any ONE release force-matched every
+    unrelated song onto it ("35 files · 1 track", 34 false duplicates offered
+    for deletion). The heterogeneity guard must route the cluster to the
+    per-recording path without touching release resolution."""
+    async def boom_get_release(client, mbid):
+        raise AssertionError("release resolution must not run for a heterogeneous singles cluster")
+
+    async def boom_search(*a, **k):
+        raise AssertionError("album search must not run for a heterogeneous singles cluster")
+
+    recorded: list[list[MusicFile]] = []
+
+    async def fake_recordings(client, files, *, acoustid_key=None):
+        recorded.append(files)
+        return []
+
+    monkeypatch.setattr(matcher.mb, "get_release", boom_get_release)
+    monkeypatch.setattr(matcher.mb, "search_releases", boom_search)
+    monkeypatch.setattr(matcher, "_match_by_recordings", fake_recordings)
+
+    files = [
+        MusicFile(1, MusicTags(artist="Justin Bieber", album="Monster", title="Monster", track_no=1, mb_release_id="rel-m")),
+        MusicFile(2, MusicTags(artist="Justin Bieber", album="Sorry", title="Sorry", track_no=1, mb_release_id="rel-s")),
+        MusicFile(3, MusicTags(artist="Justin Bieber", album="Flatline", title="Flatline", track_no=1, mb_release_id="rel-f")),
+        MusicFile(4, MusicTags(artist="Justin Bieber", album="One Time", title="One Time", track_no=1, mb_release_id="rel-o")),
+    ]
+    out = await match_album(None, files)
+    assert out == []
+    assert len(recorded) == 1 and len(recorded[0]) == 4
+
+
+@pytest.mark.asyncio
+async def test_singles_folder_name_routes_to_recordings(monkeypatch):
+    """Even with homogeneous-looking tags, a folder literally named 'Singles'
+    is a singles bucket — per-recording matching, no release resolution."""
+    async def boom_get_release(client, mbid):
+        raise AssertionError("no release resolution for a Singles folder")
+
+    async def fake_recordings(client, files, *, acoustid_key=None):
+        return []
+
+    monkeypatch.setattr(matcher.mb, "get_release", boom_get_release)
+    monkeypatch.setattr(matcher, "_match_by_recordings", fake_recordings)
+
+    files = [
+        MusicFile(i, MusicTags(artist="Justin Bieber", title=f"Song {i}"), fb_album="Singles")
+        for i in (1, 2, 3)
+    ]
+    assert await match_album(None, files) == []
+
+
+@pytest.mark.asyncio
+async def test_homogeneous_album_still_uses_id_bypass(monkeypatch):
+    """A REAL album (one shared release id, one album tag) must keep the fast
+    MBID bypass — the guard only fires on self-disagreeing clusters."""
+    async def fake_get_release(client, mbid):
+        assert mbid == "rel-1"
+        return _release()
+
+    monkeypatch.setattr(matcher.mb, "get_release", fake_get_release)
+    files = [
+        MusicFile(1, MusicTags(artist="Daft Punk", album="Discovery", track_no=1, mb_release_id="rel-1")),
+        MusicFile(2, MusicTags(artist="Daft Punk", album="Discovery", track_no=2, mb_release_id="rel-1")),
+        MusicFile(3, MusicTags(artist="Daft Punk", album="Discovery", title="Aerodynamic", mb_release_id="rel-1")),
+    ]
+    out = {m.file_id: m for m in await match_album(None, files)}
+    assert out[1].matched_via == "tracknum"

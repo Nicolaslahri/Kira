@@ -189,6 +189,24 @@ async def match_album(
     if not files:
         return []
 
+    # 0. Loose-singles heterogeneity guard — BEFORE any release resolution.
+    #    A folder of distinct singles has per-file DIFFERENT album tags and
+    #    release MBIDs (each single is its own release), so any one "winning"
+    #    release force-matches every unrelated song onto it: most_common of 35
+    #    distinct rel_ids picked an arbitrary single ("Monster"), _assign put
+    #    every track_no=1 file on ITS track 1 at 0.92, and the card read
+    #    "35 files · 1 track" with 34 false duplicates offered for deletion.
+    #    Real albums are homogeneous (one album tag, one release id); when the
+    #    cluster disagrees with itself — or the FOLDER says it's a singles
+    #    bucket — match each file to its OWN recording instead.
+    if len(files) >= 3:
+        _albums = {normalize(a) for a in (_album_of(f) for f in files) if a}
+        _ids = {f.tags.mb_release_id for f in files if f.tags.mb_release_id}
+        _fb = next((f.fb_album for f in files if f.fb_album), "")
+        if (max(len(_albums), len(_ids)) > max(2, len(files) // 3)
+                or normalize(_fb) in SINGLES_ALBUM_MARKERS):
+            return await _match_by_recordings(client, files, acoustid_key=acoustid_key)
+
     # 1. id bypass — the release MBID the files' tags agree on.
     release = None
     rel_ids = [f.tags.mb_release_id for f in files if f.tags.mb_release_id]
