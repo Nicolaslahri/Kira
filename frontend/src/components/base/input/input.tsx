@@ -79,6 +79,13 @@ export const Input = ({
                     {...props}
                 />
             )}
+            {/* Trailing (eye / browse / clear) stays available even when locked —
+                e.g. the path field's Browse must work without clicking Edit.
+                Rendered BEFORE the Edit chip: the trailing set varies per field
+                (eye, clear, both, neither), so Edit-first landed "Edit" at a
+                different offset on every stacked row — Edit-last pins it flush
+                right, one aligned column across the whole card. */}
+            {trailing}
             {locked && (
                 <button
                     type="button"
@@ -89,9 +96,6 @@ export const Input = ({
                     Edit
                 </button>
             )}
-            {/* Trailing (eye / browse / clear) stays available even when locked —
-                e.g. the path field's Browse must work without clicking Edit. */}
-            {trailing}
         </div>
     );
 };

@@ -2063,11 +2063,18 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
                 else _parallel_lane)
         lane.append((bucket_key, cfids))
 
+    # Live music-lane progress. The lane runs on its OWN session concurrently
+    # with the anime loop, and two sessions must not fight over the Scan row —
+    # so the lane only mutates this counter and the ORCHESTRATOR (below)
+    # publishes it. Without this, a music-heavy scan sat at "Matching 0/N"
+    # until the whole lane finished, then jumped straight to 100%.
+    _music_progress: dict = {"matched": 0, "path": None}
+
     async def _bump_progress(rep_path: str | None) -> None:
         await _touch_db_scan_lock()   # keep the >6h-stale lock claim fresh mid-scan
         _sc = await session.get(Scan, scan_id)
         if _sc is not None:
-            _sc.matched_count = matched
+            _sc.matched_count = matched + _music_progress["matched"]
             if rep_path:
                 _sc.current_path = rep_path
         await session.commit()
@@ -2130,12 +2137,17 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
         async with SessionLocal() as s3:
             for bkey, bfids in _music_lane:
                 try:
-                    _n, _ = await _process_match_cluster(
+                    _n, _rep3 = await _process_match_cluster(
                         s3, engine, bkey, bfids,
                         overridden=overridden, music_enabled=music_enabled,
                         auto_enabled=auto_enabled, auto_th=auto_th,
                     )
                     _lane_matched += _n
+                    # Publish per-cluster progress; the orchestrator's poll
+                    # loop writes it to the Scan row (never this session).
+                    _music_progress["matched"] = _lane_matched
+                    if _rep3:
+                        _music_progress["path"] = _rep3
                 except Exception as e:
                     logger.warning(f"_match_phase: music cluster {bkey!r} failed (isolated): {e!r}")
                     try:
@@ -2231,7 +2243,16 @@ async def _match_phase(session, engine, fids: list[int], scan_id: int) -> int:
                 spawn_tracked(_AniDBP.drain_relations_verify(),
                               label="anidb-relations-verify")
         if _music_task is not None:
+            # Poll while the lane runs so its per-cluster counter reaches the
+            # Scan row every ~1.5s — a music-only reparse previously showed
+            # "Matching 0/N" for the entire lane and jumped to 100% at the end.
+            while True:
+                _done, _ = await asyncio.wait({_music_task}, timeout=1.5)
+                await _bump_progress(_music_progress["path"])
+                if _done:
+                    break
             matched += await _music_task
+            _music_progress["matched"] = 0   # folded into `matched` now
             # The music worker session committed rows this session may hold
             # stale copies of.
             session.expire_all()
